@@ -321,6 +321,7 @@ struct RegistryInner {
 pub struct LandQueueRegistry {
     config: LandQueueConfig,
     batch_gate: Option<BatchUpdateGate>,
+    closed: AtomicBool,
     inner: Mutex<RegistryInner>,
 }
 
@@ -335,6 +336,7 @@ impl LandQueueRegistry {
         Self {
             config,
             batch_gate: None,
+            closed: AtomicBool::new(false),
             inner: Mutex::new(RegistryInner {
                 lanes: HashMap::new(),
                 key_states: HashMap::new(),
@@ -349,6 +351,7 @@ impl LandQueueRegistry {
         Self {
             config,
             batch_gate: Some(gate),
+            closed: AtomicBool::new(false),
             inner: Mutex::new(RegistryInner {
                 lanes: HashMap::new(),
                 key_states: HashMap::new(),
@@ -436,29 +439,30 @@ impl LandQueueRegistry {
         };
 
         // Wait for delivery or cooperative cancellation.
+        // Lock hierarchy: `self.inner` -> `lane.queue` -> `entry.state` -> `entry.outcome`.
         loop {
             if entry.is_canceled() {
+                let mut q = lane
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut st = entry
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match *st {
                     EntryState::Queued => {
-                        let mut q = lane
-                            .queue
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if *st == EntryState::Queued {
-                            q.retain(|item| item.id != entry.id);
-                            *st = EntryState::Done;
-                            return Err(LandError::Canceled);
-                        }
+                        q.retain(|item| item.id != entry.id);
+                        *st = EntryState::Done;
+                        return Err(LandError::Canceled);
                     }
                     EntryState::Executing => {
                         // Batch is already running and may still land.
                         return Err(LandError::Canceled);
                     }
                     EntryState::Done => {
+                        drop(st);
+                        drop(q);
                         return entry
                             .outcome
                             .lock()
@@ -486,6 +490,7 @@ impl LandQueueRegistry {
     }
 
     pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         let lanes: Vec<Arc<Lane>> = {
             let mut inner = self
                 .inner
@@ -495,15 +500,16 @@ impl LandQueueRegistry {
             inner.lanes.values().cloned().collect()
         };
         for lane in lanes {
+            let _q = lane
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             lane.cv.notify_all();
         }
     }
 
     fn is_closed(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed
+        self.closed.load(Ordering::Acquire)
     }
 
     fn run_lane(self: Arc<Self>, lane: Arc<Lane>) {
@@ -2198,6 +2204,8 @@ CREATE TABLE IF NOT EXISTS land_tickets (
 );
 CREATE INDEX IF NOT EXISTS idx_land_tickets_queue
   ON land_tickets(repo_key, target_branch, ticket_key, seq ASC);
+CREATE INDEX IF NOT EXISTS idx_land_tickets_branch
+  ON land_tickets(repo_key, target_branch, priority DESC, seq ASC);
 CREATE INDEX IF NOT EXISTS idx_land_tickets_holder
   ON land_tickets(holder_id);
 "#;
@@ -2425,20 +2433,36 @@ impl LandTicketStore {
             })?;
 
             let mut all_head = true;
-            for key in &sorted_keys {
+            if actual_branch_wide {
                 let head_holder: Option<String> = tx
                     .query_row(
                         "SELECT holder_id FROM land_tickets
-                         WHERE repo_key = ?1 AND target_branch = ?2 AND ticket_key = ?3
+                         WHERE repo_key = ?1 AND target_branch = ?2
                          ORDER BY priority DESC, seq ASC
                          LIMIT 1",
-                        params![repo_key, target_branch, key],
+                        params![repo_key, target_branch],
                         |row| row.get(0),
                     )
                     .ok();
                 if head_holder.as_deref() != Some(holder_id.as_str()) {
                     all_head = false;
-                    break;
+                }
+            } else {
+                for key in &sorted_keys {
+                    let head_holder: Option<String> = tx
+                        .query_row(
+                            "SELECT holder_id FROM land_tickets
+                             WHERE repo_key = ?1 AND target_branch = ?2 AND ticket_key IN (?3, ?4)
+                             ORDER BY priority DESC, seq ASC
+                             LIMIT 1",
+                            params![repo_key, target_branch, key, TICKET_BRANCH_WIDE_KEY],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if head_holder.as_deref() != Some(holder_id.as_str()) {
+                        all_head = false;
+                        break;
+                    }
                 }
             }
             tx.commit().map_err(|e| LandError::Failed {
@@ -3192,5 +3216,148 @@ mod tests {
             adapt_batch_size(40, Duration::from_millis(350), target, 100),
             40
         );
+    }
+
+    #[test]
+    fn branch_wide_and_file_level_tickets_are_mutually_exclusive_both_ways() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let store = LandTicketStore::for_repo(repo).unwrap();
+
+        // 1. Holding branch_wide blocks concurrent file-level ["a.rs"] until released.
+        let mut bw_guard = store
+            .acquire(
+                repo,
+                "main",
+                &[],
+                true,
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
+        let file_acquired = Arc::new(AtomicBool::new(false));
+        let file_acquired_clone = Arc::clone(&file_acquired);
+        let repo_f = repo.to_path_buf();
+        let t_file = std::thread::spawn(move || {
+            let s = LandTicketStore::for_repo(&repo_f).unwrap();
+            let mut g = s
+                .acquire(
+                    &repo_f,
+                    "main",
+                    &["a.rs".into()],
+                    false,
+                    Duration::from_secs(10),
+                    Duration::from_secs(5),
+                    None,
+                )
+                .unwrap();
+            file_acquired_clone.store(true, Ordering::SeqCst);
+            g.release();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !file_acquired.load(Ordering::SeqCst),
+            "file-level ticket must block while branch_wide ticket is held"
+        );
+        bw_guard.release();
+        t_file.join().unwrap();
+        assert!(file_acquired.load(Ordering::SeqCst));
+
+        // 2. Holding ["a.rs"] blocks concurrent branch_wide until released.
+        let mut file_guard = store
+            .acquire(
+                repo,
+                "main",
+                &["a.rs".into()],
+                false,
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
+        let bw_acquired = Arc::new(AtomicBool::new(false));
+        let bw_acquired_clone = Arc::clone(&bw_acquired);
+        let repo_bw = repo.to_path_buf();
+        let t_bw = std::thread::spawn(move || {
+            let s = LandTicketStore::for_repo(&repo_bw).unwrap();
+            let mut g = s
+                .acquire(
+                    &repo_bw,
+                    "main",
+                    &[],
+                    true,
+                    Duration::from_secs(10),
+                    Duration::from_secs(5),
+                    None,
+                )
+                .unwrap();
+            bw_acquired_clone.store(true, Ordering::SeqCst);
+            g.release();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !bw_acquired.load(Ordering::SeqCst),
+            "branch_wide ticket must block while file-level ticket is held"
+        );
+        file_guard.release();
+        t_bw.join().unwrap();
+        assert!(bw_acquired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn concurrent_submit_queued_cancel_and_close_is_deadlock_free() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let base = git(repo, &["rev-parse", "refs/heads/main"]);
+        let oids: Vec<String> = (1..=6)
+            .map(|i| {
+                make_branch_commit(repo, &format!("c-{i}"), &format!("c-{i}.txt"), "v\n", &base)
+            })
+            .collect();
+
+        let registry = Arc::new(LandQueueRegistry::new(LandQueueConfig {
+            window: Duration::from_millis(80),
+            ..LandQueueConfig::default()
+        }));
+
+        let cancel_flags: Vec<Arc<AtomicBool>> =
+            (0..6).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let barrier = Arc::new(Barrier::new(7));
+        let mut handles = Vec::new();
+        for (i, oid) in oids.into_iter().enumerate() {
+            let reg = Arc::clone(&registry);
+            let repo_p = repo.to_path_buf();
+            let flag = Arc::clone(&cancel_flags[i]);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let mut req = LandRequest::new(repo_p, format!("c-{}", i + 1), "main", oid);
+                req.cancel = Some(flag);
+                reg.submit(req)
+            }));
+        }
+
+        // Concurrently cancel half the queued requests and close the registry during collection.
+        let reg_close = Arc::clone(&registry);
+        let cancel_clone = cancel_flags;
+        let b_close = Arc::clone(&barrier);
+        let closer = std::thread::spawn(move || {
+            b_close.wait();
+            std::thread::sleep(Duration::from_millis(3));
+            for (i, flag) in cancel_clone.iter().enumerate() {
+                if i % 2 == 0 {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            reg_close.close();
+        });
+
+        closer.join().unwrap();
+        for h in handles {
+            let res = h.join().unwrap();
+            assert!(res.is_ok() || matches!(res, Err(LandError::Canceled)));
+        }
     }
 }
