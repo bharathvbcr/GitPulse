@@ -9,7 +9,7 @@ export interface LiveLoaderOptions<Mode> {
    * One read. `isCurrent()` turns false once the surface is reset or disposed,
    * so an answer that arrives after that must be discarded, not applied.
    */
-  read(mode: Mode | undefined, isCurrent: () => boolean): Promise<void>;
+  read(mode: Mode | undefined, isCurrent: () => boolean): Promise<void | "failed">;
   /** A read that rejected while still current. */
   onError(cause: unknown): void;
   /** How long a change burst is coalesced before one re-read. */
@@ -20,6 +20,15 @@ export interface LiveLoaderOptions<Mode> {
    * each one was a full re-read. `load()` itself is never held back.
    */
   minGapMs?: number;
+  /**
+   * Opt-in backoff for a source that is failing. A read that resolves
+   * `"failed"` (or throws) is retried by the loader after `baseMs`, then
+   * twice that, doubling up to `maxMs`, until a read succeeds: asking a busy
+   * store again every `minGapMs` is what kept it busy. A change that arrives
+   * meanwhile is held to the same schedule; `load()` never is. Without this
+   * option a failed read is not retried and nothing here changes.
+   */
+  retry?: { baseMs: number; maxMs: number };
 }
 
 /**
@@ -53,6 +62,9 @@ export function createLiveReturn(): (onScreen: boolean) => boolean {
 /** Changes reach a surface within this long, however often they come. */
 export const LIVE_MIN_GAP_MS = 1_500;
 
+/** The longest a failing live read waits before it is asked again (see `retry`). */
+export const LIVE_RETRY_MAX_MS = 15_000;
+
 /**
  * The load/coalesce/refresh loop the Task archive and the Attention inbox
  * both had, line for line: one read at a time (a load that arrives mid-read
@@ -71,6 +83,10 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
   let lastReadAt = -Infinity;
   /** A change-driven read came due while a read was running; it is scheduled once that read ends. */
   let owed = false;
+  /** Reads in a row that failed; only counted when `retry` is set. */
+  let failures = 0;
+  /** How long the next change-driven read waits for the failures so far; 0 when the last one landed. */
+  const backoffMs = () => (options.retry && failures > 0 ? Math.min(options.retry.maxMs, options.retry.baseMs * 2 ** (failures - 1)) : 0);
 
   async function load(mode?: Mode): Promise<void> {
     if (!options.canRun() || disposed) return;
@@ -82,18 +98,22 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
     const isCurrent = () => epoch === generation && !disposed;
     loading = true;
     lastReadAt = Date.now();
+    let failed = false;
     try {
-      await options.read(mode, isCurrent);
+      failed = (await options.read(mode, isCurrent)) === "failed";
     } catch (cause) {
+      failed = true;
       if (isCurrent()) options.onError(cause);
     } finally {
       loading = false;
       lastReadAt = Date.now();
+      // A read that a reset orphaned says nothing about the source now.
+      if (options.retry && isCurrent()) failures = failed ? failures + 1 : 0;
       if (again) {
         again = false;
         owed = false;
         void load();
-      } else if (owed) {
+      } else if (owed || (failed && options.retry && isCurrent())) {
         owed = false;
         schedule();
       }
@@ -108,7 +128,9 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
   function schedule(): void {
     if (!options.canRun() || disposed || timer !== undefined) return;
     if (loading) { owed = true; return; }
-    const gap = lastReadAt + (options.minGapMs ?? LIVE_MIN_GAP_MS) - Date.now();
+    // A change after the whole backoff has passed with nothing scheduled finds a source that may have recovered.
+    if (failures > 0 && Date.now() - lastReadAt >= backoffMs()) failures = 0;
+    const gap = Math.max(lastReadAt + (options.minGapMs ?? LIVE_MIN_GAP_MS), lastReadAt + backoffMs()) - Date.now();
     timer = setTimeout(() => {
       timer = undefined;
       // A read began meanwhile (an explicit load): this one waits for it.
@@ -129,6 +151,7 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
     /** The list is a different list now: orphan the read in flight and any pending refresh. */
     reset(): void {
       generation += 1;
+      failures = 0;
       cancelScheduled();
     },
     /** For callbacks guarded by "still mounted". */

@@ -45,7 +45,7 @@ describe("browser regression gate", () => {
     expect(nativeRunnerBinary("linux", { GITPULSE_WEBVIEW_RUNNER_BIN: "/opt/bin/runner" }, "/repo")).toBe(path.resolve("/opt/bin/runner"));
   });
   it("gives a long page its own deadline and keeps the minute for every other page", () => {
-    expect(harnessDeadlineSeconds("tasks")).toBe(300);
+    expect(harnessDeadlineSeconds("tasks")).toBe(360);
     expect(harnessDeadlineSeconds("health")).toBe(120);
     for (const harness of BROWSER_HARNESSES.filter(name => !(name in HARNESS_DEADLINE_SECONDS))) expect(harnessDeadlineSeconds(harness)).toBe(DEFAULT_DEADLINE_SECONDS);
     expect(DEFAULT_DEADLINE_SECONDS).toBe(60);

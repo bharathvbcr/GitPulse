@@ -240,3 +240,97 @@ describe("createLiveLoader on an unfocused but visible window", () => {
     disconnect();
   });
 });
+
+describe("createLiveLoader retry", () => {
+  /** A source whose answers the test chooses: each read takes the next outcome, and its start time is logged. */
+  function failing(outcomes: Array<"ok" | "failed" | "throw">, retry?: { baseMs: number; maxMs: number }) {
+    const starts: number[] = [];
+    let call = 0;
+    const loader = createLiveLoader({
+      canRun: () => true,
+      read: async () => {
+        starts.push(Date.now());
+        const outcome = outcomes[Math.min(call++, outcomes.length - 1)];
+        if (outcome === "throw") throw new Error("boom");
+        return outcome === "failed" ? "failed" : undefined;
+      },
+      onError: () => {},
+      minGapMs: 0,
+      retry,
+    });
+    return { loader, starts };
+  }
+  const gapsOf = (starts: number[]) => starts.slice(1).map((at, i) => at - starts[i]);
+
+  it("retries a failed read at a doubling interval up to the cap", async () => {
+    vi.useFakeTimers();
+    const { loader, starts } = failing(["failed"], { baseMs: 1_000, maxMs: 8_000 });
+    void loader.load();
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(gapsOf(starts).slice(0, 5)).toEqual([1_000, 2_000, 4_000, 8_000, 8_000]);
+    loader.dispose();
+  });
+
+  it("counts a thrown read as a failure too", async () => {
+    vi.useFakeTimers();
+    const { loader, starts } = failing(["throw"], { baseMs: 1_000, maxMs: 8_000 });
+    void loader.load();
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(gapsOf(starts)).toEqual([1_000, 2_000, 4_000]);
+    loader.dispose();
+  });
+
+  it("starts the schedule over once a read lands", async () => {
+    vi.useFakeTimers();
+    const { loader, starts } = failing(["failed", "failed", "failed", "ok", "failed"], { baseMs: 1_000, maxMs: 8_000 });
+    void loader.load();
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(gapsOf(starts)).toEqual([1_000, 2_000, 4_000]);
+    // The fourth read landed: nothing is owed, and the next change begins again at the base interval.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(starts).toHaveLength(4);
+    loader.schedule();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(starts).toHaveLength(5);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(starts).toHaveLength(6);
+    loader.dispose();
+  });
+
+  it("holds changes that arrive during the backoff to it, and never holds back load()", async () => {
+    vi.useFakeTimers();
+    const { loader, starts } = failing(["failed"], { baseMs: 1_000, maxMs: 8_000 });
+    void loader.load();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(starts).toHaveLength(2);
+    // Failed twice: the next try is due in 2 s. Changes in that window do not bring it forward.
+    for (let t = 0; t < 1_500; t += 100) { loader.schedule(); await vi.advanceTimersByTimeAsync(100); }
+    expect(starts).toHaveLength(2);
+    await loader.load();
+    expect(starts).toHaveLength(3);
+    loader.dispose();
+  });
+
+  it("does not retry at all unless asked to", async () => {
+    vi.useFakeTimers();
+    const { loader, starts } = failing(["failed"]);
+    void loader.load();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(starts).toHaveLength(1);
+    loader.dispose();
+  });
+
+  it("a reset forgets the failures", async () => {
+    vi.useFakeTimers();
+    const { loader, starts } = failing(["failed"], { baseMs: 1_000, maxMs: 8_000 });
+    void loader.load();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(starts).toHaveLength(3);
+    loader.reset();
+    const before = starts.length;
+    void loader.load();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(starts.length - before).toBe(2);
+    loader.dispose();
+  });
+});
