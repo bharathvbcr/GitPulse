@@ -18,6 +18,7 @@ local-first desktop workspace with 11 specialized sections across 5 views. This 
 | Look up a view or section in detail | [View reference](VIEW_REFERENCE.md) |
 | Run agents on a task board, with guards and collision warnings | [Agents guide](AGENTS_GUIDE.md) |
 | Compare Waylode with other tools | [Why Waylode](WHY_WAYLODE.md) |
+| Design thesis, trade-offs & stack boundaries | [Philosophy](PHILOSOPHY.md) |
 | Find a command or keyboard shortcut | [Command palette](COMMAND_PALETTE.md) · [Keyboard shortcuts](../wiki/Keyboard%20Shortcuts.md) |
 | Explore topics, tags and SEO | [Topics and SEO](../README.md#topics-tags--discoverability) |
 
@@ -26,9 +27,9 @@ local-first desktop workspace with 11 specialized sections across 5 views. This 
 | Guide | Covers |
 | --- | --- |
 | [Tasks and workspaces](TASKS_AND_WORKSPACES.md) | Quick add, boards, saved workspaces, drafting, archive, agent handoff |
-| [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse `--cone` checkouts, zero-copy DevMap overlays, `gitpulse-rustc` build cache, parallel agent radar |
+| [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse `--cone` checkouts, zero-copy DevMap overlays, `waylode-rustc` build cache, parallel agent radar |
 | [Mavi](MAVI.md) | Agent conversations: the timeline, approvals, live per-turn changes, SSH hosts, and how it is kept safe |
-| [Terminal](TERMINAL.md) · [Terminal host](TERMINAL_HOST.md) | Sessions, split panes, search, export, `gitpulse-ptyd` host & crash survival |
+| [Terminal](TERMINAL.md) · [Terminal host](TERMINAL_HOST.md) | Sessions, split panes, search, export, `waylode-ptyd` host & crash survival |
 | [Coverage](COVERAGE.md) | Report formats, generation, missing toolchains, diagnostics |
 | [Cloud, SSH and Remote Control sessions](CLOUD_SESSIONS.md) | What works off-Mac, DevMap setup script, what is unavailable |
 | [Repository hygiene](REPOSITORY_HYGIENE.md) | Storage scopes, cleanup previews, scheduling |
@@ -55,10 +56,11 @@ local-first desktop workspace with 11 specialized sections across 5 views. This 
 | [Good first issues](GOOD_FIRST_ISSUES.md) | Scoped contribution ideas |
 | [Dependency health](DEPENDENCY_HEALTH.md) | Dependency maintenance and unresolved advisories |
 | [Performance](PERFORMANCE.md) | Performance design and measurement boundaries |
-| [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse cones, DevMap overlays, `gitpulse-rustc` build cache, parallel agent radar |
+| [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse cones, DevMap overlays, `waylode-rustc` build cache, parallel agent radar |
 | [Overview hardening](OVERVIEW_HARDENING.md) | Worktree identity and incomplete-state contracts |
 | [Native notifications](NATIVE_NOTIFICATIONS_ADAPTER.md) | Adapter contract and platform qualification |
 | [Contracts](../contracts/README.md) | Cross-process lease and operation schemas |
+| [Specifications](../specs/README.md) | 7-layer Waylode specs (`001` ADE & worktrees, `002` host integration & seams, `003` Primary vs. Labs editions) |
 
 ## Implementation and evidence
 
@@ -83,8 +85,4 @@ wiki summaries or marketing copy. Add maintained guides to this index, link from
 the relevant feature section, and preserve existing anchors where practical.
 Historical release sections and audit records retain their original context.
 
-The public website is owned by the separate Portfolio repository, in
-`src/pages/GitPulse.jsx` and `src/pages/GitPulse.css`; its catalog summary lives in
-`src/data/projectData.js` and route metadata in `src/lib/routes.js`. Its screenshots
-live under `public/assets/`. The page links back to these canonical guides. Updating
-this repository does not publish the website or synchronize the GitHub wiki.
+The public website is owned by the separate Portfolio repository (`pages/GitPulse.jsx`, `pages/GitPulse.css`, `data/projectData.js`, `lib/routes.js`, and screenshots under `assets/` in that repo). The page links back to these canonical guides. Updating this repository does not publish the website or synchronize the GitHub wiki.

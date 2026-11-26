@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Feature reference](FEATURES.md) · [Architecture](ARCHITECTURE.md)
 
-This document records the systems research, failure-mode analysis, and architectural design behind Waylode's zero-copy branching, sparse worktree provisioning, parallel DevMap delta overlays, content-addressed `gitpulse-rustc` build cache, and multi-agent coordination bus.
+This document records the systems research, failure-mode analysis, and architectural design behind Waylode's zero-copy branching, sparse worktree provisioning, parallel DevMap delta overlays, content-addressed `waylode-rustc` build cache, and multi-agent coordination bus.
 
 ---
 
@@ -19,7 +19,7 @@ Running multiple autonomous coding agents in parallel against one repository str
 | **GitButler Virtual Branches** | Multiple virtual lanes multiplexed inside a single working directory | Single working tree | Single shared index | Single `target/` directory | Disjoint hunk assignment in one tree | Breaks down when two parallel agents edit the same file or run incompatible build/test processes simultaneously |
 | **Dagger `container-use` & Worktrunk** | Ephemeral container checkouts (`container-use`) or branch-addressed Git worktrees with CoW cache copy (`Worktrunk`) | Container layer or full Git worktree |Copied or rebuilt per lane | Whole-directory `target/` reflink when unlocked | Post-hoc merge / PR review | When an active build holds `.cargo-lock`, whole-directory `target/` cloning must skip the build directory |
 | **`sccache` (`RUSTC_WRAPPER`)** | Content-addressed compiler wrapper hashing `rustc -vV`, flags, and pre-processed/source inputs | N/A (compiler layer) | N/A | Shared `.rlib` / `.rmeta` object cache across directories | N/A | Copies bytes into `--out-dir` rather than APFS/FICLONE CoW reflinking; external daemon setup required |
-| **Waylode Zero-Copy Engine** | Carried-churn branching + DevMap-guided `--cone` sparse checkouts + `<512 B` DevMap base pointers + Blake3/CAS AST overlays + `gitpulse-rustc` CoW cache + `<git-common-dir>` lane bus | Only transitive `--cone` directories materialized on disk | Shared anchor `devmap.sqlite` + mmap `.csr` + per-lane `overlay.json` & `RoaringBitmap` dirty CSR mask | Whole-`target/` CoW clone when idle **plus** lock-free per-crate `gitpulse-rustc` CoW cache when `.cargo-lock` is held | Pre-edit file/symbol claims + bounded message ring + 3-layer CSR/ODB collision radar | Zero server infrastructure, zero FUSE kernel extensions, 100% compatible with standard Git remotes |
+| **Waylode Zero-Copy Engine** | Carried-churn branching + DevMap-guided `--cone` sparse checkouts + `<512 B` DevMap base pointers + Blake3/CAS AST overlays + `waylode-rustc` CoW cache + `<git-common-dir>` lane bus | Only transitive `--cone` directories materialized on disk | Shared anchor `devmap.sqlite` + mmap `.csr` + per-lane `overlay.json` & `RoaringBitmap` dirty CSR mask | Whole-`target/` CoW clone when idle **plus** lock-free per-crate `waylode-rustc` CoW cache when `.cargo-lock` is held | Pre-edit file/symbol claims + bounded message ring + 3-layer CSR/ODB collision radar | Zero server infrastructure, zero FUSE kernel extensions, 100% compatible with standard Git remotes |
 
 ---
 
@@ -52,13 +52,13 @@ flowchart TB
     subgraph LaneA["Agent Worktree Lane A (Sparse Cone)"]
         ConeA["<code>git sparse-checkout --cone</code><br/>DevMap 1-hop dependency closure"]
         RefA["<code>base_store_ref.json</code> (&lt;512 B)<br/>+ <code>overlay.json</code> (RoaringBitmap CSR mask)"]
-        RustcA["<code>RUSTC_WRAPPER=gitpulse-rustc</code><br/>Stage 1 direct + Stage 2 <code>.d</code> verify + CoW reflink"]
+        RustcA["<code>RUSTC_WRAPPER=waylode-rustc</code><br/>Stage 1 direct + Stage 2 <code>.d</code> verify + CoW reflink"]
     end
 
     subgraph LaneB["Agent Worktree Lane B (Sparse Cone)"]
         ConeB["<code>git sparse-checkout --cone</code><br/>DevMap 1-hop dependency closure"]
         RefB["<code>base_store_ref.json</code> (&lt;512 B)<br/>+ <code>overlay.json</code> (RoaringBitmap CSR mask)"]
-        RustcB["<code>RUSTC_WRAPPER=gitpulse-rustc</code><br/>Stage 1 direct + Stage 2 <code>.d</code> verify + CoW reflink"]
+        RustcB["<code>RUSTC_WRAPPER=waylode-rustc</code><br/>Stage 1 direct + Stage 2 <code>.d</code> verify + CoW reflink"]
     end
 
     ConeA --> ODB
@@ -258,28 +258,30 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=waylode-rustc cargo check --workspace
 | `build` | Invoke `cargo` inside a worktree with `RUSTC_WRAPPER=waylode-rustc` wired to `<git-common-dir>/gitpulse/build-cache` | `--repo`, `--worktree`, `--rustc-wrapper`, `-- <cargo args...>` |
 | `cache-stats` | Measure `<git-common-dir>/gitpulse/build-cache` hits/misses/bytes and optionally evict oldest blobs down to a byte budget | `--repo`, `--prune`, `--max-bytes` |
 
-### MCP Tools (`gitpulse-mcp`)
+### MCP Tools (`waylode-mcp`)
+
+All 11 worktree tools also accept legacy `gitpulse_worktree_*` names (`WAYLODE_MCP_EXPOSE_LEGACY=1` advertises them in `tools/list`).
 
 | Tool | Role | Safety & Gate Contract |
 | --- | --- | --- |
-| `gitpulse_worktree_create` | Create full, `--zero-copy`, or DevMap-expanded sparse worktrees | Repository trust + harness gate |
-| `gitpulse_worktree_switch` | Locate an existing branch worktree (or create when requested) | Repository trust + harness gate on create |
-| `gitpulse_worktree_isolate` | Provision CoW caches and DevMap state into an existing worktree | Repository trust + harness gate |
-| `gitpulse_worktree_overlay_sync` | Compile dirty/untracked files into `overlay.json` + CAS ASTs + CSR dirty bitmap | Repository trust + canonical containment |
-| `gitpulse_worktree_claim` | Atomically register/update file & symbol intent claims and return immediate conflicts | Repository trust + `.bus.lock` serialization |
-| `gitpulse_worktree_release` | Release an agent lane's active claim record on completion | Repository trust + `.bus.lock` serialization |
-| `gitpulse_worktree_send_message` | Post direct or broadcast coordination messages to `messages.json` | Repository trust + 16 KiB payload cap |
-| `gitpulse_worktree_inbox` | Read direct + broadcast coordination messages since `since_seq` | Read-only (`readOnlyHint: true`) |
-| `gitpulse_worktree_radar` | Run 3-layer collision radar (claims + 1-hop CSR call-graph + ODB merge-tree) | Read-only (`readOnlyHint: true`), capped within 64 KiB MCP wire budget |
-| `gitpulse_worktree_merge` | ODB-quarantined squash or merge-commit integration + worktree teardown | Repository trust + harness gate (`destructiveHint: true`) |
-| `gitpulse_worktree_prune` | Prune 6-point-integrated worktrees; skips (with a reason) any with a live process inside unless `reap_processes: true` opts in to reaping; per-worktree `outcomes` | Repository trust + harness gate (`destructiveHint: true`) |
+| `waylode_worktree_create` | Create full, `--zero-copy`, or DevMap-expanded sparse worktrees | Repository trust + harness gate |
+| `waylode_worktree_switch` | Locate an existing branch worktree (or create when requested) | Repository trust + harness gate on create |
+| `waylode_worktree_isolate` | Provision CoW caches and DevMap state into an existing worktree | Repository trust + harness gate |
+| `waylode_worktree_overlay_sync` | Compile dirty/untracked files into `overlay.json` + CAS ASTs + CSR dirty bitmap | Repository trust + canonical containment |
+| `waylode_worktree_claim` | Atomically register/update file & symbol intent claims and return immediate conflicts | Repository trust + `.bus.lock` serialization |
+| `waylode_worktree_release` | Release an agent lane's active claim record on completion | Repository trust + `.bus.lock` serialization |
+| `waylode_worktree_send_message` | Post direct or broadcast coordination messages to `messages.json` | Repository trust + 16 KiB payload cap |
+| `waylode_worktree_inbox` | Read direct + broadcast coordination messages since `since_seq` | Read-only (`readOnlyHint: true`) |
+| `waylode_worktree_radar` | Run 3-layer collision radar (claims + 1-hop CSR call-graph + ODB merge-tree) | Read-only (`readOnlyHint: true`), capped within 64 KiB MCP wire budget |
+| `waylode_worktree_merge` | ODB-quarantined squash or merge-commit integration + worktree teardown | Repository trust + harness gate (`destructiveHint: true`) |
+| `waylode_worktree_prune` | Prune 6-point-integrated worktrees; skips (with a reason) any with a live process inside unless `reap_processes: true` opts in to reaping; per-worktree `outcomes` | Repository trust + harness gate (`destructiveHint: true`) |
 
 ---
 
 ## 5. Desktop UI & Frontend Store Integration
 
 - **Worktrees Panel (`WorktreesPanel.svelte`)**: Exposes checkboxes for **Copy-on-Write dependency caches** (`node_modules`, `target`) and **Seed DevMap index** (`seedDevmap`, on by default: a CoW-cloned store, then built for the worktree, §7), with the **Zero-copy DevMap pointer** opt-in (`zeroCopyDevmap`, off by default; only Waylode reads it), plus a **Sparse cone paths** field that passes repo-relative directories or files to `cmd_add_worktree` (`add_worktree_configured`). When `sparsePaths` are supplied, the backend runs `add_sparse_worktree_zero_copy` and returns the DevMap-expanded cone alongside CoW cache and `.gitpulse/hooks.toml` execution reports.
-- **Map & Health Status Honesty (`OpenedRepoStore::ZeroCopy`)**: In-process DevMap readers (`src-tauri/src/codeintel/store.rs`) recognize `base_store_ref.json` when a linked worktree has no local `devmap.sqlite`, verify that the worktree and anchor share the exact canonical `<git-common-dir>` (`evaluate_zero_copy_status`), and open the anchor's read-only SQLite snapshot without copying it while preserving explicit `stale` freshness reasons whenever `HEAD`, `overlay.json`, or dirty files diverge from `anchor_head_sha`.
+- **Map & Health Status Honesty (`OpenedRepoStore::Stacked`)**: In-process DevMap readers (`src-tauri/src/codeintel/mod.rs` and `src-tauri/src/codeintel/worktree_overlay.rs`) recognize stacked/zero-copy base references when a linked worktree has no local `devmap.sqlite`, verify that the worktree and anchor share the exact canonical `<git-common-dir>` (`evaluate_zero_copy_status`), and open the anchor's read-only SQLite snapshot without copying it while preserving explicit `stale` freshness reasons whenever `HEAD`, `overlay.json`, or dirty files diverge from `anchor_head_sha`.
 - **Single-Facet Branch Refresh (`repoStore.ts`)**: `createBranch`, `renameBranch`, and `deleteBranch` call `hydrateFacet(path, "branches")` rather than reloading unrelated status, commit-graph, or stash facets. `withCarriedChurn` carries verified `ahead`/`behind`/`insertions`/`deletions` across matching commit tips (including unshadowed remote-tracking tips), and `sessionBook.statsDrained` short-circuits progressive `fetchBranchStats` sweeps once all eligible branches are verified against the current default base.
 
 ---
@@ -288,8 +290,8 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=waylode-rustc cargo check --workspace
 
 - **Cross-Repo Pointer Verification**: Both `load_zero_copy_base_ref` and `OpenedRepoStore::open` verify via `resolve_git_common_dir` that `anchor_repo_root` belongs to the same Git repository family as the linked worktree and contains no `..` traversal components; crafted `base_store_ref.json` files pointing at unrelated repositories or arbitrary SQLite files are refused.
 - **Managed Task-Lane Directory Reservation**: `refuse_gitpulse_lane_target` rejects manual, CLI, and MCP worktree targets inside `<repo>/.gitpulse/worktrees/` so user or external agent checkouts cannot collide with Waylode's managed task-attempt lanes.
-- **Path-Traversal & Payload Bounds on the Agent Bus**: `sanitize_claim_paths` rejects absolute paths, `..` segments, and NUL bytes. Advisory `flock(2)` on `<git-common-dir>/gitpulse/lanes/.bus.lock` serializes concurrent readers and writers across processes, enforcing hard caps of 64 active lanes, 128 claimed files/symbols per lane, 256 retained messages, 16 KiB per message body, and a 64 KiB MCP wire ceiling on `gitpulse_worktree_radar` (which sets `truncated: true` rather than exceeding the frame limit).
-- **Bounded Compiler Wrapper Inputs & Sound `OUT_DIR` Reuse**: `gitpulse-rustc` refuses `@<rspfile>` response files larger than 8 MiB or nested deeper than four levels, skips caching whenever `-C incremental` or `build_script_build` is active, and strips comments and string literals (`has_compile_only_out_dir_tokens`) before exempting `# env-dep:OUT_DIR` so crates embedding `env!("OUT_DIR")` at runtime never reuse another worktree's path.
+- **Path-Traversal & Payload Bounds on the Agent Bus**: `sanitize_claim_paths` rejects absolute paths, `..` segments, and NUL bytes. Advisory `flock(2)` on `<git-common-dir>/gitpulse/lanes/.bus.lock` serializes concurrent readers and writers across processes, enforcing hard caps of 64 active lanes, 128 claimed files/symbols per lane, 256 retained messages, 16 KiB per message body, and a 64 KiB MCP wire ceiling on `waylode_worktree_radar` (which sets `truncated: true` rather than exceeding the frame limit).
+- **Bounded Compiler Wrapper Inputs & Sound `OUT_DIR` Reuse**: `waylode-rustc` (legacy alias `gitpulse-rustc`) refuses `@<rspfile>` response files larger than 8 MiB or nested deeper than four levels, skips caching whenever `-C incremental` or `build_script_build` is active, and strips comments and string literals (`has_compile_only_out_dir_tokens`) before exempting `# env-dep:OUT_DIR` so crates embedding `env!("OUT_DIR")` at runtime never reuse another worktree's path.
 
 ---
 

@@ -1,0 +1,7 @@
+# Constitution & Invariants: 002 - Host Integration & Cross-Repo Seams
+
+1. **Read-Only Vendored & Contract Discipline**: `src-tauri/vendored/*` MUST never be hand-edited (all changes go upstream first, then `bun run vendor`), and root `contracts/*` MUST remain byte-synchronized downstream copies of `DevCouncil`/`Manvi` contracts.
+2. **Schema & Tool Subset Lockstep**: Every shipped schema constant (`CURRENT_SCHEMA_VERSION`, `SCHEMA_VERSION`, `WORKBENCH_SCHEMA`, `EXTRACTION_SCHEMA_VERSION`, `STACK_FORMAT_VERSION`) and every `devmap_*` tool in `src-tauri/src/mcp/devmap_parity.rs` MUST pass `scripts/check-schema-parity.mjs`.
+3. **Zero Silent Repository Mutation**: Sidecar processes (`manvi serve` with `MANVI_HARNESS_INIT_ENABLED=false`) and repository initialization (`cmd_devcouncil_init`) MUST never create tracked files or edit `.gitignore` on tab open; repo-tracked agent assets stay explicitly previewed (`cmd_devmap_integrate`).
+4. **Honest Unavailable Reporting**: Missing `devmap` / `manvi` / `dcstore` binaries or unverifiable schema responses MUST report `absent` / `unverifiable` / `Unchecked` rather than silently succeeding.
+5. **Documented Exceptions Only**: Any host deviation from upstream crates (such as `preflight.rs::parse_git_version` or omitting `PreToolUse` in `plugins/waylode-agy/hooks.json`) MUST carry explicit inline rationale, adversarial unit coverage, and an entry in `specs/002`.

@@ -1,10 +1,10 @@
-//! Putting `gitpulse-hook` on every Claude Code session GitPulse launches.
+//! Putting `waylode-hook` on every Claude Code session Waylode launches.
 //!
-//! The shipped plugin (`plugins/gitpulse/hooks/hooks.json`) runs the hook, but
+//! The shipped plugin (`plugins/waylode/hooks/hooks.json`) runs the hook, but
 //! only in a Claude Code configuration directory that enables the plugin. A
 //! session launched under `CLAUDE_CONFIG_DIR=~/.claude-chandra` has no hooks at
 //! all, so the command gate never sees what that agent runs and the notifier
-//! hears only a bell. GitPulse already passes every launch a session-scoped
+//! hears only a bell. Waylode already passes every launch a session-scoped
 //! `--settings` object ([`super::terminal_command::notify_flags`]); this adds
 //! the plugin's gate and notification hooks ([`INJECTED_EVENTS`]) to it.
 //!
@@ -20,7 +20,7 @@
 //!   once. A plugin's or skill's copy of the same handler stays separate."
 //!   So a session whose configuration also enables the plugin runs the hook
 //!   twice. That configuration cannot be known here: a shell wrapper may set
-//!   `CLAUDE_CONFIG_DIR` after GitPulse hands over the command line, and a
+//!   `CLAUDE_CONFIG_DIR` after Waylode hands over the command line, and a
 //!   guess that the plugin is enabled leaves the session ungated — the very
 //!   case this exists for. So the hook always goes on, and the hook itself
 //!   makes the second run harmless: every check is a read, both copies reach
@@ -29,8 +29,8 @@
 //!   order book (`alerts::intake::OrderBook::repeats`).
 //!
 //! The hook entries are not written out a second time here: they are the
-//! plugin manifest's own `PreToolUse` entries with the bare `gitpulse-hook`
-//! name replaced by the absolute path of the binary GitPulse ships beside
+//! plugin manifest's own `PreToolUse` entries with the bare `waylode-hook`
+//! name replaced by the absolute path of the binary Waylode ships beside
 //! itself. A bare name is not reachable from the released app's PATH, and a
 //! mistyped path in settings leaves the gate silently disabled, which is why
 //! a missing binary is reported rather than injected.

@@ -1,14 +1,14 @@
-//! DevMap tool-name parity for `gitpulse-mcp`.
+//! DevMap tool-name parity for `waylode-mcp` (legacy alias `gitpulse-mcp`).
 //!
 //! Upstream `devmap_serve::mcp::TOOL_NAMES` is the published surface of the
-//! standalone `devmap mcp` server. GitPulse does not vendor that crate (it
-//! pulls `hyper` / HTTP transport crates GitPulse does not otherwise need);
+//! standalone `devmap mcp` server. Waylode does not vendor that crate (it
+//! pulls `hyper` / HTTP transport crates Waylode does not otherwise need);
 //! instead this module serves a subset of it (11 of upstream's tools) with
 //! in-process dispatch through [`crate::codeintel`]. That every name served
 //! here is one upstream publishes is checked by `scripts/check-schema-parity.mjs`
 //! against `TOOL_NAMES` at the DevCouncil commit vendored in VENDOR.json.
 //!
-//! Every call still requires GitPulse's `repo_path` — this process mediates
+//! Every call still requires Waylode's `repo_path` — this process mediates
 //! many repositories. The standalone `devmap mcp` server accepts the same
 //! argument and refuses first-wins when more than one store is in scope.
 
@@ -20,11 +20,11 @@ use crate::codeintel::{NameQueryOptions, WalkBounds, MCP_DEFAULT_WALK_DEPTH};
 use super::validate::{tool_args, Spec, ToolArgs, Unit};
 use super::{budget_spec, parse, path_spec, repo_spec, tool, BudgetArgs, RepoArgs, MAX_ARG_CHARS};
 
-/// The `devmap_*` tools GitPulse serves: a subset of
+/// The `devmap_*` tools Waylode serves: a subset of
 /// `devmap_serve::mcp::TOOL_NAMES` (upstream publishes more), listed in the
-/// order GitPulse advertises them.
+/// order Waylode advertises them.
 ///
-/// GitPulse does not vendor devmap-serve, so nothing in this crate can read
+/// Waylode does not vendor devmap-serve, so nothing in this crate can read
 /// upstream's list. The test below only checks `tool_definitions()` against
 /// this list. That every name here is one upstream publishes is checked by the
 /// tool-list row of `scripts/check-schema-parity.mjs` (`bun run

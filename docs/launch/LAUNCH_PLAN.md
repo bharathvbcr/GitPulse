@@ -397,16 +397,16 @@ Labs test counts (those were grep counts, not test results).
 
 | Metric | Value | Evidence (HEAD) |
 |---|---|---|
-| MCP tools for agents | 65 (54 `gitpulse_*` + 11 `devmap_*`) | Key count of `src-tauri/src/mcp/tool_input_schemas.snapshot.json` |
+| MCP tools for agents | 66 (55 `waylode_*` + 11 `devmap_*`) | Key count of `src-tauri/src/mcp/tool_input_schemas.snapshot.json` |
 | MCP prompts | 4 | `src-tauri/src/mcp/prompts.rs` |
-| Native commands | 330+ | `generate_handler!` in `src-tauri/src/lib.rs`; two counting methods gave 332 and 335, so publish "330+" |
-| Views and sections | 4 and 11 | `src/lib/views/viewRegistry.ts` |
+| Native commands | 330+ | `generate_handler!` in `src-tauri/src/lib.rs` |
+| Views and sections | 5 and 11 | `src/lib/views/viewRegistry.ts` |
 | Launchers | 6 (Claude, Codex, Manvi, Grok, Antigravity, shell) | `src/lib/terminal/tabs.ts:15` |
-| Worktree coordination tools | 11 | the `gitpulse_worktree_*` family in the same snapshot |
-| Theme presets / wallpapers | 17 / 11 | `src/lib/ui/appearance/presets.ts`, `backdrops.ts` |
+| Worktree coordination tools | 11 | the `waylode_worktree_*` family in the same snapshot |
+| Theme presets / wallpapers | 21 / 11 | `src/lib/ui/appearance/presets.ts`, `backdrops.ts` |
 | Palette modes | 8 | `src/lib/palette/modes.ts:26-34` |
 | Coverage formats parsed | 7 | `src-tauri/src/analyzer/coverage.rs` parser dispatch |
-| Health sections | 12 | `src/lib/components/health/sections.ts:56` |
+| Health sections | 13 | `src/lib/health/sections.ts:56` |
 | Task board capacity | 2,000 cards per board fill | `fillBoard` / `MAX_CANDIDATES` |
 | Open repository tabs | up to 1,000 | `src/lib/repos/tabModel.ts:26` (`MAX_OPEN_TABS`) |
 | Lane solve on 100,000 commits | ~41 ms (assembly ~58 ms) | `docs/PERFORMANCE.md:1367,1379`. Usable only with "lane solve" in the wording; never as a frame rate |
@@ -604,7 +604,7 @@ most of them.
 
 | Claim | Where (tracked) | Correct version |
 |---|---|---|
-| "100K+ commits at 60/120 FPS" | `README.md:131`, `docs/FEATURES.md:385`, `docs/ARCHITECTURE.md:475` | No frame-rate benchmark backs it. Quote `docs/PERFORMANCE.md:1367,1379` (100k-row lane solve ~41 ms, assembly ~58 ms) or drop it |
+| "100K+ commits at 60/120 FPS" | `README.md:131`, `docs/FEATURES.md` (earlier line 385), `docs/ARCHITECTURE.md:475` | No frame-rate benchmark backs it. Quote `docs/PERFORMANCE.md:1367,1379` (100k-row lane solve ~41 ms, assembly ~58 ms) or drop it |
 | "scaling to 1,000 repositories … 24 active watches" | `README.md:126` | 1,000 open tabs; 32 watched repos; 24 recents |
 | "5-verdict ladder" | `README.md:232`, `docs/MODULE_INTEGRATION.md:52`, `docs/SECURITY.md:26`, `wiki/Architecture.md:40` | The code has 8 statuses; check `contracts/verdict.schema.json` before restating |
 | Kingfisher as the secrets scanner | `wiki/Security.md:33`, `wiki/Architecture.md:77` | In-process scan; Kingfisher is an optional second opinion |
@@ -616,20 +616,20 @@ most of them.
 gitignored, so changes there never ship.
 - `README.md`: new hero line (§1), "Why Waylode" block, comparison link, new hero screenshot, refreshed 2.0 bullets
 - `docs/FEATURES.md`: restructure to §3's areas, with status columns removed for released items
-- New `docs/WHY_GITPULSE.md`: positioning plus the dated comparison table and sources
+- New `docs/WHY_WAYLODE.md`: positioning plus the dated comparison table and sources
 - New `docs/AGENTS_GUIDE.md`, or extend `wiki/MCP and Agents.md`: launching, guards, agent-to-agent messaging, collision workflow
 - `docs/GETTING_STARTED.md`: a "run your first two agents" path
 - `wiki/Home.md`, `wiki/Views.md`, `wiki/Keyboard Shortcuts.md`: new screenshots and current shortcuts
-- New `docs/LABS.md`: only after decision 1 in §11
+- `LABS.md` (private Labs repo): only after decision 1 in §11
 
 ---
 
 ## 8b. Website overhaul (gitpulse.vbcr.dev)
 
 The page lives in the **Portfolio** repo (`~/Code/web/Portfolio`):
-- `src/pages/GitPulse.jsx` (331 lines) and `src/pages/GitPulse.css`
-- the catalog entry in `src/data/projectData.js` and route metadata in `src/lib/routes.js`
-- screenshots under `public/assets/` (PNG and WebP)
+- `pages/GitPulse.jsx` (331 lines) and `pages/GitPulse.css`
+- the catalog entry in `data/projectData.js` and route metadata in `lib/routes.js`
+- screenshots under `public/assets/` in the Portfolio repo (PNG and WebP)
 
 Updating Waylode does not publish the site.
 
@@ -645,7 +645,7 @@ Updating Waylode does not publish the site.
 3. **Five problems, five answers:** map, collisions, guards, code graph, load. Each has a short clip or a still.
 4. **A board your agents write to:** the §3.5 story.
 5. **Built for power users:** terminal, full git client, insights, themes.
-6. **Comparison:** the dated table with its sources, linking to `docs/WHY_GITPULSE.md`.
+6. **Comparison:** the dated table with its sources, linking to `docs/WHY_WAYLODE.md`.
 7. **Numbers:** only rows from the metrics table in §3.
 8. **Free vs Labs:** "Everything local or on your own machines is free." Then the Labs preview: free
    Labs (runners, vault) and paid Labs (sync, team, Jira/Trello and other issue-tracker integrations),
@@ -726,7 +726,7 @@ You said: commit and merge everything, then launch a live preview and record. Th
 2. **Labs in this launch?** Recommendation: preview only. No release build enables `cloud-labs`, and
    sync, the vault and the kill switch need external crypto review first.
 3. **Competitors.** Ten are researched: Claude Code, T3 Code, VS Code, Cursor, Conductor, Codex,
-   Zed, Warp, GitKraken and Tower. Recommendation: put all ten in `WHY_GITPULSE.md` and on the site.
+   Zed, Warp, GitKraken and Tower. Recommendation: put all ten in `WHY_WAYLODE.md` and on the site.
    The slide shows the six closest (Claude Code, T3 Code, Cursor, Zed, Warp, GitKraken), dated and
    sourced, with the "where others are stronger" row. The video shows one table card.
 4. **Deck format and voice:** a Slides artifact vs `.pptx`; your own voice vs captions only.

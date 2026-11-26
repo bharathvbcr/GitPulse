@@ -1,9 +1,10 @@
-# Terminal host (`gitpulse-ptyd`)
+# Terminal host (`waylode-ptyd`)
 
 Card: *Terminal sessions survive a Waylode app exit or crash: move PTY
 ownership into a separate PTY host process* (`ft-1c36bec1d71ba700f65fbfbb12015e71`,
 lane L6 of the 2026-10-12 terminal crash-resilience audit, wave 11 of the
-audit-2026-10-13 plan). Written against `main` at `8026dd7e`.
+audit-2026-10-13 plan). Originally written against `main` at `8026dd7e` and
+updated for `waylode-ptyd` / protocol 5 (`5fcea3dbc`).
 
 ## The problem
 
@@ -19,7 +20,7 @@ itself dying. Only moving the masters out of the app can.
 ## The shape
 
 ```
- webview ──Channel──▶ app (TerminalSessions facade) ──unix socket──▶ gitpulse-ptyd
+ webview ──Channel──▶ app (TerminalSessions facade) ──unix socket──▶ waylode-ptyd
    ▲  cmd_terminal_*        │  proxies, lanes, observers,                │ engine: openpty, spawn,
    └──ack───────────────────┘  incidents, emits                          │ reader, OutputFlow, ring,
                                                                          │ kill/reap, exit receipts
@@ -27,18 +28,18 @@ itself dying. Only moving the masters out of the app can.
 
 * **The engine** (`Engine`, `terminal::engine`) is the core PTY engine:
   `spawn_session_inner`, the reader loop, `OutputFlow`, `kill_session`,
-  `terminate_pty_child`, `session_context`. It lives inside `gitpulse-ptyd` on
+  `terminate_pty_child`, `session_context`. It lives inside `waylode-ptyd` on
   Unix and in `TerminalSessions` only on non-Unix (`#[cfg(not(unix))]`, Windows
   until its ConPTY host ships); the Unix in-process engine path in the app
   process has been deleted. It no longer takes a Tauri `AppHandle`: everything
   it used one for (`terminal-loss`, `terminal-exit`, incidents, alert banners)
   goes through a `SessionEvents` value the caller supplies.
-* **The host** is a binary, `gitpulse-ptyd` (Rust, `src/bin/gitpulse-ptyd.rs`),
-  started unconditionally on Unix. It is not a mode of `gitpulsed`: that
-  daemon's contract is that it *does not serve requests* and holds no children
-  past a cycle, and its single-instance lock is per profile, not per protocol.
-  A request server that owns long-lived children is a different process with a
-  different lifecycle.
+* **The host** is a binary, `waylode-ptyd` (Rust, `src-tauri/src/bin/waylode-ptyd.rs`,
+  pre-rename `gitpulse-ptyd`), started unconditionally on Unix. It is not a mode of
+  `wayloded` (pre-rename `gitpulsed`): that daemon's contract is that it *does
+  not serve requests* and holds no children past a cycle, and its single-instance
+  lock is per profile, not per protocol. A request server that owns long-lived
+  children is a different process with a different lifecycle.
 * **The facade** is `TerminalSessions`. Every caller keeps holding it and
   calling the same `terminal::` functions; on Unix (`#[cfg(unix)]`), it
   unconditionally wraps `HostClient` (failing closed via
@@ -49,8 +50,20 @@ itself dying. Only moving the masters out of the app can.
 
 ## Protocol
 
-A unix-domain `SOCK_STREAM` socket, one frame at a time in each direction.
+A unix-domain `SOCK_STREAM` socket, one frame at a time in each direction (currently
+`PROTOCOL = 5` in `src-tauri/src/terminal/host/proto.rs`):
 
+* **Protocol versions:** `3` added `Transcript` ([Saved transcripts](#saved-transcripts));
+  `4` added child-orchestration lineage (`Telemetry`, `SetAgentMeta`,
+  `OrchestrationSnapshot`, `TranscriptTail::total_bytes`); **`5`** added the
+  `screen` notice channel (agent permission dialogs read off rendered terminal
+  output via `note_prompt_notice`, alongside hooked `permission_prompt` reports)
+  and the prompt fields on `Telemetry`. `ListeningPorts` also scopes agent CLI
+  exclusions at `SHELL_PROCESS_NAMES` (`src-tauri/src/terminal/port_probe.rs`)
+  so dev servers started through an agent's shell remain visible. A protocol-4
+  host left running across an update (`compat_v4.rs`) cannot report `screen`
+  prompts, so it is treated as another protocol's host (list/read/stop-only,
+  retired when idle).
 * A frame is a 4-byte big-endian header length, that many bytes of JSON (the
   typed header, at most 512 KiB — a spawn request carries argv and environment,
   each bounded at 128 KiB by `validate_pty_options`), a 4-byte big-endian
@@ -68,10 +81,10 @@ A unix-domain `SOCK_STREAM` socket, one frame at a time in each direction.
   (`cmd_terminal_ack` runs it on the control pool, not on an async-runtime
   worker). Requests: `hello`, `retire`,
   `spawn`, `write`, `resize`, `ack`, `detach`, `detach_all`, `attach`,
-  `attach_tracked`, `kill`, `stop_all`, `list`, `context`, `background`,
-  `limit`, `stall`, `receipts`, `forget`, `transcript` (protocol 3, see
-  [Saved transcripts](#saved-transcripts)), and the test-only `wakeups`, `size`,
-  `hold`, `release`.
+  `attach_tracked`, `kill`, `stop_all`, `list`, `context`, `listening_ports`,
+  `background`, `limit`, `stall`, `receipts`, `forget`, `transcript` (protocol 3),
+  `telemetry`, `set_agent_meta`, `orchestration_snapshot` (protocol 4+),
+  and the test-only `wakeups`, `size`, `hold`, `release`.
 * The app keeps each session's input and geometry lanes in front of the host,
   as in-process: a session's keystrokes go one at a time in order, a full
   queue is refused at once, and a call dropped before its turn is skipped
@@ -130,8 +143,8 @@ Today `OutputFlow::reserve` blocks the reader until the webview repays the
 
 ## Lifecycle
 
-* **Where:** `<config dir>/pty-host/` (`~/Library/Application Support/GitPulse/pty-host`
-  on macOS), created `0700` and refused if any component is a symlink. The socket
+* **Where:** `<config dir>/pty-host/` (`~/Library/Application Support/Waylode/pty-host`
+  on macOS; migrated from `GitPulse/`), created `0700` and refused if any component is a symlink. The socket
   is `ptyd-v<PROTOCOL>.sock`, `0600`, bound through `local_socket::bind_private`
   (the one hardened bind the agent bridge and the instance mailbox already
   share). A path too long for `sun_path` is reported by name, as it is there.
@@ -139,10 +152,10 @@ Today `OutputFlow::reserve` blocks the reader until the webview repays the
   `ptyd-v<PROTOCOL>.lock` in that directory for its whole life. A second host
   started for the same protocol exits at once and says who holds it.
 * **Start:** the app connects at startup (before it reconciles task runs) and
-  on its first terminal call; when nothing answers, it starts `gitpulse-ptyd`
+  on its first terminal call; when nothing answers, it starts `waylode-ptyd`
   from beside its own executable (`insights::bundled_binary`, the owner that
-  already finds `gitpulse-mcp` and `gitpulse-hook` in `Contents/MacOS`, where
-  the bundler places every `[[bin]]`; `GITPULSE_PTYD` overrides it) with
+  already finds `waylode-mcp` and `waylode-hook` in `Contents/MacOS`, where
+  the bundler places every `[[bin]]`; `WAYLODE_PTYD` — or legacy `GITPULSE_PTYD` — overrides it) with
   `setsid`, stdin and stdout on `/dev/null` and stderr on `ptyd.log` in the
   host directory. It is not spawned through `procguard::spawn`: the quit sweep
   (`procguard::reap_all`) kills what that tracks, and the host must outlive the
@@ -218,7 +231,7 @@ reaped. The exit is then sent to the app as an `exit` event.
   arriving during recording leaves both proxy and host state intact, so adopt never
   ends a session that was confirmed during adoption.
 * **`Host::knows` client-side vouched snapshots:** To eliminate IPC round-trips
-  to `gitpulse-ptyd` for session membership checks, `Host::knows` answers directly
+  to `waylode-ptyd` for session membership checks, `Host::knows` answers directly
   from the host client's vouched snapshot. Authority survives spawns, quits, and
   wrapped exit records mid-adoption, while newly opened connections cleanly revoke
   previous authority. A delivered exit is not vouched for immediately until verified.
@@ -387,7 +400,7 @@ sequence in another), and the file is reachable only by the user who owns it.
   opening line is not is masked up to the closing line. What it cannot see: a
   secret split by the margin's own start, or a key body longer than the margin
   with neither line in view. Redaction is a mask for display, not a guarantee.
-* On Unix `gitpulse-ptyd` and `0600` `pty-host/transcripts/` are unconditional
+* On Unix `waylode-ptyd` and `0600` `pty-host/transcripts/` are unconditional
   (covered by the owner security sign-off below). `keep_terminals_running`
   now defaults on (`unwrap_or(true)`) and governs hosted Manvi for managed
   agent runs rather than PTY hosting.
@@ -417,9 +430,9 @@ live in the memory of the `manvi serve` that Waylode spawns, so closing that
 child cancels every run. The `keep_terminals_running` setting (labeled *"Keep
 managed agent runs running when Waylode quits"* in Settings → Agents,
 default-on via `unwrap_or(true)`) therefore hosts that child outside the app,
-in Manvi's socket mode (`manvi serve --listen`, `docs/SERVE_HOST_PLANE.md` in
+in Manvi's socket mode (`manvi serve --listen`, `SERVE_HOST_PLANE.md` in
 Manvi). `KeepTerminalsSetting.svelte` toggles `keep_terminals_running` and also
-renders the read-only Unix terminal host (`gitpulse-ptyd`) status and any
+renders the read-only Unix terminal host (`waylode-ptyd`) status and any
 `trouble` message. Code: `harness/hosted.rs` (paths, record, capability, the
 account Settings reads) and `harness/sidecar.rs` (the connection, which speaks
 to the socket exactly as to a pipe).
@@ -434,11 +447,11 @@ to the socket exactly as to a pipe).
   file), and checked again from the running server's `hello` (`serve.status`
   and `serve.stop_all` must be served). The policy and hook sidecars never
   host runs and are untouched.
-* **Where.** `<config>/GitPulse/manvi-host/`: the socket (`serve.sock`), the
+* **Where.** `<config>/Waylode/manvi-host/` (migrated from `GitPulse/manvi-host/`): the socket (`serve.sock`), the
   server's persistent state directory, `serve.log`, and `host.json`, the record
   Waylode writes when it starts a server (socket, owner id, pid, the model
   selection it was started with, the profile). The server is started detached
-  (`setsid`) and outside `procguard`, like `gitpulse-ptyd`, so no quit sweep
+  (`setsid`) and outside `procguard`, like `waylode-ptyd`, so no quit sweep
   reaches it; it exits by itself after five minutes with no client and no
   running run.
 * **Quit.** With a hosted Manvi holding working runs the question is the
@@ -510,7 +523,7 @@ to the socket exactly as to a pipe).
   dial the server. Settings then describes the stdio child's behaviour (runs end
   with the app), which is not true of runs that server already holds; turn the
   setting back on to adopt them. Interactive PTY terminal sessions stay in
-  `gitpulse-ptyd` on Unix regardless of this toggle.
+  `waylode-ptyd` on Unix regardless of this toggle.
 * **Socket path.** The path must fit both the system's limit and Manvi's own
   (100 bytes); a longer one is refused before anything is started, with the
   reason.
@@ -524,8 +537,8 @@ to the socket exactly as to a pipe).
   path already did (`jobs::hang_up`, `jobs::kill_stragglers`); the last
   `portable_pty` `Child::kill` on the session leader is replaced by
   `signal_process` keyed to the start time recorded at spawn.
-* `signal_guard` already counts `gitpulse-ptyd` as a Waylode process (names
-  starting `gitpulse`, other than `gitpulse-hook`). It now also refuses a
+* `signal_guard` counts `waylode-ptyd` (and legacy `gitpulse-ptyd`) as a Waylode process (names
+  starting `waylode` or `gitpulse`, other than `waylode-hook` / `gitpulse-hook`). It also refuses a
   signal command that reaches a *session leader* Waylode hosts — a process
   whose parent is a Waylode process and which leads its own session — not only
   hosted agents. Jobs running under a hosted shell are not protected: killing a
@@ -538,7 +551,7 @@ Unix only, as the PTY internals already are (`cfg(unix)` around `input`,
 host binary prints that it is unsupported. A ConPTY host is a separate card.
 Gatekeeper: the helper ships beside the app binary in `Contents/MacOS`, where a
 signed and notarized bundle carries it; nothing is loaded from outside the
-bundle except through the explicit `GITPULSE_PTYD` override that development
+bundle except through the explicit `WAYLODE_PTYD` (legacy `GITPULSE_PTYD`) override that development
 builds use.
 
 ## Coupling inventory (S2-10)
@@ -554,14 +567,14 @@ into the rows they belong to (2, 3 and 4).
 | # | Coupling point | Moves to host | Stays in app | Deleted |
 |---|---|---|---|---|
 | 1 | Workbench: `terminal_run.rs:73` `spawn(&TerminalSessions)`, `:159` `start(&TerminalSessions)`, `:270` `impl SessionObserver for RunObserver` | — | **Stays.** Both functions keep their `&TerminalSessions` parameter (the facade). `RunObserver` stays in the app: it writes to the workbench store, which the host never opens. Its `before_spawn` runs before the spawn request (the app now picks the session id), `started` when the reply names the pid, `finished` when the `exit` event or a receipt arrives. A run whose observer died with an earlier app gets an *adopted* observer that rebuilds `receipts::Observed` from the stored run. | — |
-| 2 | `TerminalSessions` `Arc<Mutex<HashMap>>` cloned into teardown (`lib.rs:177-178`, `:625`); `teardown.rs:46` | The `Engine` session map itself (masters, children, readers) inside `gitpulse-ptyd` | On `#[cfg(unix)]`, `TerminalSessions` holds only `host: HostClient` (cloned into teardown and `procguard::set_shutdown_hook`). `teardown.rs:46` (`stop_terminals`) becomes *stop* or *disconnect* by the quit choice; a signal exit disconnects. Non-Unix (`#[cfg(not(unix))]`) keeps `Engine` in-process. | **Unix in-process engine path & `Option<HostClient>` deleted** (Migration Step 3): `TerminalSessions::engine` on Unix and all Unix fallback branches in `terminal/mod.rs`, `terminal/ipc.rs`, and `terminal/orchestrate.rs`. |
+| 2 | `TerminalSessions` `Arc<Mutex<HashMap>>` cloned into teardown (`lib.rs:177-178`, `:625`); `teardown.rs:46` | The `Engine` session map itself (masters, children, readers) inside `waylode-ptyd` | On `#[cfg(unix)]`, `TerminalSessions` holds only `host: HostClient` (cloned into teardown and `procguard::set_shutdown_hook`). `teardown.rs:46` (`stop_terminals`) becomes *stop* or *disconnect* by the quit choice; a signal exit disconnects. Non-Unix (`#[cfg(not(unix))]`) keeps `Engine` in-process. | **Unix in-process engine path & `Option<HostClient>` deleted** (Migration Step 3): `TerminalSessions::engine` on Unix and all Unix fallback branches in `terminal/mod.rs`, `terminal/ipc.rs`, and `terminal/orchestrate.rs`. |
 | 3 | Page-load detach (`desktop/mod.rs:255-256`) | `detach_all` runs in the host | The call site stays and sends `detach_all`; it is a disconnect of views, never a stop. | — |
 | 4 | `cmd_terminal_*` (`commands/terminals.rs`), and `quitRisks` | — | **Stays**, unchanged in signature. Each command calls the same `terminal::` function, which routes unconditionally to `state.host` on Unix (`cmd_terminal_ack` unconditionally runs on the async control pool). `cmd_terminal_sessions` returns the host's list, so `quitRisks` (`quitGuard.ts`) already treats the host list as authoritative and needs no change. | **Unix in-process branch deleted** in `commands/terminals.rs` (`cmd_terminal_ack` and helpers no longer check an `is_host` opt-in). |
 | 5 | Per-session `Channel` + `OutputFlow` credit, `Route::Hold` dropping bytes (mod.rs:1783-1785), no ring | `OutputFlow` (the window) and the new ring | The `Channel` (a webview object) and the relay that forwards `output`/`end` frames to it and `ack`s back | Dropping detached bytes: replaced by the ring. |
 | 6 | `terminal-loss` / `terminal-exit` / incident emits | The decision to emit (reader, finalize) | The emits themselves and the incident `Recorder`, fed by `loss` and `exit` events through `SessionEvents` | The `AppHandle` parameter of the engine |
 | 7 | `SessionWatcher::observe` on raw bytes in the reader (mod.rs:759-825, `:1872`) | **Runs in the host's reader**, on every byte as now, so a detached session's bell is still seen while an app is connected | `alerts::offer` runs in the app, fed by `notice` events | — |
 | 8 | `session_context`, `foreground`, `getsid`-checked kill | All of it: it needs the child handle and the master's process group, which live in the host. | — | — |
-| 9 | Spawn deps: `validate_repo`, `require_unsubstitutable_dir`, `sysload::admit`, `record_session_spawn`, `GITPULSE_SESSION_ID` / `GITPULSE_NOTIFY_SOCKET` env, fixed socket name `agent-notify.sock` | `validate_repo`, `resolve_start_dir`, `task_start`, `require_unsubstitutable_dir` (trust is checked where the fork happens) and the environment (`GITPULSE_SESSION_ID`, `GITPULSE_NOTIFY_SOCKET`, run id) | `sysload::admit` (its "Admit anyway" override is app memory) and `record_session_spawn` (the app's ledger record, after the reply). `agent-notify.sock` keeps its fixed name in the config directory, so a hook in a session that outlived one app reaches the next. | — |
+| 9 | Spawn deps: `validate_repo`, `require_unsubstitutable_dir`, `sysload::admit`, `record_session_spawn`, `WAYLODE_SESSION_ID` / `WAYLODE_NOTIFY_SOCKET` (plus legacy `GITPULSE_*`) env, fixed socket name `agent-notify.sock` | `validate_repo`, `resolve_start_dir`, `task_start`, `require_unsubstitutable_dir` (trust is checked where the fork happens) and the environment (`WAYLODE_SESSION_ID`, `WAYLODE_NOTIFY_SOCKET`, legacy `GITPULSE_*`, run id) | `sysload::admit` (its "Admit anyway" override is app memory) and `record_session_spawn` (the app's ledger record, after the reply). `agent-notify.sock` keeps its fixed name in the config directory, so a hook in a session that outlived one app reaches the next. | — |
 | 10 | Ids `term-<app pid>-<n>` persisted in `hostedClaude` | — | Ids are still minted by the app, as `term-<app pid>-<n>`, and the host refuses a duplicate. They stay unique across app restarts because the app's pid changes, and a session adopted after a restart keeps the id `hostedClaude` stored. | — |
 
 ## Security impact statement
@@ -607,7 +620,7 @@ read a session's output only by attaching to it, while it lived. Now it can read
 the last 8 MiB per session of finished ones from the socket (`transcript`) or
 from the files, for up to 14 days or until the 256 MiB directory bound evicts
 them. The same-user reasoning above holds (the files are `0600` in a `0700`
-symlink-refused directory, opened `O_NOFOLLOW`), and on Unix `gitpulse-ptyd`
+symlink-refused directory, opened `O_NOFOLLOW`), and on Unix `waylode-ptyd`
 writes `pty-host/transcripts/` unconditionally under the owner sign-off below.
 See [Saved transcripts](#saved-transcripts).
 
@@ -623,7 +636,7 @@ holding managed Codex and Claude runs.
   that can drive them: `manvi-host/serve.sock` accepts any process of the same
   user that can prepare, activate, stop and read managed runs for the profile.
   Quitting no longer ends an agent the person has forgotten about unless they
-  choose *Stop Them and Quit* (or disable `"Keep managed agent runs running when GitPulse quits"`
+  choose *Stop Them and Quit* (or disable `"Keep managed agent runs running when Waylode quits"`
   so runs revert to the stdio child); otherwise a left-running agent ends when
   it finishes, is stopped, or the machine restarts. This shares the same-user
   threat model above, now default-on under the owner sign-off below.
@@ -676,11 +689,11 @@ holding managed Codex and Claude runs.
    (`default off`) while both backends ran under `GITPULSE_TEST_TERMINAL_BACKEND=host`
    (a `test:terminal-host` runner, removed once step 3 made every suite use the
    host, which left it re-running the same seven suites).
-3. **Done (2026-11-14):** `gitpulse-ptyd` is the unconditional Unix default
+3. **Done (2026-11-14):** `waylode-ptyd` (then `gitpulse-ptyd`) is the unconditional Unix default
    and the Unix in-process app PTY path (`TerminalSessions` owning `Engine` on
    Unix and Unix fallback branches) has been deleted in the same change. Unix
    apps fail closed via `HostClient::unavailable` if the host cannot start,
-   all Unix integration suites run directly against `gitpulse-ptyd`,
+   all Unix integration suites run directly against `waylode-ptyd`,
    `keep_terminals_running` defaults on (`unwrap_or(true)`) for hosted Manvi,
    and Windows keeps the in-process `Engine` under `#[cfg(not(unix))]` until
    its ConPTY host card.

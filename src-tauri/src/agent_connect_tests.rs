@@ -752,3 +752,39 @@ fn json_answers_are_read_through_a_wrapper_notice_and_trailing_hook_noise() {
         ConnectActionState::Done
     );
 }
+
+#[test]
+fn build_plan_uses_shared_host_preflight_seam_once() {
+    use std::cell::RefCell;
+
+    let fx = fixture();
+    let mcp = fx.bundle.join("waylode-mcp");
+    let claude_ok = format!("waylode:\n  Command: {}\n", mcp.display());
+    let codex_ok = serde_json::json!({
+        "name": "waylode",
+        "transport": {"type": "stdio", "command": mcp.to_string_lossy()},
+    })
+    .to_string();
+    let runner = FakeRunner::new(vec![
+        ("/fake/bin/claude", true, claude_ok.as_str()),
+        ("/fake/bin/codex", true, codex_ok.as_str()),
+    ]);
+    let probes = RefCell::new(Vec::new());
+    let find = |name: &str| {
+        probes.borrow_mut().push(name.to_string());
+        Some(format!("/fake/bin/{name}"))
+    };
+    let plan = build_plan(&env(&fx, &runner, &find));
+    assert_eq!(*probes.borrow(), vec!["claude", "cursor", "codex"]);
+    assert_eq!(plan.agents_found, vec!["claude", "codex"]);
+    assert_eq!(
+        plan.agent_commands
+            .iter()
+            .map(|c| (c.agent.as_str(), c.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (IntegrationHost::Claude.as_str(), IntegrationHost::Claude.label()),
+            (IntegrationHost::Codex.as_str(), IntegrationHost::Codex.label()),
+        ]
+    );
+}

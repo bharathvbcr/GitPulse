@@ -1,6 +1,6 @@
-# Linux `gitpulse-mcp` and `gitpulse-hook`: plan
+# Linux `waylode-mcp` and `waylode-hook` (pre-rename `gitpulse-*`): plan
 
-Read-only planning pass, 2026-11-23. Nothing here is built. The goal: Claude Code sessions on
+Read-only planning pass, 2026-11-23 (before the Waylode binary rename to `waylode-mcp` / `waylode-hook` in `5fcea3dbc`). Nothing here is built. The goal: Claude Code sessions on
 Linux, in the cloud, over SSH and on BYOK runner boxes, get Waylode Insights and DevMap tools.
 
 Some answers below are incomplete. `gitpulse_insights` timed out. DevMap answered with

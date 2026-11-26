@@ -1,14 +1,14 @@
 //! Mavi: a chat-first surface for coding agents.
 //!
-//! Every other agent GitPulse hosts is a terminal. Mavi runs Claude Code in
+//! Every other agent Waylode hosts is a terminal. Mavi runs Claude Code in
 //! its structured mode (`--input-format stream-json --output-format
 //! stream-json --permission-prompt-tool stdio`) and hands the page typed
 //! lines, so the page can render a timeline, inline permission requests and
 //! the files each turn changed, instead of a screen of text.
 //!
-//! The agent runs on this computer, in a repository GitPulse trusts, or on
+//! The agent runs on this computer, in a repository Waylode trusts, or on
 //! another machine through the system `ssh` ([`ssh`]). The process lives in
-//! this app: quitting GitPulse ends it, and reopening a thread resumes the
+//! this app: quitting Waylode ends it, and reopening a thread resumes the
 //! conversation by its id (`--resume`), which the agent keeps in its own
 //! transcript.
 //!

@@ -94,7 +94,7 @@ not guard.
    the edit hook warn the agent that edits it second. The agents can also send each
    other messages. [Collisions and messaging](AGENTS_GUIDE.md#agent-to-agent-messaging)
    explains both.
-7. **Finish.** An agent calls `gitpulse_complete_task` when its work is done and
+7. **Finish.** An agent calls `waylode_complete_task` when its work is done and
    verified. The card moves to Done only when Manvi has recorded a passed verification
    for the head the worktree is still on; otherwise it moves to Review, and you decide. Merge or remove the worktree from
    **Worktrees** when you have reviewed the result.
@@ -107,14 +107,15 @@ missing, with a **Set up code map** or **Build index** button in place; the
 Manvi card and status pill do the same for Manvi.
 
 - **Connect your agent:** **Settings → Agents → Connect your agent** (also on the
-  first-run card and the setup wizard's last step) links the `gitpulse-mcp` and
-  `gitpulse-hook` that ship inside the app into `~/.local/bin` and registers the
+  first-run card and the setup wizard's last step) links the `waylode-mcp` and
+  `waylode-hook` that ship inside the app into `~/.local/bin` (with legacy
+  `gitpulse-mcp`/`gitpulse-hook` compat links where needed) and registers the
   MCP server with Claude Code and Codex through their own `mcp add`. It shows
   the plan first and changes nothing until you apply it; anything already set
   up differently is left alone and reported, with the commands to switch it.
   **Copy setup prompt** gives your agent the same steps to carry out instead,
   plus the optional Claude Code plugin that adds Waylode's hooks and skills.
-  The plugin also provides the `gitpulse` server, so use it or the direct
+  The plugin also provides the `waylode` server, so use it or the direct
   registration, not both; Connect skips the Claude Code registration when the
   plugin is enabled. No source checkout or Rust toolchain is needed.
 - **GitHub:** install and authenticate `gh` for pull requests, issues, and Actions.

@@ -39,7 +39,7 @@ If macOS blocks a download you have chosen to trust, after installing it at the
 path below you can remove its quarantine attribute:
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/GitPulse.app
+xattr -dr com.apple.quarantine /Applications/Waylode.app
 ```
 
 This removes a local quarantine attribute; it does not verify or notarize the app.
@@ -47,14 +47,14 @@ Open Waylode from Applications, Finder, or Spotlight.
 
 To let Claude Code or Codex use Waylode's MCP tools, open
 **Settings → Agents → Connect your agent** once Waylode runs from
-Applications. The `gitpulse-mcp` and `gitpulse-hook` binaries ship inside
-`GitPulse.app/Contents/MacOS/`; connecting links them into `~/.local/bin` and
+Applications. The `waylode-mcp` and `waylode-hook` binaries ship inside
+`Waylode.app/Contents/MacOS/`; connecting links them into `~/.local/bin` and
 registers the MCP server through each agent's own CLI, after showing you the
 plan. Because the links point into the app, they follow the app when you update
 it. Connecting does not install Waylode's Claude Code plugin, which is what
 wires its hooks; **Copy setup prompt** includes the plugin's install commands,
-and its hooks find `gitpulse-hook` only when `~/.local/bin` is on your shell's
-`PATH`. The plugin also provides the `gitpulse` server, so use the plugin or
+and its hooks find `waylode-hook` only when `~/.local/bin` is on your shell's
+`PATH`. The plugin also provides the `waylode` server, so use the plugin or
 the direct registration, not both: when the plugin is enabled, Connect marks
 the Claude Code registration done instead of adding a second server. A
 registration or link from an older setup (for example a `cargo install` copy
@@ -92,8 +92,8 @@ the pin is that build's code hash, and every new build has a different one. If
 you replaced an ad-hoc Waylode, or replaced one build with another signed by a
 different identity, while **Also run when Waylode is closed** was on, the cleaner
 agent's next run (within 60 seconds) is killed before any Waylode code runs.
-macOS saves a `gitpulse-*.ips` report with "Launch Constraint Violation" and may
-show "gitpulse quit unexpectedly". The Waylode window is not affected. launchd
+macOS saves a `waylode-*.ips` report with "Launch Constraint Violation" and may
+show "waylode quit unexpectedly". The Waylode window is not affected. launchd
 then re-pins the agent to the new build, and the run after that succeeds. The
 launch-at-login agent starts only at login, so it does not hit this within a
 session.
@@ -102,9 +102,9 @@ To avoid the refused run when installing such a build, unload the cleaner agent
 before you replace the app and load it again afterwards:
 
 ```sh
-launchctl bootout "gui/$(id -u)/dev.vbcr.gitpulse.hygiene"
-# replace /Applications/GitPulse.app here
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.vbcr.gitpulse.hygiene.plist
+launchctl bootout "gui/$(id -u)/dev.vbcr.waylode.hygiene"
+# replace /Applications/Waylode.app here
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.vbcr.waylode.hygiene.plist
 ```
 
 `bootout` stops a cleaner run that is in progress at that moment. An agent
@@ -112,23 +112,26 @@ loaded with `bootstrap` is not pinned for the rest of that login session; macOS
 pins it again when it loads the agent at the next login. Skip both commands if
 the agent is not installed.
 
-#### Upgrading from the `com.gitpulse.desktop` bundle identifier
+#### Upgrading from pre-rename bundle identifiers (`dev.vbcr.gitpulse`, `com.gitpulse.desktop`)
 
-Waylode's bundle identifier is now `dev.vbcr.gitpulse`. The first launch
-copies the page's website data (`~/Library/WebKit/com.gitpulse.desktop/WebsiteData`)
+Waylode's bundle identifier is now `dev.vbcr.waylode`. The first launch
+copies the page's website data (`~/Library/WebKit/dev.vbcr.gitpulse/WebsiteData`
+or `~/Library/WebKit/com.gitpulse.desktop/WebsiteData`)
 to the new identifier, moves a saved Claude API key to its new Keychain item,
-and replaces the cleaner agent `com.gitpulse.hygiene` with
-`dev.vbcr.gitpulse.hygiene`. The old website data is left in place, so a
-downgrade still finds it; delete it when you no longer need it. Your repositories,
-profile (`~/Library/Application Support/GitPulse`) and launch-at-login entry do
-not depend on the identifier. macOS treats the renamed app as a new app, so it
-asks again for notifications and for access to Desktop, Documents and Downloads,
-and a Full Disk Access grant has to be given again.
+migrates the profile directory (`~/Library/Application Support/Waylode` from
+`~/Library/Application Support/GitPulse` if present), and replaces the cleaner
+agents `dev.vbcr.gitpulse.hygiene` and `com.gitpulse.hygiene` with
+`dev.vbcr.waylode.hygiene`. The old website data is left in place, so a
+downgrade still finds it; delete it when you no longer need it. Your repositories
+and launch-at-login entry do not depend on the identifier. macOS treats the
+renamed app as a new app, so it asks again for notifications and for access to
+Desktop, Documents and Downloads, and a Full Disk Access grant has to be given
+again.
 
 #### Quitting
 
 Cmd-Q, Dock → Quit, the status menu's Quit item, and a Quit Apple event
-(`osascript -e 'quit app id "dev.vbcr.gitpulse"'`) all go through the same
+(`osascript -e 'quit app id "dev.vbcr.waylode"'`) all go through the same
 confirmation. Waylode asks first when Git actions are still running, editor saves
 are in flight, or editor drafts are unsaved, and quits immediately otherwise.
 A logout or restart waits while Waylode asks, then continues if you quit, or
@@ -152,10 +155,10 @@ it later in System Settings → Privacy & Security → Automation.
 
 #### Local builds and duplicate registrations
 
-`bun run tauri build` leaves a complete `GitPulse.app` in
+`bun run tauri build` leaves a complete `Waylode.app` in
 `src-tauri/target/release/bundle/macos/`, and Spotlight registers every app bundle
 it indexes. That copy then competes with the installed one for "Open with",
-`open -a GitPulse`, and `.git` file associations. Building the DMG also mounts it
+`open -a Waylode`, and `.git` file associations. Building the DMG also mounts it
 under `/Volumes/dmg.*`, which can leave a registration for each mount that no
 longer exists.
 
@@ -164,9 +167,9 @@ the installed one:
 
 ```sh
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-"$LSREGISTER" -u src-tauri/target/release/bundle/macos/GitPulse.app
-"$LSREGISTER" -f /Applications/GitPulse.app
-"$LSREGISTER" -dump | grep -E '^path: .*GitPulse\.app'
+"$LSREGISTER" -u src-tauri/target/release/bundle/macos/Waylode.app
+"$LSREGISTER" -f /Applications/Waylode.app
+"$LSREGISTER" -dump | grep -E '^path: .*Waylode\.app'
 ```
 
 Spotlight re-registers the build copy the next time it indexes `target/`. To stop
@@ -174,7 +177,7 @@ that, use one of these:
 
 - Add `src-tauri/target` to System Settings → Spotlight → Search Privacy. This
   also keeps the large build tree out of the index.
-- Delete `src-tauri/target/release/bundle/macos/GitPulse.app` after installing it.
+- Delete `src-tauri/target/release/bundle/macos/Waylode.app` after installing it.
   The DMG beside it is the artifact to keep.
 
 `lsregister -gc` compacts the database. It is not established here whether it also
@@ -251,7 +254,7 @@ read back by a host built against an older one. (The dc-store vendored in this
 tree is store schema 11 with workbench schema 17.) Waylode, Manvi and DevCouncil
 share that profile, so update all three together, built from the same dc-store
 schema, before any of them opens it. A connected app install updates the
-`gitpulse-mcp` and `gitpulse-hook` it links along with the app; a source build
+`waylode-mcp` and `waylode-hook` it links along with the app; a source build
 must reinstall them (`bun run mcp:install`). A binary built against an older
 schema refuses the migrated profile. The release notes in the CHANGELOG record each schema change.
 After updating, `bun run check:schema-parity` asks each installed reader which

@@ -19,7 +19,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC"]
-        Bridge["invoke('cmd_*') — 328 handlers, check:ipc"]
+        Bridge["invoke('cmd_*') — 370 handlers, check:ipc"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -30,7 +30,7 @@ flowchart TB
         Secrets["Secrets Scanner (Kingfisher)"]
         AI["AI Phrasing & Commit Brief"]
         Ledger["Event Ledger WAL"]
-        MCP["gitpulse-mcp & gitpulsed"]
+        MCP["waylode-mcp & wayloded"]
         DevMapSubsys["DevMap Query & Gate Subsystem"]
     end
 
@@ -55,7 +55,7 @@ flowchart TB
     Backend --> LocalBox
 ```
 
-The 328-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `bun run check:ipc`.
+The 370-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `bun run check:ipc`.
 
 ## Layout
 
@@ -84,7 +84,7 @@ GitPulse/
 
 There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/repos/persist.ts`, registered in `src/lib/views/viewRegistry.ts`, rendered from `App.svelte`. Adding a view means changing all three.
 
-Errors across IPC carry their kind as a `CommandError` from the runners to the command edge; there is no thread-local error record. The DevMap status probe is off the live-refresh IPC path: a refresh waits at most a 1 s grace for it and otherwise defers (`probe_pending`). Counting the lines of untracked files (`git_reader.rs`) stops at 2,000 files and 128 MiB per refresh, skips a file over 64 MiB, opens files with `O_NONBLOCK`, and reuses counts through a `ScanIdentity` cache. `ViewSectionPanel.svelte` keys its content on the current repository, so a repository switch rebuilds the leaves inside it, and `gitpulse-mcp` serves the `devmap_*` tools with the standalone server's defaults (depth 3) over schema 29 zstd-compressed stores. For PTY management under the `gitpulse-ptyd` backend, `Host::knows` evaluates session membership directly from client-side vouched snapshots, eliminating IPC round-trip overhead. Background-class processes on macOS enter Darwin's background band in the child process before `exec` (`procguard::spawn_background`), while the frontend terminal holds recently hidden WebGL contexts and enforces DEC 2026 synchronized output boundaries. In the workbench, the verification sweep driver batches claimed card queries via `latest_many` to minimize background polling overhead.
+Errors across IPC carry their kind as a `CommandError` from the runners to the command edge; there is no thread-local error record. The DevMap status probe is off the live-refresh IPC path: a refresh waits at most a 1 s grace for it and otherwise defers (`probe_pending`). Counting the lines of untracked files (`git_reader.rs`) stops at 2,000 files and 128 MiB per refresh, skips a file over 64 MiB, opens files with `O_NONBLOCK`, and reuses counts through a `ScanIdentity` cache. `ViewSectionPanel.svelte` keys its content on the current repository, so a repository switch rebuilds the leaves inside it, and `waylode-mcp` serves the `devmap_*` tools with the standalone server's defaults (depth 3) over schema 29 zstd-compressed stores. For PTY management under the `waylode-ptyd` backend (protocol 5), `Host::knows` evaluates session membership directly from client-side vouched snapshots, eliminating IPC round-trip overhead. Background-class processes on macOS enter Darwin's background band in the child process before `exec` (`procguard::spawn_background`), while the frontend terminal holds recently hidden WebGL contexts and enforces DEC 2026 synchronized output boundaries. In the workbench, the verification sweep driver batches claimed card queries via `latest_many` to minimize background polling overhead.
 
 ## Why Fleet is not a view
 
@@ -109,7 +109,7 @@ flowchart LR
         MVPolicy --> MVSidecar
         MVWorkbench --> MVSidecar
     end
-    subgraph GP["GitPulse (Host)"]
+    subgraph GP["Waylode (Host)"]
         Rust["Rust core (Tauri 2)"]
         Gate["devmap gate & probe"]
         Client["Harness client"]
@@ -128,20 +128,20 @@ flowchart LR
 
 | Binary | Transport | Role |
 | --- | --- | --- |
-| `gitpulse-mcp` | MCP JSON-RPC over stdio | Control plane for coding agents: read-only (`readOnlyHint: true`) insights, collisions, 3-layer agent radar, inbox, ledger, and DevMap queries, plus repository-trust-gated task-board and `gitpulse_worktree_*` lifecycle/coordination tools. |
-| `gitpulsed` | NDJSON, interval loop | **Write** attribution catch-up into the ledger when the GUI is closed. Serves no requests and never takes a lease. |
-| `gitpulse-hook` | Host hook JSON on stdin/stdout | Agent hook dispatcher; failures report no decision and leave host permissions in control, except a bare invocation with no subcommand, which exits 2 (blocks) so a host that drops the hook's arguments cannot read it as allow. |
-| `gitpulse-ptyd` | Unix socket to the app | Unix terminal host: holds PTY terminal sessions on Unix (`#[cfg(unix)]`) so shells and TUI agents survive app restarts or crashes. See [Terminal host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL_HOST.md). |
+| `waylode-mcp` | MCP JSON-RPC over stdio | Control plane for coding agents: read-only (`readOnlyHint: true`) insights, collisions, 3-layer agent radar, inbox, ledger, and DevMap queries, plus repository-trust-gated task-board and `waylode_worktree_*` lifecycle/coordination tools (legacy `gitpulse_*` aliases resolve; `WAYLODE_MCP_EXPOSE_LEGACY=1` advertises them). |
+| `wayloded` | NDJSON, interval loop | **Write** attribution catch-up into the ledger when the GUI is closed (legacy alias `gitpulsed`). Serves no requests and never takes a lease. |
+| `waylode-hook` | Host hook JSON on stdin/stdout | Agent hook dispatcher (legacy alias `gitpulse-hook`); failures report no decision and leave host permissions in control, except a bare invocation with no subcommand, which exits 2 (blocks) so a host that drops the hook's arguments cannot read it as allow. |
+| `waylode-ptyd` | Unix socket to the app | Unix terminal host (protocol 5, legacy alias `gitpulse-ptyd`): holds PTY terminal sessions on Unix (`#[cfg(unix)]`) so shells and TUI agents survive app restarts or crashes. See [Terminal host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL_HOST.md). |
 | `waylode-worktree` | CLI (`--json` or text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` compiler, and `<git-common-dir>/gitpulse/lanes/` multi-agent coordination CLI. See [Zero-copy agentic worktrees](https://github.com/bharathvbcr/GitPulse/blob/main/docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
 | `waylode-rustc` | `RUSTC_WRAPPER` | Two-stage Blake3 + `.d` dep-info / `# env-dep:` Rust compiler cache materializing artifacts via APFS `clonefile` / Linux `FICLONE` from `<git-common-dir>/gitpulse/build-cache/`. |
 
 ```sh
-gitpulsed --interval 300 /path/to/repo
+wayloded --interval 300 /path/to/repo
 ```
 
 Catch-up is idempotent against a ledger watermark; interrupting a cycle is safe.
 
-Each pass leaves its outcome in the ledger's `catch_up_state` table (one row per worktree), which is how a read-only process such as `gitpulse-mcp` reports `last_catch_up`, `stale` and what the pass covered. The transcript walk reads up to five directories below the root (the `slug/session/subagents/workflows/wf_*/` layout) and 5000 files; anything it sees past those bounds is counted as `transcripts_unlisted` (`unlisted_depth`, `unlisted_cap`), marks the pass `truncated`, and keeps the walk from forgetting any transcript offset.
+Each pass leaves its outcome in the ledger's `catch_up_state` table (one row per worktree), which is how a read-only process such as `waylode-mcp` reports `last_catch_up`, `stale` and what the pass covered. The transcript walk reads up to five directories below the root (the `slug/session/subagents/workflows/wf_*/` layout) and 5000 files; anything it sees past those bounds is counted as `transcripts_unlisted` (`unlisted_depth`, `unlisted_cap`), marks the pass `truncated`, and keeps the walk from forgetting any transcript offset.
 
 ## Profile tasks and workspaces
 

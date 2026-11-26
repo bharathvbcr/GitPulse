@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Waylode Cross-Repo Seam Manifest",
+  "version": "1.0.0",
+  "owner_repo": "Waylode",
+  "repo_root": "/Users/bharath/Code/devtools/GitPulse",
+  "vendored_crates": {
+    "manifest": "src-tauri/vendored/VENDOR.json",
+    "devcouncil_count": 12,
+    "markdev_count": 4,
+    "total_count": 16
+  },
+  "schema_parity_script": "scripts/check-schema-parity.mjs",
+  "devmap_mcp_subset": {
+    "source_file": "src-tauri/src/mcp/devmap_parity.rs",
+    "tool_count": 11,
+    "tools": [
+      "devmap_status",
+      "devmap_search",
+      "devmap_dependencies",
+      "devmap_impact",
+      "devmap_trace",
+      "devmap_neighbors",
+      "devmap_dead_symbols",
+      "devmap_clones",
+      "devmap_preview",
+      "devmap_explore",
+      "devmap_affected_tests"
+    ],
+    "upstream_owner": "DevCouncil rust/devmap-serve/src/mcp.rs::TOOL_NAMES"
+  },
+  "sidecar": {
+    "binary": "manvi serve",
+    "source_file": "src-tauri/src/harness/sidecar.rs",
+    "init_env_override": "MANVI_HARNESS_INIT_ENABLED=false",
+    "contracts_copied_readonly": [
+      "contracts/verdict.schema.json",
+      "contracts/verdict.cases.json",
+      "contracts/event.schema.json",
+      "contracts/lease.schema.md",
+      "contracts/serve.ops.schema.json"
+    ]
+  },
+  "deliberate_exceptions": [
+    {
+      "symbol": "parse_git_version",
+      "file": "src-tauri/src/engine/git_cli/preflight.rs",
+      "line": 76,
+      "diverges_from": "dc_proc::GitVersion::parse",
+      "reason": "Avoids direct dc-proc linkage and preserves overflow->None, 2.45.1-rc1 patch retention, and major-only git version 3 parsing"
+    }
+  ],
+  "audited_overlaps": [
+    {
+      "id": "OV-INTEGRATE-01",
+      "matrix_capability": "host_integration_and_wiring",
+      "canonical_owner": "DevCouncil",
+      "surfaces": [
+        "src-tauri/src/agent_connect.rs",
+        "src-tauri/src/workbench/agy_plugin.rs",
+        "src-tauri/src/workbench/claude_hook.rs",
+        "src-tauri/src/devmap/integrate.rs"
+      ],
+      "closure_tasks": ["T-06", "T-07"]
+    },
+    {
+      "id": "OV-SKILLS-01",
+      "matrix_capability": "agent_skills_packaging",
+      "canonical_owner": "DevCouncil",
+      "surfaces": [
+        "plugins/waylode/skills/",
+        "src-tauri/src/devmap/integrate.rs"
+      ],
+      "closure_tasks": ["T-07"]
+    }
+  ]
+}

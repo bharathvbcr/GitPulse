@@ -85,7 +85,7 @@ native `canonical_task_briefs_use_native_storage_without_starting_a_model_worker
 test in `src-tauri/src/workbench.rs`. These verify version binding, complete
 repository vectors, bounded text, restart persistence and stale-source refusal.
 Canonical formatting and corrupt/large storage cases are covered upstream by
-Manvi's `crates/dc-store/tests/workbench_briefs.rs`; its Go store tests exercise
+DevCouncil's `workbench_briefs.rs` tests (wrapped by Manvi's `dc-store`); its Go store tests exercise
 the real persistent child. The disposable [workbench harness](harness/README.md)
 checks the rendered copy action without changing the OS clipboard.
 

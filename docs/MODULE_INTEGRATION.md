@@ -58,9 +58,9 @@ flowchart TD
         ManviSidecar --> ManviAgents
     end
 
-    subgraph GitPulseHost["GitPulse Desktop Host"]
+    subgraph WaylodeHost["Waylode Desktop Host"]
         direction TB
-        UIHost["Svelte 5 UI (Work · Code · History · Insights)"]
+        UIHost["Svelte 5 UI (Work · Mavi · Code · History · Insights)"]
         RustIPC["Rust Core (370 Handlers, Tauri 2 IPC)"]
         InProcessReaders["In-process Vendored Readers<br/>(<code>src-tauri/vendored/</code>)"]
         CLIGate["Live Indexing Gate & Daemon Probe<br/>(<code>src-tauri/src/devmap/</code>)"]
@@ -87,7 +87,7 @@ flowchart TD
 sequenceDiagram
     autonumber
     participant UI as Svelte 5 UI
-    participant Rust as GitPulse Rust Core
+    participant Rust as Waylode Rust Core
     participant Manvi as manvi serve (Sidecar)
     participant DevCouncil as dc-store / DevMap
     participant Git as Git Engine / CLI
@@ -97,8 +97,8 @@ sequenceDiagram
     Rust->>Rust: Evaluate local policy grants
     alt No cached grant
         Rust->>Manvi: NDJSON request (guard_command / guard_file)
-        Manvi->>Manvi: Evaluate 5-stage policy safety ladder
-        Manvi-->>Rust: Verdict (Allowed · Demoted · Warned · Blocked · Unchecked)
+        Manvi->>Manvi: Evaluate policy gate (8 decision statuses)
+        Manvi-->>Rust: Verdict (Allowed · Demoted · Granted · Widened · Degraded · Warned · Blocked · Unchecked)
     end
     alt Blocked
         Rust-->>UI: Refusal & rationale

@@ -29,12 +29,13 @@ Waylode is also the successor to the deprecated [LiquiTask](https://github.com/b
 
 ## How the app is organized
 
-Four **views**, each a header tab. Sections inside a view are lenses on the same subject — switching Graph → Diff keeps the commit you selected.
+Five **views**, each a header tab. Sections inside a view are lenses on the same subject — switching Graph → Diff keeps the commit you selected.
 
 ```mermaid
 flowchart LR
     subgraph Views["The five views"]
         Work["Work — Overview · Remote · Tasks"]
+        Mavi["Mavi — agent orchestration"]
         Code["Code — Explorer (Search and Blame toggles) · Map"]
         History["History — Graph (commits / HEAD moves / suspects) · Diff"]
         Insights["Insights — Pulse · Coverage · Health (includes Secrets) · Storage"]

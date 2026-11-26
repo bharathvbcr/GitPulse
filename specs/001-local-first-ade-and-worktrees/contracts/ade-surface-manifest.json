@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Waylode ADE Surface Manifest",
+  "version": "1.0.0",
+  "owner_repo": "Waylode",
+  "repo_root": "/Users/bharath/Code/devtools/GitPulse",
+  "ui": {
+    "views": ["work", "mavi", "code", "history", "insights"],
+    "view_count": 5,
+    "section_count": 11,
+    "health_section_count": 13,
+    "presets": 21,
+    "brand_presets": 4,
+    "wallpapers": 11,
+    "brand_logo_styles": ["way-arc", "folded-ribbon", "lode-compass"],
+    "brand_logo_palettes": ["cobalt", "lodestar", "oxblood", "gilded"],
+    "theme_schemas": ["waylode-theme/1", "gitpulse-theme/1"]
+  },
+  "ipc": {
+    "registered_handlers": 370,
+    "contracts": 141,
+    "structs": 372,
+    "fields": 2614
+  },
+  "binaries": [
+    "waylode",
+    "wayloded",
+    "waylode-mcp",
+    "waylode-hook",
+    "waylode-ptyd",
+    "waylode-worktree",
+    "waylode-rustc"
+  ],
+  "mcp": {
+    "total_tools": 66,
+    "waylode_tools": 55,
+    "devmap_parity_tools": 11,
+    "prompts": 4,
+    "legacy_alias_opt_in_env": "WAYLODE_MCP_EXPOSE_LEGACY"
+  },
+  "terminal_host": {
+    "binary": "waylode-ptyd",
+    "protocol_version": 5,
+    "compat_fallback": "src-tauri/src/terminal/host/compat_v4.rs",
+    "spawn_allowed_modes": ["inspect", "ask", "edit", "auto_review", "preapproved"]
+  },
+  "delegated_boundaries": {
+    "code_intelligence": "DevCouncil (specs/003-stack-boundaries-and-non-overlap, specs/004-modular-engines-and-policy)",
+    "policy_and_agent_runtime": "Manvi (specs/001-agent-harness-and-serve-plane, specs/002-policy-enforcement-and-hardening)"
+  }
+}

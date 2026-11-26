@@ -58,8 +58,73 @@ impl IntegrationHost {
         }
     }
 
+    /// Human-facing host label shared across host integration and Connect panels.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Cursor => "Cursor",
+            Self::Codex => "Codex",
+        }
+    }
+
+    /// CLI executable name probed by the shared host preflight seam.
+    pub fn cli_program(self) -> &'static str {
+        self.as_str()
+    }
+
     pub fn all() -> [Self; 3] {
         [Self::Claude, Self::Cursor, Self::Codex]
+    }
+}
+
+/// Result of checking whether an agent host's CLI is present on the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCliStatus {
+    pub host: IntegrationHost,
+    pub program: Option<String>,
+}
+
+/// Probes one host CLI through `find_tool` (`process::find_external_tool` in production).
+pub fn probe_host_cli_with(
+    host: IntegrationHost,
+    find_tool: &dyn Fn(&str) -> Option<String>,
+) -> HostCliStatus {
+    HostCliStatus {
+        host,
+        program: find_tool(host.cli_program()),
+    }
+}
+
+/// Probes all supported integration host CLIs once for a single preflight pass.
+pub fn probe_host_clis_with(find_tool: &dyn Fn(&str) -> Option<String>) -> Vec<HostCliStatus> {
+    IntegrationHost::all()
+        .into_iter()
+        .map(|host| probe_host_cli_with(host, find_tool))
+        .collect()
+}
+
+/// Probes all supported integration host CLIs using `process::find_external_tool`.
+pub fn probe_host_clis() -> Vec<HostCliStatus> {
+    probe_host_clis_with(&crate::engine::process::find_external_tool)
+}
+
+/// Looks up a previously probed CLI path for `host`.
+pub fn host_cli_program<'a>(statuses: &'a [HostCliStatus], host: IntegrationHost) -> Option<&'a str> {
+    statuses
+        .iter()
+        .find(|status| status.host == host)
+        .and_then(|status| status.program.as_deref())
+}
+
+fn host_cli_preflight_note(host: IntegrationHost, cli_present: bool) -> Option<String> {
+    if cli_present {
+        None
+    } else {
+        Some(format!(
+            "{} CLI (`{}`) was not detected on PATH; file-based integration assets can still be written.",
+            host.label(),
+            host.cli_program()
+        ))
     }
 }
 
@@ -328,6 +393,26 @@ fn run(
         .map_err(CommandError::from)
 }
 
+fn preview_with_context(
+    host: IntegrationHost,
+    repo: &Path,
+    binary: &ResolvedDevmap,
+    cli_present: bool,
+) -> IntegrationPlan {
+    match run(binary, repo, host, false) {
+        Ok(payload) => {
+            let mut plan = parse_plan(host, repo, &payload, false);
+            if let Some(note) = host_cli_preflight_note(host, cli_present) {
+                if !plan.notes.iter().any(|existing| existing == &note) {
+                    plan.notes.push(note);
+                }
+            }
+            plan
+        }
+        Err(e) => IntegrationPlan::unavailable(host, &repo.to_string_lossy(), e.into_message()),
+    }
+}
+
 /// What integrating `host` into `repo_path` would change. Writes nothing.
 pub fn preview(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
     let repo = match validate_repo(repo_path) {
@@ -338,10 +423,11 @@ pub fn preview(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
         Ok(binary) => binary,
         Err(e) => return IntegrationPlan::unavailable(host, repo_path, e),
     };
-    match run(&binary, &repo, host, false) {
-        Ok(payload) => parse_plan(host, &repo, &payload, false),
-        Err(e) => IntegrationPlan::unavailable(host, repo_path, e.into_message()),
-    }
+    let cli_present =
+        probe_host_cli_with(host, &crate::engine::process::find_external_tool)
+            .program
+            .is_some();
+    preview_with_context(host, &repo, &binary, cli_present)
 }
 
 /// Write the integration assets. Only ever called from an explicit user action.
@@ -373,9 +459,32 @@ pub fn apply(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
 /// Whether each host's assets already match this binary, for every host at
 /// once. Preview-only, so it is safe to call when a repository is opened.
 pub fn survey(repo_path: &str) -> Vec<IntegrationPlan> {
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(e) => {
+            let reason = e.into_message();
+            return IntegrationHost::all()
+                .into_iter()
+                .map(|host| IntegrationPlan::unavailable(host, repo_path, reason.clone()))
+                .collect();
+        }
+    };
+    let binary = match resolve_binary() {
+        Ok(binary) => binary,
+        Err(reason) => {
+            return IntegrationHost::all()
+                .into_iter()
+                .map(|host| IntegrationPlan::unavailable(host, repo_path, reason.clone()))
+                .collect();
+        }
+    };
+    let cli_statuses = probe_host_clis();
     IntegrationHost::all()
         .into_iter()
-        .map(|host| preview(repo_path, host))
+        .map(|host| {
+            let cli_present = host_cli_program(&cli_statuses, host).is_some();
+            preview_with_context(host, &repo, &binary, cli_present)
+        })
         .collect()
 }
 
@@ -531,5 +640,26 @@ mod tests {
         // a silent mismatch: an unknown host is rejected by the CLI and comes
         // back as an unavailable plan.
         assert_eq!(ids, vec!["claude", "cursor", "codex"]);
+    }
+
+    #[test]
+    fn shared_host_cli_probe_deduplicates_lookup_and_reports_absent_cli() {
+        let seen = std::cell::RefCell::new(Vec::<String>::new());
+        let find = |program: &str| {
+            seen.borrow_mut().push(program.to_string());
+            (program == "claude").then(|| "/usr/local/bin/claude".to_string())
+        };
+        let statuses = probe_host_clis_with(&find);
+        assert_eq!(seen.borrow().as_slice(), &["claude", "cursor", "codex"]);
+        assert_eq!(
+            host_cli_program(&statuses, IntegrationHost::Claude),
+            Some("/usr/local/bin/claude")
+        );
+        assert_eq!(host_cli_program(&statuses, IntegrationHost::Cursor), None);
+        assert_eq!(host_cli_program(&statuses, IntegrationHost::Codex), None);
+        assert!(host_cli_preflight_note(IntegrationHost::Claude, true).is_none());
+        let cursor_note = host_cli_preflight_note(IntegrationHost::Cursor, false)
+            .expect("absent CLI emits preflight note");
+        assert!(cursor_note.contains("Cursor CLI (`cursor`)"));
     }
 }

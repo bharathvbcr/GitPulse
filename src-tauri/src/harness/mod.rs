@@ -1,12 +1,12 @@
 //! Integration with the MANVI coding-agent harness.
 //!
-//! GitPulse embeds MANVI the way its host plane is meant to be embedded: as a
+//! Waylode embeds MANVI the way its host plane is meant to be embedded: as a
 //! `manvi serve` child speaking NDJSON over stdio. Three of its planes are
 //! used — the command gate and the write gate guard every mutating Git action,
 //! and the local-LLM plane (capability probing, token budgeting, completion
 //! parsing) backs the AI features in `crate::ai`.
 //!
-//! Everything here degrades: with no harness installed GitPulse still commits,
+//! Everything here degrades: with no harness installed Waylode still commits,
 //! pushes and rebases, and every unguarded action is reported as unguarded.
 
 pub(crate) mod anthropic_account;

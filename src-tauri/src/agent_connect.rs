@@ -22,6 +22,7 @@
 //! through the repository-trust guard. Every child is bounded with
 //! [`process::run_bounded_capped`], as the tool installer's probes are.
 
+use crate::devmap::{host_cli_program, probe_host_clis_with, IntegrationHost};
 use crate::engine::process;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -165,31 +166,27 @@ pub struct ConnectEnv<'a> {
     pub runner: &'a dyn CliRunner,
 }
 
-#[derive(Clone, Copy)]
-enum Agent {
-    Claude,
-    Codex,
+type Agent = IntegrationHost;
+
+const AGENTS: [Agent; 2] = [IntegrationHost::Claude, IntegrationHost::Codex];
+
+trait AgentCliExt {
+    fn key(self) -> &'static str;
+    fn get_args_for(self, server_name: &str) -> Vec<String>;
+    fn add_args(self, command: &str) -> Vec<String>;
+    fn remove_args_for(self, server_name: &str, scope: Option<&str>) -> Vec<String>;
+    fn remove_line_for(self, server_name: &str, scope: Option<&str>) -> String;
+    fn remove_line(self, scope: Option<&str>) -> String;
 }
 
-const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
-
-impl Agent {
+impl AgentCliExt for IntegrationHost {
     fn key(self) -> &'static str {
-        match self {
-            Agent::Claude => "claude",
-            Agent::Codex => "codex",
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Agent::Claude => "Claude Code",
-            Agent::Codex => "Codex",
-        }
+        self.cli_program()
     }
     /// `claude mcp get <name>` / `codex mcp get <name> --json`.
     fn get_args_for(self, server_name: &str) -> Vec<String> {
         let mut args = vec!["mcp".into(), "get".into(), server_name.into()];
-        if matches!(self, Agent::Codex) {
+        if matches!(self, IntegrationHost::Codex) {
             args.push("--json".into());
         }
         args
@@ -198,7 +195,7 @@ impl Agent {
     /// Codex has no scope flag, its registry is the one `~/.codex/config.toml`.
     fn add_args(self, command: &str) -> Vec<String> {
         let mut args: Vec<String> = vec!["mcp".into(), "add".into()];
-        if matches!(self, Agent::Claude) {
+        if matches!(self, IntegrationHost::Claude) {
             args.extend(["--scope".into(), "user".into()]);
         }
         args.extend([SERVER_NAME.into(), "--".into(), command.into()]);
@@ -206,18 +203,15 @@ impl Agent {
     }
     fn remove_args_for(self, server_name: &str, scope: Option<&str>) -> Vec<String> {
         let mut args = vec!["mcp".into(), "remove".into(), server_name.into()];
-        if let (Agent::Claude, Some(scope)) = (self, scope) {
+        if let (IntegrationHost::Claude, Some(scope)) = (self, scope) {
             args.extend(["-s".into(), scope.into()]);
         }
         args
     }
-}
-
-impl Agent {
     /// The agent's own line that removes the registration, for the user to run.
     fn remove_line_for(self, server_name: &str, scope: Option<&str>) -> String {
         let mut line = format!("{} mcp remove {server_name}", self.key());
-        if let (Agent::Claude, Some(scope)) = (self, scope) {
+        if let (IntegrationHost::Claude, Some(scope)) = (self, scope) {
             line.push_str(" -s ");
             line.push_str(scope);
         }
@@ -521,10 +515,11 @@ fn registration_for(
     let registered = match agent {
         Agent::Claude => claude_command(&run.output),
         Agent::Codex => codex_command(&run.output),
+        Agent::Cursor => None,
     };
     let scope = match agent {
         Agent::Claude => claude_scope(&run.output),
-        Agent::Codex => None,
+        Agent::Codex | Agent::Cursor => None,
     };
     match registered {
         Some(found) if same_file(Path::new(&found), Path::new(command)) => {
@@ -644,6 +639,7 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
     }
     if let Ok(mcp) = &env.mcp {
         let command = mcp.to_string_lossy().into_owned();
+        let cli_statuses = probe_host_clis_with(env.find_tool);
         for agent in AGENTS {
             plan.agent_commands.push(AgentCommand {
                 agent: agent.key().to_string(),
@@ -651,15 +647,15 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
                 add: shell_words(agent.key(), &agent.add_args(&command)),
                 verify: format!("{} mcp list", agent.key()),
             });
-            let Some(program) = (env.find_tool)(agent.key()) else {
+            let Some(program) = host_cli_program(&cli_statuses, agent).map(str::to_string) else {
                 continue;
             };
             plan.agents_found.push(agent.key().to_string());
             let add_line = shell_words(agent.key(), &agent.add_args(&command));
             let registered = registration_for(agent, SERVER_NAME, &program, env.runner, &command);
             let plugin = match agent {
-                Agent::Claude => claude_plugin_server(&program, env.runner),
-                Agent::Codex => PluginServer::None,
+                IntegrationHost::Claude => claude_plugin_server(&program, env.runner),
+                IntegrationHost::Codex | IntegrationHost::Cursor => PluginServer::None,
             };
             let label = agent.label();
             let (state, mut detail, commands) = match (registered, plugin) {
@@ -725,7 +721,7 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
                     vec![agent.remove_line(scope), add_line.clone()],
                 ),
             };
-            if matches!(agent, Agent::Claude) {
+            if matches!(agent, IntegrationHost::Claude) {
                 detail.push(' ');
                 detail.push_str(CLAUDE_PROFILE_NOTE);
             }
@@ -920,8 +916,9 @@ fn apply_cleanup_legacy(env: &ConnectEnv, action: &ConnectAction) -> Result<(), 
         .into_iter()
         .find(|a| a.key() == key)
         .ok_or_else(|| format!("unknown agent {key}"))?;
-    let program =
-        (env.find_tool)(key).ok_or_else(|| format!("{} is no longer installed", agent.label()))?;
+    let program = crate::devmap::probe_host_cli_with(agent, env.find_tool)
+        .program
+        .ok_or_else(|| format!("{} is no longer installed", agent.label()))?;
     let command = env
         .mcp
         .as_ref()
@@ -948,8 +945,9 @@ fn apply_register(env: &ConnectEnv, action: &ConnectAction) -> Result<(), String
         .into_iter()
         .find(|a| a.key() == key)
         .ok_or_else(|| format!("unknown agent {key}"))?;
-    let program =
-        (env.find_tool)(key).ok_or_else(|| format!("{} is no longer installed", agent.label()))?;
+    let program = crate::devmap::probe_host_cli_with(agent, env.find_tool)
+        .program
+        .ok_or_else(|| format!("{} is no longer installed", agent.label()))?;
     let mcp = env.mcp.as_ref().map_err(Clone::clone)?;
     let run = env
         .runner

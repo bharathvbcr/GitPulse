@@ -44,7 +44,7 @@ Use `bun run test:native -- --harness <slug>` for one page or `bun run test:nati
 
 ## 3. Real-Binary `tauri-driver` E2E Smoke + Screenshots
 
-`scripts/e2e-driver-smoke.mjs` launches the real compiled `gitpulse` binary through W3C WebDriver (`tauri-driver` + `WebKitWebDriver` on Linux, or `tauri-driver` + `msedgedriver` on Windows) against an isolated profile directory (`HOME`/`XDG_*` on Linux, `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`WEBVIEW2_USER_DATA_FOLDER` on Windows) and verifies:
+`scripts/e2e-driver-smoke.mjs` launches the real compiled `waylode` binary through W3C WebDriver (`tauri-driver` + `WebKitWebDriver` on Linux, or `tauri-driver` + `msedgedriver` on Windows) against an isolated profile directory (`HOME`/`XDG_*` on Linux, `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`WEBVIEW2_USER_DATA_FOLDER` on Windows) and verifies:
 
 1. Cold start with isolated profile and zero uncaught page errors (`01-cold-start.png`)
 2. Real Git repository + OS file watcher (`notify`) + live diff (`02-repo-watcher-diff.png`)
@@ -60,7 +60,7 @@ Repository trust for the disposable E2E fixture repos is persisted inside the is
 bun run build
 cargo build --manifest-path src-tauri/Cargo.toml --locked \
   --features tauri/custom-protocol \
-  --bin gitpulse --bin gitpulse-ptyd \
+  --bin waylode --bin waylode-ptyd \
   --example e2e_seed_trust
 bun run test:e2e:driver -- --artifacts .gitpulse/scratch/e2e-artifacts
 ```
@@ -104,7 +104,7 @@ For real WebView2 GPU rendering, ConPTY behavior, NSIS/MSI install & upgrade flo
 
 - **`.github/workflows/ci.yml`** runs sharded `cargo nextest` across Linux (3 shards + extras, including `gtk_runtime` under Xvfb), Windows (4 shards + extras, including `windows_runtime`), and macOS (3 shards + extras) with pinned `devmap` (`DEVMAP_REV`) and `manvi` (`MANVI_REV`) on all three platforms, gated by `rust-test-complete` (`scripts/check-shard-coverage.mjs`) proving every listed test ran exactly once on all three platforms.
 - **`.github/workflows/e2e-desktop.yml`** runs `gtk_runtime` (X11 + headless Wayland) and `windows_runtime` (`windows-latest`), native WebKitGTK/WebView2 harness checks (`all` — full 47-harness native suite — on pushes to `main`, nightly schedules, and `workflow_dispatch` with default `all`; `diagnostics` smoke on `pull_request` unless overridden via the `harnesses` input), and real-binary `tauri-driver` E2E smoke + PNG screenshot upload (`e2e-desktop-linux`, `e2e-desktop-windows`, with automatic `msedgedriver` <-> WebView2 major-version matching on Windows).
-- **`.github/workflows/release.yml`** runs `preflight` with pinned `devmap` and `manvi`, `prepare` enforcing job-level CI provenance across all required `ci.yml` and `coverage.yml` jobs (`scripts/release-state.mjs`), per-leg bundle manifest checks (`scripts/check-release-assets.mjs`, including macOS universal `.app` verification) and `gitpulse-ptyd` release symbol verification (`scripts/check-ptyd-release.mjs`) on Unix legs, `attest` with SBOM JSON validation + bounded upload retries + canonical `SHA256SUMS.txt` manifest, and full draft download/unpack inspection in `verify` (downloading and verifying `SHA256SUMS.txt` against every uploaded asset digest).
+- **`.github/workflows/release.yml`** runs `preflight` with pinned `devmap` and `manvi`, `prepare` enforcing job-level CI provenance across all required `ci.yml` and `coverage.yml` jobs (`scripts/release-state.mjs`), per-leg bundle manifest checks (`scripts/check-release-assets.mjs`, including macOS universal `.app` verification) and `waylode-ptyd` release symbol verification (`scripts/check-ptyd-release.mjs`) on Unix legs, `attest` with SBOM JSON validation + bounded upload retries + canonical `SHA256SUMS.txt` manifest, and full draft download/unpack inspection in `verify` (downloading and verifying `SHA256SUMS.txt` against every uploaded asset digest).
 
 ## 7. Cross-Platform vs. Intentionally Unix-Gated Rust Tests
 
@@ -113,7 +113,7 @@ Shared helpers in `src-tauri/src/test_support.rs` (`sh_path`, `sh_quote`, `write
 The remaining `#[cfg(unix)]` Rust test suites are intentionally Unix-gated because they assert POSIX-only primitives:
 
 - **`tests/secrets_stress.rs`**: asserts POSIX signal delivery (`SIGKILL`, `SIGBUS`, `SIGABRT`), raw `waitpid` status (`0x0009`), `/dev/zero`/`dd`, `chmod 0o000`, and Unix-only scrubbed environment variables (`PWD`, `SHLVL`, `_`, `OLDPWD`).
-- **`tests/terminal_*.rs` and `tests/adv_m3_pty_stress.rs`**: drive the Unix-only `gitpulse-ptyd` daemon over Unix domain sockets, `libc::kill(pid, 0)`, POSIX signals/kqueue, and `/bin/sh` job control. Windows ConPTY round-trip behavior is verified end-to-end by `scripts/e2e-driver-smoke.mjs` (`terminal-pty-roundtrip`).
+- **`tests/terminal_*.rs` and `tests/adv_m3_pty_stress.rs`**: drive the Unix-only `waylode-ptyd` daemon over Unix domain sockets, `libc::kill(pid, 0)`, POSIX signals/kqueue, and `/bin/sh` job control. Windows ConPTY round-trip behavior is verified end-to-end by `scripts/e2e-driver-smoke.mjs` (`terminal-pty-roundtrip`).
 - **`git_writer::a_cancelled_commit_leaves_no_index_lock`, `a_commit_stopped_at_its_deadline_leaves_no_index_lock`, `a_cancelled_commit_whose_hook_flooded_leaves_no_index_lock`, and `a_deadline_commit_whose_hook_traps_term_and_floods_leaves_no_index_lock`**: verify Git's graceful `.git/index.lock` cleanup on POSIX `SIGTERM` prior to `SIGKILL`; Windows terminates hook trees via `taskkill /T /F` (no graceful `SIGTERM`).
 - **`git_writer::resolve_clone_destination_canonicalizes_and_rejects_symlinks`, `clone_repo_refuses_symlinked_destination_and_leaves_target_untouched`, and `directories_and_symlinks_are_reported_as_the_index_shows_them`**: create POSIX symlinks via `std::os::unix::fs::symlink` (unprivileged symlink creation is disabled by default on Windows).
 - **`github::tests::{a_critical_alert_beyond_the_first_page_is_still_ranked_first, severity_tiers_are_fetched_concurrently_not_one_after_another, a_failing_tier_no_longer_discards_the_other_tiers, a_failed_tier_is_named_on_the_report, find_issue_by_marker_and_update_use_view_and_edit}`**: drive fake `gh` stubs with arguments containing Windows `cmd.exe` metacharacters (`&`, `?`, `=`, `"`, `<`, `>`) that Rust's `.cmd` argument hardening rejects or escapes differently from a native PE `gh.exe`; the underlying tier concurrency/deadline logic is tested cross-platform in `tiers_run_up_to_the_concurrency_cap_and_no_further` and `tiers_past_the_deadline_are_named_not_requested`.

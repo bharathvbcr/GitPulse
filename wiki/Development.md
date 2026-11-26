@@ -70,7 +70,7 @@ While iterating:
 | `bun run check:vendor-schema` | Vendored store schema ↔ installed `devmap` CLI |
 | `bun run check:types` | serde structs ↔ TypeScript interfaces |
 | `bun run check:release` | Version manifests agree |
-| `bun run mcp:install` | Put this tree's `gitpulse-mcp` and `gitpulse-hook` on PATH |
+| `bun run mcp:install` | Put this tree's `waylode-mcp` and `waylode-hook` (and legacy aliases) on PATH |
 | `bun run mcp:doctor` | PATH binary matches this tree (not in ci:local) |
 
 Every bug fix ships with a test that fails against the unfixed code.

@@ -44,7 +44,7 @@ Commit messages are classified in the app directly from the staged patch into a 
 
 ```mermaid
 flowchart LR
-    subgraph GitPulseCore["GitPulse Desktop"]
+    subgraph GitPulseCore["Waylode Desktop"]
         UIComp["Commit / Review / Health Suggestion"]
         PromptPrep["Harness prompt preparation & token limits"]
         ActionRunner["cmd_manvi_run_action<br/>(argv allowlist, no shell)"]

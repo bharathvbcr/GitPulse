@@ -1,20 +1,20 @@
 # Waylode Rename & Logo Change Master Plan
 
 > [!IMPORTANT]
-> **Unified Integration Branch (`rename/waylode-all`):** Phase 1 (`waylode-brand`), Phase 1B (Logo & Palette), Phase 2 (Surfaces, Binaries, MCP & Env Vars), and Phase 3 (Saved Data, OS Identity & Packaging) are unified onto `rename/waylode-all` (`.gitpulse/worktrees/waylode-rename-all`) off `main`.
+> **Status — Landed (Phases 1–4 in `5fcea3dbc`):** Phase 1 (`waylode-brand`), Phase 1B (Cobalt Way-Arc brand in `brand/waylode-mark.json` & 4 brand theme presets: `Waylode Cobalt`, `Waylode Lodestar`, `VBCR Oxblood`, `Waylode Gilded`), Phase 2 (Surfaces, Binaries, MCP, Plugins & Env Vars), Phase 3 (Saved Data, OS Identity & Packaging), and Phase 4 (Crates & Workspace Rename to `waylode` / `waylode_lib` / `crates/waylode-worktree`) landed in commit `5fcea3dbc`.
 
 ---
 
 ## 1. Locked-In Executive Decisions
 
-The following decisions are **locked in** for `rename/waylode-all`:
+The following decisions were **locked in** and landed across Phases 1–4 (`5fcea3dbc`):
 
-1. **Waylode Logo Concept & Palette (Phase 1B):**
-   - **Logo Concept:** **Concept 2 — "Lodestone Way-Arc"** — Keeps the open outer ring while replacing the ECG pulse with a rising forward-way crest toward the upper-right lodestar (`M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8` + star at `23.8, 9.0`), preserving continuity for existing users and `tray.rs`.
-   - **Palette:** **Lodestar gold -> teal -> sky** (`#fbbf24 -> #2dd4bf -> #38bdf8`) on `#151d2b -> #0a0d14`, updating `--brand-gradient` in `src/app.css` and contrast/contract tests accordingly.
-2. **Branch & Scope Strategy (Phases 1 + 1B + 2 + 3 Unified):**
-   - Execute **Phases 1 + 1B + 2 + 3** together on unified branch **`rename/waylode-all`** (absorbing `waylode-brand` and `waylode-aliases` as the baseline).
-   - Rename `tauri.conf.json` `productName` to `"Waylode"` (with `wix.upgradeCode` pinned before any Windows Waylode release) and rename `docs/WHY_GITPULSE.md` -> `docs/WHY_WAYLODE.md` (+ link updates).
+1. **Waylode Logo Concept & Palette (Phase 1B — Landed as Cobalt Way-Arc):**
+   - **Logo Concept:** **Way-Arc** (`brand/waylode-mark.json`, default `BrandLogoStyle = "way-arc"` alongside `"folded-ribbon"` and `"lode-compass"`) — Keeps the open outer ring while replacing the ECG pulse with a rising forward-way crest toward the upper-right lodestar (`M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8` + star at `23.8, 9.0`), preserving continuity for existing users and `tray.rs`.
+   - **Palette:** **Cobalt** (`#7dd3fc -> #38bdf8 -> #3b82f6` on `#0f172a -> #060a14`, default `BrandLogoPalette = "cobalt"` alongside `"lodestar"`, `"oxblood"`, and `"gilded"`), paired with the four brand presets in `src/lib/ui/appearance/presets.ts` (`Waylode Cobalt`, `Waylode Lodestar`, `VBCR Oxblood`, `Waylode Gilded`).
+2. **Branch & Scope Strategy (Phases 1 + 1B + 2 + 3 + 4 Unified):**
+   - Executed together and landed in `5fcea3dbc`.
+   - Renamed `tauri.conf.json` `productName` to `"Waylode"` (with `wix.upgradeCode` pinned before Windows builds) and renamed the comparison doc to `docs/WHY_WAYLODE.md` (+ link updates).
 3. **Daemon Binary Names (Phase 2):** **`wayloded`** (1:1 parity with `gitpulsed`) and **`waylode-ptyd`** (1:1 parity with `gitpulse-ptyd`).
 4. **MCP Legacy Tool Bridge (Phase 2):**
    - Canonicalize `gitpulse_* -> waylode_*` **before** schema validation (`validate_arguments`), board canonicalization (`with_current_board_status`), and CLI lookup (`find_tool()`), **and** provide opt-in `WAYLODE_MCP_EXPOSE_LEGACY=1` to advertise the 55 `gitpulse_*` aliases in `tools/list` while keeping default `tools/list` lean at 66 tools.
@@ -22,7 +22,7 @@ The following decisions are **locked in** for `rename/waylode-all`:
    - Keep **`.gitpulse/` permanently unrenamed** on disk (to avoid breaking active linked worktrees registered in `.git/worktrees/*/gitdir` and repo `.gitignore`/exclude rules) and **indefinitely dual-read `gitpulse.lockedBranch`** (plus `gitpulse.{gate,trainWorktree,gateDiskGb}`).
 6. **Windows Upgrade & Relay Scope (Phase 2/3):**
    - Pin `bundle.windows.wix.upgradeCode` (extracted from `GitPulse_0.2.0-beta.1_*_en-US.msi`) + NSIS legacy uninstaller hook before any Windows Waylode build ships; leave `MarkDev` (`relay.gitpulse.dev`) + `Graft` (`graft.gitpulse.*` phone-bridge protocol) for a separate post-Phase-2 relay/protocol cutover.
-7. **Plan Location:** Checked in at `docs/WAYLODE_RENAME_PLAN.md` on `rename/waylode-all`.
+7. **Plan Location:** Checked in at `docs/WAYLODE_RENAME_PLAN.md`.
 
 ---
 
@@ -54,7 +54,7 @@ Before shipping any public Waylode artifact:
    - **Mutated test fixtures:** `git config user.name` fixtures (`"GitPulse Contract"` / `"GitPulse Tester"`) in `git_writer.rs`, `stash.rs`, `ops.rs`, `worktree.rs`, and `"dependent": "GitPulse"` in `src-tauri/src/analyzer/deps.rs:5170,5176`.
 4. **Agent-facing leaks (`RUST_EXCLUDED` incomplete):** `src-tauri/src/workbench/terminal_command.rs:1553` (agent CLI prompt) and `src-tauri/src/workbench/agy_plugin.rs:266` (hook block JSON message) were rewritten even though Phase 1 is brand-only.
 5. **Other Phase 1 gaps:**
-   - `scripts/brand-rename.mjs:11` cites a non-existent `scripts/brand-rename.contract.test.ts`.
+   - `scripts/brand-rename.mjs:11` previously cited a non-existent contract test filename (now `scripts/brand-rename-contract.test.ts`).
    - `src/lib/ui/copy/sentenceCase.ts:43`: `PROPER_NOUNS` lacks `"Waylode"`, so `toSentenceCase()` lowercases mid-sentence `"Waylode"` to `"waylode"`.
    - [tauri.conf.json](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/tauri.conf.json#L87): `longDescription` still starts with `"GitPulse is a high-performance..."`, and `:3` `productName` is `"GitPulse"` (leaving macOS app menu + `AboutMetadata` at [menu.rs](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/desktop/menu.rs#L137-L144) showing `"GitPulse"`).
    - `scripts/architecture-docs-contract.test.ts:126-128` was updated to `/Waylode[\s*]*uses[\s*]*Manvi/i`, while `:112` test title still says `GitPulse`.
@@ -134,7 +134,7 @@ All three fit `Logo.svelte` (`viewBox="0 0 32 32"`, `stroke-width="3.4"`, `strok
 | `gitpulse-mcp` (`:39`) | `waylode-mcp` | MCP stdio server & CLI | `gitpulse-mcp` compat link; update `SERVER_NAME` + `check-mcp-install` |
 | `gitpulse-hook` (`:43`) | `waylode-hook` | Hook + `term` + `lease` wrapper | `gitpulse-hook` compat link; **fix `lease.rs:505` prefix check** |
 | `gitpulse-ptyd` (`:47`) | `waylode-ptyd` | Unix PTY host daemon | Internal (`current_exe().parent()`), update `check-ptyd-release.mjs` |
-| `gitpulse-worktree` (`crates/gitpulse-worktree/Cargo.toml:16`) | `waylode-worktree` | Standalone worktree CLI | Compat link in `~/.cargo/bin` / `~/.local/bin` |
+| `gitpulse-worktree` (pre-rename crate, now `crates/waylode-worktree/Cargo.toml`) | `waylode-worktree` | Standalone worktree CLI | Compat link in `~/.cargo/bin` / `~/.local/bin` |
 | `gitpulse-rustc` (`:20`) | `waylode-rustc` | Rustc wrapper | Compat link in `~/.cargo/bin` / `~/.local/bin` |
 
 **Critical Binary/Shim Pitfalls:**
@@ -201,10 +201,10 @@ All three fit `Logo.svelte` (`viewBox="0 0 32 32"`, `stroke-width="3.4"`, `strok
 - **CRITICAL — Duplicate Side-by-Side Windows Installs:** [tauri.conf.json](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/tauri.conf.json#L65-L69) does **not** pin `bundle.windows.wix.upgradeCode`. Tauri derives `UpgradeCode` via UUIDv5 from `productName`, so changing `"GitPulse" -> "Waylode"` generates a brand-new GUID and installs Waylode **beside** GitPulse. Extract the exact `UpgradeCode` from `GitPulse_0.2.0-beta.1_*_en-US.msi` and pin it in `tauri.conf.json`; add an NSIS pre-install hook to uninstall prior `GitPulse` `-setup.exe` installs.
 - **CI / Release Scripts:** Update `.github/workflows/release.yml` (`GitPulse.app`, `gitpulse-ptyd`, `gitpulse.cargo.cdx`, CI caches), `scripts/check-release-assets.mjs` (`Waylode_${version}_*` + `Waylode.app/Contents/MacOS/waylode`), `scripts/check-release-version.mjs` (`CRATE_NAME`), and `scripts/release-state.mjs`.
 
-### 6.5 Phase 4: Internal Crates & Repo Rename (Optional, Last)
-- `src-tauri/Cargo.toml` (`gitpulse`, `gitpulse_lib`) and **standalone workspace** `crates/gitpulse-worktree/Cargo.toml` (`gitpulse-worktree`, `gitpulse_worktree`, separate `Cargo.lock` + Kani workflow in `.github/workflows/deep-checks.yml`).
-- Because CI runs `--locked`, **both** `src-tauri/Cargo.lock` and `crates/gitpulse-worktree/Cargo.lock` must be regenerated in the same commit, along with `windows-test-manifest-contract.test.ts` and `check-shard-coverage.test.ts`.
-- Renaming GitHub `bharathvbcr/GitPulse -> waylode/waylode` preserves git redirects until the old name is reused, but requires explicit updates to `scripts/cloud/setup.sh:62` (`RAW_BASE`), `plugins/*/skills/merge-train/failset/go.mod`, `Cargo.toml`/`package.json` repository URLs, and GitHub Actions/OAuth apps.
+### 6.5 Phase 4: Internal Crates & Repo Rename (Landed in `5fcea3dbc`)
+- `src-tauri/Cargo.toml` (`waylode`, `waylode_lib`) and **standalone workspace** `crates/waylode-worktree/Cargo.toml` (`waylode-worktree`, `waylode_worktree`, separate `Cargo.lock` + Kani workflow in `.github/workflows/deep-checks.yml`).
+- Because CI runs `--locked`, **both** `src-tauri/Cargo.lock` and `crates/waylode-worktree/Cargo.lock` were regenerated in the same commit, along with `windows-test-manifest-contract.test.ts` and `check-shard-coverage.test.ts`.
+- Renaming GitHub `bharathvbcr/GitPulse -> waylode/waylode` (when/if the remote repository slug changes) preserves git redirects until the old name is reused, and requires explicit updates to `scripts/cloud/setup.sh:62` (`RAW_BASE`), `plugins/*/skills/merge-train/failset/go.mod`, `Cargo.toml`/`package.json` repository URLs, and GitHub Actions/OAuth apps.
 
 ---
 
@@ -215,4 +215,4 @@ All three fit `Logo.svelte` (`viewBox="0 0 32 32"`, `stroke-width="3.4"`, `strok
 | **Phase 1 & 1B (Brand + Logo)** | `bun run check` • `bun run design:gate` • `bun run check:brand-assets` (new) • `bun run test` (incl. `Logo.contract.test.ts`, `documented-counts-contract.test.ts`, `architecture-docs-contract.test.ts`, `l5-cursor-docs-claims.test.ts`) • `cargo test --manifest-path src-tauri/Cargo.toml --locked` |
 | **Phase 2 (Surfaces & Parity)** | `bun run mcp:install` • `bun run mcp:doctor` (passes for `waylode-mcp` / `waylode-hook` & `waylode://server/manifest`) • `bun run check:schema-parity` • `bun run check:ptyd-release` • Compat check: `gitpulse-mcp call gitpulse_insights repo_path=$(pwd)` & `waylode-mcp call waylode_insights repo_path=$(pwd)` both succeed; `build_pty_command` scrubs both `WAYLODE_*` and `GITPULSE_*` secrets |
 | **Phase 3 (Upgrade Matrix)** | **From `com.gitpulse.desktop` AND `dev.vbcr.gitpulse`:** (1) Precedence test proves `dev.vbcr.gitpulse` beats stale `com.gitpulse.desktop` on macOS, Windows (`EBWebView`), and Linux (`XDG_DATA_HOME`); (2) Keychain loads `anthropic-api-key`; (3) `Application Support/GitPulse` copies atomically to `Waylode` with live-daemon lock check; (4) `launchctl list` / Win `Run` / Linux autostart show only `Waylode` + `dev.vbcr.waylode.hygiene`; (5) Windows MSI/NSIS upgrade leaves **1** entry in Add/Remove Programs; (6) Antigravity/Claude/Codex have no duplicate `gitpulse` + `waylode` plugins |
-| **Phase 4 (Crates & CI)** | `cargo test --manifest-path src-tauri/Cargo.toml --locked` • `cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml --locked` • `bun run check:release` • `release.yml` dry-run |
+| **Phase 4 (Crates & CI)** | `cargo test --manifest-path src-tauri/Cargo.toml --locked` • `cargo test --manifest-path crates/waylode-worktree/Cargo.toml --locked` • `bun run check:release` • `release.yml` dry-run |

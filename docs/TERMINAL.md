@@ -245,7 +245,7 @@ prompt.
 - **Normalized copy & empty-selection guard:** Trailing padding before newlines and at selection end is stripped; `Copy` with no selection preserves the existing clipboard instead of overwriting it with empty text.
 - **OSC 52 (write-only):** Programs running inside the PTY can write UTF-8 text to the clipboard via `OSC 52` (capped at ~1 MiB UTF-8); clipboard read queries (`?`) are ignored.
 - **Command blocks & viewport context menu:** Right-click on the terminal canvas (or hold `Shift`/`Alt` in mouse-tracking TUI apps) opens Copy, Copy as Markdown, Paste, Last Command / Output, Run in New Split Shell, and Send to Agent actions. Completed `OSC 133` command blocks also show inline `Copy` (`Shift+Click` includes `$ command`) and `↻ Shell` buttons in the gutter badge, and successful copies flash briefly in the fixed-height status row.
-- **Agent shell execution & opt-in shell reads:** Both MCP callers (`gitpulse_terminal_exec`, `gitpulse_terminal_spawn`, `gitpulse_terminal_list`, `gitpulse_terminal_wait`, `gitpulse_terminal_read`, `gitpulse_terminal_send`, `gitpulse_terminal_close`, `gitpulse_terminal_open_file`) and `gitpulse-hook term` support caller-scoped standalone multi-shell orchestration as well as in-PTY `GITPULSE_TERMINAL_SESSION` + `GITPULSE_SESSION_TOKEN` callers. `gitpulse_terminal_read` supports up to `1000` lines (`64 KiB`), `offset_lines` paging over `2000`-row scrollback, `grep`, and `last_command_only`. Enabling `allow_agent_shell_reads` in Settings -> Agents grants read-only `list(include_repo_shells=true)` / `wait` / `read` access (`owned: false`) to user `"shell"` tabs while keeping `send`, `close`, and targeted `exec` strictly scoped to caller-spawned shells.
+- **Agent shell execution & opt-in shell reads:** Both MCP callers (`waylode_terminal_exec`, `waylode_terminal_spawn`, `waylode_terminal_list`, `waylode_terminal_wait`, `waylode_terminal_read`, `waylode_terminal_send`, `waylode_terminal_close`, `waylode_terminal_open_file` — legacy `gitpulse_terminal_*` names also accepted) and `waylode-hook term` support caller-scoped standalone multi-shell orchestration as well as in-PTY `WAYLODE_TERMINAL_SESSION` + `WAYLODE_SESSION_TOKEN` (legacy `GITPULSE_*` fallbacks) callers. `waylode_terminal_spawn` accepts optional `model`, `mode` (`inspect`, `ask`, `edit`, `auto_review`, `preapproved` — `bypass` is never selectable over MCP), and `settings` (a repo-relative JSON settings path ≤ 64 KiB for `claude`/`agy`, refusing `permissions.defaultMode: "bypassPermissions"` or `disableAllHooks: true`) for agent children rather than hand-typed shell commands. When a spawned child raises a permission prompt (`permission_prompt` hook report via `note_prompt_notice`, or an `agy` dialog detected off screen), `waylode_terminal_wait` wakes with `matched_reason: "needs_input"` and surfaces `agent_prompt` so the caller can name the tab instead of guessing consent. `waylode_terminal_read` supports up to `1000` lines (`64 KiB`), `offset_lines` paging over `2000`-row scrollback, `grep`, and `last_command_only`. Enabling `allow_agent_shell_reads` in Settings -> Agents grants read-only `list(include_repo_shells=true)` / `wait` / `read` access (`owned: false`) to user `"shell"` tabs while keeping `send`, `close`, and targeted `exec` strictly scoped to caller-spawned shells. Port probing (`cmd_terminal_listening_ports`) excludes ports opened directly by an agent CLI (`agy`, `claude`, `codex`, `grok`, `manvi`), while stopping agent ownership at interactive/command shells (`SHELL_PROCESS_NAMES`) so dev servers started by an agent's shell tool remain visible.
 
 Holding the new/close shortcut does not repeatedly create or terminate shells.
 IME composition and the shell's ordinary Ctrl+F binding are preserved.
@@ -265,7 +265,7 @@ address — `localhost:5173`, a bare port such as `3000`, or a full
   session says which address it blocked.
 - **No access to Waylode.** The page runs in its own webview with no route to
   Waylode's commands and its own non-persistent storage
-  ([Security](SECURITY.md#browser-sessions-pages-with-no-route-to-gitpulse)).
+  ([Security](SECURITY.md#browser-sessions-pages-with-no-route-to-waylode)).
 - **The page is a native view over the tab.** It follows the tab's area as the
   dock moves or resizes and with the interface size, and it is hidden while the
   tab is not on screen (another tab, Console, a hidden dock or repository) and
@@ -279,7 +279,7 @@ address — `localhost:5173`, a bare port such as `3000`, or a full
   (another link, or a session that cannot open, still goes to your system
   browser). **↗** in the address bar opens the current address in your system
   browser.
-- **Agents can open one.** An agent calls the `gitpulse_browser_open` MCP tool
+- **Agents can open one.** An agent calls the `waylode_browser_open` (legacy alias `gitpulse_browser_open`) MCP tool
   with a trusted repository and a local address; Waylode comes to the front,
   opens that repository and its dock, and shows the page — reusing, and
   reloading, a session already on that address, so an agent that edits and
@@ -302,7 +302,7 @@ message. Invalid Unicode is also refused before any portion is sent. Failed or
 timed-out writes are not retried, since part of a command may already have arrived;
 restart the session before entering more input.
 
-On Unix (`#[cfg(unix)]`), PTY sessions live in `gitpulse-ptyd`, survive a quit or a crash,
+On Unix (`#[cfg(unix)]`), PTY sessions live in `waylode-ptyd` (protocol 5), survive a quit or a crash,
 and a quit with sessions running asks whether to leave them or stop them. **Settings →
 Agents → Keep managed agent runs running when Waylode quits** (`keep_terminals_running`,
 on by default) governs the detached `manvi serve --listen` process that hosts managed
@@ -448,7 +448,7 @@ native display rates without frame buffer stalls.
 
 ## Unicode 11 character widths
 
-Terminal sessions incorporate `@xterm/addon-unicode11` (`src/lib/terminal/unicodeWidth.ts`).
+Terminal sessions incorporate `@xterm/addon-unicode11` (`src/lib/components/TerminalSession.svelte`, verified by `src/lib/terminal/unicodeWidth.test.ts`).
 Emojis, variation selectors, and wide symbols are assigned full double-cell widths (2 grid
 columns), preventing wide glyphs from overlapping adjacent terminal text or misaligning
 TUI borders and status bars.

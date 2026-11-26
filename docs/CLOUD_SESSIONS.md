@@ -10,7 +10,7 @@ under `https://code.claude.com/docs/en/`). Anything not cited is under
 
 ## What works where
 
-| Surface | Runs on | DevMap | `gitpulse-mcp` / Insights |
+| Surface | Runs on | DevMap | `waylode-mcp` / Insights |
 | --- | --- | --- | --- |
 | Cloud session (claude.ai/code) | Anthropic VM, Ubuntu 24.04 x86_64 ([cloud-environments, What's available in cloud sessions](https://code.claude.com/docs/en/cloud-environments.md#whats-available-in-cloud-sessions)) | Yes, if the environment setup script installed it | No |
 | SSH session | Your Linux host, its own `~/.claude` | Yes, after running `scripts/cloud/setup.sh` there | No |
@@ -117,7 +117,7 @@ first.
 
 ## Not available, and why
 
-`gitpulse-mcp` (the `gitpulse_*` tools: insights, collision risk, ledger, task
+`waylode-mcp` (or legacy `gitpulse-mcp` — the `waylode_*` / legacy `gitpulse_*` tools: insights, collision risk, ledger, task
 board) is not provided in cloud or SSH sessions:
 
 - no Linux build is published (the only release, v0.2.0-beta.1, shipped macOS

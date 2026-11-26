@@ -255,17 +255,20 @@ dark appearance, and the veil finishes the job.
 and a macOS **Window wallpaper** picker (`WallpaperSettings.svelte`,
 `backdrops.ts`, `wallpaperStore.ts`):
 
-- **Theme presets (17 built-in).** Standard (*Neural HUD*, *Reactor*, *Pure
+- **Theme presets (21 built-in).** Waylode Brand (*Waylode Cobalt*, *Waylode
+  Lodestar*, *VBCR Oxblood*, *Waylode Gilded*), Standard (*Neural HUD*, *Reactor*, *Pure
   Black*, *Crimson*, *Phosphor*, *Synthwave*, *Paper*), Developer (*Amber CRT*,
   *Blueprint*, *Midnight IDE*, *Arctic*, *Solar Dark*, *Daylight*), and Science
-  Fiction (*Nebula*, *Orbital*, *Neon City*, *Hyperspace*). Every preset is a
-  validated `gitpulse-theme/1` palette paired with a default backdrop and
+  Fiction (*Nebula*, *Orbital*, *Neon City*, *Hyperspace*), alongside **Brand Logo**
+  style (*Way-Arc*, *Folded Ribbon*, *Lode Compass*) and palette (*Cobalt*,
+  *Lodestar*, *Oxblood*, *Gilded*) controls (`brandLogo.ts`, `brand/waylode-mark.json`). Every preset is a
+  validated `gitpulse-theme/1` palette (imports accept both `waylode-theme/1` and `gitpulse-theme/1`) paired with a default backdrop and
   material intensity, checked by `presets.contract.test.ts` against the same
   contrast guard and material floor as imported theme files. The material floor
   is computed over the active palette (`materialModel.ts`), so high-contrast dark
   palettes like *Pure Black* enforce their own minimum veil (`0.55`).
 - **My themes shelf.** Saves the current look or retains imported
-  `gitpulse-theme/1` files (bounded to 24 entries, re-validated on read, and
+  `waylode-theme/1` / `gitpulse-theme/1` files (bounded to 24 entries, re-validated on read, and
   preserved across **Reset appearance**).
 - **Window wallpapers (macOS only).** Eleven seeded, static SVG backdrops (*Mesh*,
   *Aurora*, *Topography*, *Prism*, *Dusk*, *CRT scanlines*, *Blueprint*,

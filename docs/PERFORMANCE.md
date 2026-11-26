@@ -63,13 +63,14 @@ native commands.
   could not accept additional repositories. An empty log is not proof that
   all documents refreshed.
 
-On macOS the durable app log is `~/Library/Logs/GitPulse/gitpulse.log`; its
-previous generation is `gitpulse.log.1`. Each is bounded to 1 MiB. The
-Diagnostics report includes the actual path and any read/write degradation.
-The new performance records contain no command arguments or result bodies.
+- **Durable diagnostics log** (`~/Library/Logs/Waylode/waylode.log` on macOS,
+  with `waylode.log.1` as the previous generation; legacy pre-rename installs
+  wrote `~/Library/Logs/GitPulse/gitpulse.log`). Each is bounded to 1 MiB. The
+  Diagnostics report includes the actual path and any read/write degradation.
+  The new performance records contain no command arguments or result bodies.
 
 ```sh
-tail -n 200 "$HOME/Library/Logs/GitPulse/gitpulse.log"
+tail -n 200 "$HOME/Library/Logs/Waylode/waylode.log"
 ```
 
 For a native stall that does not finish, identify the running Waylode PID
@@ -3409,7 +3410,7 @@ An earlier run of the same comparison at load 8–12, from a shell prototype of 
 Process start is not the cost: `dcgrep health` takes 3.5 ms (min of 12). For comparison, `rg --files --hidden` (ripgrep 15.2.0) uses the same `ignore` walker and takes 19 ms in parallel, 32 ms with `-j1`. dcgrep's `list_files` (DevCouncil `rust/dc-grep/src/lib.rs`) took 53.5 ms in that comparison.
 
 - **It walks serially**, with `walker.build()` rather than `build_parallel()`.
-- **It stats every file again.** `entry.metadata()` runs for every regular file, even when `include_oversized` makes the size unused. On unix, walkdir 2.5.0's `DirEntry::metadata()` is a fresh `lstat` (`src/dent.rs:139`), contrary to the comment beside the call.
+- **It stats every file again.** `entry.metadata()` runs for every regular file, even when `include_oversized` makes the size unused. On unix, walkdir 2.5.0's `DirEntry::metadata()` issues a fresh `lstat` (`dent.rs` line 139 in `walkdir`), contrary to the comment beside the call.
 - **It probes every directory for `.git`**, about 395 of them here.
 - **It answers a larger question than Waylode asks.** Waylode takes tracked paths from the index and needs only the untracked ones from dcgrep. dcgrep still walks all of them, while `git ls-files --others --exclude-standard` alone takes 22 ms.
 

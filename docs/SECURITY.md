@@ -288,7 +288,7 @@ flowchart TD
   native launch validation alone does not prove the provider's effective policy.
   See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the verification limits.
 - Model-assisted remediation actions (`cmd_manvi_run_action`) are restricted to a strict command allowlist and require explicit user confirmation.
-- On Unix (`#[cfg(unix)]`), the PTYs live in a separate process, `gitpulse-ptyd`, reached over a
+- On Unix (`#[cfg(unix)]`), the PTYs live in a separate process, `waylode-ptyd` (legacy alias `gitpulse-ptyd`), reached over a
   unix socket that only the same user can connect to (`0700` directory, `0600` socket, peer uid
   checked on every connection). Repository validation, trust and `require_unsubstitutable_dir`
   run in that process, where the fork happens; a session-only trust grant never reaches it.
@@ -365,7 +365,7 @@ flowchart TD
   run. Per session: 8 pending messages, 2 waiting hooks; 64 sessions and 16
   waiting hooks overall; pending messages expire after 2 hours, claimed ones
   after 10 minutes. The session cap and the waiter caps count every Claude
-  session in any Waylode terminal (`GITPULSE_SESSION_ID` is set on plain
+  session in any Waylode terminal (`WAYLODE_SESSION_ID` / legacy `GITPULSE_SESSION_ID` is set on plain
   terminals too), not only task attempts, so many plain `claude` tabs can fill
   them, after which a send answers `mailbox_full`.
 - The newest hooks on a session take precedence: a later stop's two hooks
@@ -374,7 +374,7 @@ flowchart TD
   timeout. A hook that claims a message but cannot write it to stderr still
   exits 2 with the message lost; it is logged, and the message is reported as
   claimed ("picked up"), never as read.
-- Delivery is a second `Stop` hook entry, `gitpulse-hook deliver`, registered
+- Delivery is a second `Stop` hook entry, `waylode-hook deliver`, registered
   with `asyncRewake: true` and a 1800 s timeout (Claude Code hooks reference,
   https://code.claude.com/docs/en/hooks.md: an `asyncRewake` hook runs in the
   background and wakes the session on exit 2, showing stderr as a system
@@ -382,7 +382,7 @@ flowchart TD
   message, writes it to stderr and exits 2. Every other outcome (timeout,
   unknown session, full caps, an untrusted mailbox, any I/O error) exits 0. Only
   a session Waylode launched has a mailbox: the hook acts only when
-  `GITPULSE_SESSION_ID` is set and the payload's `session_id` is a canonical
+  `WAYLODE_SESSION_ID` (or `GITPULSE_SESSION_ID`) is set and the payload's `session_id` is a canonical
   UUID, and an unknown session creates nothing on disk. Every stop waits,
   `stop_hook_active` or not: the turn an `asyncRewake` wake starts is itself a
   stop-hook continuation (inferred from the Claude Code 2.1.317 binary, where
@@ -413,7 +413,7 @@ flowchart TD
   what a person previewed and confirmed. No new network endpoint, credential,
   socket or Tauri command (the host method is `runs.send_to_agent` on the
   existing workbench seam). The hook adds a background process per idle
-  GitPulse-launched Claude session, bounded by the waiter caps and the
+  Waylode-launched Claude session, bounded by the waiter caps and the
   timeout. Expired entries are removed by the deposit and claim paths
   themselves, not by a daemon.
 
@@ -504,7 +504,7 @@ flowchart TD
 
 ### Claude Code worktree hooks and `.worktreeinclude`
 
-- **What changed.** The plugin's `gitpulse-hook` becomes a git writer:
+- **What changed.** The plugin's `waylode-hook` becomes a git writer:
   `worktree-create` runs `git worktree add`, and `worktree-remove` runs
   `git worktree remove` and `git branch -d`, from the agent's session. It also
   runs the repository's approved `post_create` hooks there.
@@ -548,14 +548,14 @@ flowchart TD
   path, never by content.
 
 ### Zero-Copy Worktree Pointers, Agent Bus & Build Cache Boundaries
-- **Cross-repository pointer validation**: Zero-copy DevMap pointers (`base_store_ref.json`) are accepted only when `resolve_git_common_dir` proves the linked worktree and `anchor_repo_root` share the exact canonical Git common directory and contain no `..` traversal components (`codeintel/worktree_overlay.rs`, `codeintel/store.rs`). Crafted pointers targeting unrelated repositories or arbitrary SQLite databases fail closed.
-- **Managed lane directory reservation**: `.gitpulse/worktrees/` is reserved for GitPulse-managed task-attempt lanes; manual UI, CLI, and MCP worktree creation inside that directory is refused (`refuse_gitpulse_lane_target`).
-- **Bounded, lock-serialized agent coordination bus**: `<git-common-dir>/gitpulse/lanes/` serializes reads and writes under `flock(2)` on `.bus.lock`, rejects absolute paths, `..` traversal segments, and NUL bytes (`sanitize_claim_paths`), and enforces hard caps on active lanes (64), claimed paths/symbols per lane (128), retained messages (256), message body bytes (16 KiB), and `gitpulse_worktree_radar` wire size (64 KiB, reporting `truncated: true` when cut).
-- **MCP write & Git mutation gates**: Read tools (`readOnlyHint: true`, including `gitpulse_worktree_inbox` and `gitpulse_worktree_radar`) never mutate Git or task state. Mutating `gitpulse_worktree_*` tools require explicit repository trust (`repository_trust::require`), canonical path containment within the repository's worktree family, and Manvi policy-harness checks (`harness::guard_command`) on Git mutations.
-- **Sound `gitpulse-rustc` artifact reuse**: `gitpulse-rustc` bounds `@<rspfile>` expansion (8 MiB, depth 4), never caches `-C incremental` or `build_script_build` invocations, re-verifies every `.d` file dependency and `# env-dep:` variable on Stage 2 hits, and strips comments and string literals before applying the compile-time `include*!(concat!(env!("OUT_DIR"), ...))` exemption so runtime `OUT_DIR` paths cannot leak across worktrees.
+- **Cross-repository pointer validation**: Zero-copy DevMap pointers (`base_store_ref.json`) are accepted only when `resolve_git_common_dir` proves the linked worktree and `anchor_repo_root` share the exact canonical Git common directory and contain no `..` traversal components (`codeintel/worktree_overlay.rs`, `codeintel/mod.rs`). Crafted pointers targeting unrelated repositories or arbitrary SQLite databases fail closed.
+- **Managed lane directory reservation**: `.gitpulse/worktrees/` is reserved for Waylode-managed task-attempt lanes; manual UI, CLI, and MCP worktree creation inside that directory is refused (`refuse_gitpulse_lane_target`).
+- **Bounded, lock-serialized agent coordination bus**: `<git-common-dir>/gitpulse/lanes/` serializes reads and writes under `flock(2)` on `.bus.lock`, rejects absolute paths, `..` traversal segments, and NUL bytes (`sanitize_claim_paths`), and enforces hard caps on active lanes (64), claimed paths/symbols per lane (128), retained messages (256), message body bytes (16 KiB), and `waylode_worktree_radar` wire size (64 KiB, reporting `truncated: true` when cut).
+- **MCP write & Git mutation gates**: Read tools (`readOnlyHint: true`, including `waylode_worktree_inbox` and `waylode_worktree_radar`) never mutate Git or task state. Mutating `waylode_worktree_*` tools (and legacy `gitpulse_worktree_*` aliases) require explicit repository trust (`repository_trust::require`), canonical path containment within the repository's worktree family, and Manvi policy-harness checks (`harness::guard_command`) on Git mutations.
+- **Sound `waylode-rustc` artifact reuse**: `waylode-rustc` bounds `@<rspfile>` expansion (8 MiB, depth 4), never caches `-C incremental` or `build_script_build` invocations, re-verifies every `.d` file dependency and `# env-dep:` variable on Stage 2 hits, and strips comments and string literals before applying the compile-time `include*!(concat!(env!("OUT_DIR"), ...))` exemption so runtime `OUT_DIR` paths cannot leak across worktrees.
 
 ### Process Signal Guard (Linux & macOS Models)
-- The signal guard protects Waylode, `gitpulse-ptyd`, and child agent sessions from accidental mass-termination by external tools (e.g. `pkill`, `killall`, `pgrep`, `pidof`).
+- The signal guard protects Waylode, `waylode-ptyd`, and child agent sessions from accidental mass-termination by external tools (e.g. `pkill`, `killall`, `pgrep`, `pidof`).
 - **Linux Tool Modeling**: On Linux, the signal guard directly models `procps pkill`/`pgrep`, `psmisc killall`, and `sysvinit pidof` (`ft-06723bb7`, `d9954240`, `1ba087a0`).
   - Matches process names against both `comm` and `argv[0]`'s basename (union with macOS reading).
   - Inspects real, effective, and saved UIDs from `/proc/<pid>/status` and applies exact `kill(2)` permission checks.
@@ -569,7 +569,7 @@ flowchart TD
 - If a background child fails to enter the band (such as under sandbox policies that deny `system-sched`), the spawn fails explicitly with a tagged errno ("could not enter the background band: <errno>") rather than silently running at normal priority.
 
 ### Hook Notify Transport & Durable Drop Records
-- Agent hook notifications (`gitpulse-hook`) communicate over a private, non-blocking Unix domain socket with strict deadlines (300 ms for `SessionEnd`, 1.5 s for other events).
+- Agent hook notifications (`waylode-hook`) communicate over a private, non-blocking Unix domain socket with strict deadlines (300 ms for `SessionEnd`, 1.5 s for other events).
 - If a reply deadline expires or the bridge closes without responding, the hook appends a durable drop record (`{"v":1,"at":<unix_ms>,"event":...,"session":...}`) to `<socket>.drops` beside the socket (`ft-6d8ff969`, `ft-878db72b`).
 - Records are tightened to `0600` best-effort through the file handle (`fchmod`), never as a blocking precondition.
 - Single-owner rotation renames `.drops` to `.prev` when exceeding 32 KiB, halting appending at 64 KiB.
@@ -657,7 +657,7 @@ is built to have no way back in:
   (`browser/pane.rs`), not yet exercised by a test.
 - **Page text is data.** The URL and title a page reports are capped in the
   backend, and the title goes through the tab-title sanitizer.
-- **Agents can open, not drive.** `gitpulse_browser_open` lets an agent ask the
+- **Agents can open, not drive.** `waylode_browser_open` (legacy alias `gitpulse_browser_open`) lets an agent ask the
   running app to open a session. It refuses an untrusted repository and a
   non-loopback URL, and reaches the app only through the single-instance
   mailbox, which accepts this user's processes alone (peer uid checked) and

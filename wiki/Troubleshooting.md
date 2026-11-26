@@ -5,7 +5,7 @@
 The release binaries are unsigned. After installing to `/Applications`:
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/GitPulse.app
+xattr -dr com.apple.quarantine /Applications/Waylode.app
 ```
 
 See [[Installation]].
@@ -58,7 +58,7 @@ rotated out. Each copied section is capped at 64 Ki characters and says when cut
 
 ## Terminal vanished after switching views
 
-The dock is toggled with `Ctrl+\``. Hiding it or switching views or **repositories** does not kill the session: each repository tab has its own terminal dock and preserves its sessions until you close the terminal tab or repository tab (and on Unix, PTY sessions live in `gitpulse-ptyd` and survive app quit or crash unless stopped). Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size, double-click a page header/background, or toggle the dock to return to the repository view.
+The dock is toggled with `Ctrl+\``. Hiding it or switching views or **repositories** does not kill the session: each repository tab has its own terminal dock and preserves its sessions until you close the terminal tab or repository tab (and on Unix, PTY sessions live in `waylode-ptyd` and survive app quit or crash unless stopped). Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size, double-click a page header/background, or toggle the dock to return to the repository view.
 
 ## Terminal shows non-GPU rendering or text glitching
 
@@ -68,12 +68,12 @@ If WebGL acceleration experiences repeated context losses (surpassing the 3-reco
 
 This notice indicates agent hook notifications were sent when Waylode was busy, shutting down, or temporarily unreachable. The hook waited out its timeout budget (300 ms for `SessionEnd`, 1.5 s for others), recorded a timed drop in `.drops`, and exited without waiting further. This does not mean the event was lost (the app may have applied it as the hook gave up). Records rotate to `.prev` at 32 KiB and expire automatically after 7 days.
 
-## `gitpulse-mcp` is missing or stale
+## `waylode-mcp` is missing or stale
 
-App install: open **Settings → Agents → Connect your agent**. It links the app's bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin` and registers the server with Claude Code and Codex, so they follow the app when it updates. Check these first:
+App install: open **Settings → Agents → Connect your agent**. It links the app's bundled `waylode-mcp` and `waylode-hook` into `~/.local/bin` (plus legacy `gitpulse-mcp`/`gitpulse-hook` compat links where needed) and registers the server with Claude Code and Codex, so they follow the app when it updates. Check these first:
 
 - `~/.local/bin` is not on the `PATH` of the shell your agent starts from. The Claude Code plugin starts both binaries by bare name.
-- You ran `bun run mcp:install` before: `~/.cargo/bin/gitpulse-mcp` or `gitpulse-hook` may shadow the app's copies, or a registration may point at the cargo copy. Connect leaves those alone and shows them. Switch with `cargo uninstall gitpulse` and the remove/add commands it shows.
+- You ran `bun run mcp:install` before: `~/.cargo/bin/waylode-mcp` or `waylode-hook` (or pre-rename `gitpulse-mcp`/`gitpulse-hook`) may shadow the app's copies, or a registration may point at the cargo copy. Connect leaves those alone and shows them. Switch with `cargo uninstall waylode` (or `cargo uninstall gitpulse` for older installs) and the remove/add commands it shows.
 - Claude Code runs with a non-default `CLAUDE_CONFIG_DIR`: Connect uses the `claude` CLI's default profile, so use **Copy setup prompt** instead.
 
 Source checkout only:
@@ -83,7 +83,7 @@ bun run mcp:install
 bun run mcp:doctor
 ```
 
-Doctor reports absent / unresponsive / stale / matching for **both** `gitpulse-mcp` and `gitpulse-hook`. Agents spawn the bare names out of `.mcp.json` and `hooks/hooks.json`, so both must be on `PATH`; `GITPULSE_MCP_PATH` only moves the binary Waylode's own Settings panel reports and is not read by any MCP client. See [[MCP and Agents]].
+Doctor reports absent / unresponsive / stale / matching for **both** `waylode-mcp` and `waylode-hook`. Agents spawn the bare names out of `.mcp.json` and `hooks/hooks.json`, so both must be on `PATH`; `WAYLODE_MCP_PATH` / `GITPULSE_MCP_PATH` only moves the binary Waylode's own Settings panel reports and is not read by any MCP client. See [[MCP and Agents]].
 
 ## Manvi is not installed
 

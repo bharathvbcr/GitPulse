@@ -106,7 +106,7 @@ of each. Add a tracked `docs/evidence/` convention (a short README and one worke
 example, such as the spawn benchmark summary in `PERFORMANCE.md`) so the next
 measurement commits a small summary file and links to it.
 
-**Done when:** `docs/evidence/README.md` states the format and size limit, one
+**Done when:** a new `README.md` inside `docs/evidence/` (planned) states the format and size limit, one
 existing claim links to a committed file, and the `/tmp` rejection in
 `scripts/documented-counts-contract.test.ts` still passes.
 **Verify:** `bun run test scripts/documented-counts-contract.test.ts`.

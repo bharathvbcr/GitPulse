@@ -20,7 +20,7 @@ same facts over MCP (66 tools).
 | Chat-centred agent apps | Waylode |
 |---|---|
 | One transcript per agent; history is scroll-back | One live map of every repository, worktree, task and session |
-| The agent sees the code it opened | Agents query the code graph, collisions, tasks and load (`gitpulse_insights`, `devmap_*`) |
+| The agent sees the code it opened | Agents query the code graph, collisions, tasks and load (`waylode_insights`, `devmap_*`) |
 | Agents work alone | Agents claim files, message peers and file tasks for each other |
 | You read what the agent says it did | You see what it changed: ledger, provenance, turn checkpoints, diffs |
 | The machine is invisible | The load scheduler shows the machine's state and acts on it |
@@ -87,13 +87,13 @@ Legend: ✅ stated by the official source · ◐ partial (the limit is named) ·
 | Cross-agent file collision warning | ✅ radar, claims, guard hook | ◐ isolation only | ? | ❌ | ? | ❌ (warns in docs) | ? |
 | Agent-to-agent messaging | ✅ peer inbox, `agent_send` / `agent_wait` | ✅ cross-session messaging | ? | ? | ? | ? | ? |
 | Task board that launches agents | ✅ 5 columns, cross-repo | ❌ status list | ◐ inbox-style thread sidebar, not a board (source to confirm) | ? | ? | ? | ◐ automations |
-| Agents file follow-up tasks for later | ✅ `gitpulse_add_task` with duplicate gating | ? | ? | ? | ? | ? | ? |
+| Agents file follow-up tasks for later | ✅ `waylode_add_task` with duplicate gating | ? | ? | ? | ? | ? | ? |
 | Command/policy guard | ✅ Manvi gate + trust | ✅ hooks, permissions | ? | ? | ? | ? | ◐ sandbox |
 | Code graph impact / affected tests | ✅ DevMap | ❌ not found | ? | ? | ? | ? | ? |
 | Load-aware scheduling | ✅ memory-pressure governor, build slots | ❌ not found | ? | ? | ? | ? | ? |
 | Full git GUI (graph, blame, conflicts, reflog) | ✅ | ❌ | ◐ diff/commit/PR | ? | ? | ◐ diff/checks | ◐ |
 | GitHub PRs / Actions | ✅ review, merge, dispatch, rerun | ◐ PR/CI card | ◐ | ◐ | ? | ◐ | ? |
-| Terminal with splits and sessions that survive quit | ✅ (Unix: `gitpulse-ptyd`) | ◐ | ? | ◐ | ? | ◐ | ◐ |
+| Terminal with splits and sessions that survive quit | ✅ (Unix: `waylode-ptyd`) | ◐ | ? | ◐ | ? | ◐ | ◐ |
 | MCP server exposed to agents | ✅ 66 tools | ? | ? | ? | ? | ❌ | ? |
 | Local-first, no telemetry | ✅ local-first; "zero telemetry" is the README's claim (no analytics dependency found; not audited) | ◐ opt-out | ? | ? | ? | ◐ PostHog | ? |
 | Cloud / remote execution | Not in this release | ✅ cloud, SSH | ✅ LAN/Tailscale | ◐ | ✅ cloud VMs | Cloud shutting down | ✅ |
@@ -153,6 +153,10 @@ Each line names a limit the product's own documentation states. None is an opini
 **Waylode's own limits.** It is tested on macOS only. It has no cloud agents in this release. It is not
 an editor. Antigravity sessions get no command guard. The guards apply only where its hooks are
 registered, so an agent started outside Waylode under another profile has none.
+
+### Free and open source
+
+- **Waylode Primary (Free & Open Source, `MIT OR Apache-2.0`):** Zero sign-in and zero local paywalls across the desktop ADE, local DevCouncil engines (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `dcredact`, public OSS PR Gate), local Manvi harness/policy enforcement/JSON audit export, local MarkDev/Graft, and **BYOK** compute (SSH runners, `cloud_vms`, your own model keys).
 
 ## Where the others are stronger
 

@@ -37,12 +37,12 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 - **Launchers**: six (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab (macOS), from the dock.
   Each launcher has a default model, effort, advisor and commit model in **Settings → Agents**.
 - **Live session detection**, including sessions Waylode did not launch (Claude, Codex, Antigravity,
-  DevCouncil and Manvi), over MCP as `gitpulse_sessions`. The Agents plane (`⌘⇧A`) draws the checkouts,
+  DevCouncil and Manvi), over MCP as `waylode_sessions`. The Agents plane (`⌘⇧A`) draws the checkouts,
   terminals and task attempts your repositories hold.
 - **Agent tree**: parent and child sessions nested, collapsible and filterable.
 - **A worktree per agent**, with copy-on-write `node_modules` and `target` caches, `.worktreeinclude`, and the
   DevMap store seeded from the main checkout. The `claude --worktree` flow goes through Waylode's hooks.
-- **Agent-to-agent communication**: the peer inbox (`gitpulse_agent_register`, `_peers`, `_send`, `_inbox`,
+- **Agent-to-agent communication**: the peer inbox (`waylode_agent_register`, `_peers`, `_send`, `_inbox`,
   `_wait`), worktree lane messages, and **Send to agent** from the UI.
 - **Collision radar, file claims and the collision guard hook**: warnings before two agents' edits meet.
 - **Follow agent**: a split pane that follows an agent's file edits live.
@@ -50,8 +50,9 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
   changed what, and how a commit landed), and **merge-conflict prediction** between worktrees in a quarantine.
 - **Notifications**, an attention inbox and a menu-bar status glyph.
 - **Managed runs that survive quitting** (hosted `manvi serve`), on Unix.
-- **MCP server for agents**: 66 tools (55 `gitpulse_*` and 11 `devmap_*`), 4 prompts and `gitpulse://`
-  resources, with plugins for Claude Code, Codex, Cursor and Antigravity. See the [agents guide](AGENTS_GUIDE.md).
+- **Mavi threads**: structured Claude Code conversations (local or SSH) with inline approvals, explicit `AskUserQuestion` choice cards (unanswered or declined questions are never treated as consent), child terminal tab cards, and cleanup via `cmd_mavi_close_thread_children` on forget.
+- **MCP server for agents**: 66 tools (55 `waylode_*` — with legacy `gitpulse_*` aliases accepted and `WAYLODE_MCP_EXPOSE_LEGACY=1` to advertise them — and 11 `devmap_*`), 4 prompts and `waylode://`
+  resources (plus `gitpulse://` alias), with plugins for Claude Code, Codex, Cursor and Antigravity. See the [agents guide](AGENTS_GUIDE.md).
 - **Agent reads of shells you opened** (opt-in, off by default): `allow_agent_shell_reads` lets MCP callers
   read secret-scrubbed output from your shell sessions in the same trusted repository.
 
@@ -86,11 +87,11 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 - Quick add, compose from notes, due dates, relations (blocks, depends, related, duplicate) and merging duplicates.
 - **Manvi assist**: refine, suggest and field locks.
 - **Launch an agent from a card**: model, effort and advisor per launch, one tracked attempt per run, in its own worktree.
-- **Verification chips.** `gitpulse_complete_task(done)` needs a passed Manvi verification for the worktree's
+- **Verification chips.** `waylode_complete_task(done)` needs a passed Manvi verification for the worktree's
   current head; otherwise the card goes to Review.
 - **GitHub issue to task**, and an archive dock with a Deleted view.
 - **Agents file tasks over MCP**, with duplicate gating, `expected_revision` protection and
-  `gitpulse_import_tasks` for `tasks/*.md` briefs.
+  `waylode_import_tasks` for `tasks/*.md` briefs.
 
 ## 6. Remote and GitHub
 
@@ -150,7 +151,8 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 - Tabs, **nested splits** (rows and columns, up to 8 panes) and split groups, tab and session search, Find
   and text size.
 - Sessions grouped by repository in the session list.
-- **Sessions that survive reload and app quit** (`gitpulse-ptyd`), with transcript recovery and resume, on Unix.
+- **Sessions that survive reload and app quit** (`waylode-ptyd`, protocol 5), with transcript recovery, hooked/screen permission prompt detection (`needs_input`), and resume, on Unix.
+- **Agent child spawn flags & shell-scoped port probe**: `waylode_terminal_spawn` accepts `model`, `mode` (`inspect`/`ask`/`edit`/`auto_review`/`preapproved`), and repo-relative `settings` for agent children; dev servers launched through an agent's shell remain visible in port probing while agent CLI listeners stay excluded.
 - WebGL rendering, synchronized output and Unicode 11. Command blocks (OSC 133).
 - **Browser pane** for localhost dev servers, which agents can open (macOS).
 - Select-to-copy, OSC 52, "Copy last command output", "Run in new split shell", launcher icons and per-tab counts.
@@ -158,7 +160,8 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 
 ## 12. Customization
 
-- 17 theme presets (Standard, Developer, Sci-Fi), a My themes shelf (24), and import and export.
+- 21 theme presets (4 Cobalt **Way-Arc** brand presets — *Waylode Cobalt*, *Waylode Lodestar*, *VBCR Oxblood*, *Waylode Gilded* — plus Standard, Developer, and Sci-Fi), a My themes shelf (24), and import and export.
+- 3 brand logo styles (*Way-Arc*, *Folded Ribbon*, *Lode Compass*) and 4 brand logo palettes (*Cobalt*, *Lodestar*, *Oxblood*, *Gilded*).
 - 11 macOS wallpapers plus your own image, glass appearance, and opt-in wallpaper motion.
 - **Command palette** with 8 modes (`>` `/` `%` `#` `@` `:` `::` `?`) opened with `⌘K`.
 - 9 settings sections with search, and a status bar that is full, minimal or hidden.
@@ -170,7 +173,7 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
   Windows x64 and arm64. The Linux and Windows builds have not been tested. macOS builds are ad-hoc signed,
   not notarized, and Windows builds are unsigned.
 - On Windows, without a process scan, some live agent sessions show as unknown rather than zero.
-- Five binaries: `gitpulse`, `gitpulse-mcp`, `gitpulse-hook`, `gitpulse-ptyd` and `gitpulsed`.
+- Five core binaries: `waylode`, `waylode-mcp`, `waylode-hook`, `waylode-ptyd` and `wayloded` (plus standalone `waylode-worktree` and `waylode-rustc`, with legacy `gitpulse*` compatibility links).
 - Local-first: repository and task state stay on your machine. Git remotes, GitHub, release checks you opt
   into and configured agent providers use the network; see [Security](SECURITY.md).
 
@@ -186,6 +189,4 @@ These are not in the app today.
 - "Ask Manvi to organise the board".
 - Posting `devcouncil verify` results to GitHub.
 - Windows and Linux test passes, so each can move from "built" to "tested". Notarized macOS builds.
-- **Labs preview (not in this release):** remote runners over ssh, an encrypted secrets vault, snapshot
-  import, device and settings sync, and a team kill switch exist on a development branch behind a build
-  flag. No release build enables them. Issue-tracker integrations beyond GitHub are not built.
+- **Waylode Primary (`MIT OR Apache-2.0`, public `bharathvbcr/GitPulse`):** All local ADE features, local DevCouncil (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `dcredact`, public OSS PR Gate), local Manvi (harness, policy enforcement, JSON audit export, solo AI spend limits), local MarkDev/Graft, and **BYOK** compute (SSH runners, `cloud_vms`, user model keys) are 100% free with zero sign-in required.

@@ -59,11 +59,11 @@ in Health. That signal is re-checked on the live process before it is sent
 
 | Card | Scope | State |
 |---|---|---|
-| 1 (sensor) | This page: sampler, `host-load.v1`, sensor states, sessions by process scan, `GITPULSE_RUN_ID`, memguard health, orphans, Health | Implemented |
+| 1 (sensor) | This page: sampler, `host-load.v1`, sensor states, sessions by process scan, `WAYLODE_RUN_ID` / `GITPULSE_RUN_ID`, memguard health, orphans, Health | Implemented |
 | 1b | Admission of agent launches on the sensor state | Implemented (see Admission and shedding) |
 | 1c | Shedding Waylode's own background and reactive work | Implemented (see Admission and shedding) |
 | 1d | Leases and the priority queue ("time slots"), and idle-session advice and parking | Implemented (see Build leases and idle sessions). The shim cutover is the owner's |
-| 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases are card 1d's. `gitpulse_system_load` and launch-environment caps are not |
+| 3 | The `waylode-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases are card 1d's. `waylode_system_load` and launch-environment caps are not |
 | Per-call gate cost | The hook's per-call budget | Separate card |
 | Startup churn | The startup git-spawn burst | Separate card |
 | 4 | Pressure relief: slow and freeze by default; terminate is opt-in | Implemented: slowing, freezing, offers for observed agents and untrusted repositories, and rung C (opt-in terminate of a tree it froze; see Pressure relief). The launched-orphan stop is not built |
@@ -110,7 +110,7 @@ otherwise it is `unavailable`, never a guessed `normal`.
 A fixed-size record of 816 bytes (version 2: the 664 bytes of version 1, the
 48-byte `GPX3` governor/segment extension at `664..712`, and a 104-byte `GPXM`
 metrics extension at `712..816`; see Compatibility) in the per-user config directory
-(`~/Library/Application Support/GitPulse/host-load.v1`), beside
+(`~/Library/Application Support/Waylode/host-load.v1`, migrated from legacy `GitPulse/`), beside
 `spawn-budget.v2`. It sits in the config directory rather than `TMPDIR` because
 agent hosts give their children a private `TMPDIR`. It opens through the same
 refusals as the spawn budget (`fs_entry::open_private_record`): it must not be
@@ -134,7 +134,7 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
   like every other reading) and **the governor's published verdict**: tier,
   binding, whether launches are admitted, whether background work is shed and
   whether reactive work is shed. It is the hysteresis-held verdict of the app's
-  sampler, so a reader with no history (the hook, `gitpulse-mcp`) can use it
+  sampler, so a reader with no history (the hook, `waylode-mcp`) can use it
   without reading settings. **It is one tick behind the readings beside it**:
   the sampler publishes, then counts the sample, so a record carries the
   verdict the previous count produced (pending on a writer's first tick, and
@@ -142,7 +142,7 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
   gate). The extension opens with the magic `GPX3` (`GPX2` was the block before the two disk fill rates changed its layout; a branch build that reads `GPX2` ignores this one) and ends
   with a checksum of its own, which also covers the sequence.
 - **Metrics extension (version 2, bytes 712 to 816):** opens with magic `GPXM`
-  after the unchanged `GPX3` block (so older `gitpulse-hook` and `gitpulse-mcp`
+  after the unchanged `GPX3` block (so older `waylode-hook`/`gitpulse-hook` and `waylode-mcp`/`gitpulse-mcp`
   binaries continue reading `GPX3` at `664..712` untouched) and ends with its
   own FNV-1a checksum (`OFF_M_CHECKSUM` at 808). Carries `cpu_usage` (total/user/system
   tenths of %), `gpu` (`IOAccelerator` utilization, renderer/tiler %, in-use and
@@ -274,8 +274,8 @@ beside it, in the same directory, that keeps them.
 
 Only in the Waylode app process. `lib.rs::run` starts the sampler from its
 setup (`start_host_load_sampler`). `tests/host_load_sampler_scope.rs` pins that
-this is the only start, and that no other shipped binary (`gitpulsed`,
-`gitpulse-mcp`, `gitpulse-hook`) reaches it.
+this is the only start, and that no other shipped binary (`wayloded`,
+`waylode-mcp`, `waylode-hook`) reaches it.
 
 **Cadence.** Fixed at 2 s on a fixed grid. Hysteresis downstream counts
 samples, so the interval never adapts. A tick that runs past the cadence is an
@@ -350,8 +350,8 @@ the same kind is a wrapper's target (Codex's npm shim starting the native
 is its own session.
 
 **Launched vs observed.** Every PTY Waylode starts carries
-`GITPULSE_SESSION_ID`; a task attempt's also carries `GITPULSE_RUN_ID`.
-`GITPULSE_RUN_ID` is the launch table's environment half
+`WAYLODE_SESSION_ID` (and legacy `GITPULSE_SESSION_ID`); a task attempt's also carries `WAYLODE_RUN_ID` (with legacy `GITPULSE_RUN_ID` fallback).
+`WAYLODE_RUN_ID` is the launch table's environment half
 (`terminal_command::launch_env`, beside `policy()`'s flags). The PTY spawn path
 sets it after the caller's own environment, so an IPC caller cannot file a
 session under another run. It is *removed* from plain terminals, so a Waylode
@@ -390,7 +390,7 @@ baseline, not a rate.
   pressure level about 6 s after it is allocated. The top-five footprints can
   move before the level does.
 - **WebKit helpers appear foreign.** The window's `WebContent` process is
-  parented to launchd, so it is listed among the non-GitPulse footprints.
+  parented to launchd, so it is listed among the non-Waylode footprints.
 - **Subagents run in-process.** A Claude Code subagent's tool calls run in the
   parent session's process tree; there is no second `claude` process (V,
   2026-10-10). Their work is attributed to the parent session.
@@ -558,7 +558,7 @@ spawn is admitted while background and reactive are shed.
 `host_load.override_admit`, with the site, reason, binding, sensor state and
 message, in the launch's repository. It is written off the launch path.
 
-**Scope of shedding.** Only the app process sheds. `gitpulse-mcp`, `gitpulsed`
+**Scope of shedding.** Only the app process sheds. `waylode-mcp`, `wayloded`
 and the hook have no governor, so an agent's MCP calls are never refused on
 pressure. Shedding acts on spawns through the gate; background work that
 spawns no git child (a pure IPC read) is not shed by this card.
@@ -665,8 +665,8 @@ pass). It only reads; refreshing the cache is the host's plugin update.
 line right under its header, where the brief's 2,000-byte cap never cuts: tier and
 what binds it with the sensor's state, or `UNKNOWN (why)` and that heavy commands
 are not load-checked, and the Claude and Codex sessions launched and observed. It
-reads the same snapshot and never samples. The `gitpulse:load` skill
-(`plugins/gitpulse/skills/load`) says what to do with it and with a
+reads the same snapshot and never samples. The `waylode:load` skill
+(`plugins/waylode/skills/load`) says what to do with it and with a
 refusal; the terminal launch prompt names it, because `dc-store` owns the shared
 brief and does not.
 
@@ -691,13 +691,13 @@ On 2026-10-17 four to seven release builds from separate agent worktrees
 starved the window server. On 2026-11-14 sixteen runs queued for two slots of
 a shell shim while the host was healthy. The shim (`~/.claude-bin/cargo`) sees
 neither the session a build belongs to, nor the governor's verdict, nor who is
-waiting. `sysload::lease` owns that state and `gitpulse-hook` is the program a
+waiting. `sysload::lease` owns that state and `waylode-hook` is the program a
 build goes through.
 
 ### The lease
 
 A heavy `cargo` or `go` command takes one of N slots and holds it until the
-build's own process exits. State is under `<config>/GitPulse/leases/`:
+build's own process exits. State is under `<config>/Waylode/leases/` (migrated from `GitPulse/`):
 
 - `slot-1` to `slot-16`: lock files. The holder takes a POSIX record lock
   (`fcntl F_SETLK`) on its slot and then `exec`s the build, so the build
@@ -740,23 +740,23 @@ unless the verdict refuses, in which case it keeps waiting until `wait_hard_s`
 
 ### The wrapper
 
-`gitpulse-hook` run as `cargo` or `go` (symlinks the app keeps in
-`<config>/GitPulse/lease-bin`, maintained by `sysload::lease::ensure_links`),
-or `gitpulse-hook lease -- <program> ...`. It runs before the hook's own start
+`waylode-hook` run as `cargo` or `go` (symlinks the app keeps in
+`<config>/Waylode/lease-bin`, maintained by `sysload::lease::ensure_links`),
+or `waylode-hook lease -- <program> ...`. It runs before the hook's own start
 deadline. It leases a `cargo` verb that compiles or tests (build, check,
 clippy, test, bench, doc, rustc, rustdoc, fix, install, nextest, llvm-cov,
 mutants, fuzz, miri, and the short aliases) and `go build` and `go test`. It
 never leases `cargo run`, `clean`, `fmt`, `metadata`, `tree` or `help`,
 `cargo llvm-cov clean`, `report` or `show-env` (the owner's shim lets these
 through too), a call that only asks for `--help` or `-h` before any `--`, `go
-run`, `env`, `mod` or `version`, a nested call (`GITPULSE_LEASE_HELD`, `CARGO_SLOT_HELD`), a `mac_heavy` job
+run`, `env`, `mod` or `version`, a nested call (`WAYLODE_LEASE_HELD` / `GITPULSE_LEASE_HELD`, `CARGO_SLOT_HELD`), a `mac_heavy` job
 (`MAC_HEAVY_LABEL`), or anything with `host_load_leases.mode` off.
 
 **A link points only at a lease wrapper.** Before the app links `cargo` and `go`
-to its `gitpulse-hook`, and before anything routes a session through the links
+to its `waylode-hook`, and before anything routes a session through the links
 or reports them as working (`launch_env`, the session-start hook, Health), the
 link's target is run with `--version` and must list `lease` among what it
-serves (`sysload::lease::hook_serves_lease`). A `gitpulse-hook` from before
+serves (`sysload::lease::hook_serves_lease`). A `waylode-hook` (pre-rename `gitpulse-hook`) from before
 leases takes `cargo build` for an unknown hook subcommand and exits 0, so a
 `cargo test` through it would "pass" without running. A target that does not
 answer that way is never linked, and a link already in the folder that
@@ -769,7 +769,7 @@ is made or removed on it; it is asked again next time. A definite answer is
 remembered per file (device, inode, size, mtime). The app makes the links on a
 thread of their own at launch, so a slow probe never holds startup.
 
-A leased build gets `GITPULSE_LEASE_HELD=<slot>`, `CARGO_SLOT_HELD=gitpulse-lease`
+A leased build gets `WAYLODE_LEASE_HELD=<slot>` (plus legacy `GITPULSE_LEASE_HELD`), `CARGO_SLOT_HELD=gitpulse-lease`
 (so the owner's shim does not queue it a second time), and, unless the caller
 set one, `CARGO_BUILD_JOBS=max(2, cpus / slots)`. Incremental compilation stays
 on. `host_load_leases.incremental_off` (default false) sets `CARGO_INCREMENTAL=0`
@@ -848,7 +848,7 @@ A PTY that is quiet is not enough, and neither is a low CPU reading: an agent
 that is thinking silently reports no waiting state. Codex, observed sessions
 and sessions with no hook reports are always "not known".
 
-**Park** closes a GitPulse-launched Claude session's terminal and keeps its
+**Park** closes a Waylode-launched Claude session's terminal and keeps its
 conversation so the existing reopen offer ("Resume") brings it back. It is not
 SIGSTOP. It is offered, and enforced by the backend, once a session has been
 idle for `host_load_idle.park_after_s` (default 3600). Only a terminal that
@@ -870,9 +870,9 @@ cannot be resumed from Waylode, so neither is offered.
 ### Owner action: the shim cutover
 
 Waylode does not edit `~/.claude-bin/cargo`, `~/.zshenv` or any other file
-outside its own config. Until the owner puts `<config>/GitPulse/lease-bin`
+outside its own config. Until the owner puts `<config>/Waylode/lease-bin`
 ahead of `~/.claude-bin` on `PATH` (or has the shim delegate to
-`gitpulse-hook lease -- cargo`), builds from a shell Waylode did not start are
+`waylode-hook lease -- cargo`), builds from a shell Waylode did not start are
 gated by the shim's own slots and not by this. `bun run mcp:doctor` has a
 `lease:` row. It first runs the link's target with `--version`: a target that
 answers without `lease` is `stale` (it would exit 0 without building) and
@@ -897,7 +897,7 @@ alone, and a build from a shell that line does not reach is not.
 - The doctor's login-shell probe assumes the shell's `PATH` reflects what an
   agent's Bash tool sees; Claude's own shell snapshot ordering was not checked.
 - Linux and Windows: the lease code is `cfg(unix)`; nothing was run there.
-- `quiet_ms` comes from the in-process terminal host. A `gitpulse-ptyd` host
+- `quiet_ms` comes from the in-process terminal host. A `waylode-ptyd` (or pre-rename `gitpulse-ptyd`) host
   that predates it reports none, so those sessions are "not known".
 - The idle thresholds (900 s, 3600 s, 5% of a core) are a starting guess, not
   measured against real sessions.
@@ -961,7 +961,7 @@ swap or segment reading never starts a freeze and never holds one.
 
 ### Selection (rung B)
 
-Only a **GitPulse-launched** session (its tree carries a launch id) in a
+Only a **Waylode-launched** session (its tree carries a launch id) in a
 **trusted** repository (`repository_trust::require` on the session's checkout,
 which starts no `git`). In it, the single heaviest eligible *subtree* by
 footprint sum, at least 256 MiB, **below a shell that is positively an agent's
@@ -1316,10 +1316,10 @@ reboot a reused pid starts no walk, and its children are not restored.
   stopping new allocation, was not measured: a stopped process keeps its pages
   until the kernel compresses or swaps them.
 - Linux: the sensor only advises there, so the relief never acts.
-- Selection was run read-only on this host's real trees (no signals): GitPulse-
+- Selection was run read-only on this host's real trees (no signals): Waylode-
   launched Claude sessions showed root-child shells and launch ids, and
   `KERN_PROCARGS2` returned environments. Every heavy subtree was then barred by
-  `GITPULSE_LEASE_HELD` (the builds running at the time), which is why holders
+  `WAYLODE_LEASE_HELD` / `GITPULSE_LEASE_HELD` (the builds running at the time), which is why holders
   became eligible while the board refuses; a positive pick on a real tree was not
   observed. A Codex session's root is its wrapper, so its shells are
   grandchildren of the root and are never candidates.
@@ -1631,11 +1631,11 @@ Every result is tagged **real** (this machine's kernel and process table),
 | Older and newer readers | `readers_accept_newer_additive_records_and_refuse_short_or_old_ones` | simulated | pass |
 | Reader racing writer | `a_reader_racing_a_writer_sees_only_whole_records` | simulated | pass |
 | Writer election, loser reads | `one_writer_per_directory_and_the_loser_reads`, `real_sampler_publishes_and_a_second_one_reads` | simulated / real | pass |
-| GitPulse-launched terminal Claude counted | `a_terminal_claude_with_no_registry_entry_is_counted_as_launched`; fails on registry-only counting (0 vs 1) | real | pass |
+| Waylode-launched terminal Claude counted | `a_terminal_claude_with_no_registry_entry_is_counted_as_launched`; fails on registry-only counting (0 vs 1) | real | pass |
 | Reparented child attributed with its footprint | `real_reparented_fixture_is_attributed_to_its_run_with_its_footprint` (128 MiB fixture, under the 512 MiB ceiling) | real | pass |
 | Other users' processes counted | `real_scan_counts_other_users_processes_instead_of_dropping_them`; fails on the drop-on-`EPERM` reader | real | pass |
 | PID recycle | `a_recycled_pid_never_inherits_the_cached_identity`, `a_registry_entry_never_enriches_a_later_process_on_the_same_pid` | simulated | pass |
-| `GITPULSE_RUN_ID` set, removed, unspoofable | `a_task_terminal_carries_its_run_id_and_a_plain_one_none_whatever_the_caller_sent` | real | pass |
+| `WAYLODE_RUN_ID` / `GITPULSE_RUN_ID` set, removed, unspoofable | `a_task_terminal_carries_its_run_id_and_a_plain_one_none_whatever_the_caller_sent` | real | pass |
 | Sampler only in the app | `tests/host_load_sampler_scope.rs` | real (source) | pass |
 | Sampler cost | `cargo bench --bench host_load` (results below) | real | recorded |
 | 10-minute soak | `cargo test --release --test host_load_soak -- --ignored` (results below) | real (test process, not the app's hidden window) | recorded |
@@ -1653,7 +1653,7 @@ row after 5 warm-up runs (15 for the cold scan).
 
 | Row | min | p50 | p95 | worst |
 |---|---|---|---|---|
-| scan, cold (every identity read; what a new `gitpulse-mcp` pays) | 6.70 ms | 9.81 ms | 10.33 ms | 13.36 ms |
+| scan, cold (every identity read; what a new `waylode-mcp` pays) | 6.70 ms | 9.81 ms | 10.33 ms | 13.36 ms |
 | scan, warm (the sampler's steady state) | 1.81 ms | 2.44 ms | 3.40 ms | 3.96 ms |
 | host probe | 56.9 µs | 88.7 µs | 707.5 µs | 1.82 ms |
 | publish + read | 14.7 µs | 19.5 µs | 32.4 µs | 54.6 µs |
@@ -1666,7 +1666,7 @@ row says how many it read rather than assuming.
 
 ### Hook session scan
 
-`gitpulse-hook` is a new process on every call, so the in-process cold row
+`waylode-hook` is a new process on every call, so the in-process cold row
 above is not what the collision guard pays. `observe_sessions` — the read
 that guard makes on a file write — used to run the full table scan. It now
 lists pids and reads arguments only for a process whose short name could be

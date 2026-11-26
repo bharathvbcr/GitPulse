@@ -336,7 +336,7 @@ sends only the task identity to Manvi, and a clipboard copy is pasted into a
 session that has never seen this repository. They say three things — how to
 read the fields, that the author's wording is evidence to keep rather than
 paraphrase, and which of this project's own tools to orient with (the
-`gitpulse-*` and `devmap-*` skills, and the `gitpulse_*` and `devmap_*` MCP
+`waylode-*` (plus legacy `gitpulse-*`) and `devmap-*` skills, and the `waylode_*` and `devmap_*` MCP
 tools, each called with the repository's absolute `repo_path`). The skills
 named there are asserted against the directories that ship them, so the list
 cannot fall behind.
@@ -387,7 +387,7 @@ launch. A terminal handoff opens a dedicated task-bound session in the existing
 finishing the process does not accept the task or mark it Done.
 
 The agent marks it Done itself. Its launch prompt tells it to call
-`gitpulse_complete_task` on the Waylode MCP server once every acceptance
+`waylode_complete_task` on the Waylode MCP server once every acceptance
 criterion is met and its verification passed, using the id on the brief's
 `Task:` line, or to move it to **Review** and say what remains when it is not
 finished. Only the status changes; the agent's summary of what it changed and
@@ -396,7 +396,7 @@ up as it does any external write. An agent never reopens a task that is already
 Done, and an agent without the Waylode MCP server configured cannot move it at
 all — the card then stays where it was for you to move.
 
-An agent filing work keeps the board small. `gitpulse_add_task` refuses a new
+An agent filing work keeps the board small. `waylode_add_task` refuses a new
 card while an open card looks like the same work (two shared title words, or one
 and a shared label), and lists those cards. The agent then folds its work into
 one of them — rewriting its title, description and criteria with the old content
@@ -404,7 +404,7 @@ plus the new, while its column, priority, owner, labels and logs stay as you
 left them — or, having read them, names every one to say its task is separate.
 Done cards never count. Importing a `tasks/` folder is not checked.
 
-An agent can merge duplicate cards into one with `gitpulse_merge_tasks`: the
+An agent can merge duplicate cards into one with `waylode_merge_tasks`: the
 card that stays gains a `## Merged from …` section per merged card, their
 acceptance criteria and labels, and the most urgent priority, severity and due
 date among them, and the merged cards are deleted with the reason and the
@@ -415,7 +415,7 @@ merged or deleted is told where its work went.
 
 You can run the same merge from the board: select two or more cards of one
 repository and press **Merge…** on the selection bar, choose the card to keep
-and say why. It is the code `gitpulse_merge_tasks` runs — same order of
+and say why. It is the code `waylode_merge_tasks` runs — same order of
 writes, same refusals (a card changed since the board drew it, one shared with
 another repository, a target that is archived or Done) — and checklists and
 links are folded into the kept card too. When a merged card's reason is
@@ -425,7 +425,7 @@ as a merge that did not happen. A card deleted elsewhere in the instant
 between the merge's last check and its first write is the one window the
 merge cannot close; that card is recoverable from the archive's Deleted view.
 
-An agent can also delete a card, with `gitpulse_delete_task`, when the task
+An agent can also delete a card, with `waylode_delete_task`, when the task
 should not exist — a duplicate, or one it merged into another. It must give a
 reason, which is added to the task's **Logs** before the delete, so the task's
 history says why it went. It is the same delete as the board's own: the card

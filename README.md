@@ -48,16 +48,18 @@ When you run several agents across several repositories, these are the problems 
 - **The laptop melts.** The load scheduler admits, queues or sheds heavy work by host pressure.
 - **You still need Git.** The commit graph, branch stack tree, diffs, conflicts, reflog, pull requests and Actions are in the same window.
 
-The task board is part of this. An agent that finds out-of-scope work files it with `gitpulse_add_task`,
+The task board is part of this. An agent that finds out-of-scope work files it with `waylode_add_task`,
 and it lands on your board instead of scrolling away in a transcript. You can launch an agent from any
 card.
 
 Waylode does not replace Claude Code, Codex or your editor. It launches, watches, guards and lands their
-work. [Why Waylode](docs/WHY_WAYLODE.md) has the dated comparison with other tools, including where
+work. [Waylode philosophy](docs/PHILOSOPHY.md) explains the design thesis ("a workspace, not a chat
+window"), host-resource invariants, and deliberate boundaries with Manvi and DevCouncil; [Why Waylode](docs/WHY_WAYLODE.md) has the dated comparison with other tools, including where
 they are stronger. The [agents guide](docs/AGENTS_GUIDE.md) covers running agents.
 
-**Platforms.** Waylode is tested on macOS. Windows and Linux builds are produced by release CI but have
-not been tested.
+**Platforms.** Waylode is tested on macOS. Windows and Linux builds are produced by release CI but have not been tested.
+
+- **Waylode Primary (Free & Open Source, `MIT OR Apache-2.0`):** Everything on your machine and on user-paid compute (**BYOK** SSH runners, `cloud_vms`, your own model keys) requires zero sign-in and has zero local paywalls—including the full desktop ADE, local DevCouncil engines (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `dcredact`, public OSS PR Gate), local Manvi harness/policy enforcement/audit export, local MarkDev, and local Graft.
 
 ## Waylode 0.2.0 (beta)
 
@@ -68,15 +70,15 @@ Releases come on two channels: betas are tagged `vX.Y.Z-beta.N`, stable releases
 [0.2.0 release notes](docs/RELEASE_NOTES_v0.2.0.md) and [versioning](docs/INSTALLATION.md#versions-and-channels).
 The [feature reference](docs/FEATURES.md) lists every area.
 
-- **Agents:** six launchers (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab (macOS), live session detection, an agent tree, a worktree per agent with copy-on-write dependency caches, a peer inbox for agent-to-agent messages, collision radar, file claims, and turn checkpoints. The `gitpulse-mcp` server exposes 66 tools (55 `gitpulse_*`, 11 `devmap_*`) and 4 prompts.
-- **A task board agents write to:** five columns (Backlog, Ready, In progress, Review, Done), cross-repository and saved-workspace boards, up to 2,000 cards shared across a board's columns per fill, launch an agent from a card, and `gitpulse_add_task` with duplicate gating. `gitpulse_complete_task` marks a task done only after a passed verification; otherwise the card moves to Review.
+- **Agents:** six launchers (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab (macOS), live session detection, an agent tree, a worktree per agent with copy-on-write dependency caches, a peer inbox for agent-to-agent messages, collision radar, file claims, and turn checkpoints. The `waylode-mcp` server exposes 66 tools (55 `waylode_*` — with legacy `gitpulse_*` aliases accepted and `WAYLODE_MCP_EXPOSE_LEGACY=1` to advertise them — plus 11 `devmap_*`) and 4 prompts.
+- **A task board agents write to:** five columns (Backlog, Ready, In progress, Review, Done), cross-repository and saved-workspace boards, up to 2,000 cards shared across a board's columns per fill, launch an agent from a card, and `waylode_add_task` with duplicate gating. `waylode_complete_task` marks a task done only after a passed verification; otherwise the card moves to Review.
 - **Guards:** Manvi's command gate classifies each decision into one of eight statuses (see [Security](docs/SECURITY.md)), repository trust is per repository and only the desktop can grant it, and allowed agent Git mutations take pre-operation snapshots (`refs/gitpulse/ops/`) with a checked undo.
 - **Code intelligence:** DevMap map, blast radius, affected tests, regression suspects, dead symbols, clones and symbol search through the palette.
 - **Load scheduler:** a memory-pressure governor for agent launches, build leases with a queue for heavy builds, parking of idle agent sessions, and a host-load strip with CPU, GPU, memory, thermal and storage indicators.
-- **Terminal:** nested splits (up to 8 panes), split groups, command blocks, a Browser pane for local dev servers, and sessions that survive quitting the app on Unix (`gitpulse-ptyd`).
-- **Four views, 11 sections:** Work (`Overview · Remote · Tasks`), Code (`Explorer · Map`), History (`Graph · Diff`) and Insights (`Pulse · Coverage · Health · Storage`), plus Fleet and an Agents plane.
+- **Terminal:** nested splits (up to 8 panes), split groups, command blocks, a Browser pane for local dev servers (with shell-scoped port probing), terminal spawn flags (`model`, `mode`, `settings`) and hooked/screen permission prompt detection, and sessions that survive quitting the app on Unix (`waylode-ptyd`, protocol 5).
+- **Five views, 11 sections:** Work (`Overview · Remote · Tasks`), Mavi (agent conversations, inline approvals, and live per-turn changes), Code (`Explorer · Map`), History (`Graph · Diff`) and Insights (`Pulse · Coverage · Health · Storage`), plus Fleet and an Agents plane.
 - **Git client:** lane-solved commit graph with avatars, branch stack tree with restack, hunk and line staging, a 3-way conflict editor, HEAD moves (reflog) with undo, and GitHub pull requests, issues, Actions and releases.
-- **Customization:** 17 theme presets, a My themes shelf (24), 11 macOS wallpapers plus your own image, a command palette with 8 modes, and repository logos.
+- **Customization:** 21 theme presets (including Cobalt Way-Arc brand presets *Waylode Cobalt*, *Waylode Lodestar*, *VBCR Oxblood*, and *Waylode Gilded*), a My themes shelf (24), 11 macOS wallpapers plus your own image, Cobalt Way-Arc logo styles and palettes, a command palette with 8 modes, and repository logos.
 
 ## Get started
 
@@ -93,25 +95,25 @@ walks through a review, task creation, and optional setup.
 
 ## Quick install & agent setup
 
-If you installed the packaged desktop app, **Settings → Agents → Connect** (or its **Copy setup prompt**) symlinks the bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin` without needing a source checkout or Rust toolchain, and **Help → Set Up Optional Tools** installs DevMap, the analysis suite, or Manvi interactively.
+If you installed the packaged desktop app, **Settings → Agents → Connect** (or its **Copy setup prompt**) symlinks the bundled `waylode-mcp` and `waylode-hook` into `~/.local/bin` without needing a source checkout or Rust toolchain, and **Help → Set Up Optional Tools** installs DevMap, the analysis suite, or Manvi interactively.
 
 To build and wire up **Waylode**, **DevCouncil** (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`), **Manvi** (`manvi`), and MCP integrations from source (requires **Git**, **Bun 1.4.2**, **Rust 1.100+**, and **Go 1.27.4+**), paste this prompt into Claude Code, Codex, Antigravity, or Cursor (or run the fenced commands directly):
 
 ````text
-Install and wire up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain on this machine, then verify every binary, schema, and host integration without skipping failing checks:
+Install and wire up the complete Waylode, DevCouncil, Manvi, and MCP toolchain on this machine, then verify every binary, schema, and host integration without skipping failing checks:
 
 1. Preflight tools and checkouts:
    - Confirm `git`, `bun`, `rustc`/`cargo`, and `go` are on `PATH` (and `~/.local/bin` / Cargo / Go bin dirs are reachable).
-   - Check whether sibling `GitPulse`, `DevCouncil`, and `Manvi` checkouts already exist; otherwise ask where to clone `https://github.com/bharathvbcr/GitPulse.git` (and optionally `DevCouncil` / `Manvi`), and do not install system packages outside Cargo/Go/Bun user bins without asking.
+   - Check whether sibling `GitPulse` (Waylode), `DevCouncil`, and `Manvi` checkouts already exist; otherwise ask where to clone `https://github.com/bharathvbcr/GitPulse.git` (and optionally `DevCouncil` / `Manvi`), and do not install system packages outside Cargo/Go/Bun user bins without asking.
 
 2. Install Waylode MCP, hooks, and worktree/cache CLIs (`waylode-mcp`, `waylode-hook`, `waylode-worktree`, `waylode-rustc`):
-   - From a `GitPulse` checkout (or after `git clone https://github.com/bharathvbcr/GitPulse.git && cd GitPulse`):
+   - From a Waylode checkout (or after `git clone https://github.com/bharathvbcr/GitPulse.git && cd GitPulse`):
      ```sh
      bun install --frozen-lockfile
      bun run mcp:install
      cargo install --path crates/waylode-worktree --locked --force
      ```
-   - Skip rebuilding `gitpulse-mcp` / `gitpulse-hook` from source if I already linked them from the packaged app via Settings -> Agents -> Connect in `~/.local/bin`.
+   - Skip rebuilding `waylode-mcp` / `waylode-hook` from source if I already linked them from the packaged app via Settings -> Agents -> Connect in `~/.local/bin`.
 
 3. Install all DevCouncil components (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`):
    - If a local `DevCouncil` checkout is present, run `bash scripts/install.sh`; otherwise install from GitHub:
@@ -130,8 +132,8 @@ Install and wire up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain 
      ```
 
 5. Configure MCP servers and agent plugins cleanly (preview before writing; preserve existing user-owned configs):
-   - Register **either** the GitPulse plugin (`plugins/gitpulse/` for Claude Code/Codex/Cursor or `plugins/gitpulse-agy/` for Antigravity) **or** a direct `gitpulse` MCP registration (`gitpulse-mcp`), **never both** — the plugin already registers the `gitpulse` server (repo insights, worktree coordination, collision radar, task board, and in-process `devmap_*`).
-   - Run `devmap integrate <host> --dry-run` (and `devcouncil integrate <host> --dry-run` if using the orchestrator MCP) for my active agent client(s) (`claude`, `codex`, `cursor`, `antigravity`), show me the planned file changes (noting any `not_ours` protected files), and apply only with my approval (`--apply`) so `devmap mcp` (code graph) and `devcouncil mcp` (orchestrator/leases) sit cleanly alongside `gitpulse-mcp`.
+   - Register **either** the Waylode plugin (`plugins/waylode/` for Claude Code/Codex/Cursor or `plugins/waylode-agy/` for Antigravity) **or** a direct `waylode` MCP registration (`waylode-mcp`), **never both** — the plugin already registers the `waylode` server (repo insights, worktree coordination, collision radar, task board, and in-process `devmap_*`).
+   - Run `devmap integrate <host> --dry-run` (and `devcouncil integrate <host> --dry-run` if using the orchestrator MCP) for my active agent client(s) (`claude`, `codex`, `cursor`, `antigravity`), show me the planned file changes (noting any `not_ours` protected files), and apply only with my approval (`--apply`) so `devmap mcp` (code graph) and `devcouncil mcp` (orchestrator/leases) sit cleanly alongside `waylode-mcp`.
 
 6. Verify end-to-end and report exact tool outputs:
    ```sh
@@ -140,7 +142,7 @@ Install and wire up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain 
    devmap doctor && devcouncil doctor && manvi doctor
    dcstore --version && dcverify --version && dcgrep --help >/dev/null
    ```
-   - Ensure `mcp:doctor` reports matching digests for `gitpulse-mcp` and `gitpulse-hook`, and `check:schema-parity` agrees across vendored crates, `devmap`, `dcstore`, `gitpulse-mcp`, and `manvi`.
+   - Ensure `mcp:doctor` reports matching digests for `waylode-mcp` and `waylode-hook`, and `check:schema-parity` agrees across vendored crates, `devmap`, `dcstore`, `waylode-mcp`, and `manvi`.
    - In the target repository, run `devmap paths --json` and `devmap status --json` (and `devmap build --manifest` if missing or stale).
 
 Report what succeeded, what could not run, exact paths of installed binaries, and any MCP/plugin config changes made or awaiting approval.
@@ -265,7 +267,7 @@ flowchart TB
         LaneSolver["Topological Lane Solver"]
         Analyzers["Coverage, Health & LOC"]
         Ledger["Durable WAL Event Ledger"]
-        Headless["Headless Binaries<br/>(gitpulse-mcp · gitpulsed · gitpulse-hook · gitpulse-ptyd)"]
+        Headless["Headless Binaries<br/>(waylode-mcp · wayloded · waylode-hook · waylode-ptyd)"]
     end
 
     subgraph Integrations["Modular Integrations & Local Tools"]

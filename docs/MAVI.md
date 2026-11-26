@@ -21,9 +21,9 @@ Open **Mavi** in the header (⌥⌘4 on macOS, Ctrl+Shift+4 elsewhere).
   ("Read 3 files · Edited 2 files · Ran 1 command"). Failed or denied calls
   are counted on the row even when it is collapsed, and edited files are always
   shown as chips. The call running now is shown live.
-- **Permission requests** appear where they happen, with what the agent wants
+- **Permission requests & `AskUserQuestion` cards** appear where they happen, with what the agent wants
   to run: the command, or for an edit the change itself, built from the
-  request. **Allow** or **Deny** (with an optional note for the agent). There is
+  request. **Allow** or **Deny** (with an optional note for the agent). When an agent invokes `AskUserQuestion`, Mavi renders the structured question choices directly (`MaviQuestion.svelte`); an unanswered or declined question returns an explicit refusal (`QUESTION_DECLINED`) telling the agent it is **not consent** and must not pick a recommended option or continue as if agreed, and `--append-system-prompt` (`AGENT_GUIDANCE`) also instructs agents spawning terminal children (`waylode_terminal_spawn`) to wait via `waylode_terminal_wait` and report `needs_input` rather than answering prompts themselves. There is
   no single-key shortcut: someone who lands on the card and starts typing must
   never allow a command by accident. A subagent's request is shown in the main
   flow, marked as a subagent's, never folded away under its Task row. A
@@ -43,9 +43,9 @@ Open **Mavi** in the header (⌥⌘4 on macOS, Ctrl+Shift+4 elsewhere).
   with queued messages, which come back as that draft. **Stop** (or Esc from an empty composer) interrupts the
   turn; **End agent** in the header ends the agent's process (asking first
   while a turn runs), and the conversation can be resumed.
-- **Threads** can be renamed in place (the pencil, or a double-click on the
-  title). Removing one asks first, says that its agent ends, and gives the
-  conversation id that still resumes it in a terminal.
+- **Threads & spawned child terminal tabs**: Threads can be renamed in place (the pencil, or a double-click on the
+  title). Local threads pass `threadKey` on start, setting `WAYLODE_ORCHESTRATE_CALLER` (and legacy `GITPULSE_ORCHESTRATE_CALLER`) to `ext-mavi-<uuid>` so `waylode-mcp` and `waylode-hook` keep stable ownership across resumed turns and render live spawned terminal tabs as cards inside the thread (`MaviChildTabs.svelte`, `mavi-child-state` events including `needs_input`, `cleared`, `done`, and `ended`). Removing/forgetting a thread asks first, says that its agent ends, gives the
+  conversation id that still resumes it in a terminal, and invokes `cmd_mavi_close_thread_children({ threadKey })` to stop unprotected child terminals owned by that thread while skipping and counting protected tabs.
 - **Changes** (right column): what the selected turn, or the whole thread,
   changed, file by file. See below.
 - **Resume**: quitting Waylode ends every agent. A thread keeps the

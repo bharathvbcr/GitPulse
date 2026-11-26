@@ -1,7 +1,7 @@
-//! Shell out to the installed `devmap` CLI for operations GitPulse cannot do
+//! Shell out to the installed `devmap` CLI for operations Waylode cannot do
 //! in-process, and read the consumer `repo_map.json` navigator artifact.
 //!
-//! GitPulse links `devmap-query` / `devmap-store` with `default-features =
+//! Waylode links `devmap-query` / `devmap-store` with `default-features =
 //! false`, so it can *read* a map but cannot build one or run `preview` (both
 //! need the parse frontend). The installed CLI always matches the schema on
 //! disk; this module is the seam that keeps that true without pulling
@@ -26,7 +26,8 @@ pub use init::{
     ensure_state_dir_excluded, initialize as initialize_repository, ExcludeOutcome, InitReport,
 };
 pub use integrate::{
-    apply as apply_integration, preview as preview_integration, survey as survey_integrations,
+    apply as apply_integration, host_cli_program, preview as preview_integration,
+    probe_host_cli_with, probe_host_clis_with, survey as survey_integrations, HostCliStatus,
     IntegrationEntry, IntegrationHost, IntegrationKind, IntegrationPlan,
 };
 pub use live::{
