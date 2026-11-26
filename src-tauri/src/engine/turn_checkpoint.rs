@@ -78,10 +78,12 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "macos")]
 use crate::engine::git_cli::find_git_root;
 use crate::engine::git_cli::{
-    git_captured, git_captured_with_stdin, git_text_capped, git_with_index, validate_repo,
+    git_captured, git_captured_with_stdin, git_text_capped, git_with_index, resolve_git_common_dir,
+    validate_repo,
 };
 use crate::engine::git_writer::{
-    absent_oid_for_len, validate_oid, validate_ref_name, SNAPSHOT_IDENTITY_ARGS,
+    absent_oid_for_len, is_full_oid, repo_mutation_lock, validate_oid, validate_ref_name,
+    GitWriter, MAX_OPS, MAX_REFERENCE_NAME_LENGTH, OP_EXPIRY_SECS, SNAPSHOT_IDENTITY_ARGS,
 };
 use crate::engine::process::BoundedRun;
 
@@ -1462,6 +1464,216 @@ pub fn diff_turn_checkpoint(
         redacted: redacted_patch != patch,
         patch: redacted_patch,
         truncated: incomplete.is_some(),
+    })
+}
+
+// ── restore ───────────────────────────────────────────────────────────────────
+
+/// Result of restoring a worktree's tracked tree to a turn checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCheckpointRestore {
+    pub checkpoint_ref: String,
+    pub commit: String,
+    pub tree: String,
+    pub branch: Option<String>,
+    pub head_before: Option<String>,
+    pub head_after: Option<String>,
+    pub op_snapshot_ref: String,
+    pub op_snapshot_seq: u64,
+    pub forced: bool,
+}
+
+fn validate_turn_checkpoint_ref(checkpoint_ref: &str) -> Result<(), String> {
+    if checkpoint_ref.len() > MAX_REFERENCE_NAME_LENGTH {
+        return Err(format!(
+            "checkpoint ref exceeds {MAX_REFERENCE_NAME_LENGTH} bytes"
+        ));
+    }
+    if !checkpoint_ref.starts_with(TURN_REF_PREFIX) || checkpoint_ref.len() <= TURN_REF_PREFIX.len()
+    {
+        return Err(format!(
+            "checkpoint ref must begin strictly with {TURN_REF_PREFIX}"
+        ));
+    }
+    validate_ref_name(checkpoint_ref).map_err(|e| e.message().to_string())?;
+    let suffix = &checkpoint_ref[TURN_REF_PREFIX.len()..];
+    if suffix == "refs"
+        || suffix.starts_with("refs/")
+        || suffix.starts_with("heads/")
+        || suffix.starts_with("tags/")
+        || suffix.starts_with("remotes/")
+    {
+        return Err("checkpoint ref cannot contain a DWIM decoy prefix".into());
+    }
+    Ok(())
+}
+
+fn resolve_exact_turn_ref(repo: &Path, checkpoint_ref: &str) -> Result<String, String> {
+    let finished = run(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            checkpoint_ref,
+        ],
+    )?;
+    if !finished.success {
+        return Err(format!(
+            "git for-each-ref failed: {}",
+            stderr_text(&finished)
+        ));
+    }
+    let out = String::from_utf8_lossy(&finished.stdout);
+    let mut found: Option<String> = None;
+    for line in out.lines() {
+        let Some((ref_name, oid)) = line.split_once('\0') else {
+            continue;
+        };
+        if ref_name == checkpoint_ref {
+            validate_oid(oid).map_err(|e| e.message().to_string())?;
+            if !is_full_oid(oid) {
+                return Err(format!(
+                    "checkpoint ref {checkpoint_ref} resolved to non-full OID {oid}"
+                ));
+            }
+            if found.replace(oid.to_string()).is_some() {
+                return Err(format!(
+                    "checkpoint ref {checkpoint_ref} matched multiple refs"
+                ));
+            }
+        }
+    }
+    found.ok_or_else(|| format!("checkpoint ref {checkpoint_ref} does not exist"))
+}
+
+fn working_tree_has_user_changes(worktree: &Path) -> Result<bool, String> {
+    let finished = run(worktree, &["status", "--porcelain=v1", "-z"])?;
+    if !finished.success {
+        return Err(format!("git status failed: {}", stderr_text(&finished)));
+    }
+    let raw = String::from_utf8_lossy(&finished.stdout);
+    for entry in raw.split('\0') {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = &entry[3..];
+        if status == "??" && (path == ".devcouncil" || path.starts_with(".devcouncil/")) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn ensure_no_parked_op(worktree: &Path) -> Result<(), String> {
+    if let Some(parked) =
+        crate::engine::repo_op::detect_kind(worktree).map_err(|e| e.message().to_string())?
+    {
+        return Err(format!(
+            "cannot restore checkpoint while a {} is in progress; finish or abort it first",
+            parked.label()
+        ));
+    }
+    Ok(())
+}
+
+/// Restores `worktree_path`'s tracked tree and index to `checkpoint_ref` while
+/// keeping `HEAD` attached to its branch.
+///
+/// Refuses non-`refs/gitpulse/turns/` refs, parked multi-step operations, and
+/// dirty worktrees unless `force == true`. Records a pre-restore op snapshot
+/// under `refs/gitpulse/ops/*` before mutating so the restore is undoable.
+pub fn restore_turn_checkpoint(
+    repo: &Path,
+    worktree_path: &Path,
+    checkpoint_ref: &str,
+    force: bool,
+) -> Result<TurnCheckpointRestore, String> {
+    validate_turn_checkpoint_ref(checkpoint_ref)?;
+
+    let repo_str = repo
+        .to_str()
+        .ok_or_else(|| "repository path is not valid UTF-8".to_string())?;
+    let wt_str = worktree_path
+        .to_str()
+        .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
+    let repo_canon = validate_repo(repo_str).map_err(|e| e.message().to_string())?;
+    let wt_canon = validate_repo(wt_str).map_err(|e| e.message().to_string())?;
+    if !wt_canon.join(".git").exists() {
+        return Err("cannot restore checkpoint into a bare repository".into());
+    }
+    let repo_common = resolve_git_common_dir(&repo_canon).map_err(|e| e.message().to_string())?;
+    let wt_common = resolve_git_common_dir(&wt_canon).map_err(|e| e.message().to_string())?;
+    if repo_common != wt_common {
+        return Err("worktree does not belong to the specified repository".into());
+    }
+
+    // Preflight checks before recording an op snapshot so refused calls do not
+    // pollute `refs/gitpulse/ops/*`.
+    let _ = resolve_exact_turn_ref(&repo_canon, checkpoint_ref)?;
+    ensure_no_parked_op(&wt_canon)?;
+    if !force && working_tree_has_user_changes(&wt_canon)? {
+        return Err(
+            "working tree has uncommitted changes; pass force=true to overwrite them".into(),
+        );
+    }
+
+    // `record_op_snapshot_with_limits` acquires `repo_mutation_lock` itself, so
+    // record the pre-restore snapshot before taking our own guard, then re-verify
+    // invariants under the guard.
+    let wt_canon_str = wt_canon
+        .to_str()
+        .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
+    let op_snapshot = GitWriter::record_op_snapshot_with_limits(
+        wt_canon_str,
+        "turn_checkpoint.restore",
+        None,
+        None,
+        crate::ledger::ids::now_millis(),
+        MAX_OPS,
+        OP_EXPIRY_SECS,
+    )
+    .map_err(|e| e.message().to_string())?;
+
+    let lock = repo_mutation_lock(&repo_canon);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    ensure_no_parked_op(&wt_canon)?;
+    if !force && working_tree_has_user_changes(&wt_canon)? {
+        return Err(
+            "working tree became dirty before restore; pass force=true to overwrite".into(),
+        );
+    }
+    let commit = resolve_exact_turn_ref(&repo_canon, checkpoint_ref)?;
+    let (tree, _) = commit_tree_and_parent(&repo_canon, &commit)?;
+    validate_oid(&tree).map_err(|e| e.message().to_string())?;
+
+    let branch_before = resolve_branch(&wt_canon)?;
+    let head_before = resolve_head(&wt_canon)?;
+
+    run_ok(&wt_canon, &["read-tree", "--reset", "-u", &tree])?;
+
+    let branch_after = resolve_branch(&wt_canon)?;
+    let head_after = resolve_head(&wt_canon)?;
+    if branch_after != branch_before {
+        return Err(format!(
+            "HEAD branch attachment changed unexpectedly during restore ({branch_before:?} -> {branch_after:?})"
+        ));
+    }
+
+    Ok(TurnCheckpointRestore {
+        checkpoint_ref: checkpoint_ref.to_string(),
+        commit,
+        tree,
+        branch: branch_after,
+        head_before,
+        head_after,
+        op_snapshot_ref: op_snapshot.op_ref,
+        op_snapshot_seq: op_snapshot.seq,
+        forced: force,
     })
 }
 

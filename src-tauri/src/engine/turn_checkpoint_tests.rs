@@ -1252,3 +1252,191 @@ mod mailbox {
         assert_eq!(reply["outcome"], "captured");
     }
 }
+
+// ── restore ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn restore_turn_checkpoint_restores_tracked_contents_keeps_branch_attached_and_snapshots() {
+    let dir = init();
+    let root = dir.path();
+    std::fs::write(root.join("extra.txt"), "extra-v1\n").unwrap();
+    git_ok(root, &["add", "extra.txt"]);
+    git_ok(root, &["commit", "-q", "-m", "add extra"]);
+
+    let rig = rig(1_000_000);
+    let captured = take(&dir, &rig.cfg);
+    assert_eq!(captured.outcome, CaptureOutcome::Captured, "{captured:?}");
+    let checkpoint_ref = captured.ref_name.clone().unwrap();
+    let checkpoint_tree = captured.tree.clone().unwrap();
+
+    // Advance branch cleanly (clean worktree so `force = false` is allowed):
+    // mutate tracked.txt and delete extra.txt in a follow-up commit.
+    std::fs::write(root.join("tracked.txt"), "mutated\n").unwrap();
+    std::fs::remove_file(root.join("extra.txt")).unwrap();
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-q", "-m", "mutate and delete"]);
+    let head_before = git_ok(root, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_ok(root, &["symbolic-ref", "-q", "HEAD"]),
+        "refs/heads/main"
+    );
+
+    let restored = restore_turn_checkpoint(root, root, &checkpoint_ref, false).unwrap();
+    assert_eq!(restored.checkpoint_ref, checkpoint_ref);
+    assert_eq!(restored.tree, checkpoint_tree);
+    assert_eq!(restored.branch.as_deref(), Some("refs/heads/main"));
+    assert_eq!(restored.head_before.as_deref(), Some(head_before.as_str()));
+    assert_eq!(restored.head_after.as_deref(), Some(head_before.as_str()));
+    assert!(!restored.forced);
+    assert!(restored.op_snapshot_ref.starts_with("refs/gitpulse/ops/"));
+
+    // Exact tracked contents restored.
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("extra.txt")).unwrap(),
+        "extra-v1\n"
+    );
+    // Branch remains attached (never detached).
+    assert_eq!(
+        git_ok(root, &["symbolic-ref", "-q", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(git_ok(root, &["rev-parse", "HEAD"]), head_before);
+    // Pre-restore op snapshot exists and points to pre-restore HEAD.
+    let op_refs = refs_under(root, crate::engine::git_writer::OP_REF_PREFIX);
+    assert!(op_refs.contains(&restored.op_snapshot_ref), "{op_refs:?}");
+    let snapshots =
+        crate::engine::git_writer::GitWriter::list_op_snapshots(&path_of(&dir), 10).unwrap();
+    assert_eq!(snapshots.entries[0].op_ref, restored.op_snapshot_ref);
+    assert_eq!(
+        snapshots.entries[0].head_oid.as_deref(),
+        Some(head_before.as_str())
+    );
+}
+
+#[test]
+fn restore_turn_checkpoint_with_force_overwrites_dirty_mutations_and_deletions() {
+    let dir = init();
+    let root = dir.path();
+    let rig = rig(2_000_000);
+    let captured = take(&dir, &rig.cfg);
+    let checkpoint_ref = captured.ref_name.unwrap();
+
+    // Mutate and delete uncommitted working tree state.
+    std::fs::write(root.join("tracked.txt"), "dirty-edit\n").unwrap();
+    let err = restore_turn_checkpoint(root, root, &checkpoint_ref, false).unwrap_err();
+    assert!(
+        err.contains("uncommitted") || err.contains("force"),
+        "{err}"
+    );
+    assert!(
+        refs_under(root, crate::engine::git_writer::OP_REF_PREFIX).is_empty(),
+        "refused restore must not write an op snapshot"
+    );
+
+    std::fs::remove_file(root.join("tracked.txt")).unwrap();
+    let forced = restore_turn_checkpoint(root, root, &checkpoint_ref, true).unwrap();
+    assert!(forced.forced);
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(
+        git_ok(root, &["symbolic-ref", "-q", "HEAD"]),
+        "refs/heads/main"
+    );
+    let snapshots =
+        crate::engine::git_writer::GitWriter::list_op_snapshots(&path_of(&dir), 10).unwrap();
+    assert_eq!(snapshots.entries[0].op_ref, forced.op_snapshot_ref);
+    assert!(
+        snapshots.entries[0].stash_oid.is_some(),
+        "dirty pre-restore worktree must be pinned via stash_oid in op snapshot"
+    );
+}
+
+#[test]
+fn restore_turn_checkpoint_refuses_bad_refs_decoys_and_parked_ops() {
+    let dir = init();
+    let root = dir.path();
+    let rig = rig(3_000_000);
+    let captured = take(&dir, &rig.cfg);
+    let valid_ref = captured.ref_name.unwrap();
+
+    // Non-turns refs, DWIM decoys, prefix collisions, and >1024-byte refs are all refused.
+    let overlong = format!("{TURN_REF_PREFIX}{}", "a".repeat(1025));
+    let prefix_only = valid_ref.rsplit_once('/').unwrap().0.to_string();
+    for bad_ref in [
+        "HEAD",
+        "main",
+        "refs/heads/main",
+        "refs/gitpulse/ops/1",
+        "refs/heads/refs/gitpulse/turns/abc/1",
+        "refs/gitpulse/turns/refs/heads/main",
+        "refs/gitpulse/turns/",
+        "refs/gitpulse/turns/../heads/main",
+        &overlong,
+        &prefix_only,
+    ] {
+        let err = restore_turn_checkpoint(root, root, bad_ref, true).unwrap_err();
+        assert!(!err.is_empty(), "expected refusal for {bad_ref:?}");
+    }
+
+    // Parked op (merge in progress) must be refused even with force = true.
+    git_ok(root, &["checkout", "-q", "-b", "other"]);
+    std::fs::write(root.join("tracked.txt"), "other\n").unwrap();
+    git_ok(root, &["commit", "-q", "-am", "other"]);
+    git_ok(root, &["checkout", "-q", "main"]);
+    std::fs::write(root.join("tracked.txt"), "main\n").unwrap();
+    git_ok(root, &["commit", "-q", "-am", "main"]);
+    assert!(
+        crate::test_support::git_merge_in(root, &["merge", "other"]),
+        "expected merge conflict"
+    );
+    let parked_err = restore_turn_checkpoint(root, root, &valid_ref, true).unwrap_err();
+    assert!(
+        parked_err.contains("in progress") || parked_err.contains("merge"),
+        "{parked_err}"
+    );
+}
+
+#[test]
+fn restore_turn_checkpoint_works_for_linked_worktree_without_detaching_head() {
+    let main = init();
+    let parent = linked(&main);
+    let wt = parent.path().join("wt");
+    std::fs::write(wt.join("wt.txt"), "wt-v1\n").unwrap();
+    git_ok(&wt, &["add", "wt.txt"]);
+    git_ok(&wt, &["commit", "-q", "-m", "wt v1"]);
+
+    let rig = rig(4_000_000);
+    let captured = capture_turn_checkpoint(
+        wt.to_str().unwrap(),
+        &CaptureRequest {
+            event: TurnEvent::TurnEnd,
+            session_id: Some("sess-wt"),
+            label: Some("wt checkpoint"),
+        },
+        &rig.cfg,
+    );
+    assert_eq!(captured.outcome, CaptureOutcome::Captured, "{captured:?}");
+    let wt_ref = captured.ref_name.unwrap();
+
+    std::fs::write(wt.join("wt.txt"), "wt-v2\n").unwrap();
+    git_ok(&wt, &["commit", "-q", "-am", "wt v2"]);
+    let head_before = git_ok(&wt, &["rev-parse", "HEAD"]);
+
+    let restored = restore_turn_checkpoint(main.path(), &wt, &wt_ref, false).unwrap();
+    assert_eq!(restored.branch.as_deref(), Some("refs/heads/other"));
+    assert_eq!(restored.head_after.as_deref(), Some(head_before.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(wt.join("wt.txt")).unwrap(),
+        "wt-v1\n"
+    );
+    assert_eq!(
+        git_ok(&wt, &["symbolic-ref", "-q", "HEAD"]),
+        "refs/heads/other"
+    );
+}
