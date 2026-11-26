@@ -37,6 +37,58 @@ type PresetSource = Omit<ThemePreset, "theme"> & { readonly theme: Omit<GitPulse
 
 const SOURCES: readonly PresetSource[] = [
   {
+    id: "cobalt",
+    label: "Waylode Cobalt",
+    description: "Deep midnight slate with a sky-cobalt accent.",
+    backdrop: "none",
+    material: 0,
+    theme: {
+      name: "Waylode Cobalt",
+      appearance: "dark",
+      colors: { base: "#060a14", accent: "#38bdf8", contrast: 0.55 },
+      field: { hues: ["#0c4a6e", "#1d4ed8", "#1e3a8a", "#0369a1"], gain: 0.65 },
+    },
+  },
+  {
+    id: "lodestar",
+    label: "Waylode Lodestar",
+    description: "Midnight navy with a lodestar teal accent and warm amber field.",
+    backdrop: "none",
+    material: 0,
+    theme: {
+      name: "Waylode Lodestar",
+      appearance: "dark",
+      colors: { base: "#0a0d14", accent: "#2dd4bf", contrast: 0.55 },
+      field: { hues: ["#0f766e", "#b45309", "#0369a1", "#115e59"], gain: 0.65 },
+    },
+  },
+  {
+    id: "oxblood",
+    label: "VBCR Oxblood",
+    description: "Deep oxblood obsidian with a crimson accent.",
+    backdrop: "none",
+    material: 0,
+    theme: {
+      name: "VBCR Oxblood",
+      appearance: "dark",
+      colors: { base: "#0c0608", accent: "#ef4444", contrast: 0.55 },
+      field: { hues: ["#7f1d1d", "#991b1b", "#450a0a", "#630e0e"], gain: 0.6 },
+    },
+  },
+  {
+    id: "gilded",
+    label: "Waylode Gilded",
+    description: "Dark bronze surfaces with a gilded gold accent.",
+    backdrop: "none",
+    material: 0,
+    theme: {
+      name: "Waylode Gilded",
+      appearance: "dark",
+      colors: { base: "#0c0905", accent: "#fbbf24", contrast: 0.55 },
+      field: { hues: ["#78350f", "#92400e", "#451a03", "#b45309"], gain: 0.6 },
+    },
+  },
+  {
     id: "neural-hud",
     label: "Neural HUD",
     description: "Deep navy with a cyan heads-up display and a node-graph wallpaper.",

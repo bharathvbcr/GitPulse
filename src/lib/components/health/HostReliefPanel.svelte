@@ -1,0 +1,251 @@
+<script lang="ts">
+  import {
+    endedRows,
+    endingRows,
+    offerRows,
+    pausedRows,
+    reliefBindingLabel,
+    reliefHeadline,
+    reliefIsCalm,
+    reliefModeLabel,
+    reliefNowLabel,
+    reliefSummary,
+    type FrozenTree,
+    type ReliefOutcome,
+    type ReliefStatus,
+  } from "../../health/hostRelief";
+
+  /**
+   * What the memory-pressure supervisor is doing: its mode, how far it has
+   * gone, and each build or test it paused, with a way to resume them now.
+   *
+   * A status that is stale or could not be read is said so in words and never
+   * rendered as "nothing is paused": the supervisor that would have stopped a
+   * process may be gone with the process still stopped.
+   *
+   * Presentation only; `HostReliefSection` reads the status and sends the
+   * resume request.
+   */
+  let {
+    outcome,
+    now = Date.now(),
+    requesting = false,
+    requested = false,
+    error = "",
+    note = "",
+    onresume,
+    onend,
+    onpause,
+  }: {
+    outcome: ReliefOutcome | null;
+    now?: number;
+    requesting?: boolean;
+    requested?: boolean;
+    error?: string;
+    /** What the last End or Pause request said happened. */
+    note?: string;
+    onresume?: () => void;
+    /** "End" on a paused tree, after the section's confirm. */
+    onend?: (tree: FrozenTree) => void;
+    /** "Pause" on an offered tree, after the section's confirm. */
+    onpause?: (tree: FrozenTree) => void;
+  } = $props();
+
+  const status = $derived<ReliefStatus | null>(
+    outcome && (outcome.state === "fresh" || outcome.state === "stale") ? outcome.status : null,
+  );
+  const rows = $derived(status ? pausedRows(status, now) : []);
+  const offers = $derived(status ? offerRows(status, now) : []);
+  const ending = $derived(status ? endingRows(status, now) : []);
+  const ended = $derived(status ? endedRows(status, now) : []);
+  // End and Pause are acted on by the supervisor, so they are offered only
+  // while its status is current: a stale one may belong to a supervisor that is
+  // gone, and nothing would answer.
+  const live = $derived(outcome?.state === "fresh");
+  const summary = $derived(status ? reliefSummary(status) : null);
+  const calm = $derived(reliefIsCalm(outcome));
+  // A status that could not be verified is the one where the person most needs
+  // the button: the request file can be written whatever the status says.
+  const unverified = $derived(outcome?.state === "stale" || outcome?.state === "unreadable");
+  const canResume = $derived(rows.length > 0 || outcome?.state === "unreadable");
+</script>
+
+<div class="mt-4 space-y-2 text-meta" data-testid="host-relief" data-state={outcome?.state ?? "loading"}>
+  <h4 class="gp-label">Memory protection</h4>
+  <div
+    class="gp-notice"
+    data-tone={calm ? "ok" : "unknown"}
+    role="status"
+    data-testid="host-relief-headline"
+  >
+    <div class="min-w-0 flex-1">{reliefHeadline(outcome)}</div>
+  </div>
+
+  {#if status}
+    <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5" data-testid="host-relief-summary">
+      <dt class="text-textMuted">Mode</dt>
+      <dd data-testid="host-relief-mode">{reliefModeLabel(status.mode)}</dd>
+      <dt class="text-textMuted">Now</dt>
+      <dd data-testid="host-relief-rung">{reliefNowLabel(status)}</dd>
+      {#if status.rung !== "none" || (summary && summary.wouldPause.length + summary.wouldSlow > 0)}
+        <dt class="text-textMuted">Because</dt>
+        <dd data-testid="host-relief-binding">{reliefBindingLabel(status.binding)}</dd>
+      {/if}
+      {#if status.slowed > 0}
+        <dt class="text-textMuted">Slowed</dt>
+        <dd data-testid="host-relief-slowed">{status.slowed} agent process(es) at background priority</dd>
+      {/if}
+      {#if status.cap_hits > 0}
+        <dt class="text-textMuted">10-minute limit</dt>
+        <dd data-testid="host-relief-cap-hits">
+          reached {status.cap_hits} time(s): the process was resumed while memory was still tight
+        </dd>
+      {/if}
+    </dl>
+
+    {#if summary && summary.wouldPause.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-would-pause">
+        {#each summary.wouldPause as tree (`${tree.pid}:${tree.start_us}`)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2 text-textMuted">
+            Would pause <span class="font-mono text-textPrimary break-all">{tree.command}</span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if rows.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-paused">
+        {#each rows as row (row.key)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2" data-testid="host-relief-paused-row">
+            <div class="font-mono text-textPrimary break-all" data-testid="host-relief-command">{row.command}</div>
+            <div class="text-textMuted">
+              <span title={row.repoPath} data-testid="host-relief-repo">{row.repo}</span>
+              · <span data-testid="host-relief-agent">{row.agent}</span>
+              · <span data-testid="host-relief-footprint">{row.footprint}</span>
+              · paused <span data-testid="host-relief-since">{row.since}</span>
+            </div>
+            {#if live}
+              <button
+                type="button"
+                class="gp-btn text-meta px-2 py-0.5 mt-1"
+                data-testid="host-relief-end"
+                disabled={requesting}
+                title="Ends this build: it is stopped for good and the agent sees it fail"
+                onclick={() => onend?.(row.tree)}
+              >
+                End
+              </button>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if ending.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-ending">
+        {#each ending as row (row.key)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2" data-testid="host-relief-ending-row">
+            <div class="font-mono text-textPrimary break-all">{row.command}</div>
+            <div class="text-textMuted">
+              {row.repo} · {row.agent} · asked to end <span data-testid="host-relief-ending-since">{row.since}</span>.
+              Not confirmed gone yet.
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if ended.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-ended">
+        {#each ended as row (row.key)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2" data-testid="host-relief-ended-row">
+            <div class="font-mono text-textPrimary break-all">{row.command}</div>
+            <div class="text-textMuted">
+              {row.repo} · {row.agent} · ended, confirmed gone <span data-testid="host-relief-ended-since">{row.since}</span>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if offers.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-offers">
+        {#each offers as row (row.key)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2" data-testid="host-relief-offer-row">
+            <div class="font-mono text-textPrimary break-all" data-testid="host-relief-offer-command">{row.command}</div>
+            <div class="text-textMuted">
+              <span title={row.repoPath}>{row.repo}</span>
+              · {row.agent}
+              · {row.footprint}
+              · not paused
+            </div>
+            {#if row.canPause && live}
+              <button
+                type="button"
+                class="gp-btn text-meta px-2 py-0.5 mt-1"
+                data-testid="host-relief-pause"
+                disabled={requesting}
+                onclick={() => onpause?.(row.tree)}
+              >
+                Pause
+              </button>
+            {:else if row.note}
+              <p class="text-textMuted" data-testid="host-relief-offer-note">{row.note}</p>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if status.last_action}
+      <p class="text-textMuted" data-testid="host-relief-last-action">
+        Last action: {status.last_action.kind.replace("_", " ")}
+        {#if status.last_action.detail}: {status.last_action.detail}{/if}
+      </p>
+    {/if}
+
+    {#if status.failures.length > 0}
+      <div data-testid="host-relief-failures">
+        <p class="text-warn">Couldn't pause or resume {status.failures.length} process(es):</p>
+        <ul class="list-disc pl-5 text-textMuted">
+          {#each status.failures as failure (`${failure.at_ms}:${failure.pid}`)}
+            <li>pid {failure.pid}: {failure.what}</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+  {/if}
+
+  {#if canResume}
+    <div class="flex items-center gap-2">
+      <button
+        type="button"
+        class="gp-btn text-meta px-2 py-0.5"
+        data-testid="host-relief-resume"
+        disabled={requesting}
+        onclick={() => onresume?.()}
+      >
+        Resume all
+      </button>
+      {#if requested && unverified}
+        <span class="text-warn" data-testid="host-relief-requested-stale">
+          Requested, but the memory protection status couldn't be verified. If the supervisor is not running,
+          nothing will act on this and a paused process stays paused until it is resumed by hand
+          (kill -CONT with its pid).
+        </span>
+      {:else if requested}
+        <span class="text-textMuted" data-testid="host-relief-requested">
+          Requested. The supervisor resumes them on its next check.
+        </span>
+      {/if}
+    </div>
+  {/if}
+
+  {#if note}
+    <p class="text-textMuted" data-testid="host-relief-note">{note}</p>
+  {/if}
+
+  {#if error}
+    <p class="text-warn" role="alert" data-testid="host-relief-error">{error}</p>
+  {/if}
+</div>

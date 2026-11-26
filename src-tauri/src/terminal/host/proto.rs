@@ -19,8 +19,11 @@ use std::io::{self, Read, Write};
 
 /// What this build speaks. Bumped whenever a frame changes shape or meaning.
 /// 3 added `Request::Transcript`; 4 added child-orchestration lineage,
-/// `Telemetry`, `SetAgentMeta`, `OrchestrationSnapshot`, and `TranscriptTail::total_bytes`.
-pub const PROTOCOL: u32 = 4;
+/// `Telemetry`, `SetAgentMeta`, `OrchestrationSnapshot`, and `TranscriptTail::total_bytes`;
+/// 5 added the `screen` notice channel (an agent dialog read off the screen)
+/// and the prompt fields of `Telemetry`. A protocol-4 host never sends either,
+/// so its sessions cannot say "waiting on you": it is another protocol's host.
+pub const PROTOCOL: u32 = 5;
 
 /// Longest JSON header accepted. A spawn request (argv and environment are
 /// bounded at 128 KiB each by `validate_pty_options`) is the largest a caller
@@ -231,8 +234,17 @@ pub struct WireNotice {
 }
 
 /// The channels a terminal's own output can raise a notice on: the scanner's,
-/// `osc7501` for Herdr agent status coordination, and `exit` for session end.
-const TERMINAL_CHANNELS: [&str; 6] = ["bell", "osc9", "osc777", "osc99", "osc7501", "exit"];
+/// `osc7501` for Herdr agent status coordination, `exit` for session end, and
+/// `screen` for an agent dialog read off the screen (it reads as a hook report).
+const TERMINAL_CHANNELS: [&str; 7] = [
+    "bell",
+    "osc9",
+    "osc777",
+    "osc99",
+    "osc7501",
+    "exit",
+    crate::alerts::bridge::SCREEN_CHANNEL,
+];
 
 impl WireNotice {
     pub fn from_notice(notice: &crate::alerts::Notice) -> Self {
@@ -279,7 +291,11 @@ impl WireNotice {
         }
         Ok(crate::alerts::Notice {
             key: self.key,
-            origin: crate::alerts::Origin::Terminal,
+            origin: if channel == crate::alerts::bridge::SCREEN_CHANNEL {
+                crate::alerts::Origin::Hook
+            } else {
+                crate::alerts::Origin::Terminal
+            },
             label: self.label,
             place: self.place,
             event,
@@ -487,7 +503,7 @@ mod tests {
     /// named for the protocol.
     #[test]
     fn the_transcript_request_has_a_pinned_shape_and_lives_on_protocol_three() {
-        assert_eq!(PROTOCOL, 4);
+        assert_eq!(PROTOCOL, 5);
         assert_ne!(
             crate::terminal::host::socket_name(PROTOCOL),
             crate::terminal::host::socket_name(3)

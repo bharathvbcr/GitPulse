@@ -123,8 +123,8 @@ describe("GitPulse task worktrees", () => {
   });
 
   it("names each kind for a person, never as a bare directory name", () => {
-    expect(agentKindLabel("gitpulse")).toBe("GitPulse task");
-    expect(agentKindLabel("GITPULSE")).toBe("GitPulse task");
+    expect(agentKindLabel("gitpulse")).toBe("Waylode task");
+    expect(agentKindLabel("GITPULSE")).toBe("Waylode task");
     expect(agentKindLabel("claude")).toBe("Claude Code");
     expect(agentKindLabel("Claude")).toBe("Claude Code");
     expect(agentKindLabel("codex")).toBe("Codex");

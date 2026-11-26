@@ -106,7 +106,7 @@ const skillNames = (dir: string): string[] => {
     ),
   ].sort();
 };
-const pluginSkills = skillNames("plugins/gitpulse/skills");
+const pluginSkills = skillNames("plugins/waylode/skills");
 const bundledSkills = [...skillNames(".agents/skills"), ...pluginSkills];
 /**
  * Host-bound skills that require a live GitPulse PTY (`GITPULSE_SESSION_TOKEN`)
@@ -142,7 +142,10 @@ const namesWhole = (haystack: string, needle: string): boolean =>
  */
 const namesSkill = (haystack: string, skill: string): boolean =>
   pluginSkills.includes(skill)
-    ? namesWhole(haystack, `gitpulse:${skill}`) || namesWhole(haystack, `gitpulse-${skill}`)
+    ? namesWhole(haystack, `waylode:${skill}`) ||
+      namesWhole(haystack, `waylode-${skill}`) ||
+      namesWhole(haystack, `gitpulse:${skill}`) ||
+      namesWhole(haystack, `gitpulse-${skill}`)
     : namesWhole(haystack, skill);
 
 describe("the agent guidance every task handoff carries", () => {

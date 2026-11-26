@@ -46,6 +46,8 @@ pub mod lease;
 mod probe;
 pub(crate) mod procscan;
 mod profile;
+pub mod relief;
+pub(crate) mod relief_status;
 pub(crate) mod sampler;
 mod sensor;
 mod snapshot;
@@ -239,7 +241,9 @@ pub(crate) fn cpu_since(started: std::time::Duration) -> std::time::Duration {
 /// IPC caller cannot point it at another run. Every descendant inherits it,
 /// which is what lets a child that was reparented to launchd still be
 /// attributed to the run that started it (card 4 relies on that).
-pub const RUN_ID_ENV: &str = "GITPULSE_RUN_ID";
+pub const RUN_ID_ENV: &str = "WAYLODE_RUN_ID";
+/// Legacy environment variable for [`RUN_ID_ENV`].
+pub const LEGACY_RUN_ID_ENV: &str = "GITPULSE_RUN_ID";
 
 /// How GitPulse treats host load on this platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

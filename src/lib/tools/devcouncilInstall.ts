@@ -21,7 +21,7 @@ export const DEVCOUNCIL_PRESETS: {
   {
     id: "devmap",
     label: "Code map only (DevMap)",
-    detail: "Standalone code-intelligence CLI. GitPulse Map needs only this.",
+    detail: "Standalone code-intelligence CLI. Waylode Map needs only this.",
   },
   {
     id: "analysis",

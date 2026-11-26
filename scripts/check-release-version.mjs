@@ -55,7 +55,7 @@ import { formatUsage, wantsHelp } from "./usage.mjs";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /** The crate whose `[[package]]` entry in Cargo.lock carries the app version. */
-export const CRATE_NAME = "gitpulse";
+export const CRATE_NAME = "waylode";
 
 /**
  * Default manifest locations, relative to a repo root.

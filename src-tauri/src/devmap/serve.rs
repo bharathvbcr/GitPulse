@@ -293,7 +293,7 @@ fn probe_socket(socket: &str) -> DaemonState {
     DaemonState::absent(
         Some(socket.to_string()),
         "querying the devmap daemon is not supported on this platform yet; \
-         it speaks a named pipe here and GitPulse has no client for it",
+         it speaks a named pipe here and Waylode has no client for it",
     )
 }
 

@@ -212,7 +212,7 @@
           </div>
           <div>
             <h2 class="text-sm font-semibold text-textPrimary">Keyboard shortcuts</h2>
-            <p class="text-meta text-textMuted">GitPulse navigation and workflow accelerators</p>
+            <p class="text-meta text-textMuted">Waylode navigation and workflow accelerators</p>
           </div>
         </div>
 

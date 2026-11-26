@@ -5,14 +5,14 @@
 
 #![cfg(unix)]
 
-use gitpulse_lib::engine::git_cli::{
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use waylode_lib::engine::git_cli::{
     is_git_metadata_component, sandbox_create, sandbox_join_write, sandbox_join_write_entry,
     sandbox_overwrite_edited_text, sandbox_write, FileWriteError,
 };
-use gitpulse_lib::engine::git_writer::GitWriter;
-use gitpulse_lib::procguard::LockedSpawn;
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use waylode_lib::engine::git_writer::GitWriter;
+use waylode_lib::procguard::LockedSpawn;
 
 mod common;
 

@@ -118,8 +118,8 @@ pub(crate) fn assess(probe: ToolProbe) -> GitPreflight {
                 GitPreflight {
                     status: GitPreflightStatus::Outdated,
                     message: Some(format!(
-                        "Git {major}.{minor}.{patch} is too old. GitPulse needs Git {min} or \
-                         newer, for {needs}. Update Git, then restart GitPulse."
+                        "Git {major}.{minor}.{patch} is too old. Waylode needs Git {min} or \
+                         newer, for {needs}. Update Git, then restart Waylode."
                     )),
                     version: Some(line),
                 }
@@ -128,7 +128,7 @@ pub(crate) fn assess(probe: ToolProbe) -> GitPreflight {
                 status: GitPreflightStatus::Broken,
                 message: Some(format!(
                     "Git ran but reported an unrecognised version ({line}). \
-                     GitPulse needs Git {min} or newer."
+                     Waylode needs Git {min} or newer."
                 )),
                 version: Some(line),
             },
@@ -138,7 +138,7 @@ pub(crate) fn assess(probe: ToolProbe) -> GitPreflight {
             version: None,
             message: Some(format!(
                 "Git was not found. Install Git {min} or newer (https://git-scm.com/downloads), \
-                 then restart GitPulse."
+                 then restart Waylode."
             )),
         },
         ToolProbe::FoundButFailed(detail) => GitPreflight {
@@ -213,7 +213,7 @@ pub(crate) fn assess_for_clone(preflight: &GitPreflight, submodules: bool) -> Re
         Some(found) if found >= need => Ok(()),
         Some((major, minor, patch)) => Err(format!(
             "Git {major}.{minor}.{patch} has known security flaws when {why}. Update to Git \
-             {}.{}.{} or newer (for example `brew install git`), then restart GitPulse.",
+             {}.{}.{} or newer (for example `brew install git`), then restart Waylode.",
             need.0, need.1, need.2
         )),
         None => Err(format!(

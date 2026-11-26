@@ -914,7 +914,7 @@ fn test_only_module_files_resolve_by_the_compilers_rules() {
     for production in [
         "lappi/mod.rs",
         "lib.rs",
-        "bin/gitpulsed.rs",
+        "bin/wayloded.rs",
         "engine/git_cli.rs",
         "engine/process/mod.rs",
         "engine/process/env.rs",

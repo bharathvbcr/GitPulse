@@ -21,6 +21,7 @@
     type MetricSeverity,
   } from "../health/hostLoadMetrics";
   import { pollHostLoad } from "../health/hostLoadPoll";
+  import { hostRelief, reliefChipInput } from "../health/hostRelief";
   import {
     hostLoadHistory,
     hostLoadPulse,
@@ -47,7 +48,7 @@
   let triggerEl = $state<HTMLButtonElement | null>(null);
   let openHealthBtnEl = $state<HTMLButtonElement | null>(null);
 
-  let bar = $derived(bottomBarMetrics($hostLoadPulse, detail));
+  let bar = $derived(bottomBarMetrics($hostLoadPulse, detail, reliefChipInput($hostRelief)));
   let panelModel = $derived(
     $hostLoadPulse ? popoverDetailModel($hostLoadPulse, $hostLoadStatus, $hostLoadHistory) : null,
   );
@@ -488,7 +489,7 @@
           {#if panelModel.storage.available}
             <span
               class="text-micro text-faint"
-              title={`Measures immediate unallocated space available to GitPulse; ${fileManagerName($hostPlatform.os)} may report more by counting purgeable caches.`}
+              title={`Measures immediate unallocated space available to Waylode; ${fileManagerName($hostPlatform.os)} may report more by counting purgeable caches.`}
             >
               Immediate unallocated space (excludes purgeable caches).
             </span>

@@ -7,16 +7,16 @@
 //! uninitialized submodule is distinguishable from a broken one, and that a
 //! replay refuses to start on top of a parked operation.
 
-use gitpulse_lib::engine::repo_op;
-use gitpulse_lib::engine::stash::{self, StashAction};
-use gitpulse_lib::engine::submodules::{self, SubmoduleChange, SubmoduleState};
-use gitpulse_lib::engine::{remotes, GitWriter, RemoteChange, ResetMode};
-use gitpulse_lib::ipc_error::CommandError;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::engine::repo_op;
+use waylode_lib::engine::stash::{self, StashAction};
+use waylode_lib::engine::submodules::{self, SubmoduleChange, SubmoduleState};
+use waylode_lib::engine::{remotes, GitWriter, RemoteChange, ResetMode};
+use waylode_lib::ipc_error::CommandError;
+use waylode_lib::procguard::LockedSpawn;
 
 fn run_git(cwd: &Path, args: &[&str]) {
     common::unmetered_spawns();
@@ -347,7 +347,7 @@ fn release_stash_preview_reports_its_payload_limit() {
     )
     .unwrap();
     run_git(dir, &["stash", "push", "-m", "large refactor"]);
-    let oid = gitpulse_lib::engine::git_cli::git_text(dir, &["rev-parse", "refs/stash"]).unwrap();
+    let oid = waylode_lib::engine::git_cli::git_text(dir, &["rev-parse", "refs/stash"]).unwrap();
     let payload =
         serde_json::to_value(stash::show(&dir.to_string_lossy(), oid.trim()).unwrap()).unwrap();
     assert_eq!(

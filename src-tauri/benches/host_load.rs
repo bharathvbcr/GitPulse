@@ -111,7 +111,7 @@ fn one_shot() -> bool {
     };
     match mode.as_str() {
         "scan" => {
-            use gitpulse_lib::sysload::{ProcessScanner, ScanContext};
+            use waylode_lib::sysload::{ProcessScanner, ScanContext};
             let started = std::time::Instant::now();
             let mut fresh = ProcessScanner::os();
             let view = fresh.scan(&ScanContext::here());
@@ -125,7 +125,7 @@ fn one_shot() -> bool {
         }
         "sessions" => {
             let started = std::time::Instant::now();
-            match gitpulse_lib::sysload::observe_sessions() {
+            match waylode_lib::sysload::observe_sessions() {
                 Ok(sessions) => {
                     let us = started.elapsed().as_micros();
                     println!("once sessions_us={us} ok=true sessions={}", sessions.len());
@@ -144,11 +144,11 @@ fn one_shot() -> bool {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string())
             });
-            if let Ok(preview) = gitpulse_lib::repository_trust::inspect(&repo) {
-                let _ = gitpulse_lib::repository_trust::grant(&repo, &preview.identity, false);
+            if let Ok(preview) = waylode_lib::repository_trust::inspect(&repo) {
+                let _ = waylode_lib::repository_trust::grant(&repo, &preview.identity, false);
             }
             let started = std::time::Instant::now();
-            match gitpulse_lib::insights::sessions(&repo, None, &|_| None) {
+            match waylode_lib::insights::sessions(&repo, None, &|_| None) {
                 Ok(report) => {
                     let us = started.elapsed().as_micros();
                     println!(
@@ -174,7 +174,7 @@ fn one_shot() -> bool {
                     .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string())
             });
             let started = std::time::Instant::now();
-            let risk = gitpulse_lib::insights::collision_for_path(
+            let risk = waylode_lib::insights::collision_for_path(
                 &repo,
                 "src-tauri/src/sysload/procscan.rs",
                 None,
@@ -198,7 +198,7 @@ fn main() {
     if one_shot() {
         return;
     }
-    use gitpulse_lib::sysload::{
+    use waylode_lib::sysload::{
         Clock, OsSensor, ProcessScanner, ScanContext, Sensor, Snapshot, SnapshotWriter,
         WriterIdentity,
     };
@@ -238,14 +238,14 @@ fn main() {
     let snapshot_dir = tempfile::tempdir().expect("temp dir");
     let path = snapshot_dir
         .path()
-        .join(gitpulse_lib::sysload::SNAPSHOT_FILE_NAME);
+        .join(waylode_lib::sysload::SNAPSHOT_FILE_NAME);
     let mut writer = SnapshotWriter::elect(snapshot_dir.path())
         .expect("elect")
         .expect("a fresh directory has no other writer");
     let snap = Snapshot::empty(Clock::now(), WriterIdentity::default(), true);
     rows.push(measure("publish + read", SAMPLES, || {
         writer.publish(&snap).expect("publish");
-        std::hint::black_box(gitpulse_lib::sysload::read(&path).expect("decodes"));
+        std::hint::black_box(waylode_lib::sysload::read(&path).expect("decodes"));
     }));
 
     println!(

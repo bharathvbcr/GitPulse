@@ -53,11 +53,11 @@ describe("every shipped binary is wired for diagnostics", () => {
   it("finds the binaries at all", () => {
     // Without this the loop below passes vacuously on a parser change.
     expect(binaries.map((b) => b.name).sort()).toEqual([
-      "gitpulse",
-      "gitpulse-hook",
-      "gitpulse-mcp",
-      "gitpulse-ptyd",
-      "gitpulsed",
+      "waylode",
+      "waylode-hook",
+      "waylode-mcp",
+      "waylode-ptyd",
+      "wayloded",
     ]);
   });
 
@@ -66,7 +66,7 @@ describe("every shipped binary is wired for diagnostics", () => {
       const entry = production(repo(`src-tauri/${path}`));
       // main.rs delegates to lib.rs's `run()`; follow that one hop rather
       // than demanding the calls sit in a file that only forwards.
-      const source = /gitpulse_lib::run\(\)/.test(entry) ? production(LIB_RS) : entry;
+      const source = /waylode_lib::run\(\)/.test(entry) ? production(LIB_RS) : entry;
       expect(source, `${name} never calls logging::init()`).toMatch(/logging::init\(\)/);
       expect(source, `${name} never installs a panic hook`).toMatch(
         /logging::install_panic_hook\(\)/,
@@ -76,7 +76,7 @@ describe("every shipped binary is wired for diagnostics", () => {
 
   it("gives every binary a durable log of its own", () => {
     // LOGGED_BINARIES gates which stems get a file without an explicit
-    // GITPULSE_LOG_DIR. A binary missing from it logs to memory only.
+    // WAYLODE_LOG_DIR. A binary missing from it logs to memory only.
     const listed = /const LOGGED_BINARIES:\s*\[&str;\s*\d+\]\s*=\s*\[([^\]]*)\]/.exec(LOGGING);
     expect(listed, "LOGGED_BINARIES must be findable").toBeTruthy();
     const stems = [...(listed?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]);

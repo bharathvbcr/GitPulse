@@ -4,10 +4,10 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::{self, File};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
 fn wait(child: &mut Child, timeout: Duration) -> ExitStatus {
     let deadline = Instant::now() + timeout;
@@ -27,17 +27,17 @@ fn wait(child: &mut Child, timeout: Duration) -> ExitStatus {
 #[test]
 fn hook_refuses_oversized_json_before_parsing_it() {
     let input = format!(r#"{{"cwd":"{}"}}"#, "a".repeat(4 * 1024 * 1024));
-    assert!(gitpulse_lib::hooks::parse_input(&input).is_err());
-    assert!(gitpulse_lib::hooks::parse_input("{\n  \"cwd\": \"\"\n}\n").is_ok());
+    assert!(waylode_lib::hooks::parse_input(&input).is_err());
+    assert!(waylode_lib::hooks::parse_input("{\n  \"cwd\": \"\"\n}\n").is_ok());
 }
 
 #[test]
 fn hook_bounds_an_open_input_pipe_without_emitting_a_decision() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("stdout");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_waylode-hook"))
         .arg("collision-guard")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::piped())
         .stdout(File::create(&output).unwrap())
         .stderr(Stdio::null())
@@ -49,7 +49,7 @@ fn hook_bounds_an_open_input_pipe_without_emitting_a_decision() {
     assert_eq!(wait(&mut child, Duration::from_secs(8)).code(), Some(0));
     drop(held_input);
     assert!(fs::read(output).unwrap().is_empty());
-    assert!(fs::read_to_string(dir.path().join("gitpulse-hook.log"))
+    assert!(fs::read_to_string(dir.path().join("waylode-hook.log"))
         .unwrap()
         .contains("stdin"));
 }
@@ -59,8 +59,8 @@ fn hook_bounds_an_open_input_pipe_without_emitting_a_decision() {
 #[test]
 fn hook_with_no_subcommand_blocks_with_a_reason() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+    let out = Command::new(env!("CARGO_BIN_EXE_waylode-hook"))
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::null())
         .output_locked()
         .unwrap();
@@ -81,9 +81,9 @@ fn hook_identity_answers_without_waiting_for_stdin() {
     // hang for the whole 4 MiB budget instead of answering.
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("stdout");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_waylode-hook"))
         .arg("--version")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         // Held open and never written to: the state a probe leaves stdin in.
         .stdin(Stdio::piped())
         .stdout(File::create(&output).unwrap())
@@ -96,10 +96,10 @@ fn hook_identity_answers_without_waiting_for_stdin() {
 
     let printed = fs::read_to_string(&output).unwrap();
     assert!(
-        printed.starts_with(&format!("gitpulse-hook {}", gitpulse_lib::hooks::VERSION)),
+        printed.starts_with(&format!("waylode-hook {}", waylode_lib::hooks::VERSION)),
         "identity did not lead with this build's version: {printed:?}"
     );
-    for name in gitpulse_lib::hooks::SUBCOMMANDS {
+    for name in waylode_lib::hooks::SUBCOMMANDS {
         assert!(
             printed.contains(name),
             "identity does not advertise {name}: {printed:?}"
@@ -114,9 +114,9 @@ fn an_unknown_argument_stays_silent_rather_than_answering_like_an_identity() {
     // host parses as hook JSON.
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("stdout");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_waylode-hook"))
         .arg("--not-a-flag")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::null())
         .stdout(File::create(&output).unwrap())
         .stderr(Stdio::null())
@@ -185,9 +185,9 @@ fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging()
     // never sees a broken pipe. Saturating the pipe is the hang/EPIPE stand-in
     // that cannot succeed by buffering.
     let (stdout, held_reader) = pipe_output(true);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wayloded"))
         .arg("--help")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::null())
@@ -195,7 +195,7 @@ fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging()
         .unwrap();
     assert_eq!(wait(&mut child, Duration::from_secs(5)).code(), Some(1));
     drop(held_reader);
-    let log = fs::read_to_string(dir.path().join("gitpulsed.log")).unwrap();
+    let log = fs::read_to_string(dir.path().join("wayloded.log")).unwrap();
     assert!(log.contains("stdout"));
     assert!(!log.contains("[panic]"));
 }
@@ -206,13 +206,13 @@ fn argument_errors_keep_their_exit_contract_when_stderr_is_closed() {
     for (binary, expected) in [
         // No subcommand: the hook blocks (2) rather than allow, since a host
         // that ignored the exec form's `args` would start it bare.
-        (env!("CARGO_BIN_EXE_gitpulse-hook"), 2),
-        (env!("CARGO_BIN_EXE_gitpulsed"), 2),
+        (env!("CARGO_BIN_EXE_waylode-hook"), 2),
+        (env!("CARGO_BIN_EXE_wayloded"), 2),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let (stderr, reader) = pipe_output(false);
         let mut child = Command::new(binary)
-            .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+            .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -232,8 +232,8 @@ fn mcp_stops_when_the_host_keeps_stdout_open_but_stops_reading() {
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
     let (stdout, held_reader) = pipe_output(true);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"))
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+    let mut child = Command::new(env!("CARGO_BIN_EXE_waylode-mcp"))
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         // The window past which a client that stopped reading is judged stalled
         // (default 10 s); short here so the test measures the ending, not the wait.
         .env("GITPULSE_MCP_WRITE_TIMEOUT_MS", "500")
@@ -250,7 +250,7 @@ fn mcp_stops_when_the_host_keeps_stdout_open_but_stops_reading() {
         .unwrap();
     assert_eq!(wait(&mut child, Duration::from_secs(5)).code(), Some(0));
     drop(held_reader);
-    let saved = fs::read_to_string(dir.path().join("gitpulse-mcp.log")).unwrap();
+    let saved = fs::read_to_string(dir.path().join("waylode-mcp.log")).unwrap();
     assert!(saved.contains("stdout"));
     assert!(!saved.contains("[panic]"));
 }
@@ -261,8 +261,8 @@ fn mcp_output_failure_interrupts_an_idle_input_reader() {
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
     let (stdout, held_reader) = pipe_output(true);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"))
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+    let mut child = Command::new(env!("CARGO_BIN_EXE_waylode-mcp"))
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         // The window past which a client that stopped reading is judged stalled
         // (default 10 s); short here so the test measures the ending, not the wait.
         .env("GITPULSE_MCP_WRITE_TIMEOUT_MS", "500")
@@ -275,7 +275,7 @@ fn mcp_output_failure_interrupts_an_idle_input_reader() {
     let request = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
             "_meta": {
-                "io.modelcontextprotocol/protocolVersion": gitpulse_lib::mcp::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/protocolVersion": waylode_lib::mcp::PROTOCOL_VERSION,
                 "io.modelcontextprotocol/clientInfo": { "name": "idle-input-probe", "version": "0" },
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
@@ -283,11 +283,11 @@ fn mcp_output_failure_interrupts_an_idle_input_reader() {
     });
     assert!(
         matches!(
-            gitpulse_lib::mcp::accept(
+            waylode_lib::mcp::accept(
                 serde_json::from_value(request.clone()).unwrap(),
-                &mut gitpulse_lib::mcp::Era::Unknown
+                &mut waylode_lib::mcp::Era::Unknown
             ),
-            gitpulse_lib::mcp::Accepted::Ready(_)
+            waylode_lib::mcp::Accepted::Ready(_)
         ),
         "this regression must exercise an asynchronous request"
     );

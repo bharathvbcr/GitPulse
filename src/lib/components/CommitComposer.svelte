@@ -294,10 +294,10 @@
         : aiReady
           ? `Write a message for the staged diff with ${aiTarget}`
           : $aiReadiness.target === "cloud"
-            ? `Write a message from the staged diff. ${$aiReadiness.reason} Until Claude is ready, GitPulse assembles it from the change.`
+            ? `Write a message from the staged diff. ${$aiReadiness.reason} Until Claude is ready, Waylode assembles it from the change.`
           : appleReady(apple)
             ? "Write the message on-device. The patch is classified in the app; Apple Intelligence only phrases the subject."
-            : "Write a message from the staged diff. No model is running, so GitPulse assembles it from the change."}
+            : "Write a message from the staged diff. No model is running, so Waylode assembles it from the change."}
       class="gp-btn"
       data-size="sm"
     >

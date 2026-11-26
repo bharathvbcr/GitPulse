@@ -1003,7 +1003,7 @@
       </span>
       <span title="Index build number">index {statusPayload.generation_id ?? "—"}</span>
       {#if statusPayload.schema_outdated}
-        <span class="gp-chip" data-tone="danger" title="The index format is older than this version of GitPulse expects">
+        <span class="gp-chip" data-tone="danger" title="The index format is older than this version of Waylode expects">
           index format out of date ({statusPayload.schema_version ?? "?"} → {statusPayload.expected_schema_version ?? "?"})
         </span>
       {:else if statusPayload.schema_version != null}

@@ -192,7 +192,7 @@ describe("rankLogoCandidates", () => {
       rankLogoCandidates(["assets/manvi-mark.png", "assets/manvi-mark.svg", "docs/screenshot.png", "README.md"], 2),
     ).toEqual(["assets/manvi-mark.svg", "assets/manvi-mark.png"]);
     expect(
-      rankLogoCandidates(["public/gitpulse-mark.svg", "art/brand/mark.png", "src-tauri/icons/128x128.png"], 1),
+      rankLogoCandidates(["public/waylode-mark.svg", "art/brand/mark.png", "src-tauri/icons/128x128.png"], 1),
     ).toEqual(["src-tauri/icons/128x128.png"]);
     for (const nonLogo of ["benchmark.png", "bookmark.png", "watermark.png", "markdown.png"]) {
       expect(scoreLogoPath(nonLogo)).toBeNull();

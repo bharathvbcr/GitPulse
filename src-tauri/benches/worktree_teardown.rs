@@ -32,14 +32,14 @@ mod common;
 
 use common::fixture::{build_repo, count_git_processes, git, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::engine::worktree::{
-    add_worktree, lock_worktree, merge_and_teardown_worktree, remove_worktree,
-    remove_worktree_with, unlock_worktree, MergeTeardownResult,
-};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use waylode_lib::engine::worktree::{
+    add_worktree, lock_worktree, merge_and_teardown_worktree, remove_worktree,
+    remove_worktree_with, unlock_worktree, MergeTeardownResult,
+};
 
 const SPEC: Spec = Spec {
     files: 20,
@@ -110,7 +110,7 @@ fn merge(repo: &Repo, lane: &Path) -> MergeTeardownResult {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("worktree_teardown");
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("fixture");

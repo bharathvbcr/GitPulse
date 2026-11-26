@@ -12,10 +12,10 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use waylode_lib::procguard::LockedSpawn;
 
 const ROUNDS: usize = 5;
 
@@ -66,9 +66,9 @@ fn a_hook_that_judged_a_command_leaves_no_state_directory() {
         .unwrap();
 
     for round in 0..ROUNDS {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_waylode-hook"))
             .arg("command-gate")
-            .env(gitpulse_lib::logging::LOG_DIR_ENV, &logs)
+            .env(waylode_lib::logging::LOG_DIR_ENV, &logs)
             .env("HOME", home.path())
             .env("TMPDIR", tmp.path())
             .env("GITPULSE_MANVI_BIN", &manvi)

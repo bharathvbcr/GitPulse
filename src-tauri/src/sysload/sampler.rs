@@ -315,6 +315,11 @@ pub struct SamplerOptions {
     /// [`start_app`] turns it on: the ring is process-wide, so a sampler a
     /// test starts must not write to it.
     pub watch_webcontent: bool,
+    /// Makes the pressure relief (`sysload::relief`) this sampler ticks while
+    /// it holds the writer election. `None` (the default) is no relief: a
+    /// sampler a test or the soak starts must never stop or slow the agents
+    /// running on the machine. Only [`start_app`] sets it.
+    pub(crate) relief: Option<Box<dyn Fn() -> super::relief::Relief + Send>>,
 }
 
 impl SamplerOptions {
@@ -329,7 +334,7 @@ impl SamplerOptions {
             thresholds: Box::new(super::Thresholds::default),
             on_tick: None,
             begin_activity: Box::new(|| {
-                super::probe::Activity::begin("GitPulse host-load sampler")
+                super::probe::Activity::begin("Waylode host-load sampler")
                     .map(|activity| Box::new(activity) as Box<dyn Send>)
             }),
             trace_opener: trace::file_opener(),
@@ -340,6 +345,7 @@ impl SamplerOptions {
             #[cfg(test)]
             sensor_factory: None,
             watch_webcontent: false,
+            relief: None,
         }
     }
 }
@@ -433,6 +439,10 @@ pub fn start_app(mut options: SamplerOptions) -> Result<StopHandle, String> {
     // 15 s, which a sampler started by a test or a second process must not.
     let probe = super::exec_probe::start();
     options.watch_webcontent = true;
+    let relief_dir = options.dir.clone();
+    options.relief = Some(Box::new(move || {
+        super::relief::Relief::os(relief_dir.clone())
+    }));
     if let Some(probe) = &probe {
         options.exec_latency = Box::new(probe.reader());
     }
@@ -688,6 +698,8 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     #[cfg(not(test))]
     let mut sensor = OsSensor::new(&options.dir);
     let mut scanner = Scanner::os();
+    let mut relief = options.relief.as_ref().map(|make| make());
+    let me_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     let mut trend = CompressorTrend::default();
     // The free-space history behind the disk fill rate. Only the writer keeps
     // one; its rate rides in the snapshot for everyone else.
@@ -880,6 +892,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         let govern_launches = (options.govern_launches)();
         let thresholds = (options.thresholds)();
         let mut status = status;
+        let mut relief_input = None;
         {
             let mut governor = shared
                 .governor
@@ -893,6 +906,9 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             );
             // Measured in this process, so it is not in the snapshot.
             input.readings.exec_latency = (options.exec_latency)();
+            if relief.is_some() && writer.is_some() {
+                relief_input = Some(input.clone());
+            }
             let observation = if new_sample(&mut last_sample, status.snapshot.as_ref()) {
                 governor.observe(Instant::now(), input)
             } else {
@@ -912,6 +928,23 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             } else {
                 Reading::Unavailable(Why::NotYet)
             };
+        }
+
+        // The pressure relief: on the elected writer's tick, from the scan this
+        // tick just made, with no Manvi, spawn gate or subprocess. It reads the
+        // memory inputs itself, so the governor's hysteresis does not decide
+        // for it.
+        if let (Some(relief), Some(input)) = (relief.as_mut(), relief_input.as_ref()) {
+            relief.recover();
+            // Whether the build-lease board is refusing new builds under the
+            // verdict this tick published: what lets a build that holds a
+            // slot be frozen, and sets it going the tick it is not.
+            let refuses = held_verdict.value().is_some_and(|verdict| {
+                super::lease::capacity(1, &super::lease::Load::Verdict(verdict)).refuses
+            });
+            relief.tick(Instant::now(), input, refuses, &|| {
+                scanner.relief_table(me_pid)
+            });
         }
 
         // One record every fifth tick (10 s), from the elected writer only.
@@ -1662,6 +1695,131 @@ mod tests {
         sampler.stop();
     }
 
+    /// Real: the elected sampler ticks the pressure relief itself, from its
+    /// own scan and its own governor input, and publishes what it decided.
+    /// Nothing else is running in this test: no steward, no `manvi use`
+    /// probe, no spawn gate. The relief's actuator is one that refuses every
+    /// change, so the live agents on this host are never touched.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_elected_sampler_ticks_the_relief_without_manvi_and_serves_its_snapshot() {
+        use super::super::procscan::{ReliefProc, ReliefSession, ReliefTable};
+        use super::super::relief::{
+            snapshot, Actuator, Delivery, LeaseBoard, Probe, Relief, Rung, Signal,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        /// Asked to slow, and says no: the count is how often it was asked.
+        struct Refusing(Arc<AtomicUsize>);
+        impl Actuator for Refusing {
+            fn set_background(&self, _: i32, _: u64, enable: bool) -> Result<bool, String> {
+                if enable {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                Err("this test never changes a priority".into())
+            }
+            fn signal(&self, _: i32, _: u64, _: Signal) -> Result<Delivery, String> {
+                Err("this test never signals".into())
+            }
+            fn is_background(&self, _: i32, _: u64) -> Option<bool> {
+                None
+            }
+            fn is_stopped(&self, _: i32, _: u64) -> Result<bool, String> {
+                Err("this test never reads a process state".into())
+            }
+            fn process_table(&self) -> Vec<(i32, i32, u64)> {
+                Vec::new()
+            }
+        }
+        struct Blind;
+        impl Probe for Blind {
+            fn cwd(&self, _: i32) -> Option<PathBuf> {
+                None
+            }
+            fn environment(&self, _: i32) -> Option<Vec<String>> {
+                None
+            }
+            fn argv(&self, _: i32) -> Option<Vec<String>> {
+                None
+            }
+            fn lease_board(&self) -> Result<LeaseBoard, String> {
+                Err("this test reads no lease board".into())
+            }
+        }
+        // One agent session with one worker, so there is something to slow
+        // whatever this host is running.
+        let member = |pid: i32, ppid: i32, name: &str| ReliefProc {
+            pid,
+            ppid,
+            start_us: 1_000_000 + pid as u64,
+            name: name.into(),
+            footprint: Some(64 << 20),
+            exempt: false,
+        };
+        let table = ReliefTable {
+            sessions: vec![ReliefSession {
+                root: ReliefProc {
+                    exempt: true,
+                    ..member(7_000_100, 1, "claude")
+                },
+                kind: super::super::AgentKind::Claude,
+                launched: true,
+                terminal_session_id: None,
+                run_id: None,
+                members: vec![member(7_000_101, 7_000_100, "worker")],
+            }],
+        };
+        let asked = Arc::new(AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(20);
+        options.sensor_factory = Some(Box::new(|_| {
+            Box::new(super::super::sensor::ReplaySensor::new(vec![HostSample {
+                pressure: Reading::Value(Level::Critical),
+                ..HostSample::default()
+            }]))
+        }));
+        let relief_dir = dir.path().to_path_buf();
+        let counted = asked.clone();
+        let shown = table.clone();
+        options.relief = Some(Box::new(move || {
+            Relief::new(
+                relief_dir.clone(),
+                Box::new(Refusing(counted.clone())),
+                Box::new(Blind),
+                Box::new(|| crate::tool_config::SupervisorMode::Act),
+                Box::new(|_| false),
+            )
+            .with_table(Arc::new({
+                let shown = shown.clone();
+                move || shown.clone()
+            }))
+            .publishing()
+        }));
+        let sampler = start(options).unwrap();
+        // The rung alone could be the trigger's verdict with nothing done:
+        // wait for the actuator itself to have been asked to slow.
+        let reached = crate::test_support::wait_until(Duration::from_secs(30), || {
+            snapshot().rung == Rung::Slow && asked.load(Ordering::SeqCst) > 0
+        });
+        let seen = snapshot();
+        sampler.stop();
+        assert!(reached, "the relief never slowed anything: {seen:?}");
+        assert!(
+            asked.load(Ordering::SeqCst) > 0,
+            "the actuator was never asked to slow the session's worker"
+        );
+        assert!(
+            seen.failures
+                .iter()
+                .any(|f| f.what.contains("never changes a priority")),
+            "the refusal is in the snapshot, not dropped: {seen:?}"
+        );
+        assert_eq!(seen.tier, Some(super::super::Tier::Severe));
+        assert_eq!(seen.binding, Some(super::super::Binding::MemoryPressure));
+        assert_eq!(seen.mode, crate::tool_config::SupervisorMode::Act);
+    }
+
     /// Real: while the trace write is blocked the sampler keeps publishing at
     /// cadence and its governor keeps counting; readings it cannot hand over
     /// are dropped, said in the status, and the count is in the ring once the
@@ -2085,7 +2243,7 @@ mod tests {
         observed_only.claude.observed = 2;
         assert!(
             !active_work_present(dir.path(), Some(&observed_only)),
-            "external observed agents should not block GitPulse hibernation"
+            "external observed agents should not block Waylode hibernation"
         );
 
         let mut launched_agent = empty.clone();

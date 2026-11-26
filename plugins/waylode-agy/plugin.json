@@ -1,0 +1,21 @@
+{
+  "name": "waylode-agy",
+  "version": "0.2.0-beta.1",
+  "description": "Waylode control plane and bidirectional A2A bridge for Antigravity: worktrees, edit tracking and collision checks, code intelligence, and peer messaging.",
+  "author": {
+    "name": "Waylode Team",
+    "url": "https://gitpulse.vbcr.dev"
+  },
+  "homepage": "https://gitpulse.vbcr.dev",
+  "repository": "https://github.com/bharathvbcr/GitPulse",
+  "license": "MIT OR Apache-2.0",
+  "logo": "assets/logo.svg",
+  "keywords": [
+    "git",
+    "mcp",
+    "worktrees",
+    "code-intelligence",
+    "a2a",
+    "antigravity"
+  ]
+}

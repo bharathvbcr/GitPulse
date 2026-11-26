@@ -41,9 +41,9 @@
 mod common;
 
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::analyzer::CommitFilter;
-use gitpulse_lib::commands::{assemble_commit_graph, CommitGraphPayload, GraphNotes};
-use gitpulse_lib::graph::RawCommitNode;
+use waylode_lib::analyzer::CommitFilter;
+use waylode_lib::commands::{assemble_commit_graph, CommitGraphPayload, GraphNotes};
+use waylode_lib::graph::RawCommitNode;
 
 const SIZES: [(&str, usize); 3] = [("5k", 5_000), ("30k", 30_000), ("100k", 100_000)];
 

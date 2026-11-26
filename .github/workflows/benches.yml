@@ -95,8 +95,8 @@ jobs:
       # build crate `[[bin]]` targets on its own.
       - name: Build PTY helper binary
         run: |
-          cargo build --release --manifest-path src-tauri/Cargo.toml --locked --bin gitpulse-ptyd
-          ptyd="$PWD/src-tauri/target/release/gitpulse-ptyd"
+          cargo build --release --manifest-path src-tauri/Cargo.toml --locked --bin waylode-ptyd
+          ptyd="$PWD/src-tauri/target/release/waylode-ptyd"
           test -x "$ptyd" || { echo "::error::missing $ptyd"; exit 1; }
           echo "GITPULSE_PTYD=$ptyd" >> "$GITHUB_ENV"
 

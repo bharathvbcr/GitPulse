@@ -7,11 +7,13 @@
  * - a failed or denied call marks the group, and the mark survives collapse;
  * - edits are never invisible: the group carries the files it edited.
  */
+import { isQuestionTool } from "./questions";
 import type { ThinkingItem, TimelineItem, ToolItem } from "./types";
 
 export type Row =
   | { readonly kind: "item"; readonly key: string; readonly item: Exclude<TimelineItem, ToolItem> }
   | { readonly kind: "approval"; readonly key: string; readonly tool: ToolItem }
+  | { readonly kind: "question"; readonly key: string; readonly tool: ToolItem }
   | {
       readonly kind: "tools";
       readonly key: string;
@@ -199,6 +201,12 @@ export function toRows(items: readonly TimelineItem[], root: string | null): Row
       }
       // Other subagent calls belong to their Task row, not the main flow.
       if (item.parentId) continue;
+      // A question and its answer are the conversation, not tool noise.
+      if (isQuestionTool(item)) {
+        close();
+        rows.push({ kind: "question", key: `q:${item.id}`, tool: item });
+        continue;
+      }
       group.push(item);
       continue;
     }

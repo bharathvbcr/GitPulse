@@ -24,10 +24,13 @@ use crate::engine::process::run_bounded_capped;
 /// the spawned harness must promise to withhold from its own children.
 pub(crate) const CLAUDE_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
-const SERVICE: &str = "dev.vbcr.gitpulse.anthropic-api-key";
-/// The service the key was saved under before the VBCR Dev rename. Read as a
-/// fallback and moved to [`SERVICE`] on first use; see [`Keychain::load`].
-const LEGACY_SERVICE: &str = "com.gitpulse.desktop.anthropic-api-key";
+const SERVICE: &str = "dev.vbcr.waylode.anthropic-api-key";
+/// Pre-rename service names, ordered newest-first. Read as a fallback and moved
+/// to [`SERVICE`] on first use; see [`Keychain::load`].
+const LEGACY_SERVICES: [&str; 2] = [
+    "dev.vbcr.gitpulse.anthropic-api-key",
+    "com.gitpulse.desktop.anthropic-api-key",
+];
 const ACCOUNT: &str = "manvi";
 /// `security`'s exit status for "no such item".
 const NOT_FOUND: i32 = 44;
@@ -95,13 +98,19 @@ impl Keychain {
     pub(crate) fn save(&self, raw: &str) -> Result<(), CommandError> {
         let key = validate(raw)?;
         self.store(SERVICE, key)?;
-        // The new item wins over the old one on every read, so a leftover
-        // old item is stale, not wrong; it is removed so that Remove cannot be
-        // undone by it. Failing to remove it does not fail the save.
-        if let Err(error) = self.remove(LEGACY_SERVICE) {
-            log::warn!(target: "harness", "the pre-rename Claude API key item was not removed: {error}", error = error.message());
-        }
+        // The new item wins over old ones on every read, so leftover old items
+        // are stale, not wrong; they are removed so that Remove cannot be
+        // undone by them. Failing to remove one does not fail the save.
+        self.remove_legacy_items();
         Ok(())
+    }
+
+    fn remove_legacy_items(&self) {
+        for legacy in LEGACY_SERVICES {
+            if let Err(error) = self.remove(legacy) {
+                log::warn!(target: "harness", "the pre-rename Claude API key item ({legacy}) was not removed: {error}", error = error.message());
+            }
+        }
     }
 
     /// Writes `key` under `service` and confirms it by reading it back.
@@ -120,29 +129,27 @@ impl Keychain {
     /// The saved key, or `None` when there is none. A stored value that is not
     /// a key is an error, not a key: it would only fail later as a 401.
     ///
-    /// A key saved before the rename lives under the old service name. It is
-    /// found there, copied to the new service, and the old item is deleted
-    /// only once the copy reads back. Any step of that move can fail (a locked
-    /// keychain, a refused write) without losing the key: the old item stays
-    /// and the key is still returned, and the next read tries again.
+    /// Keys saved before the rename live under `LEGACY_SERVICES` (ordered
+    /// newest-first). The first tier that holds a key is copied to [`SERVICE`],
+    /// and legacy items are deleted only once the copy reads back. Any step of
+    /// that move can fail without losing the key.
     pub(crate) fn load(&self) -> Result<Option<String>, CommandError> {
         if let Some(key) = self.load_service(SERVICE)? {
             return Ok(Some(key));
         }
-        let Some(key) = self.load_service(LEGACY_SERVICE)? else {
-            return Ok(None);
-        };
-        match self.store(SERVICE, &key) {
-            Ok(()) => {
-                if let Err(error) = self.remove(LEGACY_SERVICE) {
-                    log::warn!(target: "harness", "the pre-rename Claude API key item was not removed: {error}", error = error.message());
+        for legacy in LEGACY_SERVICES {
+            let Some(key) = self.load_service(legacy)? else {
+                continue;
+            };
+            match self.store(SERVICE, &key) {
+                Ok(()) => self.remove_legacy_items(),
+                Err(error) => {
+                    log::warn!(target: "harness", "the Claude API key was not moved from {legacy} to its new Keychain item: {error}", error = error.message());
                 }
             }
-            Err(error) => {
-                log::warn!(target: "harness", "the Claude API key was not moved to its new Keychain item: {error}", error = error.message());
-            }
+            return Ok(Some(key));
         }
-        Ok(Some(key))
+        Ok(None)
     }
 
     fn load_service(&self, service: &str) -> Result<Option<String>, CommandError> {
@@ -171,14 +178,22 @@ impl Keychain {
         self.load().map(|key| key.is_some())
     }
 
-    /// Whether the Keychain holds an item for GitPulse's Claude key, checked
+    /// Whether the Keychain holds an item for Waylode's Claude key, checked
     /// from its unencrypted attributes (`find-generic-password` without `-w`)
     /// so periodic background checks never decrypt the secret into memory or
     /// trigger a macOS login-Keychain unlock prompt while the screen is locked.
     pub(crate) fn item_exists(&self) -> Result<bool, CommandError> {
-        // A key not yet moved to the new service still counts: the check must
+        // Keys not yet moved to the new service still count: the check must
         // not report a saved key missing just because nothing has read it yet.
-        Ok(self.item_exists_in(SERVICE)? || self.item_exists_in(LEGACY_SERVICE)?)
+        if self.item_exists_in(SERVICE)? {
+            return Ok(true);
+        }
+        for legacy in LEGACY_SERVICES {
+            if self.item_exists_in(legacy)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn item_exists_in(&self, service: &str) -> Result<bool, CommandError> {
@@ -198,13 +213,22 @@ impl Keychain {
         Ok(true)
     }
 
-    /// Removes the saved key, under both service names: a key removed from the
-    /// new item alone would come back from the old one. Removing a key that is
+    /// Removes the saved key, under all service names: a key removed from the
+    /// new item alone would come back from a legacy one. Removing a key that is
     /// not there succeeds.
     pub(crate) fn delete(&self) -> Result<(), CommandError> {
-        let new = self.remove(SERVICE);
-        let old = self.remove(LEGACY_SERVICE);
-        new.and(old)
+        let mut first_err = self.remove(SERVICE).err();
+        for legacy in LEGACY_SERVICES {
+            if let Err(err) = self.remove(legacy) {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn remove(&self, service: &str) -> Result<(), CommandError> {
@@ -271,9 +295,9 @@ mod tests {
         fake_security_with(dir, drop_writes, false)
     }
 
-    /// Items are kept per service: `item` for the current service name and
-    /// `item-legacy` for the pre-rename one, which is also the only name
-    /// `protect_legacy` refuses to delete.
+    /// Items are kept per service: `item` for `dev.vbcr.waylode.*`,
+    /// `item-v2` for `dev.vbcr.gitpulse.*`, and `item-v1` for
+    /// `com.gitpulse.desktop.*` (which `protect_legacy` refuses to delete).
     fn fake_security_with(
         dir: &std::path::Path,
         drop_writes: bool,
@@ -281,15 +305,17 @@ mod tests {
     ) -> Keychain {
         let argv = dir.join("argv");
         let new = dir.join("item");
-        let legacy = dir.join("item-legacy");
+        let legacy_v2 = dir.join("item-v2");
+        let legacy_v1 = dir.join("item-v1");
         let write = if drop_writes {
             ":".to_string()
         } else {
             "printf '%s' \"$key\" > \"$item\"".to_string()
         };
         let refuse = if protect_legacy {
-            r#"[ "$item" = '{legacy}' ] && exit 1"#
-                .replace("{legacy}", &legacy.display().to_string())
+            r#"[ "$item" = '{legacy_v2}' ] || [ "$item" = '{legacy_v1}' ] && exit 1"#
+                .replace("{legacy_v2}", &legacy_v2.display().to_string())
+                .replace("{legacy_v1}", &legacy_v1.display().to_string())
         } else {
             ":".to_string()
         };
@@ -298,7 +324,8 @@ mod tests {
 printf '%s\n' "$*" >> '{argv}'
 pick() {{
   case "$1" in
-    com.gitpulse.desktop*) item='{legacy}' ;;
+    dev.vbcr.gitpulse*) item='{legacy_v2}' ;;
+    com.gitpulse.desktop*) item='{legacy_v1}' ;;
     *) item='{new}' ;;
   esac
 }}
@@ -324,7 +351,8 @@ exit 2
 "#,
             argv = argv.display(),
             new = new.display(),
-            legacy = legacy.display(),
+            legacy_v2 = legacy_v2.display(),
+            legacy_v1 = legacy_v1.display(),
         );
         let program = dir.join("security");
         std::fs::write(&program, script).unwrap();
@@ -442,15 +470,21 @@ exit 2
 
     #[test]
     fn the_service_is_under_the_vbcr_namespace() {
-        assert_eq!(SERVICE, "dev.vbcr.gitpulse.anthropic-api-key");
-        assert_eq!(LEGACY_SERVICE, "com.gitpulse.desktop.anthropic-api-key");
+        assert_eq!(SERVICE, "dev.vbcr.waylode.anthropic-api-key");
+        assert_eq!(
+            LEGACY_SERVICES,
+            [
+                "dev.vbcr.gitpulse.anthropic-api-key",
+                "com.gitpulse.desktop.anthropic-api-key",
+            ]
+        );
     }
 
     #[test]
     fn a_key_saved_before_the_rename_is_found_and_moved_to_the_new_service() {
         let dir = tempfile::TempDir::new().unwrap();
         let keychain = fake_security(dir.path(), false);
-        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v1"), KEY).unwrap();
         assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("item")).unwrap(),
@@ -458,7 +492,7 @@ exit 2
             "the key must now live under the new service"
         );
         assert!(
-            !dir.path().join("item-legacy").exists(),
+            !dir.path().join("item-v1").exists(),
             "the old item goes only after the copy read back"
         );
         // Idempotent: the second read is served by the new item alone.
@@ -466,8 +500,9 @@ exit 2
         assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
         let after = argv(dir.path());
         assert!(
-            !after[before.len()..].contains("com.gitpulse.desktop"),
-            "a migrated key must not consult the old service: {after}"
+            !after[before.len()..].contains("com.gitpulse.desktop")
+                && !after[before.len()..].contains("dev.vbcr.gitpulse"),
+            "a migrated key must not consult legacy services: {after}"
         );
         assert!(
             !argv(dir.path()).contains(KEY),
@@ -476,13 +511,31 @@ exit 2
     }
 
     #[test]
+    fn three_tier_precedence_prefers_dev_vbcr_gitpulse_over_stale_com_gitpulse_desktop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), false);
+        let v1_stale = "sk-ant-api03-Stale_v1-0123456789abcdef";
+        let v2_fresh = "sk-ant-api03-Fresh_v2-0123456789abcdef";
+        std::fs::write(dir.path().join("item-v1"), v1_stale).unwrap();
+        std::fs::write(dir.path().join("item-v2"), v2_fresh).unwrap();
+
+        assert_eq!(keychain.load(), Ok(Some(v2_fresh.to_string())));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("item")).unwrap(),
+            v2_fresh
+        );
+        assert!(!dir.path().join("item-v2").exists());
+        assert!(!dir.path().join("item-v1").exists());
+    }
+
+    #[test]
     fn a_failed_copy_keeps_the_old_item_and_still_returns_the_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let keychain = fake_security(dir.path(), true);
-        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v2"), KEY).unwrap();
         assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("item-legacy")).unwrap(),
+            std::fs::read_to_string(dir.path().join("item-v2")).unwrap(),
             KEY,
             "an unconfirmed copy must never cost the only copy"
         );
@@ -493,7 +546,7 @@ exit 2
     fn a_failed_delete_of_the_old_item_does_not_lose_or_hide_the_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let keychain = fake_security_with(dir.path(), false, true);
-        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v2"), KEY).unwrap();
         assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("item")).unwrap(),
@@ -504,50 +557,58 @@ exit 2
     }
 
     #[test]
-    fn the_new_item_wins_over_a_stale_old_one() {
+    fn the_new_item_wins_over_stale_old_ones() {
         let dir = tempfile::TempDir::new().unwrap();
         let keychain = fake_security(dir.path(), false);
         let newer = "sk-ant-api03-Newer_key-0123456789abcdef";
-        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v1"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v2"), KEY).unwrap();
         std::fs::write(dir.path().join("item"), newer).unwrap();
         assert_eq!(keychain.load(), Ok(Some(newer.to_string())));
     }
 
     #[test]
-    fn saving_replaces_the_old_item_and_deleting_removes_both() {
+    fn saving_replaces_old_items_and_deleting_removes_all_three_tiers() {
         let dir = tempfile::TempDir::new().unwrap();
         let keychain = fake_security(dir.path(), false);
-        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v1"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v2"), KEY).unwrap();
         let newer = "sk-ant-api03-Newer_key-0123456789abcdef";
         keychain.save(newer).unwrap();
-        assert!(!dir.path().join("item-legacy").exists());
+        assert!(!dir.path().join("item-v1").exists());
+        assert!(!dir.path().join("item-v2").exists());
         assert_eq!(keychain.load(), Ok(Some(newer.to_string())));
 
-        // A removed key must not come back out of the pre-rename item.
-        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        // A removed key must not come back out of either pre-rename tier.
+        std::fs::write(dir.path().join("item-v1"), KEY).unwrap();
+        std::fs::write(dir.path().join("item-v2"), KEY).unwrap();
         keychain.delete().unwrap();
+        assert!(!dir.path().join("item-v1").exists());
+        assert!(!dir.path().join("item-v2").exists());
         assert_eq!(keychain.load(), Ok(None));
         assert_eq!(keychain.present(), Ok(false));
     }
 
     #[test]
     fn item_exists_counts_an_unmigrated_key_without_decrypting_it() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let keychain = fake_security(dir.path(), false);
-        assert_eq!(keychain.item_exists(), Ok(false));
-        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
-        assert_eq!(keychain.item_exists(), Ok(true));
-        assert!(
-            dir.path().join("item-legacy").exists() && !dir.path().join("item").exists(),
-            "the metadata check must not migrate, which would need the secret"
-        );
-        for line in argv(dir.path()).lines() {
+        for tier in ["item-v2", "item-v1"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let keychain = fake_security(dir.path(), false);
+            assert_eq!(keychain.item_exists(), Ok(false));
+            std::fs::write(dir.path().join(tier), KEY).unwrap();
+            assert_eq!(keychain.item_exists(), Ok(true));
             assert!(
-                !line
-                    .split_whitespace()
-                    .any(|arg| arg == "-w" || arg == "-g"),
-                "{line}"
+                dir.path().join(tier).exists() && !dir.path().join("item").exists(),
+                "the metadata check must not migrate, which would need the secret"
             );
+            for line in argv(dir.path()).lines() {
+                assert!(
+                    !line
+                        .split_whitespace()
+                        .any(|arg| arg == "-w" || arg == "-g"),
+                    "{line}"
+                );
+            }
         }
     }
 }

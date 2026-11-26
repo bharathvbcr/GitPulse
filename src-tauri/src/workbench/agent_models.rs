@@ -291,7 +291,7 @@ pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCata
             read_claude_settings(home.as_deref()).as_deref(),
         )),
         Some("listed") => Ok(listed_models(launcher, refresh, || list_with_cli(launcher))),
-        _ => Err(format!("{launcher} has no model list GitPulse can read.").into()),
+        _ => Err(format!("{launcher} has no model list Waylode can read.").into()),
     }
 }
 

@@ -6,7 +6,7 @@ import StatusPopover from "../../../src/lib/desktop/StatusPopover.svelte";
 import type { MenuAgentRequest, MenuState } from "../../../src/lib/desktop/menuState";
 import { makeMenuAgentRequest, makeMenuState, makeMenuStateWithRequests } from "../helpers/fixtures";
 
-const LOGO_TRUNK_FRAGMENT = "M24.04 9.25A10.5";
+const LOGO_TRUNK_FRAGMENT = "M23.8 9.0A10.5";
 
 const params = new URLSearchParams(location.search);
 const scenario = params.get("scenario") ?? "waiting";

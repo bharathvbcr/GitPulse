@@ -199,7 +199,7 @@ fn release_urls_in(table: &[PinnedRelease], tool: ExternalTool) -> ReleaseAvaila
         },
         None => ReleaseAvailability::Unavailable {
             reason: format!(
-                "no pinned prebuilt {} release for {target}; GitPulse installs only releases whose \
+                "no pinned prebuilt {} release for {target}; Waylode installs only releases whose \
                  checksum it carries",
                 tool.as_str()
             ),

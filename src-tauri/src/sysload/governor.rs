@@ -198,11 +198,11 @@ impl Binding {
             Self::MemoryPressure => "the kernel reports memory pressure",
             Self::CompressorThrash => "the memory compressor is thrashing",
             Self::CompressorSegments => "the memory compressor is nearly out of segments",
-            Self::Swap => "swap in use is above GitPulse's limit for it",
-            Self::LowDisk => "free disk space is below GitPulse's floor",
-            Self::DiskFilling => "free disk space is falling fast toward GitPulse's floor",
+            Self::Swap => "swap in use is above Waylode's limit for it",
+            Self::LowDisk => "free disk space is below Waylode's floor",
+            Self::DiskFilling => "free disk space is falling fast toward Waylode's floor",
             Self::Thermal => "the Mac is thermally throttled",
-            Self::CpuLoad => "the CPU load average is above GitPulse's limit for it",
+            Self::CpuLoad => "the CPU load average is above Waylode's limit for it",
             Self::Battery => "the Mac is running on battery",
             Self::ExecLatency => "process start-up is slow",
         }
@@ -470,6 +470,69 @@ fn sample(input: &Input) -> Option<Sample> {
         low_disk,
         others_clear,
     })
+}
+
+/// The memory inputs alone, as [`sample`] reads them: the highest tier any of
+/// memory pressure, compressor thrash, compressor segments and swap reaches,
+/// and the one that put it there. `None` when the host cannot be governed on
+/// (the same availability test as [`sample`]).
+///
+/// The pressure-relief supervisor (`sysload::relief`) acts only on these. The
+/// governor's held binding names whichever input entered the tier, so a Severe
+/// that a full disk entered keeps naming the disk when memory later joins it;
+/// reading memory directly cannot miss the compound crisis, and a Severe that
+/// only the disk, the CPU or the battery holds never reaches the relief.
+pub(super) fn memory_sample(input: &Input) -> Option<MemoryReading> {
+    if !matches!(availability(input), Availability::Governing) {
+        return None;
+    }
+    let mut best = (Tier::Clear, None);
+    let mut consider = |tier: Tier, binding: Binding| {
+        if tier > best.0 {
+            best = (tier, Some(binding));
+        }
+    };
+    if input.level == Some(Level::Critical) {
+        consider(Tier::Severe, Binding::MemoryPressure);
+    }
+    if input.compressor_thrash {
+        consider(Tier::Severe, Binding::CompressorThrash);
+    }
+    if input.level == Some(Level::Warn) {
+        consider(Tier::Elevated, Binding::MemoryPressure);
+    }
+    let mut segments_elevated = false;
+    for c in input.thresholds.assess(&input.readings).contributions {
+        if matches!(c.binding, Binding::CompressorSegments | Binding::Swap) {
+            consider(c.tier, c.binding);
+        }
+        if c.binding == Binding::CompressorSegments && c.tier >= Tier::Elevated {
+            segments_elevated = true;
+        }
+    }
+    Some(MemoryReading {
+        tier: best.0,
+        binding: best.1,
+        kernel_warn: matches!(input.level, Some(Level::Warn | Level::Critical)),
+        kernel_critical: input.level == Some(Level::Critical),
+        thrash: input.compressor_thrash,
+        segments_elevated,
+    })
+}
+
+/// What [`memory_sample`] read: the tier, and which inputs stand behind it. The
+/// relief needs the causes apart because swap *level* is a bad reason to act: it
+/// stays high long after a recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MemoryReading {
+    pub tier: Tier,
+    pub binding: Option<Binding>,
+    /// The kernel's memory-pressure level is Warn or worse.
+    pub kernel_warn: bool,
+    pub kernel_critical: bool,
+    pub thrash: bool,
+    /// Compressor segments are at or above their Elevated threshold.
+    pub segments_elevated: bool,
 }
 
 /// What one sample read: the tier and the resource that put it there, and what
@@ -1561,7 +1624,7 @@ pub fn admit_anyway(confirm: &dyn Fn(&str, &str) -> bool) -> Result<String, Stri
         return Ok("Nothing is refusing agent launches right now.".to_string());
     }
     let question = format!(
-        "GitPulse is refusing agent launches because {}.\n\nAdmit launches for the next {} seconds anyway? An agent started now adds to the load the machine is already struggling with.",
+        "Waylode is refusing agent launches because {}.\n\nAdmit launches for the next {} seconds anyway? An agent started now adds to the load the machine is already struggling with.",
         verdict.message,
         OVERRIDE_WINDOW.as_secs()
     );

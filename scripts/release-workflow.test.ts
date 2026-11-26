@@ -169,7 +169,7 @@ it("opens the bundled installers in verify, with the tools the runner image alre
   expect(verify).toContain("All ten installers (a beta ships no .rpm)");
   expect(verify).toContain("The dmg and both AppImages are not opened.");
   // The names it requires come from Cargo.toml, not from this workflow.
-  expect(verify).not.toContain("gitpulse-hook");
+  expect(verify).not.toContain("waylode-hook");
   expect(stateScript).toContain("declaredBinaryNames(readFileSync(path.join(\"src-tauri\", \"Cargo.toml\")");
   expect(stateScript).toContain("downloadDir: process.env.RELEASE_DOWNLOAD_DIR");
 });
@@ -196,7 +196,7 @@ function boundedCallsInFinalize(): number {
   const stubBytes = (name: string) => (name === checksumsName ? sumsBytes : rawBytes(name));
   const digest = (name: string) => `sha256:${createHash("sha256").update(stubBytes(name)).digest("hex")}`;
   let release: Record<string, unknown> = {
-    id: 42, tag_name: "v1.2.3", name: "GitPulse v1.2.3", target_commitish: commit, draft: true, prerelease: false,
+    id: 42, tag_name: "v1.2.3", name: "Waylode v1.2.3", target_commitish: commit, draft: true, prerelease: false,
     immutable: false, published_at: null, body: "pending",
     assets: expectedAssetNames("1.2.3").map((name, index) => ({id: index + 1, name, size: stubBytes(name).length, state: "uploaded", digest: digest(name)})),
   };
@@ -207,11 +207,11 @@ function boundedCallsInFinalize(): number {
     if (args[3] === "PATCH") release = {...release, ...JSON.parse(input ?? "{}")};
     return {status: 0, failed: false, stdout: `HTTP/2.0 200 Status\nContent-Type: application/json\r\n\r\n${JSON.stringify(release)}`};
   };
-  const downloadDir = mkdtempSync(path.join(tmpdir(), "gitpulse-finalize-calls-"));
+  const downloadDir = mkdtempSync(path.join(tmpdir(), "waylode-finalize-calls-"));
   try {
     const result = runReleaseStage({
       stage: "finalize", repo: "owner/repo", tag: "v1.2.3", commit, releaseId: "42", notes: "notes", downloadDir,
-      binaries: ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"],
+      binaries: ["waylode", "waylode-hook", "waylode-mcp", "waylode-ptyd", "wayloded"],
       fetchAsset: ({asset, dest}) => writeFileSync(dest, stubBytes(asset.name)),
       inspect: ({files}) => ({ok: true, invalid: false, violations: [], opened: Object.keys(files), coverage: "opened 7 of 12 installers"}),
     }, run);
@@ -293,14 +293,14 @@ it("gives preflight headroom for the serial Rust suite and installs pinned devma
   expect(rustTests).toBeGreaterThan(installManvi);
 });
 
-it("verifies per-leg installer names, macOS app bundle integrity, release gitpulse-ptyd symbols, and preserves Rust cache on failure", () => {
+it("verifies per-leg installer names, macOS app bundle integrity, release waylode-ptyd symbols, and preserves Rust cache on failure", () => {
   const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  release:"));
   const prepareTimeout = Number(/timeout-minutes:\s*(\d+)/.exec(prepare)?.[1]);
   expect(prepareTimeout).toBeGreaterThanOrEqual(10);
   const release = workflow.slice(workflow.indexOf("\n  release:"), workflow.indexOf("\n  attest:"));
   expect(release).toContain("cache-on-failure: true");
   expect(release).toContain("node scripts/check-release-assets.mjs --bundles");
-  expect(release).toContain("node scripts/check-release-assets.mjs --app src-tauri/target/universal-apple-darwin/release/bundle/macos/GitPulse.app --universal");
+  expect(release).toContain("node scripts/check-release-assets.mjs --app src-tauri/target/universal-apple-darwin/release/bundle/macos/Waylode.app --universal");
   expect(release).toContain("node scripts/check-ptyd-release.mjs --binary");
   const verify = workflow.slice(workflow.indexOf("\n  verify:"));
   expect(verify).toContain("needs.preflight.result");

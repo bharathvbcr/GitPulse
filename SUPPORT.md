@@ -1,8 +1,8 @@
-# Getting help with GitPulse
+# Getting help with Waylode
 
 | You want to | Go to |
 | --- | --- |
-| Ask how to use GitPulse, or why something behaves as it does | [Discussions, Q&A](https://github.com/bharathvbcr/GitPulse/discussions/new?category=q-a) |
+| Ask how to use Waylode, or why something behaves as it does | [Discussions, Q&A](https://github.com/bharathvbcr/GitPulse/discussions/new?category=q-a) |
 | Propose an idea that is not yet a scoped request | [Discussions, Ideas](https://github.com/bharathvbcr/GitPulse/discussions/new?category=ideas) |
 | Report a bug | A [bug report](https://github.com/bharathvbcr/GitPulse/issues/new?template=bug_report.yml) |
 | Request a scoped feature | A [feature request](https://github.com/bharathvbcr/GitPulse/issues/new?template=feature_request.yml) |
@@ -17,6 +17,6 @@ Before you ask, these answer most questions:
 - [Existing issues](https://github.com/bharathvbcr/GitPulse/issues?q=is%3Aissue) and
   [discussions](https://github.com/bharathvbcr/GitPulse/discussions)
 
-A bug report that names the GitPulse version, the platform, what you did, what
-you expected and what happened gets a fix sooner. GitPulse is maintained by one
+A bug report that names the Waylode version, the platform, what you did, what
+you expected and what happened gets a fix sooner. Waylode is maintained by one
 person, so replies can take a few days; see [GOVERNANCE.md](GOVERNANCE.md).

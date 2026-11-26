@@ -2,7 +2,7 @@
 
 Audit date: 2026-09-09. Baseline: `3d61e2e` in the task checkout.
 
-**Verified in source:** GitPulse already had a native application menu. This change expands it and adds a separate, optional icon on the right of the macOS menu bar. The foreground application's menus and its background status icon are separate surfaces. No installed application has been replaced.
+**Verified in source:** Waylode already had a native application menu. This change expands it and adds a separate, optional icon on the right of the macOS menu bar. The foreground application's menus and its background status icon are separate surfaces. No installed application has been replaced.
 
 ## Compact status icon
 
@@ -16,15 +16,15 @@ The glyph is a 4× supersampled brand pulse template, with an attention-dot vari
 
 **Clearing the count (fixed after 1.1.0):** `tray-icon`'s macOS `set_title` only calls `setTitle:` inside an `if let Some`, so passing `None` clears nothing. Switching the counts preference off, closing the last repository or opening a bare one therefore stopped updating a count that stayed on the button for the rest of the session. `tray::apply` sends an empty title instead, which is what `None` already meant on GTK and is ignored on Windows either way. `native_status_material` reproduces this against a real `NSStatusItem`: before the fix it reads back `12 · ⚠3` where it must read back nothing.
 
-**Menu-bar-only mode:** with the status icon on, **Hide Dock icon while closed** (default on) switches the app to `NSApplicationActivationPolicyAccessory` after the main window hides, and restores `Regular` when Open GitPulse / Settings / Quit reveal it.
+**Menu-bar-only mode:** with the status icon on, **Hide Dock icon while closed** (default on) switches the app to `NSApplicationActivationPolicyAccessory` after the main window hides, and restores `Regular` when Open Waylode / Settings / Quit reveal it.
 
-**Launch at login** registers a per-user LaunchAgent via `tauri-plugin-autostart` with `--background` so a login start stays in the menu bar when the status icon is enabled. The Settings toggle reads `isEnabled()` from the OS; GitPulse does not store a second preference for it.
+**Launch at login** registers a per-user LaunchAgent via `tauri-plugin-autostart` with `--background` so a login start stays in the menu bar when the status icon is enabled. The Settings toggle reads `isEnabled()` from the OS; Waylode does not store a second preference for it.
 
-**Security impact (autostart):** enabling Launch at login writes a per-user LaunchAgent that starts GitPulse at login with `--background`. It does not add network access, broaden filesystem rights, or change IPC capabilities beyond the `autostart:*` permissions granted to the main window.
+**Security impact (autostart):** enabling Launch at login writes a per-user LaunchAgent that starts Waylode at login with `--background`. It does not add network access, broaden filesystem rights, or change IPC capabilities beyond the `autostart:*` permissions granted to the main window.
 
 Click the icon to open a compact popover. Its monochrome header shows the repository switcher and branch (per-repo changed/conflict/busy badges in the switcher). Three equal cards show **Changed**, **Staged** and **Conflicts** in large type; nonzero counts open the relevant view. A short upstream row shows ahead/behind counts and a real **fetched … ago** / **never fetched** caption from `FETCH_HEAD` mtime. One blue primary action changes with context: **Review changes**, **Resolve conflicts**, **View history** or **Try again**. Active Git work and parked operations remain visible in the headline. Empty and unavailable states avoid misleading zero counts. Names truncate in the compact view and remain available in tooltips/details. Escape collapses the switcher or details first, then dismisses the panel; `R` refreshes, `1`–`3` open nonzero cards and `4` opens listed stashes in Work.
 
-**Details** contains the stash count, command palette, workspace insights, path, branch, changed/staged/conflict counts, upstream, watcher state, parked operations and running Git actions. It also exposes History, Pulse, Fleet and Terminal, plus copy branch, reveal folder, remote website and appearance shortcuts. A bounded, keyboard-scrollable area keeps the footer reachable. **Refresh**, appearance, copy and repository switching stay in the popover. Reveal and Remote dismiss the panel without bringing GitPulse forward. The footer contains **Open GitPulse**, **Settings** and **Quit**. Right-clicking the icon keeps the native Open/Settings/Quit escape path and adds the current primary action and Refresh when available. Light/dark appearance, reduced transparency and reduced motion follow the main app's preferences and system settings. The popover still cannot run Git mutations; those stay on the application menu and in the main window.
+**Details** contains the stash count, command palette, workspace insights, path, branch, changed/staged/conflict counts, upstream, watcher state, parked operations and running Git actions. It also exposes History, Pulse, Fleet and Terminal, plus copy branch, reveal folder, remote website and appearance shortcuts. A bounded, keyboard-scrollable area keeps the footer reachable. **Refresh**, appearance, copy and repository switching stay in the popover. Reveal and Remote dismiss the panel without bringing Waylode forward. The footer contains **Open Waylode**, **Settings** and **Quit**. Right-clicking the icon keeps the native Open/Settings/Quit escape path and adds the current primary action and Refresh when available. Light/dark appearance, reduced transparency and reduced motion follow the main app's preferences and system settings. The popover still cannot run Git mutations; those stay on the application menu and in the main window.
 
 On macOS, the status window uses the same native `UnderWindowBackground` material as the main app. The panel and cards carry translucent tints with a restrained highlight; the native window supplies desktop blur without a second CSS filter. Its 360px content width and 18px corners match the panel, and reopening preserves short connecting/error heights so material does not extend beyond the footer. Other native platforms retain opaque surfaces. Reduced transparency, increased contrast and forced colors restore opaque surfaces and remove highlights.
 
@@ -32,11 +32,11 @@ The icon reuses the current workspace state; enabling it starts no additional po
 
 ## Application menu inventory
 
-Menu order: **GitPulse · File · Edit · View · Go · Repository · Window · Help**.
+Menu order: **Waylode · File · Edit · View · Go · Repository · Window · Help**.
 
 | Menu | Available commands |
 | --- | --- |
-| GitPulse | About, Settings, Check for Updates, Services, Hide, Hide Others, Show All, Quit. Update checks report available/current/failed and do not install anything. |
+| Waylode | About, Settings, Check for Updates, Services, Hide, Hide Others, Show All, Quit. Update checks report available/current/failed and do not install anything. |
 | File | Open/Clone Repository, Open Recent, Clear Recent Repositories, Open Repositories, Close/Reopen Repository Tab, Next/Previous Repository Tab, Close Window. Recent history is capped at 12; identical names display distinguishing paths. Clearing history preserves repositories, tabs and closed-tab recovery. |
 | Edit | Native Undo, Redo, Cut, Copy, Paste, Select All for the focused control. |
 | View | Work, Code, History, Insights, Fleet, Show/Hide Dock, Search Commits, Command Palette, Refresh, System/Light/Dark Appearance, Toggle Dark/Light, Full Screen, Zoom In, Zoom Out, Actual Size. |
@@ -46,7 +46,7 @@ Menu order: **GitPulse · File · Edit · View · Go · Repository · Window · 
 | Go → Insights | Pulse, Coverage, Health (with secrets), Storage. |
 | Repository | Fetch, Pull, Push, Stash Working Tree, Pop Stash, Stage All, Unstage All, Quick Commit, Interactive Rebase, Create Branch, Rename Current Branch, Continue/Abort/Skip Operation, Copy Repository Path, Copy Branch, Copy Selected Commit SHA or HEAD SHA, Reveal in Finder, Open Remote Website. |
 | Window | Minimize, maximize/zoom, Close Window. |
-| Help | GitPulse Help, Keyboard Shortcuts, Diagnostics, Set Up Optional Tools, Release Notes, Report an Issue. Opening setup or an issue page does not install tools or submit an issue. |
+| Help | Waylode Help, Keyboard Shortcuts, Diagnostics, Set Up Optional Tools, Release Notes, Report an Issue. Opening setup or an issue page does not install tools or submit an issue. |
 
 Go uses the existing view registry and per-repository section persistence. Navigation closes Fleet so its destination is visible. Help remains available without a repository. Zoom uses the existing persisted scale and limits (`⌘=`, `⌘-`, `⌘0`). Keyboard Shortcuts uses `⌘/`; `?` remains available. Native shortcut ownership prevents duplicate execution in the webview.
 
@@ -77,7 +77,7 @@ Native main-thread tests construct actual macOS menu objects using Tauri's MockR
 
 The interactive fixture at `harness/status.html` renders the production popover with sample data and a labeled simulated backdrop. Its Material control switches between Glass and Opaque. Run `bun run test:webkit -- --harness status` for **53 real WebKit checks** covering the three-card layout and native window bounds, Details and its preserved actions, repository switching, keyboard navigation, loading/error/empty states, conflicts, long names, dark appearance, text/semantic-color contrast over extreme backdrops, live accessibility fallback changes, native padding/filter rules, the fixture's glass tuning read back against the native material in both appearances, active work and parked operations. These fixture checks validate the rendered component and action dispatch, not the native tray anchor or IPC transport.
 
-The reference-layout revision passed Svelte/TypeScript checks with zero errors or warnings, 203 desktop and material/harness-contract tests across 19 files, and the 51 WebKit checks. A separately identified **GitPulse Status Preview.app** debug bundle was built and its ad-hoc signature verified, using the same `status.html` production entry point. It does not replace the installed release; manual tray clicks and outside-click dismissal remain a separate check.
+The reference-layout revision passed Svelte/TypeScript checks with zero errors or warnings, 203 desktop and material/harness-contract tests across 19 files, and the 51 WebKit checks. A separately identified **Waylode Status Preview.app** debug bundle was built and its ad-hoc signature verified, using the same `status.html` production entry point. It does not replace the installed release; manual tray clicks and outside-click dismissal remain a separate check.
 
 The blur revision also passes **27 desktop Rust tests**. `cargo test --manifest-path src-tauri/Cargo.toml --test native_status_material --locked` runs the real production popover constructor on AppKit's main thread and checks the attached `NSVisualEffectView`, `UnderWindowBackground` material, behind-window blending, 18px corners, native width, autoresizing and short-height reopen behavior. It first failed on this 2x Retina screen with `Status icon display is unavailable`; selecting the icon's monitor in physical coordinates fixes that failure. The test requires an interactive macOS display and reports a skip on other platforms. Browser fallback checks activate the production CSS media rule within the test fixture; they do not change the user's OS preferences. The app and native-test Clippy check passed with warnings denied, the native main-thread menu checks passed, and the final debug bundle was rebuilt and ad-hoc signed. Existing vendored-framework and STATIC_VCRUNTIME deprecation warnings remain. Manual tray clicks, outside-click dismissal and mixed-scale physical display transitions were not exercised.
 

@@ -92,7 +92,7 @@ describe("ReleasePublish contracts", () => {
   });
 
   it("states what the gate will still require", () => {
-    expect(source).toContain("GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags.");
+    expect(source).toContain("Waylode will still require a clean, fully synchronized default branch and will refuse duplicate remote tags.");
   });
 
   it("suggests the next tag from the tag list without overwriting one the person typed", () => {

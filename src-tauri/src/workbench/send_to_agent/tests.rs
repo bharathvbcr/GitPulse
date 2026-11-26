@@ -379,7 +379,7 @@ fn a_preview_sends_nothing_and_a_confirm_sends_only_along_the_route_shown() {
     assert!(preview["reason"]
         .as_str()
         .unwrap()
-        .contains("No GitPulse hook is waiting"));
+        .contains("No Waylode hook is waiting"));
     assert_eq!(
         mailbox.pending(SESSION),
         0,

@@ -52,11 +52,11 @@ const _: () = assert!(CAPTURE_LIMIT.as_millis() < instance::HANDLER_TIMEOUT.as_m
 /// launch defers to it. An approved quit is over in about a second; the
 /// sidecar's reaping, its slowest step, gives up after ~1.2s.
 const UNGUARDED_QUIT_WAIT: Duration = Duration::from_secs(3);
-/// The identifier GitPulse ships under, as `tauri.conf.json` names it. A binary
-/// run outside its bundle (`tauri dev`, `target/*/gitpulse`) has no identifier
+/// The identifier Waylode ships under, as `tauri.conf.json` names it. A binary
+/// run outside its bundle (`tauri dev`, `target/*/waylode`) has no identifier
 /// of its own, yet the copy it must not double is the one LaunchServices knows
 /// by this one.
-const SHIPPED_IDENTIFIER: &str = "dev.vbcr.gitpulse";
+const SHIPPED_IDENTIFIER: &str = super::identity_migration::SHIPPED_IDENTIFIER;
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -135,16 +135,16 @@ pub fn establish() -> Launch {
             let pid = owner.owner_pid();
             let request = capture(&std::env::args().collect::<Vec<_>>());
             let Some(request) = request else {
-                log::info!(target: "desktop", "single instance: GitPulse {pid} is running; this launch asked for nothing");
+                log::info!(target: "desktop", "single instance: Waylode {pid} is running; this launch asked for nothing");
                 return Launch::Exit;
             };
             let reveals = !matches!(request, Request::Notification { snooze: true, .. });
             match owner.forward(&request) {
                 Ok(()) => {
-                    log::info!(target: "desktop", "single instance: handed {request:?} to GitPulse {pid}")
+                    log::info!(target: "desktop", "single instance: handed {request:?} to Waylode {pid}")
                 }
                 Err(error) => {
-                    log::error!(target: "desktop", "single instance: GitPulse {pid} did not take {request:?}: {error}")
+                    log::error!(target: "desktop", "single instance: Waylode {pid} did not take {request:?}: {error}")
                 }
             }
             if reveals {
@@ -153,7 +153,7 @@ pub fn establish() -> Launch {
             Launch::Exit
         }
         Claim::Blocked { pid, reason } => {
-            log::error!(target: "desktop", "single instance: GitPulse {pid:?} holds the profile but did not answer ({reason}); not starting a second one");
+            log::error!(target: "desktop", "single instance: Waylode {pid:?} holds the profile but did not answer ({reason}); not starting a second one");
             if let Some(pid) = pid {
                 bring_forward(pid);
             }
@@ -373,19 +373,25 @@ fn unless_already_running() -> Launch {
     let Some(pid) = unguarded_instance() else {
         return Launch::Proceed;
     };
-    log::warn!(target: "desktop", "single instance: GitPulse {pid} is running but not under this profile's guard; bringing it forward instead of starting");
+    log::warn!(target: "desktop", "single instance: Waylode {pid} is running but not under this profile's guard; bringing it forward instead of starting");
     bring_forward(pid);
     Launch::Exit
 }
 
-/// Whose running copies count as GitPulse for this launch: its own bundle's,
+/// Whose running copies count as Waylode for this launch: its own bundle's,
 /// or the shipped app's when it was started outside a bundle. The shipped app
-/// also answers to the identifier it had before the VBCR Dev rename: that copy
-/// shares this profile and its WebKit store, and must not run beside this one.
+/// also answers to the legacy identifiers it had before the Waylode rename:
+/// those copies share this profile/WebKit store, and must not run beside this one.
 fn watched_identifiers(own: Option<String>) -> Vec<String> {
     let own = own.unwrap_or_else(|| SHIPPED_IDENTIFIER.to_owned());
     if own == SHIPPED_IDENTIFIER {
-        vec![own, super::identity_migration::LEGACY_IDENTIFIER.to_owned()]
+        std::iter::once(own)
+            .chain(
+                super::identity_migration::LEGACY_IDENTIFIERS
+                    .iter()
+                    .map(|id| (*id).to_owned()),
+            )
+            .collect()
     } else {
         vec![own]
     }
@@ -458,7 +464,7 @@ fn bring_forward(pid: impl TryInto<i32>) {
             }
             let activated: Bool = msg_send![&*target, activateWithOptions: ACTIVATE_ALL_WINDOWS];
             if !activated.as_bool() {
-                log::info!(target: "desktop", "single instance: macOS declined to activate GitPulse {pid}");
+                log::info!(target: "desktop", "single instance: macOS declined to activate Waylode {pid}");
             }
         }
     });
@@ -567,13 +573,17 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_app_also_defers_to_a_copy_under_the_pre_rename_identifier() {
+    fn the_shipped_app_also_defers_to_a_copy_under_the_pre_rename_identifiers() {
         // An upgrade can start the new build while the old one still runs on
         // the same profile; LaunchServices tells them apart only by identifier.
         for own in [None, Some(SHIPPED_IDENTIFIER.to_owned())] {
             assert_eq!(
                 watched_identifiers(own),
-                [SHIPPED_IDENTIFIER, "com.gitpulse.desktop"]
+                [
+                    SHIPPED_IDENTIFIER,
+                    "dev.vbcr.gitpulse",
+                    "com.gitpulse.desktop",
+                ]
             );
         }
     }

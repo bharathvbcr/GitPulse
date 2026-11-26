@@ -39,7 +39,7 @@ afterAll(async () => {
 });
 
 async function scratchDir(prefix: string) {
-  const dir = await mkdtemp(path.join(tmpdir(), `gitpulse-mcpdoc-${prefix}-`));
+  const dir = await mkdtemp(path.join(tmpdir(), `waylode-mcpdoc-${prefix}-`));
   tempDirs.push(dir);
   return dir;
 }
@@ -65,7 +65,7 @@ async function identityServer(prefix: string, schema: number, extra: Record<stri
         if (request.id === 1) {
           process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "fake", version: "1.2.3" } } }) + "\\n");
         } else if (request.id === 2 && request.method === "resources/read") {
-          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType: "application/json", text: JSON.stringify({ storeSchemaVersion: ${schema}, ...${JSON.stringify(extra)} }) }] } }) + "\\n");
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { contents: [{ uri: "waylode://server/manifest", mimeType: "application/json", text: JSON.stringify({ storeSchemaVersion: ${schema}, ...${JSON.stringify(extra)} }) }] } }) + "\\n");
         }
       }
     });
@@ -145,39 +145,39 @@ describe("classify", () => {
   const identity = { storeSchema: 20, expectedSchema: 20 };
 
   it("rejects an older embedded schema even when the application version matches", () => {
-    const observed = { binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, storeSchema: 19, expectedSchema: 20 };
+    const observed = { binPath: "/x/waylode-mcp", version: expected, error: null, expected, storeSchema: 19, expectedSchema: 20 };
     expect(classify(observed).status).toBe("stale");
   });
 
   it("does not approve a schema check that the server could not answer", () => {
-    const observed = { binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, storeSchema: null, expectedSchema: 20 };
+    const observed = { binPath: "/x/waylode-mcp", version: expected, error: null, expected, storeSchema: null, expectedSchema: 20 };
     expect(classify(observed).status).not.toBe("ok");
   });
 
   it("reports ok when version, schema and the one-shot commands match", () => {
     const commands = [...SERVER_COMMANDS];
-    expect(classify({ binPath: "/x/gitpulse-mcp", version: "0.0.5", error: null, expected, ...identity, commands }).status).toBe("ok");
+    expect(classify({ binPath: "/x/waylode-mcp", version: "0.0.5", error: null, expected, ...identity, commands }).status).toBe("ok");
   });
 
   it("marks a server that lists no one-shot commands stale, not ok", () => {
     // An install from before the commands prints the same version and schema.
     for (const commands of [null, undefined]) {
-      const old = classify({ binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, ...identity, commands });
+      const old = classify({ binPath: "/x/waylode-mcp", version: expected, error: null, expected, ...identity, commands });
       expect(old.status).toBe("stale");
-      expect(old.violations.join(" ")).toContain("`gitpulse-mcp call`");
+      expect(old.violations.join(" ")).toContain("`waylode-mcp call`");
       expect(old.violations.join(" ")).toContain("bun run mcp:install");
     }
   });
 
   it("names the one-shot command an installed server lacks", () => {
-    const partial = classify({ binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, ...identity, commands: ["call", "describe", "tools"] });
+    const partial = classify({ binPath: "/x/waylode-mcp", version: expected, error: null, expected, ...identity, commands: ["call", "describe", "tools"] });
     expect(partial.status).toBe("stale");
-    expect(partial.violations.join(" ")).toContain("`gitpulse-mcp read`");
-    expect(partial.violations.join(" ")).not.toContain("`gitpulse-mcp call`");
+    expect(partial.violations.join(" ")).toContain("`waylode-mcp read`");
+    expect(partial.violations.join(" ")).not.toContain("`waylode-mcp call`");
   });
 
   it("does not call a --version that never answered stale", () => {
-    const silent = classify({ binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, ...identity, commands: null, commandsError: "no identity response within 10ms" });
+    const silent = classify({ binPath: "/x/waylode-mcp", version: expected, error: null, expected, ...identity, commands: null, commandsError: "no identity response within 10ms" });
     expect(silent.status).toBe("unresponsive");
     expect(silent.violations.join(" ")).toContain("within 10ms");
   });
@@ -185,18 +185,18 @@ describe("classify", () => {
   it("separates absent from ok — the collapse this check exists to prevent", () => {
     const absent = classify({ binPath: null, version: null, error: null, expected, ...identity });
     expect(absent.status).toBe("absent");
-    expect(absent.violations.join(" ")).toContain("no gitpulse-mcp on PATH");
+    expect(absent.violations.join(" ")).toContain("no waylode-mcp on PATH");
   });
 
   it("names both versions when the installed server is stale", () => {
-    const stale = classify({ binPath: "/x/gitpulse-mcp", version: "0.0.4", error: null, expected, ...identity });
+    const stale = classify({ binPath: "/x/waylode-mcp", version: "0.0.4", error: null, expected, ...identity });
     expect(stale.status).toBe("stale");
     expect(stale.violations.join(" ")).toContain('"0.0.4"');
     expect(stale.violations.join(" ")).toContain('"0.0.5"');
   });
 
   it("distinguishes a server that never answered from one that answered wrong", () => {
-    const dead = classify({ binPath: "/x/gitpulse-mcp", version: null, error: "boom", expected, ...identity });
+    const dead = classify({ binPath: "/x/waylode-mcp", version: null, error: "boom", expected, ...identity });
     expect(dead.status).toBe("unresponsive");
     expect(dead.violations.join(" ")).toContain("boom");
   });
@@ -204,7 +204,7 @@ describe("classify", () => {
 
 describe("parseServerManifest", () => {
   function response(schema: unknown, mimeType = "application/json", id = 2, extra: Record<string, unknown> = {}) {
-    return JSON.stringify({ jsonrpc: "2.0", id, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType, text: JSON.stringify({ storeSchemaVersion: schema, ...extra }) }] } });
+    return JSON.stringify({ jsonrpc: "2.0", id, result: { contents: [{ uri: "waylode://server/manifest", mimeType, text: JSON.stringify({ storeSchemaVersion: schema, ...extra }) }] } });
   }
 
   it("requires the requested resource and response id", () => {
@@ -312,7 +312,7 @@ describe("parseArgs", () => {
   });
 });
 
-/** An executable stand-in for `gitpulse-hook --version`. */
+/** An executable stand-in for `waylode-hook --version`. */
 async function fakeHook(prefix: string, stdout: string) {
   const dir = await scratchDir(prefix);
   const file = path.join(dir, "fake-hook.mjs");
@@ -323,7 +323,7 @@ async function fakeHook(prefix: string, stdout: string) {
 
 describe("parseHookIdentity", () => {
   it("reads the version and the subcommand list", () => {
-    expect(parseHookIdentity("gitpulse-hook 1.0.1\nsubcommands: a, b, c\n")).toEqual({
+    expect(parseHookIdentity("waylode-hook 1.0.1\nsubcommands: a, b, c\n")).toEqual({
       version: "1.0.1",
       subcommands: ["a", "b", "c"],
     });
@@ -331,7 +331,7 @@ describe("parseHookIdentity", () => {
 
   it("survives log noise on stderr-shaped lines without throwing", () => {
     expect(
-      parseHookIdentity("warning: something\ngitpulse-hook 2.0.0\nsubcommands: only-one\n"),
+      parseHookIdentity("warning: something\nwaylode-hook 2.0.0\nsubcommands: only-one\n"),
     ).toEqual({ version: "2.0.0", subcommands: ["only-one"] });
   });
 
@@ -339,13 +339,13 @@ describe("parseHookIdentity", () => {
     // A binary that printed a version and no subcommands has not identified
     // itself; defaulting the list to empty would read as "serves nothing" and
     // defaulting it to the declared set would read as a pass.
-    expect(parseHookIdentity("gitpulse-hook 1.0.1\n")).toEqual({ version: "1.0.1", subcommands: null });
+    expect(parseHookIdentity("waylode-hook 1.0.1\n")).toEqual({ version: "1.0.1", subcommands: null });
     expect(parseHookIdentity("subcommands: a\n")).toEqual({ version: null, subcommands: ["a"] });
     expect(parseHookIdentity("")).toEqual({ version: null, subcommands: null });
   });
 
   it("does not mistake another binary's version line for ours", () => {
-    expect(parseHookIdentity("gitpulse-mcp 1.0.1\n").version).toBeNull();
+    expect(parseHookIdentity("waylode-mcp 1.0.1\n").version).toBeNull();
   });
 });
 
@@ -380,18 +380,18 @@ describe("classifyHook", () => {
     expect(absent.violations.join(" ")).toContain("silently disabled");
 
     expect(
-      classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "1.0.1", subcommands: ["collision-guard", "command-gate"] }).status,
+      classifyHook({ ...base, binPath: "/usr/bin/waylode-hook", version: "1.0.1", subcommands: ["collision-guard", "command-gate"] }).status,
     ).toBe("ok");
   });
 
   it("reports a binary that answered nothing as unresponsive, not absent", () => {
     expect(
-      classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: null, subcommands: null, error: "no identity" }).status,
+      classifyHook({ ...base, binPath: "/usr/bin/waylode-hook", version: null, subcommands: null, error: "no identity" }).status,
     ).toBe("unresponsive");
   });
 
   it("names both versions when the installed hook is stale", () => {
-    const stale = classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "0.9.0", subcommands: ["collision-guard", "command-gate"] });
+    const stale = classifyHook({ ...base, binPath: "/usr/bin/waylode-hook", version: "0.9.0", subcommands: ["collision-guard", "command-gate"] });
     expect(stale.status).toBe("stale");
     expect(stale.violations[0]).toContain("0.9.0");
     expect(stale.violations[0]).toContain("1.0.1");
@@ -401,14 +401,14 @@ describe("classifyHook", () => {
     // The drift a source-only contract test cannot see: the manifest a client
     // reads asks for a subcommand the executable on PATH does not implement,
     // and an unknown subcommand answers with silence by design.
-    const drifted = classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "1.0.1", subcommands: ["collision-guard"] });
+    const drifted = classifyHook({ ...base, binPath: "/usr/bin/waylode-hook", version: "1.0.1", subcommands: ["collision-guard"] });
     expect(drifted.status).toBe("stale");
     expect(drifted.violations[0]).toContain("command-gate");
   });
 
   it("ignores extra subcommands the manifest does not ask for", () => {
     expect(
-      classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "1.0.1", subcommands: ["collision-guard", "command-gate", "future-hook"] }).status,
+      classifyHook({ ...base, binPath: "/usr/bin/waylode-hook", version: "1.0.1", subcommands: ["collision-guard", "command-gate", "future-hook"] }).status,
     ).toBe("ok");
   });
 });
@@ -418,7 +418,7 @@ describe("classifyHook", () => {
  * and it is POSIX-only: Windows dispatches on the extension, `CreateProcess`
  * cannot run a `.mjs`, and `spawn` without a shell refuses a `.cmd` — so
  * `fakeHook` there yields `spawn EFTYPE` rather than the behaviour under test.
- * The shipped Windows hook is `gitpulse-hook.exe`, a real executable, so the
+ * The shipped Windows hook is `waylode-hook.exe`, a real executable, so the
  * production path is not what these skip; only the stand-in is. The
  * spawn-failure branch stays covered on every platform by the missing-binary
  * case below, and the parsing itself by the `parseHookIdentity` suite.
@@ -427,7 +427,7 @@ const itPosix = it.skipIf(process.platform === "win32");
 
 describe("probeHook", () => {
   itPosix("reads a complete identity split across writes", async () => {
-    const bin = await fakeHook("ok", "gitpulse-hook 1.0.1\nsubcommands: collision-guard, command-gate, session-brief\n");
+    const bin = await fakeHook("ok", "waylode-hook 1.0.1\nsubcommands: collision-guard, command-gate, session-brief\n");
     await expect(probeHook(bin, 5000)).resolves.toEqual({
       version: "1.0.1",
       subcommands: ["collision-guard", "command-gate", "session-brief"],
@@ -465,7 +465,7 @@ describe("probeHook", () => {
 
 describe("probeServerCommands", () => {
   itPosix("reads the commands line, sorted", async () => {
-    const bin = await fakeHook("cmds", "gitpulse-mcp 1.2.3\ncommands: tools, describe, call, read\n");
+    const bin = await fakeHook("cmds", "waylode-mcp 1.2.3\ncommands: tools, describe, call, read\n");
     await expect(probeServerCommands(bin, 5000)).resolves.toEqual({
       commands: ["call", "describe", "read", "tools"],
       error: null,
@@ -473,7 +473,7 @@ describe("probeServerCommands", () => {
   });
 
   itPosix("reports an older build's version-only answer as no commands, not an error", async () => {
-    const bin = await fakeHook("old", "gitpulse-mcp 1.2.3\n");
+    const bin = await fakeHook("old", "waylode-mcp 1.2.3\n");
     await expect(probeServerCommands(bin, 5000)).resolves.toEqual({ commands: null, error: null });
   });
 
@@ -486,10 +486,10 @@ describe("probeServerCommands", () => {
 });
 
 describe("SERVER_COMMANDS", () => {
-  it("is the CLI_COMMANDS gitpulse-mcp declares", async () => {
-    const source = await readFile(new URL("../src-tauri/src/bin/gitpulse-mcp.rs", import.meta.url), "utf8");
+  it("is the CLI_COMMANDS waylode-mcp declares", async () => {
+    const source = await readFile(new URL("../src-tauri/src/bin/waylode-mcp.rs", import.meta.url), "utf8");
     const declared = /const CLI_COMMANDS: \[&str; \d+\] = \[([^\]]*)\];/.exec(source);
-    expect(declared, "CLI_COMMANDS not found in gitpulse-mcp.rs").not.toBeNull();
+    expect(declared, "CLI_COMMANDS not found in waylode-mcp.rs").not.toBeNull();
     const names = [...(declared?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
     expect(names).toEqual([...SERVER_COMMANDS].sort());
   });
@@ -497,8 +497,8 @@ describe("SERVER_COMMANDS", () => {
 
 describe("the doctor covers both executables the package spawns", () => {
   it("names the hook binary, not only the server", () => {
-    expect(SERVER_BIN).toBe("gitpulse-mcp");
-    expect(HOOK_BIN).toBe("gitpulse-hook");
+    expect(SERVER_BIN).toBe("waylode-mcp");
+    expect(HOOK_BIN).toBe("waylode-hook");
   });
 
   it("accepts a hook binary path so the probe is drivable without an install", () => {
@@ -510,13 +510,13 @@ describe("the doctor covers both executables the package spawns", () => {
 describe("the installed plugin cache", () => {
   const shipped = {
     hooks: {
-      PreToolUse: [{ matcher: "^Bash$", hooks: [{ type: "command", command: "gitpulse-hook command-gate", timeout: 10 }] }],
-      SessionStart: [{ hooks: [{ type: "command", command: "gitpulse-hook session-brief", timeout: 10 }] }],
-      PostToolUse: [{ hooks: [{ type: "command", command: "gitpulse-hook notify post_tool_use", async: true }] }],
-      Stop: [{ hooks: [{ type: "command", command: "gitpulse-hook notify stop", async: true }] }],
+      PreToolUse: [{ matcher: "^Bash$", hooks: [{ type: "command", command: "waylode-hook command-gate", timeout: 10 }] }],
+      SessionStart: [{ hooks: [{ type: "command", command: "waylode-hook session-brief", timeout: 10 }] }],
+      PostToolUse: [{ hooks: [{ type: "command", command: "waylode-hook notify post_tool_use", async: true }] }],
+      Stop: [{ hooks: [{ type: "command", command: "waylode-hook notify stop", async: true }] }],
     },
   };
-  const install = (hooks: unknown, installPath = "/cache/gitpulse/gitpulse/1.4.0") => ({
+  const install = (hooks: unknown, installPath = "/cache/waylode/waylode/1.4.0") => ({
     registry: "ok",
     registryError: null,
     installs: [{ installPath, hooks, error: null }],
@@ -536,9 +536,9 @@ describe("the installed plugin cache", () => {
   it("names the hooks the installed copy lacks, the ones declared differently, and the ones only it has", () => {
     const stale = {
       hooks: {
-        PreToolUse: [{ matcher: "^Bash$", hooks: [{ type: "command", command: "gitpulse-hook command-gate", timeout: 5 }] }],
+        PreToolUse: [{ matcher: "^Bash$", hooks: [{ type: "command", command: "waylode-hook command-gate", timeout: 5 }] }],
         SessionStart: shipped.hooks.SessionStart,
-        Elicitation: [{ hooks: [{ type: "command", command: "gitpulse-hook notify elicitation" }] }],
+        Elicitation: [{ hooks: [{ type: "command", command: "waylode-hook notify elicitation" }] }],
       },
     };
     const verdict = classifyPluginCache(install(stale), shipped);
@@ -644,11 +644,11 @@ describe("the lease row", () => {
   const link = path.join(binDir, "cargo");
 
   it("passes only when a login shell finds the wrapper's own link first", () => {
-    expect(classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", servesLease: true, resolved: link, error: null }).status).toBe("gated");
+    expect(classifyLease({ binDir, linkTarget: "/app/waylode-hook", servesLease: true, resolved: link, error: null }).status).toBe("gated");
   });
 
   it("never prints ok for a cargo that shadows the link", () => {
-    const verdict = classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", servesLease: true, resolved: "/home/u/.claude-bin/cargo", error: null });
+    const verdict = classifyLease({ binDir, linkTarget: "/app/waylode-hook", servesLease: true, resolved: "/home/u/.claude-bin/cargo", error: null });
     expect(verdict.status).toBe("shadowed");
     expect(verdict.detail).toContain("/home/u/.claude-bin/cargo");
     const report = formatReport({
@@ -657,7 +657,7 @@ describe("the lease row", () => {
     } as never);
     expect(report).toContain("shadowed by /home/u/.claude-bin/cargo");
     expect(report).toContain("FAIL (shadowed)");
-    expect(report).not.toContain("a login shell runs GitPulse's lease wrapper");
+    expect(report).not.toContain("a login shell runs Waylode's lease wrapper");
   });
 
   it("says absent when the app made no links, and unverifiable when the shell could not be asked", () => {
@@ -674,8 +674,8 @@ describe("the lease row", () => {
     const other = path.join(root, "other");
     await mkdir(bin);
     await mkdir(other);
-    const hook = path.join(root, "gitpulse-hook");
-    await writeFile(hook, "#!/bin/sh\nprintf 'gitpulse-hook 9.9.9\\nsubcommands: collision-guard, lease\\n'\n");
+    const hook = path.join(root, "waylode-hook");
+    await writeFile(hook, "#!/bin/sh\nprintf 'waylode-hook 9.9.9\\nsubcommands: collision-guard, lease\\n'\n");
     await chmod(hook, 0o755);
     const { symlink } = await import("node:fs/promises");
     await symlink(hook, path.join(bin, "cargo"));
@@ -701,15 +701,15 @@ describe("the lease row", () => {
 
 describe("the lease row's link target", () => {
   // POSIX-only: a symlink to a shebang script, run through `sh -lc`.
-  it.skipIf(process.platform === "win32")("fails a link to a gitpulse-hook that cannot be the lease wrapper, however the shell resolves cargo", async () => {
+  it.skipIf(process.platform === "win32")("fails a link to a waylode-hook that cannot be the lease wrapper, however the shell resolves cargo", async () => {
     const root = await scratchDir("lease-stale");
     const bin = path.join(root, "lease-bin");
     await mkdir(bin);
-    // gitpulse-hook from before build leases: run as cargo, it exits 0 and builds nothing.
-    const stale = path.join(root, "gitpulse-hook");
+    // waylode-hook from before build leases: run as cargo, it exits 0 and builds nothing.
+    const stale = path.join(root, "waylode-hook");
     await writeFile(
       stale,
-      "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'gitpulse-hook 0.4.0\\nsubcommands: collision-guard, command-gate\\n'; fi\nexit 0\n",
+      "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'waylode-hook 0.4.0\\nsubcommands: collision-guard, command-gate\\n'; fi\nexit 0\n",
     );
     await chmod(stale, 0o755);
     const { symlink } = await import("node:fs/promises");
@@ -725,6 +725,6 @@ describe("the lease row's link target", () => {
       lease: { ...verdict, resolved: path.join(bin, "cargo"), ok: false },
     } as never);
     expect(report).toContain("FAIL (stale)");
-    expect(report).not.toContain("a login shell runs GitPulse's lease wrapper");
+    expect(report).not.toContain("a login shell runs Waylode's lease wrapper");
   });
 });

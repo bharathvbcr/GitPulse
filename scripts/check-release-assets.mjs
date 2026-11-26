@@ -60,15 +60,15 @@ function rpmFor(version, rpm) {
  * @type {Readonly<Record<string, (version: string) => string[]>>}
  */
 export const PLATFORM_INSTALLERS = Object.freeze({
-  "macos-latest": (version) => [`GitPulse_${version}_universal.dmg`, `GitPulse_${version}_universal.app.tar.gz`],
+  "macos-latest": (version) => [`Waylode_${version}_universal.dmg`, `Waylode_${version}_universal.app.tar.gz`],
   "ubuntu-22.04": (version) => [
-    ...rpmFor(version, `GitPulse-${version}-1.x86_64.rpm`), `GitPulse_${version}_amd64.AppImage`, `GitPulse_${version}_amd64.deb`,
+    ...rpmFor(version, `Waylode-${version}-1.x86_64.rpm`), `Waylode_${version}_amd64.AppImage`, `Waylode_${version}_amd64.deb`,
   ],
   "ubuntu-22.04-arm": (version) => [
-    ...rpmFor(version, `GitPulse-${version}-1.aarch64.rpm`), `GitPulse_${version}_aarch64.AppImage`, `GitPulse_${version}_arm64.deb`,
+    ...rpmFor(version, `Waylode-${version}-1.aarch64.rpm`), `Waylode_${version}_aarch64.AppImage`, `Waylode_${version}_arm64.deb`,
   ],
-  "windows-latest": (version) => [`GitPulse_${version}_x64-setup.exe`, `GitPulse_${version}_x64_en-US.msi`],
-  "windows-11-arm": (version) => [`GitPulse_${version}_arm64-setup.exe`, `GitPulse_${version}_arm64_en-US.msi`],
+  "windows-latest": (version) => [`Waylode_${version}_x64-setup.exe`, `Waylode_${version}_x64_en-US.msi`],
+  "windows-11-arm": (version) => [`Waylode_${version}_arm64-setup.exe`, `Waylode_${version}_arm64_en-US.msi`],
 });
 
 /**
@@ -132,9 +132,9 @@ export function inspectBundles({ platform, version, paths }) {
  */
 export function supplementNames(version) {
   return {
-    checksums: `GitPulse_${version}_SHA256SUMS.txt`,
-    spdx: `GitPulse_${version}_sbom.spdx.json`,
-    cargo: `GitPulse_${version}_sbom.cargo.cdx.json`,
+    checksums: `Waylode_${version}_SHA256SUMS.txt`,
+    spdx: `Waylode_${version}_sbom.spdx.json`,
+    cargo: `Waylode_${version}_sbom.cargo.cdx.json`,
   };
 }
 
@@ -338,7 +338,7 @@ const MACHO_CPU_X86_64 = 0x01000007;
 const ELF_MACHINE = { x64: 0x3e, arm64: 0xb7 };
 const PE_MACHINE = { x64: 0x8664, arm64: 0xaa64 };
 /** The app's main binary; every other `[[bin]]` is an extra the installer lays beside it. */
-const MAIN_BINARY = "gitpulse";
+const MAIN_BINARY = "waylode";
 
 /** The check could not read a bundle at all, which is not the same as reading it and finding it wrong. */
 class UnreadableBundle extends Error {}
@@ -1036,7 +1036,7 @@ export function inspectBundleContents({ version, binaries, files, workDir, extra
           const archive = readFileSync(file);
           const packed = spec.format === "deb" ? readDebData(archive) : archive;
           const entries = readTar(gunzipSync(packed, { maxOutputLength: maxUnpackedBytes }));
-          const wanted = binaries.map((binary) => (spec.format === "deb" ? `usr/bin/${binary}` : `GitPulse.app/Contents/MacOS/${binary}`));
+          const wanted = binaries.map((binary) => (spec.format === "deb" ? `usr/bin/${binary}` : `Waylode.app/Contents/MacOS/${binary}`));
           found = [...unsafeTarPaths(entries), ...judgeTarParents(entries, wanted), ...judgeTarSourceMaps(entries)];
           for (const [index, binary] of binaries.entries()) {
             found.push(...judgeTarBinary(entries, wanted[index], binary,

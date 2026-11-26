@@ -11,13 +11,13 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use waylode_lib::procguard::LockedSpawn;
 
 fn mcp_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_gitpulse-mcp")
+    env!("CARGO_BIN_EXE_waylode-mcp")
 }
 
 fn modern_meta() -> Value {
@@ -148,7 +148,7 @@ fn gitpulse_mcp_stdio_speaks_2026_07_28_twice() {
             .map(|t| t["name"].as_str().unwrap_or(""))
             .collect();
         assert!(
-            names.contains(&"gitpulse_insights"),
+            names.contains(&"waylode_insights"),
             "launch {launch}: {names:?}"
         );
 
@@ -208,7 +208,7 @@ fn command_line_arguments_are_answered_without_serving() {
     for flag in ["--help", "-h"] {
         let (code, stdout, stderr) = run_with_args(&[flag]);
         assert_eq!(code, Some(0), "{flag}: {stderr}");
-        assert!(stdout.starts_with("gitpulse-mcp"), "{flag}: {stdout}");
+        assert!(stdout.starts_with("waylode-mcp"), "{flag}: {stdout}");
         assert!(stdout.contains("--version"), "{flag}: {stdout}");
     }
     for flag in ["--version", "-V"] {
@@ -219,7 +219,7 @@ fn command_line_arguments_are_answered_without_serving() {
         assert_eq!(
             stdout,
             format!(
-                "gitpulse-mcp {}\ncommands: tools, describe, call, read\n",
+                "waylode-mcp {}\ncommands: tools, describe, call, read\n",
                 env!("CARGO_PKG_VERSION")
             ),
             "{flag}"
@@ -270,9 +270,9 @@ fn run_one_shot_with(
         .env("GITPULSE_LOG_DIR", log_dir.path())
         // Not the terminal this test runs in: a terminal tool acts for the
         // GitPulse terminal named here, and the tests must not depend on one.
-        .env_remove(gitpulse_lib::terminal::TERMINAL_SESSION_ENV)
-        .env_remove(gitpulse_lib::alerts::bridge::SESSION_ENV)
-        .env_remove(gitpulse_lib::terminal::orchestrate::SESSION_TOKEN_ENV)
+        .env_remove(waylode_lib::terminal::TERMINAL_SESSION_ENV)
+        .env_remove(waylode_lib::alerts::bridge::SESSION_ENV)
+        .env_remove(waylode_lib::terminal::orchestrate::SESSION_TOKEN_ENV)
         .spawn_locked()
         .unwrap_or_else(|e| panic!("spawn {}: {e}", mcp_bin()));
     let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
@@ -351,8 +351,8 @@ fn a_timed_out_call_leaves_no_git_child_behind() {
     // Persist the grant so the out-of-process `gitpulse-mcp` shares the
     // hermetic trust decision.
     let repo_str = repo.path().to_str().expect("utf-8 path");
-    let preview = gitpulse_lib::repository_trust::inspect(repo_str).expect("inspect repo");
-    gitpulse_lib::repository_trust::grant(repo_str, &preview.identity, true).expect("trust");
+    let preview = waylode_lib::repository_trust::inspect(repo_str).expect("inspect repo");
+    waylode_lib::repository_trust::grant(repo_str, &preview.identity, true).expect("trust");
     let stub = tempfile::tempdir().expect("stub dir");
     let pids = stub.path().join("pids");
     let script = stub.path().join("git");
@@ -409,7 +409,7 @@ fn one_shot_commands_answer_without_a_session() {
     let (code, stdout, stderr) = run_one_shot(&["tools"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
-        stdout.lines().any(|l| l.starts_with("gitpulse_insights ")),
+        stdout.lines().any(|l| l.starts_with("waylode_insights ")),
         "{stdout}"
     );
 
@@ -419,11 +419,11 @@ fn one_shot_commands_answer_without_a_session() {
     assert!(
         catalog
             .as_array()
-            .is_some_and(|tools| tools.iter().any(|t| t["name"] == "gitpulse_status")),
+            .is_some_and(|tools| tools.iter().any(|t| t["name"] == "waylode_status")),
         "{stdout}"
     );
 
-    let (code, stdout, stderr) = run_one_shot(&["describe", "gitpulse_status"]);
+    let (code, stdout, stderr) = run_one_shot(&["describe", "waylode_status"]);
     assert_eq!(code, Some(0), "{stderr}");
     let tool: Value = serde_json::from_str(&stdout).expect("describe prints JSON");
     assert!(
@@ -435,8 +435,8 @@ fn one_shot_commands_answer_without_a_session() {
     // partial answer is still the only thing on stdout.
     let (code, stdout, stderr) = run_one_shot(&[
         "call",
-        "gitpulse_insights",
-        "repo_path=/no/such/gitpulse-cli-repo",
+        "waylode_insights",
+        "repo_path=/no/such/waylode-cli-repo",
         "--compact",
     ]);
     assert_eq!(code, Some(3), "stdout: {stdout}\nstderr: {stderr}");
@@ -447,8 +447,8 @@ fn one_shot_commands_answer_without_a_session() {
     // A write needs --write, and is refused before anything runs.
     let (code, stdout, stderr) = run_one_shot(&[
         "call",
-        "gitpulse_add_task",
-        "repo_path=/no/such/gitpulse-cli-repo",
+        "waylode_add_task",
+        "repo_path=/no/such/waylode-cli-repo",
         "title=t",
     ]);
     assert_eq!(code, Some(2), "{stderr}");
@@ -456,13 +456,13 @@ fn one_shot_commands_answer_without_a_session() {
     assert!(stderr.contains("--write"), "{stderr}");
 
     // The server's own schema check refuses a missing argument: exit 1.
-    let (code, stdout, stderr) = run_one_shot(&["call", "gitpulse_status"]);
+    let (code, stdout, stderr) = run_one_shot(&["call", "waylode_status"]);
     assert_eq!(code, Some(1), "{stdout} {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("repo_path"), "{stderr}");
 
     // A resource answers from the same binary.
-    let (code, stdout, stderr) = run_one_shot(&["read", "gitpulse://server/manifest", "--compact"]);
+    let (code, stdout, stderr) = run_one_shot(&["read", "waylode://server/manifest", "--compact"]);
     assert_eq!(code, Some(0), "{stderr}");
     let manifest: Value = serde_json::from_str(&stdout).expect("read prints JSON");
     assert!(manifest.is_object(), "{manifest}");

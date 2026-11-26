@@ -1,0 +1,56 @@
+{
+  "name": "Waylode",
+  "concept": "Concept 2 — Way-Arc (Cobalt)",
+  "viewBox": "0 0 32 32",
+  "path": "M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8",
+  "circle": {
+    "cx": 23.8,
+    "cy": 9.0,
+    "r": 2.8
+  },
+  "strokeWidth": 3.4,
+  "strokeLinecap": "round",
+  "strokeLinejoin": "round",
+  "gradient": {
+    "x1": 3,
+    "y1": 27,
+    "x2": 29,
+    "y2": 6,
+    "stops": [
+      { "offset": "0%", "color": "#7dd3fc" },
+      { "offset": "52%", "color": "#38bdf8" },
+      { "offset": "100%", "color": "#3b82f6" }
+    ]
+  },
+  "plate": {
+    "dark": ["#0f172a", "#060a14"],
+    "radialGlow": {
+      "cx": 16,
+      "cy": 16,
+      "r": 15,
+      "color": "#38bdf8",
+      "startOpacity": 0.24,
+      "endOpacity": 0
+    },
+    "rx": 10,
+    "border": {
+      "x": 0.3,
+      "y": 0.3,
+      "width": 31.4,
+      "height": 31.4,
+      "rx": 9.7,
+      "stroke": "#ffffff",
+      "strokeOpacity": 0.12,
+      "strokeWidth": 0.6
+    }
+  },
+  "artTransform": {
+    "badge": "translate(3.04 3.04) scale(0.81)",
+    "mark": "translate(-2.4 -2.4) scale(1.15)"
+  },
+  "macIcon": {
+    "size": 1024,
+    "plateSize": 824,
+    "rx": 185
+  }
+}

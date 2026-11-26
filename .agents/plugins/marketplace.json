@@ -1,14 +1,14 @@
 {
-  "name": "gitpulse",
+  "name": "waylode",
   "interface": {
-    "displayName": "GitPulse"
+    "displayName": "Waylode"
   },
   "plugins": [
     {
-      "name": "gitpulse",
+      "name": "waylode",
       "source": {
         "source": "local",
-        "path": "./plugins/gitpulse"
+        "path": "./plugins/waylode"
       },
       "policy": {
         "installation": "AVAILABLE",

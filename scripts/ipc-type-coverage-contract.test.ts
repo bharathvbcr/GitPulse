@@ -106,6 +106,7 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["PreflightReport", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["PreviewFileResult", { reason: "devmap preview file envelope; pending CONTRACTS row" }],
   ["PreviewOutcome", { reason: "devmap preview batch; pending CONTRACTS row" }],
+  ["ReliefOutcome", { reason: "internally tagged enum (`state`) the struct checker does not model; mirrored as ReliefOutcome in src/lib/health/hostRelief.ts and held to its variants by enum-variant-contract.test.ts, read by hostRelief.test.ts and the Rust wire-name test the_wire_names_are_the_contract" }],
   ["RepoMapLoad", { reason: "repo map panel load; pending CONTRACTS row" }],
   ["SearchHit", { reason: "MarkDev / vault search hit; pending CONTRACTS row" }],
   ["ReflinkResult", { reason: "worktree CoW clone result; mirrored in src/lib/branches/types.ts" }],

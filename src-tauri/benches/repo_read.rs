@@ -25,10 +25,10 @@ mod numstat_paired;
 
 use common::fixture::{build_repo, count_git_processes, dirty_files, git, trust_repo, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::engine::git_cli::sandbox_write_edited_text;
-use gitpulse_lib::engine::git_reader::GitReader;
+use waylode_lib::engine::git_cli::sandbox_write_edited_text;
+use waylode_lib::engine::git_reader::GitReader;
 #[cfg(unix)]
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 
 struct Shape {
     label: &'static str,
@@ -37,7 +37,7 @@ struct Shape {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("repo_read");
     let temp = tempfile::tempdir().expect("temp dir");
 
@@ -162,7 +162,7 @@ fn main() {
     let blame_old = {
         let dir = blame_dir.clone();
         move || {
-            gitpulse_lib::engine::git_cli::git_text_capped(
+            waylode_lib::engine::git_cli::git_text_capped(
                 &dir,
                 &["blame", "--line-porcelain", "--", "big.txt"],
                 64 << 20,
@@ -170,7 +170,7 @@ fn main() {
             .expect("line-porcelain blame")
         }
     };
-    let blame_new_bytes = gitpulse_lib::engine::git_cli::git_text_capped(
+    let blame_new_bytes = waylode_lib::engine::git_cli::git_text_capped(
         &blame_dir,
         &["blame", "--porcelain", "--", "big.txt"],
         64 << 20,
@@ -235,8 +235,8 @@ fn main() {
         stream.push_str("M 100644 inline f.txt\ndata 2\nx\n\n");
     }
     {
-        use gitpulse_lib::procguard::LockedSpawn;
         use std::io::Write;
+        use waylode_lib::procguard::LockedSpawn;
         let mut import = std::process::Command::new("git");
         import
             .args(["fast-import", "--quiet"])
@@ -269,7 +269,7 @@ fn main() {
             let mut bytes = 0u64;
             for chunk in 0..4usize {
                 let skip = format!("--skip={}", chunk * 5_000);
-                let (text, _) = gitpulse_lib::engine::git_cli::git_text_capped(
+                let (text, _) = waylode_lib::engine::git_cli::git_text_capped(
                     &old_dir,
                     &[
                         "log",
@@ -301,7 +301,7 @@ fn main() {
                 20_001,
                 Some(&revision),
                 None,
-                gitpulse_lib::graph::RefScope::Named,
+                waylode_lib::graph::RefScope::Named,
             )
             .expect("history window");
             std::hint::black_box(&rows);
@@ -449,7 +449,7 @@ fn main() {
             let mut bytes = 0u64;
             for _ in 0..REDACT_ROUNDS {
                 for text in &texts {
-                    let out = gitpulse_lib::ledger::redact::text(std::hint::black_box(text));
+                    let out = waylode_lib::ledger::redact::text(std::hint::black_box(text));
                     bytes += out.len() as u64;
                     std::hint::black_box(&out);
                 }
@@ -555,7 +555,7 @@ fn transcript_pass(
     std::fs::write(&file, text).expect("write corpus");
     std::env::set_var("GITPULSE_TRANSCRIPT_ROOT", corpus);
     let started = std::time::Instant::now();
-    let out = gitpulse_lib::ingest::ingest_transcripts(&repo);
+    let out = waylode_lib::ingest::ingest_transcripts(&repo);
     let elapsed = started.elapsed();
     std::fs::remove_file(&file).expect("remove corpus");
     assert!(

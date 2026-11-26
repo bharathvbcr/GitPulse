@@ -1,6 +1,6 @@
 # First-run walkthrough and permissions
 
-The walkthrough opens the first time this version of GitPulse runs in a webview
+The walkthrough opens the first time this version of Waylode runs in a webview
 profile. It also introduces the tour to existing profiles that have never saved
 walkthrough progress. Six steps cover repositories and trust, the registered
 Work/Code/History/Insights views, Tasks and optional tools, platform access, and
@@ -41,10 +41,10 @@ data resets the tour. No account, remote service, or installed CLI is required.
 
 ## Platform access
 
-GitPulse uses the existing native folder picker and repository trust flow.
+Waylode uses the existing native folder picker and repository trust flow.
 macOS bundle purpose strings explain access to repositories opened in Desktop,
 Documents, and Downloads. The OS decides whether to prompt and whether access is
-allowed. After denial, review GitPulse in System Settings → Privacy & Security →
+allowed. After denial, review Waylode in System Settings → Privacy & Security →
 Files and Folders and retry opening the repository. Windows and Linux guidance
 points to account/folder permissions and platform protection or confinement.
 An unknown host is explicitly identified without claiming verified access.

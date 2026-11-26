@@ -46,6 +46,8 @@ import { densityFromLegacy, type Density } from "../ui/appearance/density";
 import type { GitPulseTheme } from "../ui/appearance/themeSchema";
 import type { BackdropId } from "../ui/appearance/backdrops";
 import { clearThemePatch, presetPatch, themeSelectionPatch, type ThemePreset } from "../ui/appearance/presets";
+import type { BrandLogoPalette, BrandLogoStyle } from "../ui/appearance/brandLogo";
+import { syncBrandLogoStore } from "../ui/appearance/brandLogoStore";
 import { withSavedTheme, withoutSavedTheme, type SaveOutcome } from "../ui/appearance/savedThemes";
 import { customWallpaper } from "../ui/appearance/wallpaperStore";
 import { installWallpaperMotion } from "../ui/appearance/wallpaperMotion";
@@ -849,6 +851,7 @@ export const INTERFACE_PERSIST_DELAY_MS = 250;
 function createInterfaceStore() {
   let current = readPrefs();
   setSignalledAsksForReader(current.bellAsksForReader);
+  syncBrandLogoStore(current.logoStyle, current.logoPalette);
   const { subscribe, set } = writable<InterfacePrefs>(current);
   const pendingSave = createDeferredWrite(() => persist(current), INTERFACE_PERSIST_DELAY_MS);
   flushOnPageHide(() => pendingSave.flush());
@@ -858,6 +861,7 @@ function createInterfaceStore() {
     current = next;
     persist(next);
     setSignalledAsksForReader(next.bellAsksForReader);
+    syncBrandLogoStore(next.logoStyle, next.logoPalette);
     set(next);
   }
 
@@ -881,6 +885,7 @@ function createInterfaceStore() {
     if (keys.every((key) => Object.is(current[key], partial[key]))) return;
     current = { ...current, ...partial };
     setSignalledAsksForReader(current.bellAsksForReader);
+    syncBrandLogoStore(current.logoStyle, current.logoPalette);
     set(current);
     pendingSave.schedule();
   }
@@ -935,6 +940,8 @@ function createInterfaceStore() {
         ),
       }),
     setWallpaperMotion: (on: boolean) => patch({ wallpaperMotion: on }),
+    setLogoStyle: (logoStyle: BrandLogoStyle) => patch({ logoStyle }),
+    setLogoPalette: (logoPalette: BrandLogoPalette) => patch({ logoPalette }),
     /**
      * Applies a built-in preset: its theme, wallpaper and material, and switches
      * the window to the preset's appearance, because a theme only draws in its own.

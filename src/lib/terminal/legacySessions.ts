@@ -145,7 +145,7 @@ export function legacyStopQuestion(session: LegacySession): { title: string; mes
   const label = legacySessionLabel(session);
   return {
     title: `Stop ${label}?`,
-    message: `${label} is still running in the previous GitPulse version's terminal host. Stopping it ends whatever it is doing; this version cannot reattach to it.`,
+    message: `${label} is still running in the previous Waylode version's terminal host. Stopping it ends whatever it is doing; this version cannot reattach to it.`,
   };
 }
 

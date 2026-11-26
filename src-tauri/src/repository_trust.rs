@@ -502,7 +502,7 @@ pub(crate) fn persistent_root() -> Result<PathBuf, CommandError> {
     {
         crate::tool_config::default_config_dir()
             .map(|dir| dir.join("repository-trust-v1"))
-            .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
+            .ok_or_else(|| "Cannot resolve Waylode repository trust storage".into())
     }
 }
 
@@ -828,7 +828,7 @@ fn require_identified(repo: &Path) -> Result<Identity, CommandError> {
     // round, or nowhere at all when the worktree is gone by the time they read
     // it.
     let mut refusal = format!(
-        "{REQUIRED}: Open {} in GitPulse and trust it before running repository commands.",
+        "{REQUIRED}: Open {} in Waylode and trust it before running repository commands.",
         current.checkout.path.display()
     );
     if current.git_dir != current.common_dir {
@@ -852,7 +852,7 @@ fn require_identified(repo: &Path) -> Result<Identity, CommandError> {
             // the button as it is actually labelled, and saying where it is,
             // is the difference between that and a hunt.
             refusal.push_str(&format!(
-                " That repository was approved before GitPulse covered worktrees, \
+                " That repository was approved before Waylode covered worktrees, \
                  so the earlier approval reaches only the checkout it named — \
                  which is why you are asked again here. If this worktree is \
                  already gone, open that repository instead and use \

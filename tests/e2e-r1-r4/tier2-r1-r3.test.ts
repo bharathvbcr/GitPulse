@@ -37,9 +37,11 @@ import {
 } from "./helpers/env";
 import { makeRepoFixtures } from "./helpers/fixtures";
 
-const OLD_PULSE_LOGO_SHA256 =
-  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
-const CANONICAL_PATH_FRAGMENT = "M24.04 9.25A10.5";
+const RETIRED_LOGO_SHA256S = new Set([
+  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1",
+  "1cf0341b1cc7b556701b5bfb17c3ed02b2eba2e87863928b4de8e1cc7225fd3b",
+]);
+const CANONICAL_PATH_FRAGMENT = "M23.8 9.0A10.5";
 
 function decodePngRgbaPixels(relPath: string): {
   width: number;
@@ -298,13 +300,13 @@ describe("[Tier 2] [R1] F1 Boundaries — Logo Variants, IDs & Asset Integrity",
     expect(tiny).toContain('width="14"');
     expect(tiny).toContain('height="14"');
     expect(tiny).toContain('viewBox="0 0 32 32"');
-    expect(tiny).not.toContain("gitpulse-trace");
+    expect(tiny).not.toContain("wl-trace");
 
     expect(large).toContain('width="48"');
     expect(large).toContain('height="48"');
     expect(large).toContain('viewBox="0 0 32 32"');
     expect(large).toContain('pathLength="100"');
-    expect(large).toContain("gitpulse-trace");
+    expect(large).toContain("wl-trace");
   });
 
   it("enforces distinct transform and rounded plate bounds between badge and mark variants", () => {
@@ -319,9 +321,9 @@ describe("[Tier 2] [R1] F1 Boundaries — Logo Variants, IDs & Asset Integrity",
     expect(mark).not.toContain("<rect");
   });
 
-  it("validates PNG colorType=6 RGBA, 8-bit depth, transparent corners, and G-ring pixels on plugin & app icons", () => {
+  it("validates PNG colorType=6 RGBA, 8-bit depth, transparent corners, and Way-Arc pixels on plugin & app icons", () => {
     for (const rel of [
-      "plugins/gitpulse/assets/logo.png",
+      "plugins/waylode/assets/logo.png",
       "src-tauri/icons/32x32.png",
       "src-tauri/icons/128x128.png",
       "src-tauri/icons/128x128@2x.png",
@@ -335,17 +337,22 @@ describe("[Tier 2] [R1] F1 Boundaries — Logo Variants, IDs & Asset Integrity",
       expect(info.interlace, rel).toBe(0);
     }
 
-    const decoded = decodePngRgbaPixels("plugins/gitpulse/assets/logo.png");
+    const decoded = decodePngRgbaPixels("plugins/waylode/assets/logo.png");
     expect(decoded.width).toBe(256);
     expect(decoded.height).toBe(256);
     expect(decoded.pixel(0, 0)[3]).toBe(0);
-    const [r, _g, b, a] = decoded.pixel(60, 128);
-    expect(a).toBeGreaterThan(200);
-    expect(b).toBeGreaterThan(r);
+    const [gr, gg, gb, ga] = decoded.pixel(80, 176);
+    expect(ga).toBeGreaterThan(200);
+    expect(gb).toBeGreaterThan(gr);
+    expect(gg).toBeGreaterThanOrEqual(180);
+    const [sr, , sb, sa] = decoded.pixel(179, 83);
+    expect(sa).toBeGreaterThan(200);
+    expect(sb).toBeGreaterThan(sr);
+    expect(sb).toBeGreaterThanOrEqual(230);
   });
 
-  it("leaves zero stale logo assets across plugins/gitpulse and plugins/gitpulse-agy", () => {
-    const assetDirs = ["plugins/gitpulse", "plugins/gitpulse-agy"];
+  it("leaves zero stale logo assets across plugins/waylode and plugins/waylode-agy", () => {
+    const assetDirs = ["plugins/waylode", "plugins/waylode-agy"];
     const foundAssets: string[] = [];
 
     for (const dirRel of assetDirs) {
@@ -364,7 +371,7 @@ describe("[Tier 2] [R1] F1 Boundaries — Logo Variants, IDs & Asset Integrity",
     for (const absPath of foundAssets) {
       if (absPath.endsWith(".png")) {
         const info = readPngInfo(absPath);
-        expect(info.sha256, absPath).not.toBe(OLD_PULSE_LOGO_SHA256);
+        expect(RETIRED_LOGO_SHA256S.has(info.sha256), absPath).toBe(false);
       } else if (absPath.endsWith(".svg")) {
         const svg = readFileSync(absPath, "utf8");
         expect(svg, absPath).toContain(CANONICAL_PATH_FRAGMENT);

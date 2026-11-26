@@ -133,10 +133,14 @@ use std::sync::{Mutex, OnceLock};
 pub const SOCKET_NAME: &str = "agent-notify.sock";
 
 /// The environment variable a launched agent's hooks read to find the socket.
-pub const SOCKET_ENV: &str = "GITPULSE_NOTIFY_SOCKET";
+pub const SOCKET_ENV: &str = "WAYLODE_NOTIFY_SOCKET";
+/// Legacy environment variable for [`SOCKET_ENV`].
+pub const LEGACY_SOCKET_ENV: &str = "GITPULSE_NOTIFY_SOCKET";
 
-/// The environment variable that tells a hook which GitPulse PTY it is under.
-pub const SESSION_ENV: &str = "GITPULSE_SESSION_ID";
+/// The environment variable that tells a hook which Waylode PTY it is under.
+pub const SESSION_ENV: &str = "WAYLODE_SESSION_ID";
+/// Legacy environment variable for [`SESSION_ENV`].
+pub const LEGACY_SESSION_ENV: &str = "GITPULSE_SESSION_ID";
 
 /// Largest report accepted from one connection.
 pub const MAX_REPORT_BYTES: usize = 8 * 1024;
@@ -653,6 +657,7 @@ fn serve(state: &'static State, stream: std::os::unix::net::UnixStream, stamp: u
         move || {
             let _slot = slot;
             let outcome = handle_into(stream, budget, &mut |notice, seq| {
+                note_hook_prompt(&notice);
                 super::offer_stamped(notice, order_for(seq, stamp))
             });
             if let Outcome::Refused(reason) = outcome {
@@ -1109,6 +1114,70 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("cursor", "Cursor"),
 ];
 
+/// Told about a hook report that opens or closes a wait on the person: a
+/// `permission_prompt` (the agent is parked on a dialog) or a resolving event
+/// (a tool finished, a prompt was submitted, the session ended). The terminal
+/// layer registers one, so `wait` and `read` know a hooked agent is waiting
+/// as they know it of one whose dialog was read off its screen.
+type PromptObserver = Box<dyn Fn(&Notice) + Send + Sync>;
+
+static PROMPT_OBSERVER: std::sync::OnceLock<PromptObserver> = std::sync::OnceLock::new();
+
+/// Registers the one observer of hook prompts and resolutions. A second
+/// registration is ignored: there is one terminal registry per app.
+pub(crate) fn observe_hook_prompts(observer: impl Fn(&Notice) + Send + Sync + 'static) {
+    let _ = PROMPT_OBSERVER.set(Box::new(observer));
+}
+
+#[cfg(unix)]
+fn note_hook_prompt(notice: &Notice) {
+    let raises = notice.event == Some("permission_prompt");
+    let resolves = notice
+        .event
+        .and_then(event)
+        .is_some_and(|event| event.role == Role::Resolve);
+    if raises || resolves {
+        if let Some(observer) = PROMPT_OBSERVER.get() {
+            observer(notice);
+        }
+    }
+}
+
+/// The channel of a notice an agent's hook reported.
+pub(crate) const HOOK_CHANNEL: &str = "hook";
+
+/// The channel of a notice read off a terminal screen (see [`screen_prompt_notice`]).
+pub(crate) const SCREEN_CHANNEL: &str = "screen";
+
+/// A notice about a dialog an agent is showing in its terminal, read off the
+/// screen because that agent has no hook for it (agy asks permission in its
+/// own UI). Built like a hook report (`permission_prompt` while it is open,
+/// `prompt_submitted` once answered) so the hub stands, expires and resolves
+/// it exactly as it does one an agent reported.
+pub(crate) fn screen_prompt_notice(
+    key: &str,
+    label: &str,
+    place: Option<String>,
+    event: &'static str,
+    detail: Option<String>,
+) -> Notice {
+    Notice {
+        key: key.to_owned(),
+        origin: Origin::Hook,
+        label: label.to_owned(),
+        place,
+        event: Some(event),
+        detail,
+        is_agent: true,
+        channel: SCREEN_CHANNEL,
+        subject: None,
+        subagent: false,
+        agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
+    }
+}
+
 pub(crate) fn valid_key(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 96
@@ -1324,7 +1393,7 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         detail,
         // A hook only exists because an agent installed it.
         is_agent: true,
-        channel: "hook",
+        channel: HOOK_CHANNEL,
         subject,
         subagent,
         agent_id,

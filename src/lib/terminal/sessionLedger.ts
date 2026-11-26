@@ -439,7 +439,7 @@ export async function reopenAllSessionLedgerOffers(
 }
 
 /** Shown while the backend has not reconciled the ledger: silence there would read as "nothing to recover". */
-export const LEDGER_UNRECONCILED_TEXT = "GitPulse couldn't check which agents survived yet.";
+export const LEDGER_UNRECONCILED_TEXT = "Waylode couldn't check which agents survived yet.";
 
 /** Agent rows the app-level "interrupted agents" notice speaks for. */
 export interface InterruptedSummary {

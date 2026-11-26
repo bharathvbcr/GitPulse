@@ -5,13 +5,13 @@
 //! the check prints why and returns, so machines without it still pass; when
 //! it is present, the assertions must hold against its genuine output.
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
-use gitpulse_lib::analyzer::deps::{DepsScanner, ScanOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::analyzer::deps::{DepsScanner, ScanOptions};
 
 fn git_repo() -> TempDir {
     common::unmetered_spawns();

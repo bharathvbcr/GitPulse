@@ -123,17 +123,17 @@ pub const CONTAINER: [&str; 2] = [".gitpulse", "worktrees"];
 pub const BRANCH_PREFIX: &str = "worktree-";
 
 /// The launcher the plugin runs the worktree hooks through, relative to the
-/// plugin root (`plugins/gitpulse/`). It holds the plain-git fallback.
-pub const LAUNCHER: &str = "hooks/gitpulse-worktree.sh";
+/// plugin root (`plugins/waylode/`). It holds the plain-git fallback.
+pub const LAUNCHER: &str = "hooks/waylode-worktree.sh";
 
-/// What the shipped manifest puts in front of `gitpulse-hook <subcommand>` for
+/// What the shipped manifest puts in front of `waylode-hook <subcommand>` for
 /// the worktree events. Every reader of `hooks.json` strips exactly this
 /// ([`strip_launcher`]) and then reads the rest as it reads any other entry.
-pub const LAUNCHER_PREFIX: &str = "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/gitpulse-worktree.sh\" ";
+pub const LAUNCHER_PREFIX: &str = "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/waylode-worktree.sh\" ";
 
 /// A manifest command without the launcher in front of it, and whether it had
-/// one: `sh "…/gitpulse-worktree.sh" gitpulse-hook worktree-create` reads as
-/// `gitpulse-hook worktree-create`.
+/// one: `sh "…/waylode-worktree.sh" waylode-hook worktree-create` reads as
+/// `waylode-hook worktree-create`.
 pub fn strip_launcher(command: &str) -> (&str, bool) {
     match command.strip_prefix(LAUNCHER_PREFIX) {
         Some(rest) => (rest, true),

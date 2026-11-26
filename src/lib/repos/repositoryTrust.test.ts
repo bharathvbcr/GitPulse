@@ -116,7 +116,7 @@ describe("repository trust approval", () => {
     it("offers an extension that names what is currently unreadable", async () => {
       const message = await messageFor({ ...legacy, worktrees: 6 });
       expect(message).toContain("/repo");
-      expect(message).toMatch(/before GitPulse covered worktrees/i);
+      expect(message).toMatch(/before Waylode covered worktrees/i);
       expect(message).toMatch(/5 other working trees cannot be read/i);
       // It must not read as a first approval: the person did that already.
       expect(message).not.toMatch(/Trust it only if you trust its source/i);

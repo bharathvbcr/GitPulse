@@ -9,7 +9,6 @@ mod hermetic_env;
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use gitpulse_lib::procguard::LockedSpawn;
     use objc2::exception::{catch, throw, Exception};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Imp, Method, Sel};
@@ -18,6 +17,7 @@ mod macos {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+    use waylode_lib::procguard::LockedSpawn;
 
     static THROW: AtomicBool = AtomicBool::new(false);
     static CALLS: AtomicUsize = AtomicUsize::new(0);

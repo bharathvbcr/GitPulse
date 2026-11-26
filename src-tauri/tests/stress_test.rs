@@ -1,14 +1,14 @@
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
-use gitpulse_lib::analyzer::LocCounter;
-use gitpulse_lib::diff::{
+use std::process::Command as StdCommand;
+use std::time::Instant;
+use waylode_lib::analyzer::LocCounter;
+use waylode_lib::diff::{
     compute_word_diff, ConflictResolver, DiffLineType, FilePatch, PatchBuilder, UnifiedDiffHunk,
     UnifiedDiffLine,
 };
-use gitpulse_lib::engine::{GitReader, GitWriter};
-use gitpulse_lib::graph::{LaneSolver, RawCommitNode};
-use std::process::Command as StdCommand;
-use std::time::Instant;
+use waylode_lib::engine::{GitReader, GitWriter};
+use waylode_lib::graph::{LaneSolver, RawCommitNode};
 
 fn init_repo_with_base_file() -> tempfile::TempDir {
     common::unmetered_spawns();
@@ -343,7 +343,7 @@ fn test_conflict_resolver_diff3_with_base() {
     let doc = ConflictResolver::parse("calc.py", raw);
     assert_eq!(doc.total_conflicts, 1);
 
-    if let gitpulse_lib::diff::FileSegment::Conflict(ref chunk) = doc.segments[1] {
+    if let waylode_lib::diff::FileSegment::Conflict(ref chunk) = doc.segments[1] {
         assert_eq!(chunk.base_content.as_deref(), Some("    return 42"));
         assert_eq!(chunk.ours_content, "    return 42 * 2");
         assert_eq!(chunk.theirs_content, "    return 42 * 100");
@@ -379,7 +379,7 @@ fn test_large_file_loc_analyzer() {
 /// multi-byte character, or silently reclassify the rest of a file.
 #[test]
 fn loc_counter_survives_adversarial_content() {
-    use gitpulse_lib::analyzer::LocCounter;
+    use waylode_lib::analyzer::LocCounter;
 
     let cases: Vec<(&str, String)> = vec![
         ("empty", String::new()),
@@ -485,7 +485,7 @@ fn loc_counter_survives_adversarial_content() {
 /// apostrophe silently becomes code.
 #[test]
 fn an_unbalanced_quote_cannot_change_the_rest_of_a_file() {
-    use gitpulse_lib::analyzer::LocCounter;
+    use waylode_lib::analyzer::LocCounter;
 
     let tail = "# a real comment\nkey: value\n# another comment\n";
     let clean = LocCounter::count_for_language(tail, "YAML");
@@ -507,7 +507,7 @@ fn an_unbalanced_quote_cannot_change_the_rest_of_a_file() {
 
 #[test]
 fn test_ref_name_injection_adversarial_suite() {
-    use gitpulse_lib::engine::git_writer::{
+    use waylode_lib::engine::git_writer::{
         validate_oid, validate_oid_or_revision, validate_ref_name,
     };
 
@@ -822,8 +822,8 @@ theirs line without end marker
 
 #[test]
 fn test_stack_tree_cyclic_ancestry_safety() {
-    use gitpulse_lib::stack::StackTreeEngine;
     use std::collections::HashMap;
+    use waylode_lib::stack::StackTreeEngine;
 
     let mut branch_tips = HashMap::new();
     branch_tips.insert("feat-a".to_string(), "c1".to_string());
@@ -981,7 +981,7 @@ fn discard_changes_reports_err_while_index_lock_is_held_and_recovers() {
 /// the command layer adds beyond scheduling.
 #[test]
 fn worktree_list_add_remove_roundtrip_on_a_temp_repo() {
-    use gitpulse_lib::engine::worktree::{add_worktree, list_worktrees, remove_worktree};
+    use waylode_lib::engine::worktree::{add_worktree, list_worktrees, remove_worktree};
 
     let dir = init_repo_with_base_file();
     let repo = dir.path().to_str().unwrap().to_string();
@@ -1035,8 +1035,8 @@ fn worktree_list_add_remove_roundtrip_on_a_temp_repo() {
 // Stack hierarchy stress: adversarial grids over StackTreeEngine
 // ---------------------------------------------------------------------------
 
-use gitpulse_lib::stack::{StackTreeEngine, StackedBranchNode};
 use std::collections::{HashMap, HashSet};
+use waylode_lib::stack::{StackTreeEngine, StackedBranchNode};
 
 /// Invariants every build_stack_hierarchy output must satisfy, applied across
 /// the whole adversarial grid.

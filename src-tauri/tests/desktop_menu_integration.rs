@@ -11,19 +11,19 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::desktop::{
-    cmd_take_pending_open, handle_menu_event, queue_and_emit_open, DesktopState,
-};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use tauri::Manager;
 use tempfile::TempDir;
+use waylode_lib::desktop::{
+    cmd_take_pending_open, handle_menu_event, queue_and_emit_open, DesktopState,
+};
+use waylode_lib::procguard::LockedSpawn;
 
 fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
     tauri::test::mock_builder()
         .manage(DesktopState::default())
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .expect("mock app builds")
 }
 
@@ -35,7 +35,7 @@ fn added_menu_commands_emit_the_exact_frontend_payload_once() {
     let app = mock_app();
     let received = Arc::new(Mutex::new(Vec::new()));
     let listener_received = Arc::clone(&received);
-    let listener = app.listen(gitpulse_lib::desktop::MENU_EVENT, move |event| {
+    let listener = app.listen(waylode_lib::desktop::MENU_EVENT, move |event| {
         let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
         listener_received.lock().unwrap().push(payload);
     });

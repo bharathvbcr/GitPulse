@@ -18,12 +18,12 @@ mod common;
 #[path = "common/process_trust.rs"]
 mod process_trust;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use waylode_lib::procguard::LockedSpawn;
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -64,15 +64,15 @@ fn repository(parent: &Path) -> PathBuf {
 }
 
 fn launch(home: &Path, event: &str, payload: serde_json::Value, cwd: &Path) -> Output {
-    let launcher = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../plugins/gitpulse/hooks/gitpulse-worktree.sh");
+    let launcher =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/waylode/hooks/waylode-worktree.sh");
     let logs = tempfile::tempdir().unwrap();
     let mut child = Command::new("sh")
         .arg(launcher)
         .args([HOOK, event])
         .current_dir(cwd)
         .envs(process_trust::profile_env(home))
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -96,7 +96,7 @@ fn a_trusted_repository_gets_a_gitpulse_worktree_and_an_untrusted_one_a_plain_on
     // Trusted: GitPulse makes it.
     let repo = repository(&fixture.path().join("trusted"));
     process_trust::approve(&repo, &home);
-    let before = gitpulse_lib::ledger::latest_cursor(repo.to_str().unwrap()).unwrap_or(0);
+    let before = waylode_lib::ledger::latest_cursor(repo.to_str().unwrap()).unwrap_or(0);
     let out = launch(
         &home,
         "worktree-create",
@@ -137,7 +137,7 @@ fn a_trusted_repository_gets_a_gitpulse_worktree_and_an_untrusted_one_a_plain_on
         "worktree-bold-oak-a3f2"
     );
 
-    let events = gitpulse_lib::ledger::tail(repo.to_str().unwrap(), before, 50).expect("ledger");
+    let events = waylode_lib::ledger::tail(repo.to_str().unwrap(), before, 50).expect("ledger");
     assert!(
         events
             .iter()

@@ -60,7 +60,7 @@ impl ExportKind {
             },
             ExportKind::Theme => ExportFormat {
                 title: "Export theme",
-                filter: "GitPulse theme",
+                filter: "Waylode theme",
                 extension: "json",
                 default_stem: "gitpulse-theme",
             },
@@ -90,7 +90,7 @@ pub(crate) fn plan_export(
 ) -> Result<ExportPlan, String> {
     if data_len > MAX_EXPORT_BYTES {
         return Err(format!(
-            "The export is larger than {} MiB, which is more than GitPulse writes to one file.",
+            "The export is larger than {} MiB, which is more than Waylode writes to one file.",
             MAX_EXPORT_BYTES / (1024 * 1024)
         ));
     }
@@ -140,7 +140,7 @@ fn write_failure(path: &Path, error: &std::io::Error) -> String {
         .unwrap_or_else(|| "the file".to_owned());
     match error.kind() {
         ErrorKind::PermissionDenied => {
-            format!("GitPulse isn't allowed to write {name} in that folder. Pick another folder.")
+            format!("Waylode isn't allowed to write {name} in that folder. Pick another folder.")
         }
         ErrorKind::NotFound => format!("The folder chosen for {name} no longer exists."),
         ErrorKind::ReadOnlyFilesystem => format!("{name} is on a disk that is read-only."),
@@ -235,7 +235,7 @@ mod export_tests {
         if let Err(error) = result {
             assert_eq!(
                 error,
-                "GitPulse isn't allowed to write theme.json in that folder. Pick another folder."
+                "Waylode isn't allowed to write theme.json in that folder. Pick another folder."
             );
         }
     }

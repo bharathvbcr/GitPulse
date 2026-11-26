@@ -74,7 +74,7 @@ const FACETS: &[Facet] = &[
     Facet {
         name: "elsewhere",
         title: "Other worktrees' dirty files",
-        description: "The uncommitted files of every other worktree, for a worktree that is itself clean. It cannot know which file you will edit; ask gitpulse_collision_risk with a path for that. A worktree with scanned false was not read.",
+        description: "The uncommitted files of every other worktree, for a worktree that is itself clean. It cannot know which file you will edit; ask waylode_collision_risk with a path for that. A worktree with scanned false was not read.",
     },
     Facet {
         name: "changes",
@@ -274,15 +274,15 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             // while a tool writes. It said `true` after the task-board tools
             // began writing the GitPulse task profile.
             "readOnly": super::tools().iter().all(|tool| tool["annotations"]["readOnlyHint"] == true),
-            // True of `gitpulse_merge_conflicts` and `gitpulse_landed` read tools: a
+            // True of `waylode_merge_conflicts` and `waylode_landed` read tools: a
             // merge-tree writes its objects to a quarantined directory that is
             // deleted afterwards. Derived dynamically so the manifest reports
-            // `true` whenever policy-gated `gitpulse_worktree_*` tools are advertised.
+            // `true` whenever policy-gated `waylode_worktree_*` tools are advertised.
             "gitWrites": super::tools().iter().any(|tool| {
                 tool["annotations"]["readOnlyHint"] != true
                     && tool["name"]
                         .as_str()
-                        .is_some_and(|n| n.starts_with("gitpulse_worktree_"))
+                        .is_some_and(|n| n.starts_with("waylode_worktree_"))
             }),
             "writes": super::tools().iter()
                 .filter(|tool| tool["annotations"]["readOnlyHint"] != true)
@@ -693,14 +693,14 @@ mod tests {
 
     #[test]
     fn an_unknown_facet_names_the_ones_that_exist() {
-        let error = read("gitpulse://not_a_facet/tmp/x").expect_err("unknown facet");
+        let error = read("waylode://not_a_facet/tmp/x").expect_err("unknown facet");
         assert!(matches!(error, ReadError::NotFound(_)));
         assert!(error.message().contains("insights"), "{}", error.message());
     }
 
     #[test]
     fn a_traversal_uri_is_refused_before_any_backend_runs() {
-        let error = read("gitpulse://insights/tmp/../../etc").expect_err("traversal");
+        let error = read("waylode://insights/tmp/../../etc").expect_err("traversal");
         assert!(matches!(error, ReadError::NotFound(_)));
         assert!(error.message().contains(".."), "{}", error.message());
     }
@@ -709,7 +709,7 @@ mod tests {
     fn a_missing_repository_is_an_error_never_an_empty_contents_array() {
         // The spec forbids answering a non-existent resource with `[]`: a client
         // cannot tell that from a resource that exists and is empty.
-        let error = read("gitpulse://status/no/such/repo").expect_err("missing repo");
+        let error = read("waylode://status/no/such/repo").expect_err("missing repo");
         assert!(matches!(error, ReadError::Internal(_)));
         assert!(!error.message().is_empty());
     }
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn an_oversized_document_is_labelled_truncated_and_stops_claiming_to_be_json() {
         let big = json!({ "blob": "x".repeat(MAX_DOCUMENT_BYTES + 1024) });
-        let content = text_content("gitpulse://server/manifest", big);
+        let content = text_content("waylode://server/manifest", big);
         let text = content["text"].as_str().unwrap();
         assert!(text.contains("… truncated"), "truncation is not announced");
         assert_eq!(content["mimeType"], "text/plain");
@@ -737,7 +737,7 @@ mod tests {
             "😀".repeat(1024 * 1024 + 7),
         ] {
             let contents = vec![text_content(
-                "gitpulse://insights/tmp/x",
+                "waylode://insights/tmp/x",
                 json!({ "blob": payload }),
             )];
             let response = super::super::JsonRpcResponse {
@@ -760,8 +760,13 @@ mod tests {
             );
         }
         // The manifest is far below the cap and stays whole JSON.
-        let manifest = read("gitpulse://server/manifest").expect("manifest reads");
+        let manifest = read("waylode://server/manifest").expect("manifest reads");
+        assert_eq!(manifest[0]["uri"], "waylode://server/manifest");
         assert_eq!(manifest[0]["mimeType"], "application/json");
+        // Reading via the legacy scheme echoes the requested scheme back.
+        let legacy = read("gitpulse://server/manifest").expect("legacy manifest reads");
+        assert_eq!(legacy[0]["uri"], "gitpulse://server/manifest");
+        assert_eq!(legacy[0]["text"], manifest[0]["text"]);
     }
 
     /// A row written before the append cap existed can hold a megabyte in one
@@ -813,7 +818,7 @@ mod tests {
 
     #[test]
     fn a_document_under_the_cap_is_untouched_json() {
-        let content = text_content("gitpulse://server/health", json!({ "a": 1 }));
+        let content = text_content("waylode://server/health", json!({ "a": 1 }));
         assert_eq!(content["mimeType"], "application/json");
         let text = content["text"].as_str().unwrap();
         assert!(!text.contains("truncated"));
@@ -825,7 +830,7 @@ mod tests {
 
     #[test]
     fn the_manifest_document_reports_the_real_catalog_not_a_copy_of_it() {
-        let contents = read("gitpulse://server/manifest").expect("manifest reads");
+        let contents = read("waylode://server/manifest").expect("manifest reads");
         let text = contents[0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).expect("manifest is JSON");
         assert_eq!(parsed["name"], super::super::SERVER_NAME);
@@ -835,10 +840,10 @@ mod tests {
             super::super::tools().len()
         );
         // The task-board tools write the task profile, the policy-gated
-        // `gitpulse_worktree_*` tools mutate worktrees/branches under
+        // `waylode_worktree_*` tools mutate worktrees/branches under
         // `harness::guard_command`, and the desktop mailbox tools
-        // (`gitpulse_browser_open`, `gitpulse_terminal_spawn`,
-        // `gitpulse_terminal_open_file`, `gitpulse_terminal_send`) act on the
+        // (`waylode_browser_open`, `waylode_terminal_spawn`,
+        // `waylode_terminal_open_file`, `waylode_terminal_send`) act on the
         // running app under repository trust and Option A session lineage;
         // the manifest names all of them honestly.
         assert_eq!(parsed["readOnly"], false);
@@ -846,33 +851,33 @@ mod tests {
         assert_eq!(
             parsed["writes"],
             json!([
-                "gitpulse_add_task",
-                "gitpulse_import_tasks",
-                "gitpulse_complete_task",
-                "gitpulse_delete_task",
-                "gitpulse_merge_tasks",
-                "gitpulse_worktree_create",
-                "gitpulse_worktree_switch",
-                "gitpulse_worktree_isolate",
-                "gitpulse_worktree_prune",
-                "gitpulse_worktree_merge",
-                "gitpulse_worktree_claim",
-                "gitpulse_worktree_release",
-                "gitpulse_worktree_send_message",
-                "gitpulse_browser_open",
-                "gitpulse_terminal_spawn",
-                "gitpulse_terminal_exec",
-                "gitpulse_terminal_open_file",
-                "gitpulse_terminal_send",
-                "gitpulse_terminal_close",
-                "gitpulse_inbox_post",
-                "gitpulse_inbox_withdraw",
-                "gitpulse_kickoff_agent",
-                "gitpulse_agent_register",
-                "gitpulse_agent_send",
-                "gitpulse_agent_inbox",
-                "gitpulse_agent_wait",
-                "gitpulse_worktree_overlay_sync"
+                "waylode_add_task",
+                "waylode_import_tasks",
+                "waylode_complete_task",
+                "waylode_delete_task",
+                "waylode_merge_tasks",
+                "waylode_worktree_create",
+                "waylode_worktree_switch",
+                "waylode_worktree_isolate",
+                "waylode_worktree_prune",
+                "waylode_worktree_merge",
+                "waylode_worktree_claim",
+                "waylode_worktree_release",
+                "waylode_worktree_send_message",
+                "waylode_browser_open",
+                "waylode_terminal_spawn",
+                "waylode_terminal_exec",
+                "waylode_terminal_open_file",
+                "waylode_terminal_send",
+                "waylode_terminal_close",
+                "waylode_inbox_post",
+                "waylode_inbox_withdraw",
+                "waylode_kickoff_agent",
+                "waylode_agent_register",
+                "waylode_agent_send",
+                "waylode_agent_inbox",
+                "waylode_agent_wait",
+                "waylode_worktree_overlay_sync"
             ])
         );
         assert_eq!(
@@ -897,7 +902,7 @@ mod tests {
 
     #[test]
     fn the_health_document_says_so_when_the_command_gate_is_absent() {
-        let contents = read("gitpulse://server/health").expect("health reads");
+        let contents = read("waylode://server/health").expect("health reads");
         let text = contents[0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).expect("health is JSON");
         let gate = parsed["commandGate"].as_str().unwrap();

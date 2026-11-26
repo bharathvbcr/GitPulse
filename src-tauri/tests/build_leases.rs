@@ -18,16 +18,16 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::sysload::{
-    Binding, Clock, PublishedVerdict, Reading, Snapshot, SnapshotWriter, Tier, WriterIdentity,
-};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::sysload::{
+    Binding, Clock, PublishedVerdict, Reading, Snapshot, SnapshotWriter, Tier, WriterIdentity,
+};
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 
 /// A cargo that says when it started and stopped, and holds its slot until the
 /// test releases it.
@@ -61,9 +61,9 @@ echo "stop $TAG" >> "$LOG"
 
 fn config_dir(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/GitPulse")
+        home.join("Library/Application Support/Waylode")
     } else {
-        home.join(".config").join("gitpulse")
+        home.join(".config").join("waylode")
     }
 }
 
@@ -145,7 +145,7 @@ impl World {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("GITPULSE_TOOL_CONFIG", &self.tools)
-            .env(gitpulse_lib::logging::LOG_DIR_ENV, self.home.join("logs"))
+            .env(waylode_lib::logging::LOG_DIR_ENV, self.home.join("logs"))
             .env("GITPULSE_LEASE_POLL_MS", "50")
             .env("GITPULSE_LEASE_ANNOUNCE_MS", "200")
             .env("GITPULSE_TERMINAL_SESSION", format!("term-{tag}"))
@@ -800,7 +800,7 @@ fn shell_build(world: &World, path: &std::ffi::OsStr, tag: &str) -> std::process
         .env("TMPDIR", &world.tmp)
         .env("XDG_CONFIG_HOME", world.home.join(".config"))
         .env("GITPULSE_TOOL_CONFIG", &world.tools)
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, world.home.join("logs"))
+        .env(waylode_lib::logging::LOG_DIR_ENV, world.home.join("logs"))
         .env("LOG", &world.log)
         .env("RELEASE", &world.release)
         .env("TAG", tag)
@@ -814,13 +814,13 @@ fn shell_build(world: &World, path: &std::ffi::OsStr, tag: &str) -> std::process
 
 #[test]
 fn a_stale_hook_behind_the_links_never_passes_a_build_it_did_not_run() {
-    use gitpulse_lib::sysload::lease;
     use std::ffi::OsStr;
+    use waylode_lib::sysload::lease;
     let world = World::new(r#"{"slots":2}"#);
     let config = config_dir(&world.home);
     let app = world.home.join("App");
     std::fs::create_dir_all(&app).unwrap();
-    let hook = app.join("gitpulse-hook");
+    let hook = app.join("waylode-hook");
     std::os::unix::fs::symlink(HOOK, &hook).unwrap();
     lease::ensure_links(&config, &hook).expect("a current hook is linked");
     let bin = lease::bin_dir(&config);
@@ -875,8 +875,8 @@ fn a_stale_hook_behind_the_links_never_passes_a_build_it_did_not_run() {
 
 #[test]
 fn a_link_whose_target_went_stale_is_reported_and_not_routed() {
-    use gitpulse_lib::sysload::lease;
     use std::ffi::OsStr;
+    use waylode_lib::sysload::lease;
     let world = World::new(r#"{"slots":2}"#);
     let config = config_dir(&world.home);
     let bin = lease::bin_dir(&config);
@@ -1034,7 +1034,7 @@ fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config
     // The steward names the trusted repositories a lease covers; the hook runs
     // from this test's working directory, inside this repository.
     let here = std::env::current_dir().unwrap();
-    let covered = gitpulse_lib::harness::steward::canonical_common_dir(here.to_str().unwrap())
+    let covered = waylode_lib::harness::steward::canonical_common_dir(here.to_str().unwrap())
         .expect("the test runs inside a Git checkout");
     let steward_dir = config_dir(&world.home).join("steward");
     std::fs::DirBuilder::new()
@@ -1055,7 +1055,7 @@ fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config
     let active_json = serde_json::json!({
         "version": 2,
         "writer_pid": std::process::id(),
-        "writer_start_us": gitpulse_lib::sysload::process_start_us(std::process::id()).unwrap_or(0),
+        "writer_start_us": waylode_lib::sysload::process_start_us(std::process::id()).unwrap_or(0),
         "issued_at_ms": now_ms,
         "expires_at_ms": now_ms + 900_000,
         "tier": "severe",

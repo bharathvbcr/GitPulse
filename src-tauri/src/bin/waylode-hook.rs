@@ -1,0 +1,1481 @@
+//! Waylode hook executable.
+//!
+//! One binary, dispatched by its first argument, reading the host's hook JSON
+//! on stdin and writing hook JSON on stdout. Every decision lives in
+//! `waylode_lib::hooks` so the contract is unit-tested rather than only
+//! exercised by spawning this process.
+//!
+//! Two rules shape this file:
+//!
+//! * **stdout is the protocol channel.** On a hook invocation nothing but the
+//!   hook JSON goes down it. Diagnostics go to stderr, where a hook that exits
+//!   0 has them recorded in the host's debug log and shown to nobody else. The
+//!   git and harness subprocesses underneath already pipe their own stdout
+//!   (`engine::git_cli::git_command`, `harness::sidecar`), so none of them can
+//!   leak into ours. The one argument that is not a hook invocation —
+//!   `--version`, which no host sends — prints plain text there instead, and
+//!   deliberately prints nothing a host could parse as a decision.
+//!   The two worktree hooks (`worktree-create`, `worktree-remove`) speak
+//!   Claude Code's `WorktreeCreate`/`WorktreeRemove` protocol instead: stdout
+//!   carries the created worktree's path and nothing else, and every note goes
+//!   to stderr (`hooks::worktree`).
+//! * **Exit 0, except for one wake and the worktree hooks.** `deliver`, the
+//!   `asyncRewake` `Stop` hook, exits 2 with the message it claimed on stderr:
+//!   the documented way to wake the agent
+//!   (<https://code.claude.com/docs/en/hooks.md>), on an event with no tool
+//!   call to block. The worktree hooks exit with `hooks::worktree`'s codes,
+//!   because for those events a non-zero exit is how Claude Code learns that no
+//!   worktree was made or removed, and 75 tells the plugin's launcher to fall
+//!   back to plain git. Every other path, `deliver`'s included, exits 0.
+//!   Exit 2 blocks the tool call whatever the JSON says. A
+//!   hook that crashed, timed out or could not read its input must never be the
+//!   reason a user's edit is refused, so every failure path here degrades to
+//!   "no decision" plus a stderr line. The single exception is a hook the host
+//!   *itself* killed: `procguard::exit` reports that signal, which is not exit
+//!   2 and so still blocks nothing, and which the host already knows about
+//!   because it sent it.
+
+use std::io;
+
+use waylode_lib::hooks::{self, IDENTITY_FLAGS, SUBCOMMANDS};
+
+fn main() {
+    // A hook runs git for the user's own agent, so it spends the per-user
+    // spawn budget the app and the agent servers spend. First, before any
+    // spawn builds the gate; this only records the choice and blocks on nothing.
+    waylode_lib::engine::process::run_process_with_shared_spawn_budget();
+    // A build leased through this binary (`cargo` or `go` through the app's
+    // `lease-bin` links, or `gitpulse-hook lease -- <program>`) may wait for a
+    // slot for hours and then becomes the build. It must start no hook
+    // deadline and install no signal handler, so it is decided before either.
+    #[cfg(unix)]
+    if let Some(code) = hooks::lease_wrapper::maybe_run() {
+        std::process::exit(code);
+    }
+    // The one deadline for the whole process starts here, before anything that
+    // can block, so every later wait is cut to what the host's timeout leaves.
+    hooks::start_deadline();
+    let code = run_guarded(decide);
+    // `process::exit` below runs no destructor, so a harness sidecar this hook
+    // started (and the state directory it holds) is ended here, before the
+    // sweep takes down what is left. It waits for nothing: the host enforces a
+    // budget on the whole process, and a hook killed after its decision was
+    // printed loses the decision. A slot a call still holds is left to the
+    // sweep and the next process.
+    waylode_lib::harness::sidecar::shutdown_for_hook_exit();
+    // The decision is already on stdout. Anything a check abandoned at its
+    // deadline is still running: a `git status` or the harness sidecar, in its
+    // own process group, able to hold `.git/index.lock` after the hook is gone.
+    // `process::exit` runs no destructor, so they are taken down here, as the
+    // servers do. Free when nothing is registered; otherwise one `CHILD_GRACE`.
+    let sweep = waylode_lib::procguard::reap_all(waylode_lib::procguard::CHILD_GRACE);
+    if !sweep.is_complete() {
+        log::warn!(target: "hook", "{}", sweep.describe());
+    }
+    // Not a bare return: a hook that finished while a caught signal was still
+    // being swept would exit out from under it, leaving the git or harness
+    // subprocess the sweep was killing.
+    waylode_lib::procguard::exit(code);
+}
+
+/// Runs the hook and returns its exit code, which is 0 when a judging hook
+/// panicked. A panic otherwise exits 101: not the blocking 2, but not the
+/// promised 0 either, and a host is free to treat any non-zero hook as a
+/// failure the user has to look at. The installed panic hook has already logged
+/// the fault. A worktree hook that panicked exits non-zero instead
+/// ([`hooks::worktree::exit_code_after_panic`]): for those events exit 0 means
+/// "made" or "removed", which a panic never did.
+fn run_guarded(decide: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
+    std::panic::catch_unwind(decide).unwrap_or_else(|_| {
+        log::error!(target: "hook", "waylode-hook panicked; no decision");
+        let code = hooks::worktree::exit_code_after_panic();
+        if code == 0
+            && is_agy_invocation_from(std::env::args().skip(1), hooks::is_antigravity_env())
+        {
+            emit("{}\n".into());
+        }
+        code
+    })
+}
+
+/// Whether this run serves Antigravity, which needs a JSON object on stdout
+/// even when the hook panicked: either the environment says so, or the hook
+/// was registered `--host=agy` (the plugin's `hooks.json` does, and Antigravity
+/// does not always set the environment the check reads).
+fn is_agy_invocation_from<I, S>(args: I, env_is_agy: bool) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    env_is_agy || args.into_iter().any(|arg| arg.as_ref() == "--host=agy")
+}
+
+fn strip_host_agy_flag(raw_args: &[String]) -> (bool, Vec<String>) {
+    let mut flag_is_agy = false;
+    let mut args = Vec::with_capacity(raw_args.len());
+    for arg in raw_args {
+        if arg == "--host=agy" {
+            flag_is_agy = true;
+        } else {
+            args.push(arg.clone());
+        }
+    }
+    (flag_is_agy, args)
+}
+
+/// Runs one hook invocation and returns its exit code, which
+/// [`hooks::diagnostic`] fixes at 0 for every outcome it reports.
+fn decide() -> i32 {
+    waylode_lib::logging::init();
+    waylode_lib::logging::install_panic_hook();
+    // A host that decides a hook has taken too long kills it, and the git or
+    // harness subprocess a check was in the middle of would otherwise carry
+    // on unattached. The cost is one pipe and one thread, well under the
+    // startup this file is written to protect. Not logged at startup like the
+    // servers do: stderr is the host's debug channel and a line on every
+    // matching tool call would drown the ones that matter.
+    let _ = waylode_lib::procguard::install_signal_handlers();
+
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let (flag_is_agy, args) = strip_host_agy_flag(&raw_args);
+
+    let antigravity_env = flag_is_agy || hooks::is_antigravity_env();
+
+    let Some(subcommand) = args.first().cloned() else {
+        // Exit 2, the host's "block", not 0: a host that does not know the
+        // exec form's `args` field (the Windows settings copy uses it) would
+        // start this binary with no arguments, and exit 0 there would read as
+        // "allowed" for a collision guard or command gate that never ran.
+        let reason = format!(
+            "waylode-hook: no subcommand given; expected one of {}. Blocking: no safety check ran.",
+            SUBCOMMANDS.join(", ")
+        );
+        log::warn!(target: "hook", "{reason}");
+        emit_stderr(format!("{reason}\n"));
+        return 2;
+    };
+
+    // Asked who we are rather than to judge anything. No host sends this — it
+    // is what `npm run mcp:doctor` uses to tell an absent or stale hook binary
+    // from a current one, which no hook invocation can reveal because silence
+    // is a legitimate answer to every one of them. Handled before the
+    // subcommand check so it is never reported as an unknown subcommand, and
+    // it reads no stdin: there is none to read.
+    if IDENTITY_FLAGS.contains(&subcommand.as_str()) {
+        emit(hooks::identity());
+        return 0;
+    }
+
+    if subcommand == "term" {
+        return run_term_cli(&args[1..]);
+    }
+
+    if !SUBCOMMANDS.contains(&subcommand.as_str()) {
+        log::warn!(target: "hook", "unknown hook subcommand {subcommand:?}; no decision");
+        if antigravity_env {
+            emit("{}\n".to_string());
+        }
+        return 0;
+    }
+
+    // An unparseable payload is reported on stderr and dropped. Guessing at a
+    // decision from input we could not read would be the worst of both worlds:
+    // neither a check that ran nor an admission that one did not. Exiting 0
+    // with no stdout leaves the host's own permission flow exactly as it was
+    // (or `"{}"` on Antigravity, which never accepts empty stdout).
+    //
+    // `notify` takes the matcher's name as a second argument, because a
+    // `Notification` payload does not say which matcher routed it. It is taken
+    // first because it also decides whether stdin is read at all.
+    let argument = args.get(1).cloned();
+    let worktree_hook =
+        [hooks::worktree::CREATE, hooks::worktree::REMOVE].contains(&subcommand.as_str());
+    if worktree_hook {
+        hooks::worktree::begin();
+    }
+    let mut input = match hooks::read_for(&subcommand, argument.as_deref(), io::stdin()) {
+        Ok(input) => input,
+        Err(error) => {
+            log::warn!(target: "hook", "waylode-hook {subcommand}: {error}");
+            if antigravity_env && !worktree_hook {
+                emit("{}\n".to_string());
+            }
+            // Nothing was done; the launcher can still have plain git do it.
+            return if worktree_hook {
+                hooks::worktree::EXIT_UNAVAILABLE
+            } else {
+                0
+            };
+        }
+    };
+    // One answer to "is this Antigravity": the payload's own shape (already in
+    // `input.host`), or the `--host=agy` registration, or the environment.
+    if flag_is_agy {
+        input.is_agy = true;
+    }
+    if !input.is_cursor {
+        input.host = hooks::effective_host_kind(input.host, antigravity_env);
+    }
+
+    if worktree_hook {
+        let finished = hooks::worktree::run(&subcommand, &input);
+        for note in &finished.notes {
+            emit_stderr(format!("waylode-hook {subcommand}: {note}\n"));
+        }
+        if let Some(path) = &finished.path {
+            emit(format!("{path}\n"));
+        }
+        return finished.exit_code;
+    }
+
+    match hooks::dispatch(&subcommand, argument.as_deref(), &input) {
+        Ok(output) => {
+            // GitPulse injects the PreToolUse gates into every session it
+            // launches, so a session that also enables the plugin runs them
+            // twice. Decisions are left alone; an identical warning is said once.
+            let output = if hooks::INJECTED_SUBCOMMANDS.contains(&subcommand.as_str()) {
+                hooks::advisory_once::dedupe(&subcommand, &input, output)
+            } else {
+                output
+            };
+            if let Some(json) = output.render_for_invocation(&subcommand, &input) {
+                emit(format!("{json}\n"));
+            }
+            0
+        }
+        // `deliver` claimed a message. The agent reads stderr (the hook is
+        // registered `asyncRewake`, and exit 2 is what wakes it), so the text
+        // goes there as it is, with no log prefix, and the exit code is the
+        // one `diagnostic` fixes for a wake.
+        Err(error @ hooks::HookError::Wake(_)) => {
+            emit_stderr(format!("{error}"));
+            hooks::diagnostic(&error).exit_code
+        }
+        // One line per invocation, at the level the outcome calls for: a
+        // transport this platform does not have is information, not a failure.
+        Err(error) => {
+            let diagnostic = hooks::diagnostic(&error);
+            log::log!(target: "hook", diagnostic.level, "{}", diagnostic.line);
+            if input.is_antigravity() && diagnostic.exit_code == 0 {
+                emit("{}\n".to_string());
+            }
+            diagnostic.exit_code
+        }
+    }
+}
+
+/// The one place this binary writes to stdout.
+///
+/// Bounded and deadlined for the same reason every other stdout in this
+/// repository is: a host that has gone away leaves a pipe nobody drains, and
+/// Rust ignores SIGPIPE, so an unchecked write is a hang rather than an error.
+/// A failed write is logged and not retried — there is no second channel to
+/// deliver it on, and exiting non-zero would block the user's tool call over a
+/// message we could not send.
+fn emit(payload: String) {
+    let result = waylode_lib::output::BoundedOutput::new(
+        io::stdout(),
+        "waylode-hook-stdout",
+        hooks::MAX_INPUT_BYTES,
+        std::time::Duration::from_secs(1),
+    )
+    .and_then(|output| output.write(payload.as_bytes()));
+    if let Err(error) = result {
+        log::warn!(target: "hook", "could not deliver hook stdout: {error}; no retry");
+    }
+}
+
+/// What an `asyncRewake` hook says to the agent it wakes: stderr, bounded and
+/// deadlined like stdout, for the same reason (a host that has gone away leaves
+/// a pipe nobody drains). A message that could not be written is logged; there
+/// is no second channel, and the exit code stays the wake's, because the claim
+/// has already happened and it is the host that decides what an unread
+/// reminder is worth.
+fn emit_stderr(payload: String) {
+    let result = waylode_lib::output::BoundedOutput::new(
+        io::stderr(),
+        "waylode-hook-stderr",
+        hooks::MAX_INPUT_BYTES,
+        std::time::Duration::from_secs(1),
+    )
+    .and_then(|output| output.write(payload.as_bytes()));
+    if let Err(error) = result {
+        log::warn!(target: "hook", "could not deliver the wake message: {error}; no retry");
+    }
+}
+
+const TERM_USAGE: &str = "\
+Usage: waylode-hook term <command> [options]
+
+Scoped child terminal orchestration for coding agents. Uses `WAYLODE_TERMINAL_SESSION`
++ `WAYLODE_SESSION_TOKEN` inside a Waylode PTY, or a caller-scoped `ext-<ppid>`
+identity when run standalone (`exec`/`spawn`/`list`/`wait`/`read`/`send`/`close`).
+
+Commands:
+  spawn       Spawn a scoped child PTY (`shell`, `claude`, `agy`, `codex`, `manvi`, `grok`)
+  exec        Run a gated shell command and wait for OSC 133 completion/exit output
+  open-file   Open a repository file in a right-hand terminal split pane
+  list        List child sessions (add `--include-repo-shells` when enabled in Settings)
+  wait        Wait on a child session (`OSC 133`, `OSC 7501`, pattern, or loopback port)
+  read        Read secret-scrubbed `vt100` screen lines or last OSC 133 block
+  send        Send policy-gated plain-text input to a child session
+  close       Terminate and close a child session spawned by this caller
+
+Common options:
+  --repo <abs-path>           Repository root (defaults to git root of current working directory)
+  --caller-session <id>       Override WAYLODE_TERMINAL_SESSION
+  --caller-token <token>      Override WAYLODE_SESSION_TOKEN
+
+Spawn options:
+  --launcher <kind>           shell (default) | claude | agy | codex | manvi | grok
+  --cwd <dir>                 Subdirectory inside the repository
+  --command <cmd>             Initial command when --launcher shell
+  --prompt <text>             Initial prompt for an agent launcher
+  --title <title>             Tab / pane title
+  --split | --no-split        Split right beside parent pane (default: true)
+  --rows <1..500>             Initial PTY rows
+  --cols <2..1000>            Initial PTY columns
+
+Exec options:
+  --command <cmd>             Shell command to execute (or pass as positional arg)
+  --child <session-id>        Reuse an existing owned 'shell' session (default: spawn fresh shell)
+  --cwd <dir>                 Subdirectory inside the repository when spawning a fresh shell
+  --timeout-ms <1..25000>     Wait ceiling in milliseconds (default: 10000)
+  --pattern <substring>       Wake early as soon as output contains substring
+  --keep-open | --ephemeral   Keep shell open after running (default: keep open)
+  --split | --no-split        Split pane when spawning a fresh shell
+  --title <title>             Tab / pane title when spawning a fresh shell
+  --max-lines <1..1000>       Maximum output lines returned (default: 80)
+
+Open-file options:
+  --path <rel-path>           Repository-relative path (or pass as positional arg)
+  --line <1-based>            Optional line number
+  --column <1-based>          Optional column number
+
+List options:
+  --include-repo-shells       Include read-only repository user shells when opted in
+
+Wait options:
+  --child <session-id>        Child session id (or pass as positional arg)
+  --timeout-ms <1..25000>     Wait ceiling in milliseconds (default: 10000)
+  --pattern <substring>       Wake as soon as screen contains substring
+  --wait-for-idle             Wait until prompt/agent idle (default: true)
+  --no-wait-for-idle          Return immediately if pattern/exit already satisfied
+  --since-seq <n>             Telemetry event sequence cursor
+
+Read options:
+  --child <session-id>        Child session id (or pass as positional arg)
+  --max-lines <1..1000>       Maximum trailing lines (default: 80, max: 1000)
+  --offset-lines <0..2000>    Skip N lines upward from the bottom for scrollback paging
+  --grep <substring>          Plain-text substring filter over secret-redacted lines
+  --last-command-only         Return output of the most recent completed OSC 133 block
+
+Send options:
+  --child <session-id>        Child session id (or pass as positional arg)
+  --input <text>              Plain-text input (ANSI escapes and NUL refused)
+  --newline | --no-newline    Append trailing newline (default: true)
+
+Close options:
+  --child <session-id>        Child session id (or pass as positional arg)
+";
+
+/// The external owner a hook-CLI call with no terminal credentials runs as:
+/// the Mavi thread key in `WAYLODE_ORCHESTRATE_CALLER` (or legacy
+/// `GITPULSE_ORCHESTRATE_CALLER`) when the host set one (an invalid value is an
+/// error), otherwise `ext-<ppid>`.
+fn external_hook_caller_id(env_caller: Option<&str>) -> Result<String, String> {
+    waylode_lib::terminal::orchestrate::standalone_caller_id_from(env_caller, || {
+        #[cfg(unix)]
+        {
+            format!("ext-{}", std::os::unix::process::parent_id())
+        }
+        #[cfg(not(unix))]
+        {
+            format!("ext-{}", std::process::id())
+        }
+    })
+}
+
+/// `Call` carries the whole wire request, as it is sent; the enum is built once
+/// per CLI run, so boxing it would only add an allocation.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+enum TermCliOutcome {
+    Help(String),
+    Call(waylode_lib::terminal::orchestrate::OrchestrateCall),
+}
+
+/// Repository root, caller session id, caller token, and the standalone caller name.
+type CallerContext = (String, Option<String>, Option<String>, Option<String>);
+
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((flag, val)) => (flag, Some(val)),
+        None => (arg, None),
+    }
+}
+
+fn next_flag_value<'a>(
+    flag: &str,
+    inline: Option<&'a str>,
+    iter: &mut std::slice::Iter<'a, String>,
+) -> Result<String, String> {
+    if let Some(val) = inline {
+        return Ok(val.to_owned());
+    }
+    iter.next()
+        .cloned()
+        .ok_or_else(|| format!("flag {flag:?} requires a value"))
+}
+
+fn parse_u16_flag(flag: &str, raw: &str) -> Result<u16, String> {
+    raw.parse::<u16>()
+        .map_err(|_| format!("flag {flag:?} expects an integer in 0..=65535, got {raw:?}"))
+}
+
+fn parse_u32_flag(flag: &str, raw: &str) -> Result<u32, String> {
+    raw.parse::<u32>()
+        .map_err(|_| format!("flag {flag:?} expects a positive integer, got {raw:?}"))
+}
+
+fn parse_u64_flag(flag: &str, raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|_| format!("flag {flag:?} expects a non-negative integer, got {raw:?}"))
+}
+
+fn parse_usize_flag(flag: &str, raw: &str) -> Result<usize, String> {
+    raw.parse::<usize>()
+        .map_err(|_| format!("flag {flag:?} expects a positive integer, got {raw:?}"))
+}
+
+#[cfg(test)]
+fn parse_term_cli(
+    args: &[String],
+    default_repo: Option<&str>,
+    env_session_id: Option<&str>,
+    env_session_token: Option<&str>,
+) -> Result<TermCliOutcome, String> {
+    parse_term_cli_with(args, default_repo, env_session_id, env_session_token, None)
+}
+
+/// Parses a `term` command line. Every value that comes from the environment
+/// (repository, session id, token, the orchestrate caller variable) is passed
+/// in by the caller, so the parse reads no process state.
+fn parse_term_cli_with(
+    args: &[String],
+    default_repo: Option<&str>,
+    env_session_id: Option<&str>,
+    env_session_token: Option<&str>,
+    env_caller: Option<&str>,
+) -> Result<TermCliOutcome, String> {
+    use waylode_lib::terminal::orchestrate::OrchestrateCall;
+
+    let Some(verb) = args.first().map(String::as_str) else {
+        return Ok(TermCliOutcome::Help(TERM_USAGE.to_owned()));
+    };
+    if matches!(verb, "help" | "--help" | "-h") {
+        return Ok(TermCliOutcome::Help(TERM_USAGE.to_owned()));
+    }
+    if args
+        .iter()
+        .skip(1)
+        .any(|a| matches!(a.as_str(), "--help" | "-h"))
+    {
+        return Ok(TermCliOutcome::Help(TERM_USAGE.to_owned()));
+    }
+
+    let mut repo_override: Option<String> = None;
+    let mut sid_override: Option<String> = None;
+    let mut tok_override: Option<String> = None;
+
+    let resolve_common = |repo_opt: Option<String>,
+                          sid_opt: Option<String>,
+                          tok_opt: Option<String>|
+     -> Result<CallerContext, String> {
+        let repo = repo_opt
+            .or_else(|| default_repo.map(str::to_owned))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "missing repository root: run inside a Git worktree or pass --repo <abs-path>"
+                    .to_string()
+            })?;
+        let sid = sid_opt
+            .or_else(|| env_session_id.map(str::to_owned))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let tok = tok_opt
+            .or_else(|| env_session_token.map(str::to_owned))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        match (sid, tok) {
+            (Some(s), Some(t)) => Ok((repo, Some(s), Some(t), None)),
+            (None, None) => Ok((repo, None, None, Some(external_hook_caller_id(env_caller)?))),
+            (Some(_), None) => Err(format!(
+                "missing caller session capability token: {} is not set",
+                waylode_lib::terminal::orchestrate::SESSION_TOKEN_ENV
+            )),
+            (None, Some(_)) => Err(format!(
+                "missing caller terminal session id: {} is not set (pass --caller-session inside tests)",
+                waylode_lib::alerts::bridge::SESSION_ENV
+            )),
+        }
+    };
+
+    let mut iter = args[1..].iter();
+    let call = match verb {
+        "spawn" => {
+            let mut launcher = None;
+            let mut cwd = None;
+            let mut command = None;
+            let mut prompt = None;
+            let mut title = None;
+            let mut split = None;
+            let mut rows = None;
+            let mut cols = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--launcher" => launcher = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--cwd" => cwd = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--command" => command = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--prompt" => prompt = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--title" => title = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--split" => {
+                        if inline.is_some() {
+                            return Err("--split takes no value (use --split or --no-split)".into());
+                        }
+                        split = Some(true);
+                    }
+                    "--no-split" => {
+                        if inline.is_some() {
+                            return Err("--no-split takes no value".into());
+                        }
+                        split = Some(false);
+                    }
+                    "--rows" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        rows = Some(parse_u16_flag(flag, &v)?);
+                    }
+                    "--cols" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        cols = Some(parse_u16_flag(flag, &v)?);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term spawn`"
+                        ))
+                    }
+                }
+            }
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Spawn {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                launcher,
+                cwd,
+                command,
+                prompt,
+                title,
+                split,
+                rows,
+                cols,
+                agent: None,
+            }
+        }
+        "exec" => {
+            let mut child_session_id = None;
+            let mut cwd = None;
+            let mut command: Option<String> = None;
+            let mut timeout_ms = None;
+            let mut pattern = None;
+            let mut keep_open = None;
+            let mut split = None;
+            let mut title = None;
+            let mut max_lines = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--child" => child_session_id = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--cwd" => cwd = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--command" => command = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--timeout-ms" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        timeout_ms = Some(parse_u64_flag(flag, &v)?);
+                    }
+                    "--pattern" => pattern = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--keep-open" => {
+                        if inline.is_some() {
+                            return Err("--keep-open takes no value".into());
+                        }
+                        keep_open = Some(true);
+                    }
+                    "--ephemeral" => {
+                        if inline.is_some() {
+                            return Err("--ephemeral takes no value".into());
+                        }
+                        keep_open = Some(false);
+                    }
+                    "--split" => {
+                        if inline.is_some() {
+                            return Err("--split takes no value (use --split or --no-split)".into());
+                        }
+                        split = Some(true);
+                    }
+                    "--no-split" => {
+                        if inline.is_some() {
+                            return Err("--no-split takes no value".into());
+                        }
+                        split = Some(false);
+                    }
+                    "--title" => title = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--max-lines" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        max_lines = Some(parse_usize_flag(flag, &v)?);
+                    }
+                    _ if !raw.starts_with('-') && command.is_none() => {
+                        command = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term exec`"
+                        ))
+                    }
+                }
+            }
+            let command = command.ok_or_else(|| {
+                "`waylode-hook term exec` requires --command <shell-command>".to_string()
+            })?;
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Exec {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                child_session_id,
+                cwd,
+                command,
+                timeout_ms,
+                pattern,
+                keep_open,
+                split,
+                title,
+                max_lines,
+            }
+        }
+        "open-file" | "open_file" => {
+            let mut path: Option<String> = None;
+            let mut line = None;
+            let mut column = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--path" => path = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--line" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        line = Some(parse_u32_flag(flag, &v)?);
+                    }
+                    "--column" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        column = Some(parse_u32_flag(flag, &v)?);
+                    }
+                    _ if !raw.starts_with('-') && path.is_none() => {
+                        path = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term open-file`"
+                        ))
+                    }
+                }
+            }
+            let path = path.ok_or_else(|| {
+                "`waylode-hook term open-file` requires --path <repo-relative-path>".to_string()
+            })?;
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::OpenFile {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                path,
+                line,
+                column,
+            }
+        }
+        "list" => {
+            let mut include_repo_shells = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--include-repo-shells" => {
+                        if inline.is_some() {
+                            return Err("--include-repo-shells takes no value".into());
+                        }
+                        include_repo_shells = Some(true);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term list`"
+                        ))
+                    }
+                }
+            }
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::List {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                include_repo_shells,
+            }
+        }
+        "wait" => {
+            let mut child_session_id: Option<String> = None;
+            let mut timeout_ms = None;
+            let mut pattern = None;
+            let mut wait_for_idle = None;
+            let mut since_seq = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--child" => child_session_id = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--timeout-ms" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        timeout_ms = Some(parse_u64_flag(flag, &v)?);
+                    }
+                    "--since-seq" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        since_seq = Some(parse_u64_flag(flag, &v)?);
+                    }
+                    "--pattern" => pattern = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--wait-for-idle" => {
+                        if inline.is_some() {
+                            return Err("--wait-for-idle takes no value".into());
+                        }
+                        wait_for_idle = Some(true);
+                    }
+                    "--no-wait-for-idle" => {
+                        if inline.is_some() {
+                            return Err("--no-wait-for-idle takes no value".into());
+                        }
+                        wait_for_idle = Some(false);
+                    }
+                    _ if !raw.starts_with('-') && child_session_id.is_none() => {
+                        child_session_id = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term wait`"
+                        ))
+                    }
+                }
+            }
+            let child_session_id = child_session_id.ok_or_else(|| {
+                "`waylode-hook term wait` requires --child <session-id>".to_string()
+            })?;
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Wait {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                child_session_id,
+                timeout_ms,
+                pattern,
+                wait_for_idle,
+                since_seq,
+            }
+        }
+        "read" => {
+            let mut child_session_id: Option<String> = None;
+            let mut max_lines = None;
+            let mut offset_lines = None;
+            let mut grep = None;
+            let mut last_command_only = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--child" => child_session_id = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--max-lines" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        max_lines = Some(parse_usize_flag(flag, &v)?);
+                    }
+                    "--offset-lines" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        offset_lines = Some(parse_usize_flag(flag, &v)?);
+                    }
+                    "--grep" => grep = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--last-command-only" => {
+                        if inline.is_some() {
+                            return Err("--last-command-only takes no value".into());
+                        }
+                        last_command_only = Some(true);
+                    }
+                    _ if !raw.starts_with('-') && child_session_id.is_none() => {
+                        child_session_id = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term read`"
+                        ))
+                    }
+                }
+            }
+            let child_session_id = child_session_id.ok_or_else(|| {
+                "`waylode-hook term read` requires --child <session-id>".to_string()
+            })?;
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Read {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                child_session_id,
+                max_lines,
+                offset_lines,
+                grep,
+                last_command_only,
+            }
+        }
+        "send" => {
+            let mut child_session_id: Option<String> = None;
+            let mut input: Option<String> = None;
+            let mut append_newline = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--child" => child_session_id = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--input" => input = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--newline" => {
+                        if inline.is_some() {
+                            return Err("--newline takes no value".into());
+                        }
+                        append_newline = Some(true);
+                    }
+                    "--no-newline" => {
+                        if inline.is_some() {
+                            return Err("--no-newline takes no value".into());
+                        }
+                        append_newline = Some(false);
+                    }
+                    _ if !raw.starts_with('-') && child_session_id.is_none() => {
+                        child_session_id = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term send`"
+                        ))
+                    }
+                }
+            }
+            let child_session_id = child_session_id.ok_or_else(|| {
+                "`waylode-hook term send` requires --child <session-id>".to_string()
+            })?;
+            let input = input
+                .ok_or_else(|| "`waylode-hook term send` requires --input <text>".to_string())?;
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Send {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                child_session_id,
+                input,
+                append_newline,
+            }
+        }
+        "close" => {
+            let mut child_session_id: Option<String> = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--child" => child_session_id = Some(next_flag_value(flag, inline, &mut iter)?),
+                    _ if !raw.starts_with('-') && child_session_id.is_none() => {
+                        child_session_id = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `waylode-hook term close`"
+                        ))
+                    }
+                }
+            }
+            let child_session_id = child_session_id.ok_or_else(|| {
+                "`waylode-hook term close` requires --child <session-id>".to_string()
+            })?;
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Close {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                child_session_id,
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown `waylode-hook term` command {other:?}; expected spawn, exec, open-file, list, wait, read, send, or close"
+            ));
+        }
+    };
+
+    call.validate()?;
+    Ok(TermCliOutcome::Call(call))
+}
+
+fn call_repo_path(call: &waylode_lib::terminal::orchestrate::OrchestrateCall) -> &str {
+    use waylode_lib::terminal::orchestrate::OrchestrateCall;
+    match call {
+        OrchestrateCall::Spawn { repo_path, .. }
+        | OrchestrateCall::Exec { repo_path, .. }
+        | OrchestrateCall::OpenFile { repo_path, .. }
+        | OrchestrateCall::List { repo_path, .. }
+        | OrchestrateCall::Wait { repo_path, .. }
+        | OrchestrateCall::Read { repo_path, .. }
+        | OrchestrateCall::Send { repo_path, .. }
+        | OrchestrateCall::Close { repo_path, .. } => repo_path,
+    }
+}
+
+fn dispatch_term_call(
+    call: waylode_lib::terminal::orchestrate::OrchestrateCall,
+) -> Result<serde_json::Value, String> {
+    waylode_lib::repository_trust::require(std::path::Path::new(call_repo_path(&call)))
+        .map_err(|e| e.into_message())?;
+    #[cfg(target_os = "macos")]
+    {
+        static NEXT_TERM_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let profile = waylode_lib::tool_config::default_config_dir()
+            .ok_or_else(|| "GitPulse's profile directory is unknown (no HOME)".to_string())?;
+        let owner = waylode_lib::desktop::instance::reach_owner(
+            &profile,
+            std::time::Duration::from_secs(2),
+        )
+        .ok_or_else(|| {
+            "GitPulse is not running, so there is no terminal orchestrator to reach".to_string()
+        })?;
+        let seq = NEXT_TERM_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let req_id = format!("hook-term-{}-{seq}", std::process::id());
+        owner.orchestrate(&req_id, call)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = call;
+        Err(
+            "Terminal orchestration over the desktop mailbox is available on macOS only for now"
+                .to_string(),
+        )
+    }
+}
+
+fn run_term_cli(args: &[String]) -> i32 {
+    let default_repo = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| waylode_lib::engine::git_cli::find_git_root(&cwd))
+        .map(|p| p.to_string_lossy().into_owned());
+    let env_sid = waylode_lib::env_compat::var_compat(
+        waylode_lib::terminal::TERMINAL_SESSION_ENV,
+        waylode_lib::terminal::LEGACY_TERMINAL_SESSION_ENV,
+    )
+    .map(|s| s.trim().to_owned())
+    .filter(|s| !s.is_empty())
+    .or_else(|| {
+        waylode_lib::env_compat::var_compat(
+            waylode_lib::alerts::bridge::SESSION_ENV,
+            waylode_lib::alerts::bridge::LEGACY_SESSION_ENV,
+        )
+    });
+    let env_tok = waylode_lib::env_compat::var_compat(
+        waylode_lib::terminal::orchestrate::SESSION_TOKEN_ENV,
+        waylode_lib::terminal::orchestrate::LEGACY_SESSION_TOKEN_ENV,
+    );
+    let env_caller = waylode_lib::env_compat::var_compat(
+        waylode_lib::terminal::orchestrate::ORCHESTRATE_CALLER_ENV,
+        waylode_lib::terminal::orchestrate::LEGACY_ORCHESTRATE_CALLER_ENV,
+    );
+
+    match parse_term_cli_with(
+        args,
+        default_repo.as_deref(),
+        env_sid.as_deref(),
+        env_tok.as_deref(),
+        env_caller.as_deref(),
+    ) {
+        Ok(TermCliOutcome::Help(help)) => {
+            emit(help);
+            0
+        }
+        Ok(TermCliOutcome::Call(call)) => match dispatch_term_call(call) {
+            Ok(value) => {
+                match serde_json::to_string(&value) {
+                    Ok(serialized) => emit(format!("{serialized}\n")),
+                    Err(error) => {
+                        emit_stderr(format!(
+                            "waylode-hook term: failed to serialize response: {error}\n"
+                        ));
+                        return 1;
+                    }
+                }
+                0
+            }
+            Err(error) => {
+                emit_stderr(format!("waylode-hook term: {error}\n"));
+                1
+            }
+        },
+        Err(error) => {
+            emit_stderr(format!("waylode-hook term: {error}\n"));
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use waylode_lib::terminal::orchestrate::OrchestrateCall;
+
+    fn vec_args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// An absolute path on the platform under test: `/repo/root` has no drive,
+    /// so Windows reads it as relative and refuses it.
+    const REPO_ROOT: &str = if cfg!(windows) {
+        r"C:\repo\root"
+    } else {
+        "/repo/root"
+    };
+
+    /// A second absolute path, for `--repo` overriding the default.
+    const EXPLICIT_REPO: &str = if cfg!(windows) {
+        r"C:\explicit\repo"
+    } else {
+        "/explicit/repo"
+    };
+
+    const SAMPLE_TOKEN: &str =
+        "gpst_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn a_panicking_hook_still_exits_zero_with_no_decision() {
+        // Outside a worktree hook, which this test process never starts.
+        assert_eq!(run_guarded(|| panic!("hook fault")), 0);
+        assert_eq!(run_guarded(|| 0), 0);
+    }
+
+    /// A standalone `term exec` parsed with `env_caller` as the value of
+    /// `WAYLODE_ORCHESTRATE_CALLER`: passed in, as the CLI's entry point
+    /// passes what it read, so no test writes the process environment.
+    fn standalone_exec_caller(env_caller: Option<&str>) -> Result<Option<String>, String> {
+        match parse_term_cli_with(
+            &vec_args(&["exec", "--command", "true"]),
+            Some(REPO_ROOT),
+            None,
+            None,
+            env_caller,
+        )? {
+            TermCliOutcome::Call(OrchestrateCall::Exec {
+                external_caller_id, ..
+            }) => Ok(external_caller_id),
+            other => panic!("not an exec call: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mavi_agents_caller_variable_names_its_thread_as_the_hook_owner() {
+        let key = "ext-mavi-0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+        let got = standalone_exec_caller(Some(key)).expect("parse");
+        assert_eq!(got.as_deref(), Some(key));
+    }
+
+    #[test]
+    fn an_invalid_caller_variable_is_refused_by_the_hook_not_replaced_by_ext_ppid() {
+        for bad in ["ext-1234", "ext-mavi-not-a-uuid", "someone-else"] {
+            let err = standalone_exec_caller(Some(bad))
+                .expect_err("an invalid caller variable must fail loudly");
+            assert!(err.contains("WAYLODE_ORCHESTRATE_CALLER"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn term_cli_renders_help_when_asked_or_empty() {
+        for argv in [
+            vec_args(&[]),
+            vec_args(&["--help"]),
+            vec_args(&["help"]),
+            vec_args(&["spawn", "-h"]),
+        ] {
+            let parsed = parse_term_cli(&argv, None, None, None).expect("help");
+            assert!(matches!(parsed, TermCliOutcome::Help(_)));
+        }
+    }
+
+    #[test]
+    fn term_cli_parses_all_six_verbs_with_env_defaults_and_overrides() {
+        let spawn = parse_term_cli(
+            &vec_args(&[
+                "spawn",
+                "--launcher=shell",
+                "--cwd",
+                "src",
+                "--command",
+                "cargo test",
+                "--title",
+                "Unit tests",
+                "--no-split",
+                "--rows=36",
+                "--cols",
+                "120",
+            ]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("spawn parse");
+        assert_eq!(
+            spawn,
+            TermCliOutcome::Call(OrchestrateCall::Spawn {
+                repo_path: REPO_ROOT.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                launcher: Some("shell".into()),
+                cwd: Some("src".into()),
+                command: Some("cargo test".into()),
+                prompt: None,
+                title: Some("Unit tests".into()),
+                split: Some(false),
+                rows: Some(36),
+                cols: Some(120),
+                agent: None,
+            })
+        );
+
+        let open_file = parse_term_cli(
+            &vec_args(&["open-file", "src/main.rs", "--line", "42", "--column=7"]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("open-file parse");
+        assert_eq!(
+            open_file,
+            TermCliOutcome::Call(OrchestrateCall::OpenFile {
+                repo_path: REPO_ROOT.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                path: "src/main.rs".into(),
+                line: Some(42),
+                column: Some(7),
+            })
+        );
+
+        let list = parse_term_cli(
+            &vec_args(&[
+                "list",
+                "--repo",
+                EXPLICIT_REPO,
+                "--caller-session=term-200-9",
+                "--include-repo-shells",
+            ]),
+            Some("/ignored/default"),
+            Some("ignored-sid"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("list parse");
+        assert_eq!(
+            list,
+            TermCliOutcome::Call(OrchestrateCall::List {
+                repo_path: EXPLICIT_REPO.into(),
+                caller_session_id: Some("term-200-9".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                include_repo_shells: Some(true),
+            })
+        );
+
+        let wait = parse_term_cli(
+            &vec_args(&[
+                "wait",
+                "term-100-2",
+                "--timeout-ms",
+                "5000",
+                "--pattern=Listening on",
+                "--no-wait-for-idle",
+                "--since-seq=7",
+            ]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("wait parse");
+        assert_eq!(
+            wait,
+            TermCliOutcome::Call(OrchestrateCall::Wait {
+                repo_path: REPO_ROOT.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                child_session_id: "term-100-2".into(),
+                timeout_ms: Some(5000),
+                pattern: Some("Listening on".into()),
+                wait_for_idle: Some(false),
+                since_seq: Some(7),
+            })
+        );
+
+        let read = parse_term_cli(
+            &vec_args(&[
+                "read",
+                "--child",
+                "term-100-2",
+                "--max-lines=50",
+                "--offset-lines=12",
+                "--grep=FAIL",
+                "--last-command-only",
+            ]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("read parse");
+        assert_eq!(
+            read,
+            TermCliOutcome::Call(OrchestrateCall::Read {
+                repo_path: REPO_ROOT.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                child_session_id: "term-100-2".into(),
+                max_lines: Some(50),
+                offset_lines: Some(12),
+                grep: Some("FAIL".into()),
+                last_command_only: Some(true),
+            })
+        );
+
+        let (exec, standalone_owner) = {
+            let parsed = parse_term_cli(
+                &vec_args(&[
+                    "exec",
+                    "--command",
+                    "cargo check",
+                    "--cwd=src",
+                    "--timeout-ms=9000",
+                    "--ephemeral",
+                    "--no-split",
+                    "--title",
+                    "Check build",
+                    "--max-lines=300",
+                ]),
+                Some(REPO_ROOT),
+                None,
+                None,
+            )
+            .expect("standalone exec parse");
+            (
+                parsed,
+                external_hook_caller_id(None).expect("standalone owner"),
+            )
+        };
+        assert_eq!(
+            exec,
+            TermCliOutcome::Call(OrchestrateCall::Exec {
+                repo_path: REPO_ROOT.into(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: Some(standalone_owner),
+                child_session_id: None,
+                cwd: Some("src".into()),
+                command: "cargo check".into(),
+                timeout_ms: Some(9000),
+                pattern: None,
+                keep_open: Some(false),
+                split: Some(false),
+                title: Some("Check build".into()),
+                max_lines: Some(300),
+            })
+        );
+
+        let send = parse_term_cli(
+            &vec_args(&["send", "term-100-2", "--input", "echo ok", "--no-newline"]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("send parse");
+        assert_eq!(
+            send,
+            TermCliOutcome::Call(OrchestrateCall::Send {
+                repo_path: REPO_ROOT.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                child_session_id: "term-100-2".into(),
+                input: "echo ok".into(),
+                append_newline: Some(false),
+            })
+        );
+
+        let close = parse_term_cli(
+            &vec_args(&["close", "term-100-2"]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("close parse");
+        assert_eq!(
+            close,
+            TermCliOutcome::Call(OrchestrateCall::Close {
+                repo_path: REPO_ROOT.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                child_session_id: "term-100-2".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn term_cli_refuses_unknown_flags_missing_credentials_and_bad_paths() {
+        let missing_tok = parse_term_cli(
+            &vec_args(&["list"]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            None,
+        )
+        .expect_err("missing token");
+        assert!(
+            missing_tok.contains("WAYLODE_SESSION_TOKEN"),
+            "{missing_tok}"
+        );
+
+        let bad_flag = parse_term_cli(
+            &vec_args(&["list", "--bogus"]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect_err("unknown flag");
+        assert!(bad_flag.contains("unknown option"), "{bad_flag}");
+
+        let rel_repo = parse_term_cli(
+            &vec_args(&["list", "--repo", "relative/repo"]),
+            None,
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect_err("relative repo");
+        assert!(rel_repo.contains("absolute path"), "{rel_repo}");
+
+        let traversal = parse_term_cli(
+            &vec_args(&["open-file", "../secret.txt"]),
+            Some(REPO_ROOT),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect_err("parent traversal");
+        assert!(!traversal.is_empty());
+    }
+
+    /// A panic under a `--host=agy` registration must still answer `{}`, even
+    /// when the Antigravity environment variable is absent.
+    #[test]
+    fn host_agy_flag_identifies_antigravity_even_without_env() {
+        assert!(is_agy_invocation_from(
+            ["--host=agy", "session-brief"],
+            false
+        ));
+        assert!(!is_agy_invocation_from(["session-brief"], false));
+        assert!(is_agy_invocation_from(["session-brief"], true));
+        assert!(
+            !is_agy_invocation_from(["--host=agyx", "notify"], false),
+            "only the exact flag counts"
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["--host=agy", "peer-inbox"])),
+            (true, vec_args(&["peer-inbox"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["peer-inbox", "--host=agy"])),
+            (true, vec_args(&["peer-inbox"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["notify", "--host=agy", "permission_request"])),
+            (true, vec_args(&["notify", "permission_request"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["peer-inbox"])),
+            (false, vec_args(&["peer-inbox"]))
+        );
+    }
+}

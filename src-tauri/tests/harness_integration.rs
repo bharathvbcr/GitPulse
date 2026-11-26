@@ -6,12 +6,12 @@
 //! NOT wired into any workflow; set `GITPULSE_REQUIRE_MANVI=1` yourself to turn
 //! the binary's absence into a hard failure.
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
+use waylode_lib::procguard::LockedSpawn;
 
-use gitpulse_lib::graph::{list_ref_decorations, RefKind, RefScope};
-use gitpulse_lib::harness::{check_command, check_file, HarnessStatus, PolicyStatus};
 use tempfile::TempDir;
+use waylode_lib::graph::{list_ref_decorations, RefKind, RefScope};
+use waylode_lib::harness::{check_command, check_file, HarnessStatus, PolicyStatus};
 
 fn git(dir: &std::path::Path, args: &[&str]) {
     common::unmetered_spawns();

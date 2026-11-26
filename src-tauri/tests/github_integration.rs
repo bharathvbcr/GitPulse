@@ -11,11 +11,11 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::github::actions::{
+use waylode_lib::github::actions::{
     cancel_run_argv, parse_workflow_list, rerun_run_argv, trigger_workflow_argv,
     validate_workflow_selector,
 };
-use gitpulse_lib::github::{parse_github_remote_url, pick_github_remote, GitHubRepoRef};
+use waylode_lib::github::{parse_github_remote_url, pick_github_remote, GitHubRepoRef};
 
 fn remote() -> GitHubRepoRef {
     parse_github_remote_url("https://github.com/bharathvbcr/GitPulse.git").expect("a github remote")

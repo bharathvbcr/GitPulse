@@ -2075,7 +2075,7 @@ fn answer_asked(
 ) -> Result<(), String> {
     let slot = GateSlot::take(shared);
     let outcome = if shared.closing.load(Ordering::Acquire) {
-        Err("GitPulse is quitting".to_string())
+        Err("Waylode is quitting".to_string())
     } else if slot.is_none() {
         Err(format!("{name} is busy"))
     } else if abandonable && crate::local_socket::peer_hung_up_silently(stream) {
@@ -2176,7 +2176,7 @@ fn answer_orchestrate(
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let outcome = if shared.closing.load(Ordering::Acquire) {
-        Err("GitPulse is quitting".to_string())
+        Err("Waylode is quitting".to_string())
     } else if slot.is_none() {
         Err("terminal orchestration is busy".to_string())
     } else {
@@ -2219,13 +2219,13 @@ impl Drop for OrchestrateSlot<'_> {
 fn admit(shared: &Shared, request: Request) -> Result<Option<(Sink, Request)>, String> {
     let mut inbox = shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
     if shared.closing.load(Ordering::Acquire) {
-        return Err("GitPulse is quitting".into());
+        return Err("Waylode is quitting".into());
     }
     if let Some(sink) = &inbox.sink {
         return Ok(Some((sink.clone(), request)));
     }
     if inbox.queued.len() >= MAX_QUEUED {
-        return Err("GitPulse is still starting and its queue is full".into());
+        return Err("Waylode is still starting and its queue is full".into());
     }
     inbox.queued.push_back(request);
     Ok(None)

@@ -33,13 +33,13 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::desktop::instance::{claim, Claim};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use waylode_lib::desktop::instance::{claim, Claim};
+use waylode_lib::procguard::LockedSpawn;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -52,7 +52,7 @@ fn call(hook: &Path, home: &Path, manvi: &Path, logs: &Path, payload: &str) -> D
     let started = Instant::now();
     let mut child = Command::new(hook)
         .arg("command-gate")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs)
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs)
         .env("HOME", home)
         .env("GITPULSE_MANVI_BIN", manvi)
         .stdin(Stdio::piped())
@@ -92,7 +92,7 @@ fn median(samples: &mut [Duration]) -> Duration {
 fn command_gate_cost_with_and_without_the_app() {
     let hook = std::env::var_os("GITPULSE_BENCH_HOOK")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_gitpulse-hook")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_waylode-hook")));
     let manvi = PathBuf::from(
         std::env::var_os("GITPULSE_BENCH_MANVI").expect("GITPULSE_BENCH_MANVI names the manvi"),
     );
@@ -117,7 +117,7 @@ fn command_gate_cost_with_and_without_the_app() {
         Claim::Primary(owner) => owner,
         _ => panic!("expected to own the profile"),
     };
-    owner.attach_gate(Arc::new(gitpulse_lib::hooks::serve_gate));
+    owner.attach_gate(Arc::new(waylode_lib::hooks::serve_gate));
 
     let scratch = tempfile::tempdir().unwrap();
     let logs = scratch.path().join("logs");

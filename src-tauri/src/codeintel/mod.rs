@@ -3423,7 +3423,7 @@ pub(crate) mod tests {
         const {
             assert!(
                 SUPPORTED_STORE_SCHEMA >= 19,
-                "GitPulse must read schema 19+ maps"
+                "Waylode must read schema 19+ maps"
             );
         }
     }

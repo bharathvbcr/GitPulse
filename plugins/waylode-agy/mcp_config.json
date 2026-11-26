@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "waylode": {
+      "command": "waylode-mcp",
+      "args": [],
+      "env": {
+        "WAYLODE_HOST": "antigravity"
+      }
+    }
+  }
+}

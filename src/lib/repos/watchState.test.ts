@@ -111,7 +111,7 @@ describe("describeWatch", () => {
     const text = describeWatch(watchFailed("Too many watched repositories (max 24)"));
     expect(text).toContain("Too many watched repositories (max 24)");
     expect(text).toContain("refreshing on a timer");
-    expect(text).toContain("outside GitPulse");
+    expect(text).toContain("outside Waylode");
   });
 
   it("reads sensibly with no reason recorded", () => {

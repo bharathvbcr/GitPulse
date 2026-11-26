@@ -565,7 +565,7 @@ describe("FleetView agent sessions", () => {
 
   it("names the kinds the way the Worktrees panel does", () => {
     expect(agentKindsTitle(["claude", "gitpulse"])).toBe(
-      "Agent checkouts: Claude Code, GitPulse task. Show them in Agents.",
+      "Agent checkouts: Claude Code, Waylode task. Show them in Agents.",
     );
     expect(agentKindsTitle([])).toBe("Show this repository in Agents.");
   });

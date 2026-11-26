@@ -19,7 +19,7 @@ set -euo pipefail
 self_dir=$(cd "$(dirname "$0")" && pwd -P)
 manifest="$self_dir/../../src-tauri/Cargo.toml"
 
-REAL_LIPO="${GITPULSE_REAL_LIPO:-}"
+REAL_LIPO="${WAYLODE_REAL_LIPO:-${GITPULSE_REAL_LIPO:-}}"
 if [ -z "$REAL_LIPO" ]; then
   for candidate in /usr/bin/lipo /Library/Developer/CommandLineTools/usr/bin/lipo; do
     if [ -x "$candidate" ]; then
@@ -96,13 +96,13 @@ while read -r helper; do
   # failure. Saying so here names the cause; staying quiet defers it to the
   # bundler, which can only report the file it could not find.
   if [ -n "$missing" ]; then
-    echo "[gitpulse-lipo] '$helper' is declared in Cargo.toml and will be bundled," >&2
+    echo "[waylode-lipo] '$helper' is declared in Cargo.toml and will be bundled," >&2
     echo "                but $missing was not built. The bundle would fail at copy time." >&2
     status=1
     continue
   fi
 
-  echo "[gitpulse-lipo] universal binary for auxiliary tool: $helper -> $helper_out"
+  echo "[waylode-lipo] universal binary for auxiliary tool: $helper -> $helper_out"
   "$REAL_LIPO" "${helper_args[@]}"
 done < <(declared_binaries)
 

@@ -172,9 +172,9 @@
       <Checkbox label="Notify me about agent sessions" checked={draft.enabled} onchange={(next) => { if (draft) draft.enabled = next; }} />
       <Checkbox label="Play a sound" checked={draft.sound} onchange={(next) => { if (draft) draft.sound = next; }} />
       <Checkbox label="Also notify for a plain shell's bell" checked={draft.shell_bell} onchange={(next) => { if (draft) draft.shell_bell = next; }} />
-      <Checkbox label="Configure agent CLIs GitPulse starts" checked={draft.configure_agents} onchange={(next) => { if (draft) draft.configure_agents = next; }} />
+      <Checkbox label="Configure agent CLIs Waylode starts" checked={draft.configure_agents} onchange={(next) => { if (draft) draft.configure_agents = next; }} />
       <p class="text-textMuted pl-6 leading-snug">
-        Adds each CLI's own documented notification flag to the sessions GitPulse starts —
+        Adds each CLI's own documented notification flag to the sessions Waylode starts —
         <span class="font-mono">claude --settings</span> and <span class="font-mono">codex -c tui.notifications</span>.
         For that session only; no file of yours is written and no other setting is changed. Without
         it, neither CLI signals this terminal and a waiting agent stays silent.
@@ -182,8 +182,8 @@
       <Checkbox label="Accept reports from agent hooks" checked={draft.hook_bridge} disabled={!view.bridge_supported} onchange={(next) => { if (draft) draft.hook_bridge = next; }} />
       <p class="text-textMuted pl-6 leading-snug">
         {#if view.bridge_supported}
-          Opens a private socket in GitPulse's own folder, readable only by you, while the app is
-          running. The GitPulse plugin's hooks use it to say <em>why</em> an agent stopped —
+          Opens a private socket in Waylode's own folder, readable only by you, while the app is
+          running. The Waylode plugin's hooks use it to say <em>why</em> an agent stopped —
           permission, idle, finished — instead of only that it did. A report can raise a banner and
           nothing else.
           {#if view.status.bridge_path}<br /><span class="font-mono text-micro">{view.status.bridge_path}</span>{/if}

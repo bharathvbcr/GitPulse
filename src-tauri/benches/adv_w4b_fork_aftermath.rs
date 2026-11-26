@@ -21,9 +21,9 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use gitpulse_lib::procguard;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    use waylode_lib::procguard;
 
     const ROUNDS: usize = 400;
     const WARMUP: usize = 30;

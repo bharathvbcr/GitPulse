@@ -134,7 +134,7 @@ jobs:
         run: |
           cargo build --manifest-path src-tauri/Cargo.toml --locked \
             --features tauri/custom-protocol \
-            --bin gitpulse --bin gitpulse-ptyd \
+            --bin waylode --bin waylode-ptyd \
             --example webview_regressions --example e2e_seed_trust
 
       - name: Native GTK/WebKit Runtime Smoke (X11)
@@ -509,7 +509,7 @@ jobs:
           set -euo pipefail
           cargo build --manifest-path src-tauri/Cargo.toml --locked \
             --features tauri/custom-protocol \
-            --bin gitpulse --bin gitpulse-ptyd \
+            --bin waylode --bin waylode-ptyd \
             --example webview_regressions --example e2e_seed_trust
 
       - name: Native Windows WebView2 Runtime Smoke

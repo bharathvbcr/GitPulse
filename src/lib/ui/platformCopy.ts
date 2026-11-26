@@ -83,7 +83,7 @@ export function notificationUnavailableReason(
 ): string | null {
   if (available) return null;
   if (os !== "macos") {
-    return `GitPulse does not deliver desktop notifications on ${osDisplayName(os)} yet. Activity still appears in the in-app inbox.`;
+    return `Waylode does not deliver desktop notifications on ${osDisplayName(os)} yet. Activity still appears in the in-app inbox.`;
   }
   // On macOS the feature exists, so the probe failing is a real fault worth
   // surfacing verbatim rather than restating as "unsupported".
@@ -131,8 +131,8 @@ export function desktopNotificationsSupported(
 /** How to phrase a notification-permission prompt for this host. */
 export function notificationPermissionHint(os: HostOS): string {
   return os === "macos"
-    ? `Allow GitPulse notifications in ${systemSettingsName(os)}, then try again.`
-    : `GitPulse does not deliver desktop notifications on ${osDisplayName(os)} yet.`;
+    ? `Allow Waylode notifications in ${systemSettingsName(os)}, then try again.`
+    : `Waylode does not deliver desktop notifications on ${osDisplayName(os)} yet.`;
 }
 
 /**
@@ -283,7 +283,7 @@ export function shortcutKeyLabels(keys: readonly string[], os: HostOS): string[]
 export function repositoryAccessGuidance(os: HostOS): string {
   switch (os) {
     case "macos":
-      return "macOS may ask for access when you open repositories in Desktop, Documents, or Downloads. If denied, review GitPulse under System Settings → Privacy & Security → Files and Folders, then open the repository again.";
+      return "macOS may ask for access when you open repositories in Desktop, Documents, or Downloads. If denied, review Waylode under System Settings → Privacy & Security → Files and Folders, then open the repository again.";
     case "windows":
       return "On Windows, choose a folder your account can read and write. If access is blocked, review its folder permissions and Windows Security protection, then try opening it again.";
     case "linux":

@@ -118,7 +118,7 @@ describe("the real panel template with the hook record's fields set", () => {
       }),
     );
     expect(html).toContain('data-testid="session-alerts-hook-misses"');
-    expect(html).toContain("3 hook reports in the last 7 days got no reply from GitPulse in time");
+    expect(html).toContain("3 hook reports in the last 7 days got no reply from Waylode in time");
     expect(html).toContain("(last: session_ended at 2026-10-27T12:00:00.000Z)");
     expect(html).toContain("A missed SessionEnd can leave that agent's banner standing; hooks do not retry.");
     // The refused-report line keeps its own number and nothing else.
@@ -152,7 +152,7 @@ describe("the real panel template with the hook record's fields set", () => {
   it("still shows the count when the worker is not running (the record is the hook's, not the worker's)", async () => {
     const html = await panel(viewWith({ running: false, hook_replies_missed: 1 }));
     expect(html).toContain("The notification worker is not running");
-    expect(html).toContain("1 hook report in the last 7 days got no reply from GitPulse in time");
+    expect(html).toContain("1 hook report in the last 7 days got no reply from Waylode in time");
   });
 
   it("shows no hook line for a clean zero", async () => {

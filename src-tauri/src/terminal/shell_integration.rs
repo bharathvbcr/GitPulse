@@ -1,67 +1,81 @@
 //! Optional shell-integration bootstrap (`OSC 7` working-directory reporting and
 //! `OSC 133` FinalTerm semantic prompt/command/exit markers) for interactive
-//! `zsh`, `bash`, and `fish` sessions spawned by GitPulse.
+//! `zsh`, `bash`, and `fish` sessions spawned by Waylode.
 //!
-//! Opt-out via `GITPULSE_SHELL_INTEGRATION=0` in the user's environment. Never
-//! applied to coding-agent CLIs (`claude`, `agy`, `codex`, `grok`, `manvi`) or
-//! custom non-interactive commands.
+//! Opt-out via `WAYLODE_SHELL_INTEGRATION=0` (or legacy
+//! `GITPULSE_SHELL_INTEGRATION=0`) in the user's environment. Never applied to
+//! coding-agent CLIs (`claude`, `agy`, `codex`, `grok`, `manvi`) or custom
+//! non-interactive commands.
 
 use portable_pty::CommandBuilder;
 use std::path::{Path, PathBuf};
 
-pub const SHELL_INTEGRATION_ENV: &str = "GITPULSE_SHELL_INTEGRATION";
-pub const USER_ZDOTDIR_ENV: &str = "GITPULSE_USER_ZDOTDIR";
+pub const SHELL_INTEGRATION_ENV: &str = "WAYLODE_SHELL_INTEGRATION";
+pub const LEGACY_SHELL_INTEGRATION_ENV: &str = "GITPULSE_SHELL_INTEGRATION";
+pub const USER_ZDOTDIR_ENV: &str = "WAYLODE_USER_ZDOTDIR";
+pub const LEGACY_USER_ZDOTDIR_ENV: &str = "GITPULSE_USER_ZDOTDIR";
+pub const ZSH_SHIM_DIR_ENV: &str = "WAYLODE_ZSH_SHIM_DIR";
+pub const LEGACY_ZSH_SHIM_DIR_ENV: &str = "GITPULSE_ZSH_SHIM_DIR";
+pub const BASH_INTEGRATION_PATH_ENV: &str = "WAYLODE_BASH_INTEGRATION_PATH";
+pub const LEGACY_BASH_INTEGRATION_PATH_ENV: &str = "GITPULSE_BASH_INTEGRATION_PATH";
 
-const ZSH_ENV_SCRIPT: &str = r#"# Managed by GitPulse terminal shell integration.
+const ZSH_ENV_SCRIPT: &str = r#"# Managed by Waylode terminal shell integration.
 __gp_shim_dir="${ZDOTDIR:-}"
-if [[ -n "${GITPULSE_USER_ZDOTDIR:-}" ]]; then
-  export ZDOTDIR="${GITPULSE_USER_ZDOTDIR}"
+__gp_user_zdotdir="${WAYLODE_USER_ZDOTDIR:-${GITPULSE_USER_ZDOTDIR:-}}"
+__gp_shell_integration="${WAYLODE_SHELL_INTEGRATION:-${GITPULSE_SHELL_INTEGRATION:-1}}"
+if [[ -n "$__gp_user_zdotdir" ]]; then
+  export ZDOTDIR="$__gp_user_zdotdir"
 else
   unset ZDOTDIR
 fi
 if [[ -f "${ZDOTDIR:-$HOME}/.zshenv" ]]; then
   builtin source "${ZDOTDIR:-$HOME}/.zshenv"
 fi
-if [[ -o interactive && "${GITPULSE_SHELL_INTEGRATION:-1}" != "0" ]]; then
+if [[ -o interactive && "$__gp_shell_integration" != "0" ]]; then
   export __GITPULSE_ZSH_REAL_ZDOTDIR="${ZDOTDIR:-$HOME}"
-  export ZDOTDIR="${GITPULSE_ZSH_SHIM_DIR:-$__gp_shim_dir}"
+  export ZDOTDIR="${WAYLODE_ZSH_SHIM_DIR:-${GITPULSE_ZSH_SHIM_DIR:-$__gp_shim_dir}}"
 fi
-unset __gp_shim_dir
+unset __gp_shim_dir __gp_user_zdotdir __gp_shell_integration
 "#;
 
-const ZSH_PROFILE_SCRIPT: &str = r#"# Managed by GitPulse terminal shell integration.
+const ZSH_PROFILE_SCRIPT: &str = r#"# Managed by Waylode terminal shell integration.
 if [[ -f "${__GITPULSE_ZSH_REAL_ZDOTDIR:-$HOME}/.zprofile" ]]; then
   ZDOTDIR="${__GITPULSE_ZSH_REAL_ZDOTDIR:-$HOME}" builtin source "${__GITPULSE_ZSH_REAL_ZDOTDIR:-$HOME}/.zprofile"
 fi
 "#;
 
-const ZSH_LOGIN_SCRIPT: &str = r#"# Managed by GitPulse terminal shell integration.
+const ZSH_LOGIN_SCRIPT: &str = r#"# Managed by Waylode terminal shell integration.
+__gp_user_zdotdir="${WAYLODE_USER_ZDOTDIR:-${GITPULSE_USER_ZDOTDIR:-}}"
 if [[ -n "${__GITPULSE_ZSH_REAL_ZDOTDIR:-}" ]]; then
-  if [[ "${__GITPULSE_ZSH_REAL_ZDOTDIR}" == "${HOME}" && -z "${GITPULSE_USER_ZDOTDIR:-}" ]]; then
+  if [[ "${__GITPULSE_ZSH_REAL_ZDOTDIR}" == "${HOME}" && -z "$__gp_user_zdotdir" ]]; then
     unset ZDOTDIR
   else
     export ZDOTDIR="${__GITPULSE_ZSH_REAL_ZDOTDIR}"
   fi
 fi
+unset __gp_user_zdotdir
 if [[ -f "${__GITPULSE_ZSH_REAL_ZDOTDIR:-$HOME}/.zlogin" ]]; then
   builtin source "${__GITPULSE_ZSH_REAL_ZDOTDIR:-$HOME}/.zlogin"
 fi
 unset __GITPULSE_ZSH_REAL_ZDOTDIR
 "#;
 
-const ZSH_RC_SCRIPT: &str = r#"# Managed by GitPulse terminal shell integration.
+const ZSH_RC_SCRIPT: &str = r#"# Managed by Waylode terminal shell integration.
+__gp_user_zdotdir="${WAYLODE_USER_ZDOTDIR:-${GITPULSE_USER_ZDOTDIR:-}}"
+__gp_shell_integration="${WAYLODE_SHELL_INTEGRATION:-${GITPULSE_SHELL_INTEGRATION:-1}}"
 if [[ -n "${__GITPULSE_ZSH_REAL_ZDOTDIR:-}" ]]; then
-  if [[ "${__GITPULSE_ZSH_REAL_ZDOTDIR}" == "${HOME}" && -z "${GITPULSE_USER_ZDOTDIR:-}" ]]; then
+  if [[ "${__GITPULSE_ZSH_REAL_ZDOTDIR}" == "${HOME}" && -z "$__gp_user_zdotdir" ]]; then
     unset ZDOTDIR
   else
     export ZDOTDIR="${__GITPULSE_ZSH_REAL_ZDOTDIR}"
   fi
 fi
+unset __gp_user_zdotdir
 if [[ -f "${__GITPULSE_ZSH_REAL_ZDOTDIR:-$HOME}/.zshrc" ]]; then
   builtin source "${__GITPULSE_ZSH_REAL_ZDOTDIR:-$HOME}/.zshrc"
 fi
 
-if [[ -o interactive && "${GITPULSE_SHELL_INTEGRATION:-1}" != "0" && -z "${__GITPULSE_OSC_INSTALLED:-}" ]]; then
+if [[ -o interactive && "$__gp_shell_integration" != "0" && -z "${__GITPULSE_OSC_INSTALLED:-}" ]]; then
   typeset -g __GITPULSE_OSC_INSTALLED=1
   typeset -g __GITPULSE_CMD_ACTIVE=0
 
@@ -121,7 +135,7 @@ elif [ -f "$HOME/.bashrc" ]; then
   . "$HOME/.bashrc"
 fi
 
-if [[ $- == *i* && "${GITPULSE_SHELL_INTEGRATION:-1}" != "0" && -z "${__GITPULSE_OSC_INSTALLED:-}" ]]; then
+if [[ $- == *i* && "${WAYLODE_SHELL_INTEGRATION:-${GITPULSE_SHELL_INTEGRATION:-1}}" != "0" && -z "${__GITPULSE_OSC_INSTALLED:-}" ]]; then
   __GITPULSE_OSC_INSTALLED=1
   __GITPULSE_CMD_ACTIVE=0
   __GITPULSE_IN_PROMPT=0
@@ -197,8 +211,8 @@ if [[ $- == *i* && "${GITPULSE_SHELL_INTEGRATION:-1}" != "0" && -z "${__GITPULSE
 fi
 "#;
 
-const FISH_CONF_SCRIPT: &str = r#"# Managed by GitPulse terminal shell integration.
-if status is-interactive; and test "$GITPULSE_SHELL_INTEGRATION" != "0"; and not set -q __GITPULSE_OSC_INSTALLED
+const FISH_CONF_SCRIPT: &str = r#"# Managed by Waylode terminal shell integration.
+if status is-interactive; and test "$WAYLODE_SHELL_INTEGRATION" != "0"; and test "$GITPULSE_SHELL_INTEGRATION" != "0"; and not set -q __GITPULSE_OSC_INSTALLED
     set -g __GITPULSE_OSC_INSTALLED 1
     set -g __GITPULSE_CMD_ACTIVE 0
 
@@ -324,6 +338,12 @@ pub fn apply_to_default_shell_in(
     let disabled = cmd
         .get_env(SHELL_INTEGRATION_ENV)
         .and_then(|v| v.to_str())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            cmd.get_env(LEGACY_SHELL_INTEGRATION_ENV)
+                .and_then(|v| v.to_str())
+                .filter(|v| !v.is_empty())
+        })
         .is_some_and(|v| v.trim() == "0");
     if disabled {
         return;
@@ -349,11 +369,18 @@ pub fn apply_to_default_shell_in(
                 .map(|v| v.to_os_string())
                 .filter(|v| !v.is_empty());
             match existing_zdotdir {
-                Some(orig) => cmd.env(USER_ZDOTDIR_ENV, orig),
-                None => cmd.env_remove(USER_ZDOTDIR_ENV),
+                Some(orig) => {
+                    cmd.env(USER_ZDOTDIR_ENV, &orig);
+                    cmd.env(LEGACY_USER_ZDOTDIR_ENV, orig);
+                }
+                None => {
+                    cmd.env_remove(USER_ZDOTDIR_ENV);
+                    cmd.env_remove(LEGACY_USER_ZDOTDIR_ENV);
+                }
             }
             let zsh_shim = root.join("zsh");
-            cmd.env("GITPULSE_ZSH_SHIM_DIR", &zsh_shim);
+            cmd.env(ZSH_SHIM_DIR_ENV, &zsh_shim);
+            cmd.env(LEGACY_ZSH_SHIM_DIR_ENV, &zsh_shim);
             cmd.env("ZDOTDIR", &zsh_shim);
         }
         "fish" => {
@@ -368,7 +395,8 @@ pub fn apply_to_default_shell_in(
         }
         "bash" => {
             let bash_rc = root.join("bash").join("gitpulse.bash");
-            cmd.env("GITPULSE_BASH_INTEGRATION_PATH", &bash_rc);
+            cmd.env(BASH_INTEGRATION_PATH_ENV, &bash_rc);
+            cmd.env(LEGACY_BASH_INTEGRATION_PATH_ENV, &bash_rc);
             cmd.get_argv_mut().truncate(1);
             cmd.arg("--rcfile");
             cmd.arg(&bash_rc);
@@ -409,6 +437,20 @@ mod tests {
             Some("/Users/dev/.zsh")
         );
         assert_eq!(
+            cmd.get_env(LEGACY_USER_ZDOTDIR_ENV)
+                .and_then(|v| v.to_str()),
+            Some("/Users/dev/.zsh")
+        );
+        assert_eq!(
+            cmd.get_env(ZSH_SHIM_DIR_ENV).and_then(|v| v.to_str()),
+            Some(root.join("zsh").to_str().unwrap())
+        );
+        assert_eq!(
+            cmd.get_env(LEGACY_ZSH_SHIM_DIR_ENV)
+                .and_then(|v| v.to_str()),
+            Some(root.join("zsh").to_str().unwrap())
+        );
+        assert_eq!(
             cmd.get_env("ZDOTDIR").and_then(|v| v.to_str()),
             Some(root.join("zsh").to_str().unwrap())
         );
@@ -430,7 +472,13 @@ mod tests {
         let mut opted_out = CommandBuilder::new("/bin/zsh");
         opted_out.env(SHELL_INTEGRATION_ENV, "0");
         apply_to_default_shell_in(&mut opted_out, "/bin/zsh", true, false, tmp.path());
-        assert!(opted_out.get_env("GITPULSE_ZSH_SHIM_DIR").is_none());
+        assert!(opted_out.get_env(ZSH_SHIM_DIR_ENV).is_none());
+        assert!(opted_out.get_env(LEGACY_ZSH_SHIM_DIR_ENV).is_none());
+
+        let mut legacy_opted_out = CommandBuilder::new("/bin/zsh");
+        legacy_opted_out.env(LEGACY_SHELL_INTEGRATION_ENV, "0");
+        apply_to_default_shell_in(&mut legacy_opted_out, "/bin/zsh", true, false, tmp.path());
+        assert!(legacy_opted_out.get_env(ZSH_SHIM_DIR_ENV).is_none());
     }
 
     #[test]

@@ -1,10 +1,10 @@
-# Contributing to GitPulse
+# Contributing to Waylode
 
 For user workflows, start with the [documentation index](docs/README.md). The public
 website is maintained in the separate Portfolio repository; documentation changes
 here do not deploy it.
 
-Thank you for contributing to GitPulse! We welcome pull requests, bug reports, and feature proposals.
+Thank you for contributing to Waylode! We welcome pull requests, bug reports, and feature proposals.
 
 ---
 
@@ -20,7 +20,7 @@ Ensure you have the following tools installed on your development machine:
 | **cargo-llvm-cov** | latest | Generates the Rust LCOV report that `bun run ci:local` enforces coverage floors against. `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked` |
 | **cargo-nextest** | latest | Runs the Rust suites in `bun run ci:local` (through `cargo llvm-cov nextest`), one process per test, four at a time (`src-tauri/.config/nextest.toml`). CI still runs them under `cargo test`. `cargo install cargo-nextest --locked` |
 | **actionlint** | latest | Lints the GitHub Actions workflows in `bun run ci:local`. `release.yml` runs only on a `v*` tag, so this is the only gate that reads it before a release. `brew install actionlint` |
-| **Git** | any maintained release | Not just for version control: GitPulse shells out to `git` for every repository operation, so the binary on your `PATH` is part of the runtime. |
+| **Git** | any maintained release | Not just for version control: Waylode shells out to `git` for every repository operation, so the binary on your `PATH` is part of the runtime. |
 | **GitHub CLI** (`gh`) | optional | The GitHub panel (PRs, issues, workflow runs) and Health (Dependabot and code scanning alerts) use it. Everything else works without it. |
 
 **Platform toolchains** — Tauri builds a native binary, so each OS needs its own:
@@ -231,7 +231,7 @@ While iterating you will usually want the narrower commands instead:
 
 ## 4. Contract Verification
 
-GitPulse enforces strict contracts between the Rust backend and TypeScript frontend.
+Waylode enforces strict contracts between the Rust backend and TypeScript frontend.
 These are not style checks — each one catches a class of drift that types alone cannot:
 
 ```mermaid
@@ -268,11 +268,11 @@ flowchart TD
 | `bun run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `bun run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
-| `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares GitPulse's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
-| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 140 contracts (371 structs, 2610 fields) |
+| `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares Waylode's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 141 contracts (372 structs, 2614 fields) |
 | `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
-| `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
-| `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
+| `bun run mcp:install` | Installs `waylode-mcp` and `waylode-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/waylode/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
+| `bun run mcp:doctor` | Handshakes the `waylode-mcp` on PATH and asks the `waylode-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
 | `bun run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `bun run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty). It also fails any job or step in a workflow the release gate reads (`ci.yml`, `coverage.yml`, taken from `release-state.mjs`) that can skip or fail silently — a job `if:`, `continue-on-error`, a `needs:` on a skippable job, a step `if:` other than `!cancelled()` or a platform selector, a matrix `exclude`, a job that calls a reusable workflow (`uses`) or has no `steps` — unless `RELEASE_GATE_ALLOWLIST` lists it with a reason, because the gate reads the run's conclusion and a skipped job leaves it `success` |
 | `bun run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
@@ -315,6 +315,7 @@ several were added after the drift had already happened.
 | `provenance-verdict-contract` | A verdict written into a git note that the freshness badge does not recognise. The badge fails closed — an unrecognised verdict is never rendered as a pass — which is the safe behaviour and also a silent one: a writer that started emitting a new word would put a permanent amber badge on every verified commit with nothing to say why. Writers are found by scanning for `VerificationNote` constructions, so a second one is covered without anyone remembering. It also holds the Rust pass set in `engine/provenance.rs` (which decide `verified` and `confidence` for `gitpulse_provenance`) equal to the badge's, so an agent and the screen read the same verdict words as a pass. |
 | `bundle-binary-contract` | The Tauri bundler choosing the wrong binary. `src/bin/*.rs` is auto-discovered, so adding `gitpulsed` gave the package three binaries and `GitPulse.app` shipped the headless daemon as its executable — an installed app that opens nothing. Every other gate passed, because each binary was individually fine; only the choice of which to bundle was wrong, and no test runs the bundler. |
 | `windows-test-manifest-contract` | Windows `cargo test --lib` dying at load with `STATUS_ENTRYPOINT_NOT_FOUND` before any unit test runs. `rustc-link-arg-tests` covers `tests/*.rs` and tauri-winres covers named bins; the lib harness is neither. Catch-all `/MANIFEST:EMBED` reaches it, but the same flag while tauri-winres still embeds RT_MANIFEST is CVT1100 on `gitpulse.exe`. |
+| `windows-installer-contract` | Windows MSI upgrades silently breaking across the GitPulse-to-Waylode rename, or the NSIS installer leaving a duplicate `GitPulse` uninstall entry behind. Pins `bundle.windows.wix.upgradeCode` to `tauri-bundler`'s exact UUIDv5 for `"GitPulse"` and checks the NSIS pre-install hook in `src-tauri/windows/nsis-hooks.nsh`. |
 | `pr-timing-contract` | `gh` being asked for a field it does not know, which fails the whole PR listing; and "not reviewed yet" collapsing into "reviewed instantly". Field parity moved to `check:types` once the interface left the component. |
 | `wire-type-locality-contract` | A serde payload shape being declared inside a component, or inlined as an `invoke<{...}>` / `listen<{...}>` type argument, where `check:types` cannot reach it and a second copy can drift silently. Every instance found so far had already gone stale — TerminalRunResult, GitHubContext, ConflictChunk, CommitDetailsPayload, FileBlobPayload. |
 | `gh-json-fields-contract` | A `gh ... --json` list drifting from either gh's vocabulary or the struct that parses the reply. Asking for a field gh does not know fails the entire listing; asking for too few fails nothing at all, and the unrequested field deserializes to a default, so a title renders empty forever. |
@@ -370,6 +371,7 @@ several were added after the drift had already happened.
 | `pre-push-hook-contract` | A release tag that publishes a tree nobody meant to ship. `release.yml` triggers on `v*`, checks the tag out, and builds *that* tree — so every gate it runs (version manifests, changelog section) is evaluated at the tagged commit, and a tag left behind on an older commit passes all of them. `v0.0.6` sat 26 commits back with its own self-consistent 0.0.6 manifests and a 30-line `[0.0.6]` changelog section, so nothing in CI could have objected. The job cannot know which commit you meant; only the machine holding both the tag and the work can, which is why the check is a pre-push hook (`git config core.hooksPath .githooks`). The contract exists because an unrun hook and a passing hook look identical, and it derives the guarded glob from the workflow's own trigger so widening one without the other fails here. |
 | `fixture-author-hook-contract` | A test-fixture identity becoming the author or committer of a real commit. A fixture that writes `user.email` into this checkout's git config signs every later commit with it, and `.githooks/pre-commit` is what refuses that — but an unrun hook looks the same as a passing one. The test drives the real hook against real `git commit`s: the contract identity and the other fixture addresses are refused as author, as committer, and on an amend that would keep a fixture author, and a real identity still commits. Only `git commit` runs pre-commit, so the test also drives `.githooks/pre-merge-commit` against a real merge and `.githooks/pre-push` against real pushes to a bare remote: a fixture commit that bypassed pre-commit is refused at push, on an existing or a new branch, while one the remote already holds does not block later pushes. Pushing to a second remote, annotated-tag taggers, forty refs in one push, a five-thousand-commit history, addresses holding spaces, and a pushed object that cannot be read (refused, never passed) are covered too. The rule lives in `.githooks/lib/fixture-identity.sh`; it and `GitWriter::is_fixture_author_email` are both tested against `.githooks/lib/fixture-identity.cases`. |
 | `crash-windows-contract` | The list of crash windows in three write paths (the ledger, the ops log in `git_writer.rs`, worktree merge) drifting from the Rust source. `scripts/crash-windows.json` ties each window to its injection point and the test that proves recovery, or lists it uncovered with the reason. The test fails on a test-only hook in the scanned files that no row names, a row naming a hook or test that is gone, a cited test that is `#[ignore]`d or cfg-gated without the row saying so, and a duplicate id. It reads source text and does not run the Rust tests. Its scope is those files only, not the codebase; `crash-windows` holds the checking logic and its unit tests. |
+| `brand-rename-contract` | Brand rename scanner boundaries in `scripts/brand-rename.mjs`: verifies lookahead token boundary handling (`GitPulse\n...` and `GitPulse's`), explicit `KEPT_STANDALONE_PATHS` allowlisting vs. blanket standalone skipping, inline `#[cfg(test)]` exclusion in Rust modules, and prompt/hook function exclusions in `terminal_command.rs` and `agy_plugin.rs`. |
 
 Adding a contract test is preferred over adding a `check:*` script unless the
 check is something you would want to run on its own.
@@ -436,12 +438,12 @@ tag if the run fails.
 
 ## 5. Architecture Orientation
 
-GitPulse is a **Tauri 2** desktop app: a Rust core that owns every privileged
+Waylode is a **Tauri 2** desktop app: a Rust core that owns every privileged
 operation, and a Svelte 5 frontend that owns rendering and interaction. They meet at
 exactly one seam — `invoke("cmd_*")` — and that seam is machine-checked (§4).
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them.
-GitPulse uses Manvi for policy, workbench, and agent hosting, and selected
+Waylode uses Manvi for policy, workbench, and agent hosting, and selected
 DevCouncil crates plus the `devmap` CLI for code intelligence. Prefer the existing
 module; update one at a time. See [Module integration](docs/MODULE_INTEGRATION.md).
 
@@ -453,7 +455,7 @@ GitPulse/
 │   ├── lib/canvas/       GPU-accelerated commit-graph renderer
 │   ├── lib/views/        View registry + navigation (routerless, 5 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
-├── crates/gitpulse-worktree/ Standalone zero-copy worktree CLI & gitpulse-rustc cache wrapper
+├── crates/waylode-worktree/ Standalone zero-copy worktree CLI & waylode-rustc cache wrapper
 └── src-tauri/src/        Rust core
     ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (330+ handlers)
     ├── engine/           git CLI wrapper: reader, writer, sparse worktrees, CoW clone, agent bus, sandboxing
@@ -473,25 +475,25 @@ GitPulse/
 ### Headless binaries
 
 The desktop app is not the only way into the control plane. Four helper binaries build
-from `src-tauri` and two standalone CLI binaries build from `crates/gitpulse-worktree`:
+from `src-tauri` and two standalone CLI binaries build from `crates/waylode-worktree`:
 
 | Binary | Shape | What it is for |
 | --- | --- | --- |
-| `gitpulse-hook` | Host hook JSON on stdin/stdout | Runs the shared hook dispatcher for agent integrations; failures yield no decision plus diagnostics, leaving the host permission flow in control. |
-| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Exposes the control plane to coding agents: read-only (`readOnlyHint: true`) insights, collisions, 3-layer agent radar, agent inbox, change context, ledger, task view, in-process DevMap code graph, and provenance, plus repository-trust-gated task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and `gitpulse_worktree_*` lifecycle/coordination tools. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
-| `gitpulsed` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with GitPulse closed left a hole in the record that nothing on screen reported. |
-| `gitpulse-ptyd` | Length-prefixed frames over a Unix socket | Not a control-plane entry: the optional terminal host. With "Keep terminals running when GitPulse quits" on (off by default), it owns the PTYs so sessions survive a quit or crash. See [docs/TERMINAL_HOST.md](docs/TERMINAL_HOST.md). |
-| `gitpulse-worktree` | CLI (`--json` or human text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` delta compiler, `<git-common-dir>/gitpulse/lanes/` multi-agent coordination bus, and 6-point merge/prune driver. See [docs/ZERO_COPY_AGENTIC_WORKTREES.md](docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
-| `gitpulse-rustc` | `RUSTC_WRAPPER` compiler wrapper | Content-addressed two-stage (Blake3 direct + `.d` dep-info / `# env-dep:`) Rust build cache sharing `.rlib` / `.rmeta` / `proc-macro` outputs across sibling worktrees via APFS `clonefile` / Linux `FICLONE`. |
+| `waylode-hook` | Host hook JSON on stdin/stdout | Runs the shared hook dispatcher for agent integrations; failures yield no decision plus diagnostics, leaving the host permission flow in control. |
+| `waylode-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Exposes the control plane to coding agents: read-only (`readOnlyHint: true`) insights, collisions, 3-layer agent radar, agent inbox, change context, ledger, task view, in-process DevMap code graph, and provenance, plus repository-trust-gated task-board tools (`waylode_add_task`, `waylode_import_tasks`, `waylode_complete_task`, `waylode_delete_task`, `waylode_merge_tasks`) and `waylode_worktree_*` lifecycle/coordination tools. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/waylode/`. |
+| `wayloded` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with Waylode closed left a hole in the record that nothing on screen reported. |
+| `waylode-ptyd` | Length-prefixed frames over a Unix socket | Not a control-plane entry: the optional terminal host. With "Keep terminals running when Waylode quits" on (off by default), it owns the PTYs so sessions survive a quit or crash. See [docs/TERMINAL_HOST.md](docs/TERMINAL_HOST.md). |
+| `waylode-worktree` | CLI (`--json` or human text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` delta compiler, `<git-common-dir>/gitpulse/lanes/` multi-agent coordination bus, and 6-point merge/prune driver. See [docs/ZERO_COPY_AGENTIC_WORKTREES.md](docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
+| `waylode-rustc` | `RUSTC_WRAPPER` compiler wrapper | Content-addressed two-stage (Blake3 direct + `.d` dep-info / `# env-dep:`) Rust build cache sharing `.rlib` / `.rmeta` / `proc-macro` outputs across sibling worktrees via APFS `clonefile` / Linux `FICLONE`. |
 
-`gitpulsed` deliberately serves no requests (that is `gitpulse-mcp`'s job, and
+`wayloded` deliberately serves no requests (that is `waylode-mcp`'s job, and
 a second surface answering the same questions from the same store would be a
 second thing to keep in step) and never takes a lease, checks out a task, or
 writes a file — those belong to DevCouncil and Manvi modules, and a background process
 holding a writer lease would contend with the agent doing the work.
 
 ```bash
-gitpulsed --interval 300 /path/to/repo
+wayloded --interval 300 /path/to/repo
 ```
 
 Interruption is safe by construction rather than by signal handling: each
@@ -501,13 +503,13 @@ whatever an interrupted one did not finish and writes it exactly once.
 
 ### Vendored crates
 
-GitPulse links selected crates it does not own — `dc-evidence`, `dc-glob`, `dc-store`, `dc-redact`,
+Waylode links selected crates it does not own — `dc-evidence`, `dc-glob`, `dc-store`, `dc-redact`,
 `dc-proc`, and `dc-regress`/`dc-regress-store` from DevCouncil, five `devmap-*` crates from
 DevCouncil, and four `markdev-*` crates from MarkDev (parse/highlight with default features off).
 Manvi is the wrap around those DevCouncil components at runtime (`manvi serve`);
 its analysis crates are not a vendor origin. They used to
 be reached by relative path (`../../../../../Manvi/crates/…`), which meant a
-checkout of GitPulse alone did not build: it needed unrelated repositories
+checkout of Waylode alone did not build: it needed unrelated repositories
 present, at the right depth, on every machine and every CI runner.
 
 They are copied into `src-tauri/vendored/` instead, with
@@ -535,7 +537,7 @@ subtly wrong:
   and an inheritance form the script does not recognise is a hard failure
   rather than something passed through to fail later as a confusing cargo
   error.
-* **`tests/` and `[dev-dependencies]` are not vendored.** GitPulse has never
+* **`tests/` and `[dev-dependencies]` are not vendored.** Waylode has never
   run these crates' tests — as path dependencies outside its workspace, cargo
   does not build them — and `devmap-store` dev-depends on `devmap-serve`, which
   is outside this closure. The omission is recorded per crate rather than left
@@ -629,7 +631,7 @@ ask a question, see [SUPPORT.md](SUPPORT.md); for how decisions are made,
    [the template](.github/PULL_REQUEST_TEMPLATE.md) — it is a short checklist, not
    paperwork.
 5. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit
-   subjects (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `perf:`). GitPulse parses
+   subjects (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `perf:`). Waylode parses
    these in its own commit filter, so the repository holds itself to them.
 6. Sign off every commit (`git commit -s`). This is required: see "Licence of
    contributions" below.
@@ -660,7 +662,7 @@ can be reviewed in one sitting.
 
 ### Licence of contributions
 
-GitPulse is dual-licensed under the [MIT License](LICENSE-MIT) or the
+Waylode is dual-licensed under the [MIT License](LICENSE-MIT) or the
 [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your
 option (see [LICENSE](LICENSE)).
 
@@ -679,7 +681,7 @@ open-source licenses. A pull request with an unsigned commit is asked to amend
 it (`git commit --amend -s --no-edit`, or `git rebase --signoff main` for
 several commits).
 
-The GitPulse name and logo are not covered by the MIT or Apache-2.0 licenses;
+The Waylode name and logo are not covered by the MIT or Apache-2.0 licenses;
 see [TRADEMARKS.md](TRADEMARKS.md).
 
 ### Looking for something to work on?
@@ -692,7 +694,7 @@ see [TRADEMARKS.md](TRADEMARKS.md).
 ### Recognition
 
 Every kind of contribution counts — code, documentation, design, bug reports, testing,
-ideas. GitPulse uses the [All Contributors](https://allcontributors.org/)
+ideas. Waylode uses the [All Contributors](https://allcontributors.org/)
 specification; contributors are listed in the README. To add someone (including
 yourself), comment on any issue or PR:
 

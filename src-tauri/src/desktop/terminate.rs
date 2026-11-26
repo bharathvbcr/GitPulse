@@ -1,5 +1,5 @@
 //! AppKit's own quit requests: the app menu's Quit item (Cmd-Q), Dock → Quit,
-//! a Quit Apple event (`osascript -e 'quit app id "dev.vbcr.gitpulse"'`),
+//! a Quit Apple event (`osascript -e 'quit app id "dev.vbcr.waylode"'`),
 //! and logout or restart.
 //!
 //! TAO's application delegate implements `applicationWillTerminate:` but not
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn every_appkit_quit_asks_the_guard_and_returns_its_reply() {
-        let class = ClassBuilder::new(c"GitPulseTerminateProbe", class!(NSObject))
+        let class = ClassBuilder::new(c"WaylodeTerminateProbe", class!(NSObject))
             .expect("probe class name is unique")
             .register();
         let next = Arc::new(Mutex::new(Reply::Later));

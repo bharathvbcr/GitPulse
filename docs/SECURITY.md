@@ -1,11 +1,11 @@
-# GitPulse Security Model & Policy
+# Waylode Security Model & Policy
 
-GitPulse is a **local-first, zero-telemetry** developer desktop application.
+Waylode is a **local-first, zero-telemetry** developer desktop application.
 Repository and task state stay in local stores. Git remotes, GitHub operations,
 optional tool installation and configured agent providers can use the network.
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them.
-GitPulse uses Manvi for policy, workbench, and agent hosting, and selected
+Waylode uses Manvi for policy, workbench, and agent hosting, and selected
 DevCouncil modules for code intelligence. Take or update only the modules this
 app needs.
 
@@ -48,7 +48,7 @@ flowchart TD
 ## 1. Core Security Guarantees
 
 ### Zero Telemetry & No Remote Phoning Home
-- GitPulse has no centralized backend or analytics tracking.
+- Waylode has no centralized backend or analytics tracking.
 - Network-capable features run through user actions or explicitly enabled settings,
   including scheduled release checks, automatic task suggestions, and the
   default-on GitHub alert scan (Dependabot and code scanning via the local `gh`
@@ -70,7 +70,7 @@ flowchart TD
 - Trust permits the repository's Git hooks, helpers, and project tools to run
   with the user's account permissions, including code in submodules. It is an
   execution decision, not an OS sandbox or a claim that the project is safe.
-- GitPulse stores remembered grants in its application configuration directory,
+- Waylode stores remembered grants in its application configuration directory,
   outside repository policy and task files. A grant binds the repository — the
   common Git directory, by canonical path and filesystem identity — together
   with the checkout that was approved. Replacing either, or redirecting a
@@ -135,7 +135,7 @@ flowchart TD
 - Global tool probes run from a neutral filesystem root. Local source-tool
   installation requires approval for the checkout used to build the tool.
 - Approval binds a directory, not a path. Because the operating system resolves
-  a working-directory path again when a child starts, GitPulse pins the
+  a working-directory path again when a child starts, Waylode pins the
   approved directory and starts the child on that pinned directory, so
   renaming a path component and leaving a link in its place cannot divert a
   Git or tool process into a checkout that was never approved. Where the whole
@@ -179,11 +179,11 @@ flowchart TD
   OS sandbox against another process already running with the user's rights.
 
 ### Local `gh` Credential Safety
-- GitPulse never requests, reads, stores, or transmits your GitHub personal access tokens or passwords.
+- Waylode never requests, reads, stores, or transmits your GitHub personal access tokens or passwords.
 - All GitHub operations (PR inspection, workflow dispatch, Dependabot and code scanning queries) delegate exclusively to your locally installed and authenticated `gh` CLI.
 
 ### Local `firebase` Credential Safety
-- The same rule holds for Firebase: GitPulse never requests, reads, stores or
+- The same rule holds for Firebase: Waylode never requests, reads, stores or
   transmits your Google credentials. App Hosting reads delegate to your locally
   installed and authenticated `firebase` CLI, which owns the login.
 - Detecting that a repository uses Firebase is a local file read (`.firebaserc`,
@@ -193,7 +193,7 @@ flowchart TD
 - **Listing backends or rollouts can enable an API on your Google Cloud
   project.** The Firebase CLI runs `ensureApiEnabled` before those listings and
   turns the App Hosting API on when it is off. App Hosting publishes no
-  read-only OAuth scope, so this is not avoidable by asking differently. GitPulse
+  read-only OAuth scope, so this is not avoidable by asking differently. Waylode
   therefore treats those listings as mutations: they never run on their own, only
   from an explicit action, the panel states the side effect before the button,
   and the exact command line is judged by the policy gate before any process
@@ -204,7 +204,7 @@ flowchart TD
 - **What the CLI can do is asked, not assumed.** `apphosting:rollouts:list` is
   registered upstream only behind the `internaltesting` experiment, which is off
   by default, and an unregistered subcommand exits non-zero having written
-  nothing to either stream. GitPulse therefore probes the installed CLI — by
+  nothing to either stream. Waylode therefore probes the installed CLI — by
   listing a command *group*, which needs no login, no project and no network —
   and offers the rollout action only when the subcommand is really there. A
   capability that could not be probed is reported as unknown rather than as
@@ -219,14 +219,14 @@ flowchart TD
 #### Creating A Rollout Is The One Firebase Action That Changes Production
 - `apphosting:rollouts:create` is the only command in this module that changes
   what the user's production traffic serves. It is **not reversible from
-  GitPulse** — App Hosting publishes no rollback verb, so undoing a rollout
+  Waylode** — App Hosting publishes no rollback verb, so undoing a rollout
   means creating another against an earlier commit — and it is **not
   idempotent**: upstream allocates a new rollout id per call, so running it
   twice deploys twice.
 - It is therefore behind two steps, not one. The commit must be a full
   40-character SHA (an abbreviation is an ambiguous target for something that
   reaches production, and is refused with the reason), and the panel spells out
-  the exact project, backend and commit — plus the fact that GitPulse cannot
+  the exact project, backend and commit — plus the fact that Waylode cannot
   undo it — before the deploying button exists at all. Changing any part of that
   target disarms the confirmation, so the values sent are always the values
   reviewed.
@@ -235,7 +235,7 @@ flowchart TD
   this command's argv is built in the Firebase module rather than spelled out in
   the handler and is therefore exempt from the literal-argv comparison.
 - `--force` is never passed. Upstream prompts only when neither a branch nor a
-  commit was named, and GitPulse always names a commit, so nothing here
+  commit was named, and Waylode always names a commit, so nothing here
   suppresses a confirmation the user would otherwise have seen.
 - A rollout that started is never reported as failed. If the CLI exits zero
   without confirming the result, the panel says the rollout started but could
@@ -250,10 +250,10 @@ flowchart TD
   the same features go through Manvi's `work.assist.complete`; that route never
   sweeps, probes or falls back to loopback after a failed call. In cloud mode the
   request reaches the Claude API. Manvi does not redact the prompt (`redactions` is
-  always 0), so the staged diff or commit goes as GitPulse built it. Cloud mode is
+  always 0), so the staged diff or commit goes as Waylode built it. Cloud mode is
   followed only when someone chose it (saved config, `MANVI_*` environment or a
-  flag): an unset config answers cloud with `provider_from: default`, which GitPulse
-  reads as `not_chosen` and does not route to Manvi. GitPulse's own loopback client
+  flag): an unset config answers cloud with `provider_from: default`, which Waylode
+  reads as `not_chosen` and does not route to Manvi. Waylode's own loopback client
   (and its consent flow) is used then, and when Manvi is not installed or lacks the
   op, with a warning saying why. The one write path, `cmd_manvi_use`, runs
   `manvi use cloud|local` only on a human action: the Manvi pane's cloud/local
@@ -271,9 +271,9 @@ flowchart TD
   and the selected run settings. The local-completion transport restriction does
   not establish containment for an explicitly launched agent.
 - When `~/.anthropic-accounts` is present (Manvi's `anthropic-account` registry),
-  GitPulse launches `manvi serve` via `anthropic-account exec --no-fallback --repo $HOME -- manvi`
-  (`src-tauri/src/harness/anthropic_account.rs`). GitPulse never reads or stores
-  that Anthropic API key; if the registry exists but cannot be read, GitPulse
+  Waylode launches `manvi serve` via `anthropic-account exec --no-fallback --repo $HOME -- manvi`
+  (`src-tauri/src/harness/anthropic_account.rs`). Waylode never reads or stores
+  that Anthropic API key; if the registry exists but cannot be read, Waylode
   fails closed rather than falling back to a saved in-app key that may belong to
   another organisation. Manvi's promise to withhold `ANTHROPIC_API_KEY` from its
   child processes is verified before spawn and at the handshake.
@@ -292,7 +292,7 @@ flowchart TD
   unix socket that only the same user can connect to (`0700` directory, `0600` socket, peer uid
   checked on every connection). Repository validation, trust and `require_unsubstitutable_dir`
   run in that process, where the fork happens; a session-only trust grant never reaches it.
-  **Settings → Agents → Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`,
+  **Settings → Agents → Keep managed agent runs running when Waylode quits** (`keep_terminals_running`,
   on by default) governs whether managed agent runs also live in a detached `manvi serve --listen`
   process across app restarts. What this widens and why it grants a same-user process nothing it
   did not already have is documented in the signed-off security-impact statement in
@@ -301,7 +301,7 @@ flowchart TD
 ### GitHub Alert Scans
 - Opening a repository fetches Dependabot and code scanning alerts through the
   locally authenticated `gh` CLI. This is on by default under **Settings →
-  Analysis**. GitPulse still does not read or store GitHub tokens.
+  Analysis**. Waylode still does not read or store GitHub tokens.
 - Only critical and high findings raise a warning. A check that could not run
   (missing `gh`, not a GitHub remote, API error) is listed in Health and recorded
   in diagnostics, never presented as an all-clear.
@@ -357,7 +357,7 @@ flowchart TD
   socket: `<config dir>/agent-mailbox/<session uuid>/`. Directories are
   `0700`, files `0600`, every open is `O_NOFOLLOW`, the mailbox root and each
   session directory are refused if they are symlinks (the ancestors above the
-  GitPulse config directory are the user's own and are not checked), and an
+  Waylode config directory are the user's own and are not checked), and an
   object not owned by the current user or wider than its mode is refused and
   never read. Writes are temp-file plus
   `rename`-without-replace; a claim is a second atomic rename, so a message is
@@ -365,7 +365,7 @@ flowchart TD
   run. Per session: 8 pending messages, 2 waiting hooks; 64 sessions and 16
   waiting hooks overall; pending messages expire after 2 hours, claimed ones
   after 10 minutes. The session cap and the waiter caps count every Claude
-  session in any GitPulse terminal (`GITPULSE_SESSION_ID` is set on plain
+  session in any Waylode terminal (`GITPULSE_SESSION_ID` is set on plain
   terminals too), not only task attempts, so many plain `claude` tabs can fill
   them, after which a send answers `mailbox_full`.
 - The newest hooks on a session take precedence: a later stop's two hooks
@@ -381,7 +381,7 @@ flowchart TD
   reminder). It waits at most 1740 s with a bounded 250 ms poll, claims one
   message, writes it to stderr and exits 2. Every other outcome (timeout,
   unknown session, full caps, an untrusted mailbox, any I/O error) exits 0. Only
-  a session GitPulse launched has a mailbox: the hook acts only when
+  a session Waylode launched has a mailbox: the hook acts only when
   `GITPULSE_SESSION_ID` is set and the payload's `session_id` is a canonical
   UUID, and an unknown session creates nothing on disk. Every stop waits,
   `stop_hook_active` or not: the turn an `asyncRewake` wake starts is itself a
@@ -406,7 +406,7 @@ flowchart TD
   never resent) and `unconfirmed` (an `E_` code this build does not know). The
   note editor warns that a different note is a new message sent in addition.
   When no hook is waiting on a live session the preview says only that, and
-  that GitPulse cannot see why.
+  that Waylode cannot see why.
 - Security impact: a same-uid process could always type into an agent's
   terminal, so the mailbox widens nothing a local user could not already do; it
   adds one new way for text to reach an agent's context, and that text is only
@@ -434,7 +434,7 @@ flowchart TD
 
 ### Secrets Scanner Privacy & Fail-Closed Reporting
 - Insights → Health scans the working tree for exposed API keys, access tokens,
-  and credentials with GitPulse's own in-process scanner (`leak_scan`, the
+  and credentials with Waylode's own in-process scanner (`leak_scan`, the
   vendored `dc-redact` credential table). It reads every tracked file and every
   untracked file git does not ignore, in this process, with a per-file cap, a
   byte budget and a time limit; every input it could not read is listed and
@@ -454,7 +454,7 @@ flowchart TD
   that fails, is killed, times out or is truncated never changes the in-process
   result. It has no option to honour `.gitignore`, so it also reads ignored
   files (wholly ignored build, dependency and scratch trees are excluded by
-  GitPulse). It runs with `--redact` and `--no-validate`, a scrubbed environment
+  Waylode). It runs with `--redact` and `--no-validate`, a scrubbed environment
   (`PATH`, `HOME`, `NO_COLOR` only), and a fixed argv that never loads a
   repository config. Findings cross IPC as rule ID and name, repo-relative
   path, line, confidence, Git location, and a per-scan ordinal grouping rows
@@ -475,7 +475,7 @@ flowchart TD
 ### Dead-Branch Cleanup & Destructive Action Authorization
 - Dead-branch cleanup identifies merged, stale, or squashed branches using
   `git merge-tree` to verify merge status safely.
-- Before executing any deletion, GitPulse generates explicit git commands
+- Before executing any deletion, Waylode generates explicit git commands
   (`git branch -d/-D`, `git push --delete`) and requires user authorization.
   A refusal halts the entire batch before any branch is removed.
 - Durable tip backups: prior to any branch deletion, a restorable tip backup is
@@ -523,7 +523,7 @@ flowchart TD
 - **Hook consent is unchanged.** `post_create` commands run only when the exact
   hooks file was approved in the Worktrees panel; an unapproved or changed file
   runs nothing, and the hook says so on stderr.
-- **Untrusted repositories** (owner decision): GitPulse runs nothing in them;
+- **Untrusted repositories** (owner decision): Waylode runs nothing in them;
   `procguard` admits no child process whose working directory is in an
   untrusted repository. The binary exits 75 untouched, and the plugin's launcher
   runs the plain `git worktree add` Claude Code would have run, with no hooks,
@@ -533,7 +533,7 @@ flowchart TD
   refusal or the 540 s deadline all exit non-zero with nothing on stdout. A
   `post_create` failure keeps the worktree, as the Worktrees panel does; it is
   recorded in the worktree's git directory and the session's start-up brief
-  warns the agent, because Claude Code does not show a successful hook's stderr. A GitPulse failure
+  warns the agent, because Claude Code does not show a successful hook's stderr. A Waylode failure
   before any write exits 75 so plain git can still make the worktree.
 - **`.worktreeinclude` can copy secrets.** It copies the files the
   repository's owner listed and ignored, which in practice means `.env`,
@@ -555,7 +555,7 @@ flowchart TD
 - **Sound `gitpulse-rustc` artifact reuse**: `gitpulse-rustc` bounds `@<rspfile>` expansion (8 MiB, depth 4), never caches `-C incremental` or `build_script_build` invocations, re-verifies every `.d` file dependency and `# env-dep:` variable on Stage 2 hits, and strips comments and string literals before applying the compile-time `include*!(concat!(env!("OUT_DIR"), ...))` exemption so runtime `OUT_DIR` paths cannot leak across worktrees.
 
 ### Process Signal Guard (Linux & macOS Models)
-- The signal guard protects GitPulse, `gitpulse-ptyd`, and child agent sessions from accidental mass-termination by external tools (e.g. `pkill`, `killall`, `pgrep`, `pidof`).
+- The signal guard protects Waylode, `gitpulse-ptyd`, and child agent sessions from accidental mass-termination by external tools (e.g. `pkill`, `killall`, `pgrep`, `pidof`).
 - **Linux Tool Modeling**: On Linux, the signal guard directly models `procps pkill`/`pgrep`, `psmisc killall`, and `sysvinit pidof` (`ft-06723bb7`, `d9954240`, `1ba087a0`).
   - Matches process names against both `comm` and `argv[0]`'s basename (union with macOS reading).
   - Inspects real, effective, and saved UIDs from `/proc/<pid>/status` and applies exact `kill(2)` permission checks.
@@ -585,9 +585,9 @@ flowchart TD
 - This eliminates the legacy thread-local error store (`take_last_error`), preventing ambient error state from leaking across concurrent command invocations or worker threads.
 
 ### Opt-In Release Checks
-- Automatic application release checks are off by default; GitPulse does not
+- Automatic application release checks are off by default; Waylode does not
   automatically install application updates.
-- When explicitly enabled under **Settings → Updates**, GitPulse compares public release tags once a day via `git ls-remote` against the upstream repository.
+- When explicitly enabled under **Settings → Updates**, Waylode compares public release tags once a day via `git ls-remote` against the upstream repository.
 - No user tokens, repository paths, or hardware telemetry are ever sent. The
   **Include beta releases** choice filters the tag list locally and is not sent either.
 - Release checks only notify with a link to GitHub releases. Optional-tool setup
@@ -615,7 +615,7 @@ The webview operates under a strict CSP configured in `src-tauri/tauri.conf.json
   `ws` origins on loopback; release builds never carry them.
 
 Rendered repository Markdown is untrusted content in the app's own document.
-MarkDev's renderer escapes raw HTML and refuses active URL schemes; GitPulse
+MarkDev's renderer escapes raw HTML and refuses active URL schemes; Waylode
 then namespaces every rendered id, replaces any picture that would resolve
 against the app's own origin, and handles every link itself — the webview
 never follows one (`src/lib/files/markdownLinks.ts`, guarded by
@@ -624,7 +624,7 @@ to prevent exponential event duplication attacks from malformed wikilinks (`[[a|
 under `ENABLE_WIKILINKS`. Pictures beside a note are read only from inside its
 repository, through the same containment check as `cmd_get_file_blob`.
 
-### Browser Sessions: Pages With No Route to GitPulse
+### Browser Sessions: Pages With No Route to Waylode
 
 A Browser session in the terminal dock (macOS) shows a local dev server's page
 in a native webview laid over the tab (`src-tauri/src/browser`). That brings
@@ -649,7 +649,7 @@ is built to have no way back in:
   Subresource requests (`fetch`, images) are not navigations and are not
   filtered.
 - **Its own storage.** Each session uses a non-persistent data store, so a page
-  on the app's own dev origin cannot read GitPulse's localStorage or cookies,
+  on the app's own dev origin cannot read Waylode's localStorage or cookies,
   and nothing is written to disk.
 - **At most 8 sessions**, and every session is closed when the main page
   reloads (both tested). New-window requests are denied and no download
@@ -667,7 +667,7 @@ is built to have no way back in:
   is not approved.
 
 Once the page has keyboard focus it receives keystrokes, as any browser does;
-nothing typed there reaches GitPulse.
+nothing typed there reaches Waylode.
 
 ---
 
@@ -678,7 +678,7 @@ discussion. Report it privately through GitHub's private vulnerability reporting
 
 👉 **[Open a private Security Advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new)**
 
-This is the only reporting channel. GitPulse does not publish a security email
+This is the only reporting channel. Waylode does not publish a security email
 address. Include the version (or commit), the platform, what you expected, what
 happened, and the smallest steps that reproduce it. If you cannot use GitHub's
 form, say so in a private message to the maintainer, [@bharathvbcr](https://github.com/bharathvbcr),
@@ -695,7 +695,7 @@ Checks* above) announces a new version once its checksums are published.
 
 ### What to expect
 
-GitPulse is maintained by one person, so these are targets, not guarantees:
+Waylode is maintained by one person, so these are targets, not guarantees:
 
 - **Acknowledgement** within 5 business days of your report.
 - **Assessment** (accepted, needs more information, or not a vulnerability) within
@@ -725,7 +725,7 @@ source or runtime security verification. Re-run both checks for a release.
 
 ## Posting verification results to GitHub
 
-GitPulse writes to GitHub in one new way: a commit status (`devcouncil/verify`) and an
+Waylode writes to GitHub in one new way: a commit status (`devcouncil/verify`) and an
 optional pull-request comment carrying a task's verification verdict, through the user's
 own `gh` login (owner-approved option A). The boundaries are enforced in
 `src-tauri/src/workbench/verify_status.rs` and pinned by its tests. It is off per
@@ -735,4 +735,4 @@ is off). It runs only from the desktop commands `cmd_verify_status_post` and
 for the commit it names and a clean worktree at that commit; anything not established posts
 `error`, and a verdict that cannot be tied to the commit posts nothing. The content is a
 fixed vocabulary, counts and criterion numbers: no command output, environment, diff hunks
-or free text. The request is `gh api`; GitPulse never reads, stores or logs the token.
+or free text. The request is `gh api`; Waylode never reads, stores or logs the token.

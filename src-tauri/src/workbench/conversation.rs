@@ -46,7 +46,7 @@ pub(super) fn judge(
     let provider = run["provider"].as_str().unwrap_or_default();
     if provider != "claude" && provider != "agy" {
         return refuse(
-            "Only a Claude Code or Antigravity conversation can be resumed from GitPulse.",
+            "Only a Claude Code or Antigravity conversation can be resumed from Waylode.",
         );
     }
     let state = run["state"].as_str().unwrap_or_default();

@@ -46,7 +46,7 @@ const MAIN_BINARY = /"mainBinaryName"\s*:\s*"([^"]+)"/.exec(tauriConf)?.[1] ?? "
 const helpers = declaredBinaries.filter((bin) => bin !== MAIN_BINARY);
 
 function withRecorder<T>(run: (dir: string, env: NodeJS.ProcessEnv) => T): T {
-  const dir = mkdtempSync(join(tmpdir(), "gitpulse-codesign-"));
+  const dir = mkdtempSync(join(tmpdir(), "waylode-codesign-"));
   try {
     const recorder = join(dir, "recorder");
     writeFileSync(
@@ -54,7 +54,7 @@ function withRecorder<T>(run: (dir: string, env: NodeJS.ProcessEnv) => T): T {
       ["#!/usr/bin/env bash", 'echo "$@" >> "$RECORD"', "exit 0", ""].join("\n"),
     );
     chmodSync(recorder, 0o755);
-    return run(dir, { RECORD: join(dir, "log"), GITPULSE_REAL_CODESIGN: recorder });
+    return run(dir, { RECORD: join(dir, "log"), WAYLODE_REAL_CODESIGN: recorder });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -167,18 +167,18 @@ describe("universal-build codesign shim", () => {
     "against real codesign in an app bundle",
     () => {
       function withBundle<T>(run: (macos: string) => T): T {
-        const dir = mkdtempSync(join(tmpdir(), "gitpulse-codesign-app-"));
+        const dir = mkdtempSync(join(tmpdir(), "waylode-codesign-app-"));
         try {
-          const macos = join(dir, "GitPulse.app", "Contents", "MacOS");
+          const macos = join(dir, "Waylode.app", "Contents", "MacOS");
           mkdirSync(macos, { recursive: true });
           writeFileSync(
-            join(dir, "GitPulse.app", "Contents", "Info.plist"),
+            join(dir, "Waylode.app", "Contents", "Info.plist"),
             [
               `<?xml version="1.0" encoding="UTF-8"?>`,
               `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
               `<plist version="1.0"><dict>`,
               `<key>CFBundleExecutable</key><string>${MAIN_BINARY}</string>`,
-              `<key>CFBundleIdentifier</key><string>dev.vbcr.gitpulse</string>`,
+              `<key>CFBundleIdentifier</key><string>dev.vbcr.waylode</string>`,
               `<key>CFBundlePackageType</key><string>APPL</string>`,
               `</dict></plist>`,
               "",
@@ -214,7 +214,7 @@ describe("universal-build codesign shim", () => {
         const result = withBundle((macos) =>
           spawnSync(shimPath, signArgs(join(macos, MAIN_BINARY)), {
             encoding: "utf8",
-            env: { ...process.env, GITPULSE_REAL_CODESIGN: "/usr/bin/codesign" },
+            env: { ...process.env, WAYLODE_REAL_CODESIGN: "/usr/bin/codesign" },
           }),
         );
         expect(result.status, result.stderr).toBe(0);

@@ -24,7 +24,7 @@ const canonicalSumsBytes = Buffer.from(
 const stubBytes = (name: string) => (name === checksumsAssetName ? canonicalSumsBytes : rawStubBytes(name));
 const stubDigest = (name: string) => `sha256:${createHash("sha256").update(stubBytes(name)).digest("hex")}`;
 function draft() {
-  return {id: 42, tag_name: tag, name: `GitPulse ${tag}`, target_commitish: commit, draft: true, prerelease: false,
+  return {id: 42, tag_name: tag, name: `Waylode ${tag}`, target_commitish: commit, draft: true, prerelease: false,
     immutable: false, published_at: null, body: "pending",
     upload_url: "https://uploads.github.com/repos/owner/repo/releases/42/assets{?name,label}",
     assets: expectedAssetNames("1.2.3")
@@ -157,7 +157,7 @@ function fixture(change: {
   return {run, calls, patches, uploadedBytes};
 }
 
-const binaries = ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"];
+const binaries = ["waylode", "waylode-hook", "waylode-mcp", "waylode-ptyd", "wayloded"];
 const scratch: string[] = [];
 afterAll(() => { for (const dir of scratch) rmSync(dir, {recursive: true, force: true}); });
 
@@ -168,7 +168,7 @@ afterAll(() => { for (const dir of scratch) rmSync(dir, {recursive: true, force:
  */
 type Verdict = {ok: boolean; invalid: boolean; violations: string[]; opened: string[]; coverage: string};
 function bundleDeps(fault: {corrupt?: string; short?: string; fail?: string; order?: string[]; swapDuringInspect?: boolean; verdict?: Verdict; bytesOverride?: Map<string, Buffer>} = {}) {
-  const downloadDir = path.join(mkdtempSync(path.join(tmpdir(), "gitpulse-release-state-")), "bundles");
+  const downloadDir = path.join(mkdtempSync(path.join(tmpdir(), "waylode-release-state-")), "bundles");
   scratch.push(path.dirname(downloadDir));
   const fetched: string[] = [];
   const inspected: {binaries: string[]; files: Record<string, string | undefined>}[] = [];
@@ -311,8 +311,8 @@ describe("remote release lifecycle", () => {
     const leftover = {
       ...draft(),
       assets: [
-        {id: 11, name: "GitPulse_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`},
-        {id: 12, name: "GitPulse_1.2.3_x64_en-US.msi", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`},
+        {id: 11, name: "Waylode_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`},
+        {id: 12, name: "Waylode_1.2.3_x64_en-US.msi", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`},
       ],
     };
     const {run, calls} = fixture({release: leftover, list: [leftover]});
@@ -332,7 +332,7 @@ describe("remote release lifecycle", () => {
   it("refuses a leftover installer that has no asset id instead of skipping it", () => {
     const leftover = {
       ...draft(),
-      assets: [{name: "GitPulse_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}],
+      assets: [{name: "Waylode_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}],
     };
     const {run, calls} = fixture({release: leftover, list: [leftover]});
     expect(() => runReleaseStage(options, run)).toThrow(/asset ID/);
@@ -410,9 +410,9 @@ describe("remote release lifecycle", () => {
   it("wipes leftover assets across multiple passes when inline asset lists span pages and fails closed if assets persist", () => {
     const pass1 = {
       ...draft(),
-      assets: [{id: 11, name: "GitPulse_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}],
+      assets: [{id: 11, name: "Waylode_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}],
     };
-    const pass2 = [{id: 12, name: "GitPulse_1.2.3_x64_en-US.msi", size: 10, state: "uploaded", digest: `sha256:${"c".repeat(64)}`}];
+    const pass2 = [{id: 12, name: "Waylode_1.2.3_x64_en-US.msi", size: 10, state: "uploaded", digest: `sha256:${"c".repeat(64)}`}];
     const multi = fixture({release: pass1, list: [pass1], wipeResidualAssets: [pass2]});
     expect(runReleaseStage(options, multi.run).release_id).toBe("42");
     const deleted = multi.calls.filter(call => call.includes("DELETE")).map(call => call[5]);
@@ -543,9 +543,9 @@ describe("remote release lifecycle", () => {
     expect(corruptFix.patches).toHaveLength(0);
   });
   it.each([
-    ["a digest that is not GitHub's", {corrupt: "GitPulse_1.2.3_amd64.deb"}, /does not match GitHub's SHA-256/],
-    ["a short download", {short: "GitPulse_1.2.3_x64_en-US.msi"}, /downloaded \d+ bytes, expected \d+/],
-    ["a download that fails", {fail: "GitPulse_1.2.3_universal.app.tar.gz"}, /download refused/],
+    ["a digest that is not GitHub's", {corrupt: "Waylode_1.2.3_amd64.deb"}, /does not match GitHub's SHA-256/],
+    ["a short download", {short: "Waylode_1.2.3_x64_en-US.msi"}, /downloaded \d+ bytes, expected \d+/],
+    ["a download that fails", {fail: "Waylode_1.2.3_universal.app.tar.gz"}, /download refused/],
   ])("refuses %s before opening anything or writing notes", (_label, fault, expected) => {
     const {run, patches} = fixture();
     const deps = bundleDeps(fault);
@@ -601,7 +601,7 @@ describe("remote release lifecycle", () => {
   });
   it("refuses an asset that is larger than the download bound", () => {
     const release = draft();
-    release.assets = release.assets.map(asset => asset.name === "GitPulse_1.2.3_amd64.deb" ? {...asset, size: 513 * 1024 * 1024} : asset);
+    release.assets = release.assets.map(asset => asset.name === "Waylode_1.2.3_amd64.deb" ? {...asset, size: 513 * 1024 * 1024} : asset);
     const {run} = fixture({release});
     const deps = bundleDeps();
     expect(() => runReleaseStage({...finalize, ...deps}, run)).toThrow(/size outside/);
@@ -609,8 +609,8 @@ describe("remote release lifecycle", () => {
   });
   it("writes no notes when a binary is missing from a bundle, and says which", () => {
     const {run, patches} = fixture();
-    const deps = bundleDeps({verdict: {ok: false, invalid: false, violations: ["GitPulse_1.2.3_amd64.deb: missing: gitpulse-hook"], opened: [], coverage: "opened 7 of 12 installers"}});
-    expect(() => runReleaseStage({...finalize, ...deps}, run)).toThrow(/GitPulse_1\.2\.3_amd64\.deb: missing: gitpulse-hook/);
+    const deps = bundleDeps({verdict: {ok: false, invalid: false, violations: ["Waylode_1.2.3_amd64.deb: missing: waylode-hook"], opened: [], coverage: "opened 7 of 12 installers"}});
+    expect(() => runReleaseStage({...finalize, ...deps}, run)).toThrow(/Waylode_1\.2\.3_amd64\.deb: missing: waylode-hook/);
     expect(patches).toHaveLength(0);
   });
   it("refuses a bundle whose bytes change while they are being opened", () => {
@@ -792,10 +792,10 @@ describe("attest stage", () => {
     runReleaseStage(attest, spy);
     const lines = manifest.trimEnd().split("\n");
     expect(lines).toHaveLength(expectedInstallerNames("1.2.3").length + 2);
-    expect(lines).toContain(`${stubDigest("GitPulse_1.2.3_arm64_en-US.msi").slice("sha256:".length)}  GitPulse_1.2.3_arm64_en-US.msi`);
+    expect(lines).toContain(`${stubDigest("Waylode_1.2.3_arm64_en-US.msi").slice("sha256:".length)}  Waylode_1.2.3_arm64_en-US.msi`);
     expect(lines).toContain(`${sha(sboms.spdx)}  ${names.spdx}`);
     expect(lines).toContain(`${sha(sboms.cargo)}  ${names.cargo}`);
-    expect(lines.every(line => /^[a-f0-9]{64} {2}GitPulse[-_]1\.2\.3[-_]/.test(line))).toBe(true);
+    expect(lines.every(line => /^[a-f0-9]{64} {2}Waylode[-_]1\.2\.3[-_]/.test(line))).toBe(true);
     expect([...lines].sort((a, b) => compareCodePoints(a.slice(66), b.slice(66)))).toEqual(lines);
   });
 
@@ -804,10 +804,10 @@ describe("attest stage", () => {
     const hexB = "b".repeat(64);
     // Code-point sort puts '-' (0x2d) < '.' (0x2e) < '_' (0x5f) deterministically across all locales.
     const formatted = formatChecksumsManifest([
-      {name: "GitPulse_1.2.3_arm64_en-US.msi", digest: `sha256:${hexB.toUpperCase()}`},
-      {name: "GitPulse_1.2.3_arm64-setup.exe", digest: hexA},
+      {name: "Waylode_1.2.3_arm64_en-US.msi", digest: `sha256:${hexB.toUpperCase()}`},
+      {name: "Waylode_1.2.3_arm64-setup.exe", digest: hexA},
     ]);
-    expect(formatted).toBe(`${hexA}  GitPulse_1.2.3_arm64-setup.exe\n${hexB}  GitPulse_1.2.3_arm64_en-US.msi\n`);
+    expect(formatted).toBe(`${hexA}  Waylode_1.2.3_arm64-setup.exe\n${hexB}  Waylode_1.2.3_arm64_en-US.msi\n`);
     expect(() => formatChecksumsManifest([{name: "a", digest: hexA}, {name: "a", digest: hexB}])).toThrow(/Duplicate/);
     expect(() => formatChecksumsManifest([{name: "bad name", digest: hexA}])).toThrow(/Invalid checksums manifest filename/);
     expect(() => parseChecksumsManifest(`${hexA}  a\r\n`)).toThrow(/CR line endings/);
@@ -897,7 +897,7 @@ describe("attest stage", () => {
     const release = installersOnly();
     release.assets = release.assets.filter(asset => !asset.name.includes("arm64"));
     const {run, calls} = fixture({release});
-    expect(() => runReleaseStage(attest, run)).toThrow(/missing: GitPulse_1\.2\.3_arm64-setup\.exe/);
+    expect(() => runReleaseStage(attest, run)).toThrow(/missing: Waylode_1\.2\.3_arm64-setup\.exe/);
     expect(uploads(calls)).toHaveLength(0);
   });
 
@@ -942,7 +942,7 @@ describe("attest stage", () => {
   it("leaves finalize an exact inventory of installers plus supplements", () => {
     const {run, uploadedBytes} = fixture({release: installersOnly()});
     const finalizing = {...attest, stage: "finalize", notes: "notes", ...bundleDeps({bytesOverride: uploadedBytes})};
-    expect(() => runReleaseStage(finalizing, run)).toThrow(/missing: GitPulse_1\.2\.3_SHA256SUMS\.txt/);
+    expect(() => runReleaseStage(finalizing, run)).toThrow(/missing: Waylode_1\.2\.3_SHA256SUMS\.txt/);
     runReleaseStage(attest, run);
     expect(runReleaseStage(finalizing, run).release_id).toBe("42");
   });
@@ -979,7 +979,7 @@ describe.skipIf(process.platform === "win32")("finalize with the real download a
   };
 
   it.each([
-    ["a 404 from the download", "notfound", /Download of GitPulse_1\.2\.3_\S+ failed: .*404/],
+    ["a 404 from the download", "notfound", /Download of Waylode_1\.2\.3_\S+ failed: .*404/],
     ["a body that stops after three bytes", "partial", /downloaded 3 bytes, expected \d+/],
     ["an HTML page where the bytes should be", "redirect-page", /downloaded \d+ bytes, expected \d+|does not match GitHub's SHA-256/],
   ])("HOLDS: refuses %s before any inspection or notes, and leaves no file behind", (_label, mode, expected) => {
@@ -1029,7 +1029,7 @@ describe.skipIf(process.platform === "win32")("finalize with the real download a
     try {
       fetchReleaseAsset({
         repo: "owner/repo",
-        asset: { id: 99, name: "GitPulse_1.2.3_amd64.deb", size: 12, digest: `sha256:${"a".repeat(64)}` },
+        asset: { id: 99, name: "Waylode_1.2.3_amd64.deb", size: 12, digest: `sha256:${"a".repeat(64)}` },
         dest,
         timeoutMs: 10_000,
       });

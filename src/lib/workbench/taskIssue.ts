@@ -27,7 +27,7 @@ import { bounded, MAX_TASK_LABELS } from "./taskActions";
 export const MAX_TASK_ISSUE_TITLE = 256;
 /** Kept under the backend's 64 KiB body limit with room for the clip note. */
 export const MAX_TASK_ISSUE_BODY_BYTES = 60 * 1024;
-const CLIP_NOTE = "\n\n[GitPulse clipped this task to stay below GitHub's body limit.]";
+const CLIP_NOTE = "\n\n[Waylode clipped this task to stay below GitHub's body limit.]";
 const MARKER = "<!-- gitpulse:task-issue:v1 -->";
 
 /** The backend refuses these in a title; they reorder how text renders. */
@@ -82,7 +82,7 @@ export function taskIssueDraft(task: Pick<Task, "title" | "description" | "accep
   if (criteria.length) {
     sections.push("", "## Acceptance criteria", "", ...criteria.map((line) => `- [ ] ${line}`));
   }
-  sections.push("", "---", "_Filed from a GitPulse task._");
+  sections.push("", "---", "_Filed from a Waylode task._");
   const clipped = clipUtf8(sections.join("\n"), MAX_TASK_ISSUE_BODY_BYTES, CLIP_NOTE);
   return { title: cleanTitle(task.title), body: clipped.text, clipped: clipped.clipped };
 }
@@ -156,7 +156,7 @@ export async function linkTaskToIssue(
 
 function checkoutPhrase(checkout: string, derived: boolean): string {
   return derived
-    ? `${checkout} (inferred from the repository's git directory; not open in GitPulse)`
+    ? `${checkout} (inferred from the repository's git directory; not open in Waylode)`
     : checkout;
 }
 

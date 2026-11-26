@@ -14,7 +14,7 @@ fn main() {
 
     let mut granted = Vec::with_capacity(repos.len());
     for repo in repos {
-        let preview = match gitpulse_lib::repository_trust::inspect(&repo) {
+        let preview = match waylode_lib::repository_trust::inspect(&repo) {
             Ok(preview) => preview,
             Err(error) => {
                 eprintln!(
@@ -24,7 +24,7 @@ fn main() {
                 process::exit(1);
             }
         };
-        if let Err(error) = gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true) {
+        if let Err(error) = waylode_lib::repository_trust::grant(&repo, &preview.identity, true) {
             eprintln!(
                 "e2e_seed_trust: grant failed for {repo}: {}",
                 error.message()

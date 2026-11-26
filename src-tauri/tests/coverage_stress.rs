@@ -4,15 +4,15 @@
 //! found in audit that has since been fixed and now asserts the fixed
 //! behavior, failing loudly if it reappears.
 
-use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
-use gitpulse_lib::engine::git_cli::{git_text, git_text_partial, git_with_stdin};
-use gitpulse_lib::engine::process::MAX_OUTPUT_BYTES;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 use tempfile::TempDir;
+use waylode_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
+use waylode_lib::engine::git_cli::{git_text, git_text_partial, git_with_stdin};
+use waylode_lib::engine::process::MAX_OUTPUT_BYTES;
+use waylode_lib::procguard::LockedSpawn;
 
 fn git_repo() -> TempDir {
     common::unmetered_spawns();
@@ -35,12 +35,12 @@ fn write(dir: &Path, rel: &str, content: &str) {
     fs::write(dest, content).unwrap();
 }
 
-fn scan(dir: &Path) -> gitpulse_lib::analyzer::coverage::CoverageReport {
+fn scan(dir: &Path) -> waylode_lib::analyzer::coverage::CoverageReport {
     common::unmetered_spawns();
     CoverageScanner::scan(dir.to_str().unwrap()).expect("scan should not error")
 }
 
-fn entries_for(report: &gitpulse_lib::analyzer::coverage::CoverageReport, path: &str) -> usize {
+fn entries_for(report: &waylode_lib::analyzer::coverage::CoverageReport, path: &str) -> usize {
     report
         .files
         .iter()
@@ -595,7 +595,7 @@ fn oversized_git_stream_errors_for_git_text_but_degrades_for_git_text_partial() 
     assert!(small.contains("src/lib.rs"));
 }
 
-fn rust_commands(report: &gitpulse_lib::analyzer::coverage::CoverageReport) -> Vec<String> {
+fn rust_commands(report: &waylode_lib::analyzer::coverage::CoverageReport) -> Vec<String> {
     report
         .families
         .iter()

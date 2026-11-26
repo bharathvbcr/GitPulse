@@ -66,7 +66,7 @@ function extensionMessage(preview: TrustPreview): string {
   const others = preview.worktrees - 1;
   return (
     `${preview.path}\n\n` +
-    `You approved this repository before GitPulse covered worktrees, so that approval reaches only this checkout. ` +
+    `You approved this repository before Waylode covered worktrees, so that approval reaches only this checkout. ` +
     `Its ${others} other working tree${others === 1 ? "" : "s"} cannot be read — worktree comparisons, collision checks, and the fleet view leave ${others === 1 ? "it" : "them"} out and say so.\n\n` +
     `Extending covers this repository and every worktree of it, including ones added later. ` +
     `They share one configuration, one set of hooks, and one object database, which is what this decision is about.`
@@ -90,7 +90,7 @@ export async function requestRepositoryTrust(path: string, confirmLabel: string,
     title: extending ? "Extend trust to this repository's worktrees?" : "Trust this repository?",
     message: extending
       ? extensionMessage(preview)
-      : `${preview.path}\n\nOpening or operating on this checkout can run Git hooks, helpers, and the repository's own tools with your account's permissions, including code in its submodules. Trust it only if you trust its source and contents. This decision also allows GitPulse's MCP tools to read this checkout.\n\n${scopeOf(preview)}`,
+      : `${preview.path}\n\nOpening or operating on this checkout can run Git hooks, helpers, and the repository's own tools with your account's permissions, including code in its submodules. Trust it only if you trust its source and contents. This decision also allows Waylode's MCP tools to read this checkout.\n\n${scopeOf(preview)}`,
     confirmLabel: extending ? "Extend Trust" : confirmLabel,
     cancelLabel: extending ? "Not Now" : "Cancel",
   });

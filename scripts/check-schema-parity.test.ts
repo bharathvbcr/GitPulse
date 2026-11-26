@@ -166,7 +166,7 @@ describe("judge", () => {
   });
 
   it("calls a reader one schema behind stale and names both numbers", () => {
-    const row = judge(owner, { reader: "gitpulse-mcp", keys: [...ALL], schemas: { ...owner, store: 26 } });
+    const row = judge(owner, { reader: "waylode-mcp", keys: [...ALL], schemas: { ...owner, store: 26 } });
     expect(row.verdict).toBe("stale");
     expect(row.detail).toContain("devmap store 26, DevCouncil writes 27");
   });
@@ -176,7 +176,7 @@ describe("judge", () => {
   });
 
   it("never reads a schema the reader did not report as a match", () => {
-    const row = judge(owner, { reader: "old gitpulse-mcp", keys: [...ALL], schemas: { store: 27 } });
+    const row = judge(owner, { reader: "old waylode-mcp", keys: [...ALL], schemas: { store: 27 } });
     expect(row.verdict).toBe("unverifiable");
     expect(row.detail).toContain("dc-store, workbench, devmap-extract");
   });
@@ -189,15 +189,15 @@ describe("judge", () => {
   });
 
   it("calls a vendored extractor at 87 stale against DevCouncil's 94, and a match at 94", () => {
-    const stale = judge(owner, { reader: "GitPulse vendored crates", keys: [...ALL], schemas: { ...owner, extract: 87 } });
+    const stale = judge(owner, { reader: "Waylode vendored crates", keys: [...ALL], schemas: { ...owner, extract: 87 } });
     expect(stale.verdict).toBe("stale");
     expect(stale.detail).toContain("devmap-extract 87, DevCouncil writes 94");
-    expect(judge(owner, { reader: "GitPulse vendored crates", keys: [...ALL], schemas: { ...owner } }).verdict).toBe("match");
+    expect(judge(owner, { reader: "Waylode vendored crates", keys: [...ALL], schemas: { ...owner } }).verdict).toBe("match");
   });
 
   it("calls a consumer that cannot report its extract version unverifiable, and the summary fails", () => {
     const { extract: _omitted, ...withoutExtract } = owner;
-    const row = judge(owner, { reader: "old gitpulse-mcp", keys: [...ALL], schemas: withoutExtract });
+    const row = judge(owner, { reader: "old waylode-mcp", keys: [...ALL], schemas: withoutExtract });
     expect(row.verdict).toBe("unverifiable");
     expect(row.detail).toContain("does not report devmap-extract");
     expect(summarize([judge(owner, { reader: "ok", keys: [...ALL], schemas: { ...owner } }), row]).ok).toBe(false);
@@ -418,7 +418,7 @@ describe("GITPULSE_VENDOR_GIT_TIMEOUT_MS", () => {
 
 describe("parseArgs", () => {
   it("accepts the documented flags and refuses anything else", () => {
-    expect(parseArgs(["--json", "--app", "/x/GitPulse.app", "--timeout", "500"])).toEqual({ app: "/x/GitPulse.app", timeoutMs: 500, json: true });
+    expect(parseArgs(["--json", "--app", "/x/Waylode.app", "--timeout", "500"])).toEqual({ app: "/x/Waylode.app", timeoutMs: 500, json: true });
     expect(parseArgs(["--timeout", "0"])).toHaveProperty("error");
     expect(parseArgs(["--bogus"])).toHaveProperty("error");
   });

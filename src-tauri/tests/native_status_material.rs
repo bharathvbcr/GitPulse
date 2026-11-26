@@ -29,10 +29,10 @@ fn main() {
     if nextest_list::answer_list("native_status_material", true) {
         return;
     }
-    use gitpulse_lib::desktop::{install_menu, popover, set_menu_state, DesktopState, MenuState};
     use std::sync::mpsc;
     use std::time::Duration;
     use tauri::{Manager, RunEvent};
+    use waylode_lib::desktop::{install_menu, popover, set_menu_state, DesktopState, MenuState};
 
     // A lost main-thread callback must fail the check rather than hang CI.
     std::thread::spawn(|| {
@@ -40,7 +40,7 @@ fn main() {
         eprintln!("FAIL native status material: main-thread deadline expired");
         std::process::exit(1);
     });
-    let mut context = gitpulse_lib::context();
+    let mut context = waylode_lib::context();
     context.config_mut().identifier = "com.gitpulse.tests.status-material".into();
     // The main window comes from the merged platform config, not from Rust, so
     // its backdrop is checked by building it from that config, hidden.

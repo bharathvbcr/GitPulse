@@ -829,7 +829,7 @@
     }
     await loadFiles(repo, true);
     if (outcome?.left_behind) {
-      repoStore.setError(`${row.path} still holds ignored files, which GitPulse does not delete.`);
+      repoStore.setError(`${row.path} still holds ignored files, which Waylode does not delete.`);
     }
   }
 
@@ -1357,7 +1357,7 @@
                   const base = (effectiveRepoPath ?? "").replace(/[\\/]+$/, "");
                   const sep = base.includes("\\") ? "\\" : "/";
                   const fullPath = base ? `${base}${sep}${r.path}` : r.path;
-                  e.dataTransfer?.setData("application/x-gitpulse-filepath", fullPath);
+                  e.dataTransfer?.setData("application/x-waylode-filepath", fullPath);
                   e.dataTransfer?.setData("text/plain", r.path);
                   if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
                   terminalDropZones.beginInAppDrag([fullPath], r.kind === "file");

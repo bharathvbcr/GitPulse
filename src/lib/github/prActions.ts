@@ -157,7 +157,7 @@ export function describePrAction(
         message: [
           `Open ${action.draft ? "a draft" : "a"} pull request from ${context.headBranch ?? "the current branch"} into ${action.base}?`,
           `Title: ${action.title.trim()}`,
-          "GitPulse does not push: the branch must already be on GitHub, or gh refuses.",
+          "Waylode does not push: the branch must already be on GitHub, or gh refuses.",
           published,
         ].join("\n\n"),
         confirmLabel: "Open Pull Request",

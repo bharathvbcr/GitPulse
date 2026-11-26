@@ -24,14 +24,14 @@ mod hermetic_env;
 #[path = "common/marked_children.rs"]
 mod marked_children;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use marked_children::Marked;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 const HANG: Duration = Duration::from_secs(60);
 
 /// One `command-gate` answer for a Bash command, as parsed JSON.
@@ -48,7 +48,7 @@ fn gate(command: &str) -> (Option<i32>, Option<Value>) {
     .to_string();
     let mut child = Command::new(HOOK)
         .arg("command-gate")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -38,10 +38,10 @@
 mod common;
 
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::alerts::{self, Host, Notice, Offer, Origin};
-use gitpulse_lib::tool_config::SessionAlertSettings;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use waylode_lib::alerts::{self, Host, Notice, Offer, Origin};
+use waylode_lib::tool_config::SessionAlertSettings;
 
 const SESSIONS: usize = 64;
 const NOTICES: usize = 50_000;

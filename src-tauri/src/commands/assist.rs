@@ -197,7 +197,7 @@ pub(super) fn resolve_route(
         Ok((
             Route::Local(fallback.clone()),
             Some(format!(
-                "{why} GitPulse used its own connection to a local model server instead."
+                "{why} Waylode used its own connection to a local model server instead."
             )),
         ))
     };

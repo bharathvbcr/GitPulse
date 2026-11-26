@@ -1,4 +1,4 @@
-# GitPulse
+# Waylode
 
 <p align="center">
   <a href="https://gitpulse.vbcr.dev/"><img src="https://img.shields.io/badge/website-gitpulse.vbcr.dev-F97316?style=flat&logo=safari&logoColor=white" alt="Website"></a>
@@ -13,9 +13,9 @@
 
 <p align="center"><sub>Tested on macOS; Windows and Linux builds are available but not yet tested.</sub></p>
 
-**A workspace, not a chat window. GitPulse is the local-first command centre for agentic coding.**
+**A workspace, not a chat window. Waylode is the local-first command centre for agentic coding.**
 
-GitPulse is built for the agentic era. It gives the same information and the same tools to the
+Waylode is built for the agentic era. It gives the same information and the same tools to the
 people and to the agents doing the work. It runs Claude Code, Codex and other agents side by side
 across all your repositories. Each agent gets its own worktree, a policy guard and a code map, and
 a load scheduler keeps the machine responsive. A full Git client sits in the same window. It is a
@@ -23,27 +23,27 @@ native Rust and Tauri 2 app with a Svelte 5 frontend, free and dual-licensed und
 
 [Download the 0.2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1) ·
 [Getting started](docs/GETTING_STARTED.md) ·
-[Why GitPulse](docs/WHY_GITPULSE.md) ·
+[Why Waylode](docs/WHY_WAYLODE.md) ·
 [Agents guide](docs/AGENTS_GUIDE.md) ·
 [Documentation](docs/README.md) ·
 [Website](https://gitpulse.vbcr.dev/) ·
 [Release notes](CHANGELOG.md) ·
 [0.2.0 notes](docs/RELEASE_NOTES_v0.2.0.md)
 
-![GitPulse on macOS: a Claude Code agent fixing two wiki pages in its own worktree, with Follow agent showing each file it edits beside its terminal](docs/assets/hero-agents.webp)
+![Waylode on macOS: a Claude Code agent fixing two wiki pages in its own worktree, with Follow agent showing each file it edits beside its terminal](docs/assets/hero-agents.webp)
 
-## Why GitPulse
+## Why Waylode
 
 Most agent apps are organised around a chat transcript: one agent, one conversation, and you scroll
-to find out what happened. GitPulse is organised around the work itself: repositories, worktrees,
+to find out what happened. Waylode is organised around the work itself: repositories, worktrees,
 tasks, sessions, code and machine load. It shows that state to you in the UI, and to your agents
 through the same facts over MCP (66 tools).
 
-When you run several agents across several repositories, these are the problems GitPulse is built for:
+When you run several agents across several repositories, these are the problems Waylode is built for:
 
-- **You lose the map.** Live session detection finds agent sessions across your repositories, including ones GitPulse did not launch, and the agent tree nests them.
+- **You lose the map.** Live session detection finds agent sessions across your repositories, including ones Waylode did not launch, and the agent tree nests them.
 - **Agents collide.** The collision radar and file claims warn before two agents' edits meet, and agents can message each other through a peer inbox.
-- **Agents do damage.** Manvi's command gate, per-repository trust, the secret gate on commits GitPulse makes, and pre-operation undo snapshots limit what an agent can do.
+- **Agents do damage.** Manvi's command gate, per-repository trust, the secret gate on commits Waylode makes, and pre-operation undo snapshots limit what an agent can do.
 - **Agents do not know the code.** DevMap gives you, and them, the blast radius and the affected tests for a change.
 - **The laptop melts.** The load scheduler admits, queues or sheds heavy work by host pressure.
 - **You still need Git.** The commit graph, branch stack tree, diffs, conflicts, reflog, pull requests and Actions are in the same window.
@@ -52,16 +52,16 @@ The task board is part of this. An agent that finds out-of-scope work files it w
 and it lands on your board instead of scrolling away in a transcript. You can launch an agent from any
 card.
 
-GitPulse does not replace Claude Code, Codex or your editor. It launches, watches, guards and lands their
-work. [Why GitPulse](docs/WHY_GITPULSE.md) has the dated comparison with other tools, including where
+Waylode does not replace Claude Code, Codex or your editor. It launches, watches, guards and lands their
+work. [Why Waylode](docs/WHY_WAYLODE.md) has the dated comparison with other tools, including where
 they are stronger. The [agents guide](docs/AGENTS_GUIDE.md) covers running agents.
 
-**Platforms.** GitPulse is tested on macOS. Windows and Linux builds are produced by release CI but have
+**Platforms.** Waylode is tested on macOS. Windows and Linux builds are produced by release CI but have
 not been tested.
 
-## GitPulse 0.2.0 (beta)
+## Waylode 0.2.0 (beta)
 
-GitPulse 0.2.0 is out in beta as [`v0.2.0-beta.1`](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1),
+Waylode 0.2.0 is out in beta as [`v0.2.0-beta.1`](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1),
 a GitHub pre-release for macOS; the stable 0.2.0 release follows. Versions restart at 0.x because
 only macOS is tested so far, and 1.0.0 is kept for the first release tested on all three systems.
 Releases come on two channels: betas are tagged `vX.Y.Z-beta.N`, stable releases `vX.Y.Z`. See the
@@ -80,7 +80,7 @@ The [feature reference](docs/FEATURES.md) lists every area.
 
 ## Get started
 
-1. [Install GitPulse](docs/INSTALLATION.md) and Git for your platform.
+1. [Install Waylode](docs/INSTALLATION.md) and Git for your platform.
 2. Open a repository and review **Trust and Open**. Trust allows its hooks,
    helpers, and project tools to run with your account permissions.
 3. Use **Work** for changes in flight, **History** to review a commit, and
@@ -95,7 +95,7 @@ walks through a review, task creation, and optional setup.
 
 If you installed the packaged desktop app, **Settings → Agents → Connect** (or its **Copy setup prompt**) symlinks the bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin` without needing a source checkout or Rust toolchain, and **Help → Set Up Optional Tools** installs DevMap, the analysis suite, or Manvi interactively.
 
-To build and wire up **GitPulse**, **DevCouncil** (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`), **Manvi** (`manvi`), and MCP integrations from source (requires **Git**, **Bun 1.4.2**, **Rust 1.100+**, and **Go 1.27.4+**), paste this prompt into Claude Code, Codex, Antigravity, or Cursor (or run the fenced commands directly):
+To build and wire up **Waylode**, **DevCouncil** (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`), **Manvi** (`manvi`), and MCP integrations from source (requires **Git**, **Bun 1.4.2**, **Rust 1.100+**, and **Go 1.27.4+**), paste this prompt into Claude Code, Codex, Antigravity, or Cursor (or run the fenced commands directly):
 
 ````text
 Install and wire up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain on this machine, then verify every binary, schema, and host integration without skipping failing checks:
@@ -104,12 +104,12 @@ Install and wire up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain 
    - Confirm `git`, `bun`, `rustc`/`cargo`, and `go` are on `PATH` (and `~/.local/bin` / Cargo / Go bin dirs are reachable).
    - Check whether sibling `GitPulse`, `DevCouncil`, and `Manvi` checkouts already exist; otherwise ask where to clone `https://github.com/bharathvbcr/GitPulse.git` (and optionally `DevCouncil` / `Manvi`), and do not install system packages outside Cargo/Go/Bun user bins without asking.
 
-2. Install GitPulse MCP, hooks, and worktree/cache CLIs (`gitpulse-mcp`, `gitpulse-hook`, `gitpulse-worktree`, `gitpulse-rustc`):
+2. Install Waylode MCP, hooks, and worktree/cache CLIs (`waylode-mcp`, `waylode-hook`, `waylode-worktree`, `waylode-rustc`):
    - From a `GitPulse` checkout (or after `git clone https://github.com/bharathvbcr/GitPulse.git && cd GitPulse`):
      ```sh
      bun install --frozen-lockfile
      bun run mcp:install
-     cargo install --path crates/gitpulse-worktree --locked --force
+     cargo install --path crates/waylode-worktree --locked --force
      ```
    - Skip rebuilding `gitpulse-mcp` / `gitpulse-hook` from source if I already linked them from the packaged app via Settings -> Agents -> Connect in `~/.local/bin`.
 
@@ -148,7 +148,7 @@ Report what succeeded, what could not run, exact paths of installed binaries, an
 
 ## Five views, one workspace
 
-GitPulse has 5 application views with 11 specialized sections. Each view keeps related sections together.
+Waylode has 5 application views with 11 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
@@ -170,8 +170,8 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   phrasing with on-device Apple Intelligence fallback.
 - **Manage worktrees and branches.** Zero-round-trip branch churn carry-forward on branch mutations,
   DevMap-guided `--cone` sparse worktrees, `<512 B` zero-copy DevMap base pointers with Blake3/CAS delta overlays,
-  copy-on-write dependency cache sync (`node_modules`, `target`, `.venv`), an opt-in `gitpulse-rustc` (`RUSTC_WRAPPER`)
-  shared crate cache in the separately installed `gitpulse-worktree` CLI (the app itself does not use it), parallel agent coordination bus and 3-layer CSR/ODB collision radar (`gitpulse-worktree` CLI & `gitpulse-mcp`),
+  copy-on-write dependency cache sync (`node_modules`, `target`, `.venv`), an opt-in `waylode-rustc` (`RUSTC_WRAPPER`)
+  shared crate cache in the separately installed `waylode-worktree` CLI (the app itself does not use it), parallel agent coordination bus and 3-layer CSR/ODB collision radar (`waylode-worktree` CLI & `waylode-mcp`),
   dead-branch cleanup with durable WAL tip backups and authorized delete actions, macOS pre-exec background QoS band isolation,
   named localhost routes via portless, and trust-gated lifecycle hooks.
 - **Organize the work.** Quick add parses priority, labels, owner, repository,
@@ -227,7 +227,7 @@ Built-in AI (commit messages, explanations, branch names, health and coverage pl
 runs on whatever Manvi itself is set to (`manvi use`), through Manvi's
 `work.assist.complete`: a local model server in local mode, the Claude API in cloud
 mode, and only in cloud mode does a diff leave the machine. Cloud mode has to be
-chosen: with nothing saved, Manvi reports its built-in default (cloud) and GitPulse
+chosen: with nothing saved, Manvi reports its built-in default (cloud) and Waylode
 does not follow it. It uses its own loopback client instead, which asks before it
 sends anything to a server it found, until a mode is chosen in the Manvi pane or with
 `manvi use`. The loopback client is also the fallback when Manvi is not installed or
@@ -242,7 +242,7 @@ MCP server cannot grant repository trust. Read the
 
 ## Architecture
 
-DevCouncil is **components and modules**. Manvi wraps them. GitPulse uses Manvi
+DevCouncil is **components and modules**. Manvi wraps them. Waylode uses Manvi
 for policy, workbench, and agent hosting, and selected DevCouncil components
 for code intelligence. Modules can be updated independently.
 
@@ -292,7 +292,7 @@ flowchart TB
 
 See [architecture](docs/ARCHITECTURE.md) for ownership and contracts, and
 [module integration](docs/MODULE_INTEGRATION.md) for the boundaries between projects.
-GitPulse succeeds the deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask)
+Waylode succeeds the deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask)
 workbench; this does not imply complete feature parity.
 
 ## Build and contribute
@@ -398,7 +398,7 @@ types.
 
 ## License & Acknowledgements
 
-Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option — see [LICENSE](LICENSE). See [NOTICE](NOTICE) for third-party and vendored crate attributions. The GitPulse name and logo are not covered by the MIT or Apache-2.0 licenses; see [TRADEMARKS.md](TRADEMARKS.md).
+Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option — see [LICENSE](LICENSE). See [NOTICE](NOTICE) for third-party and vendored crate attributions. The Waylode name and logo are not covered by the MIT or Apache-2.0 licenses; see [TRADEMARKS.md](TRADEMARKS.md).
 
 - **[The Tauri Programme (`tauri-apps`)](https://github.com/tauri-apps/tauri)** (`tauri`, `wry`, `tao`, `muda` — Apache-2.0 OR MIT) — Desktop shell runtime and patched crates under `src-tauri/framework/`.
 - **[webkit2gtk-rs](https://github.com/tauri-apps/webkit2gtk-rs)** (`The Gtk-rs Project Developers` & `Antoni Boucher`, MIT), **[libappindicator-rs](https://github.com/qDot/libappindicator-rs)** (`Kyle Machulis / qDot`), and **[notify](https://github.com/notify-rs/notify)** (`Félix Saparelli & contributors`).

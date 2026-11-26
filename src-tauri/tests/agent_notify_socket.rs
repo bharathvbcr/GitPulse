@@ -19,11 +19,11 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use waylode_lib::procguard::LockedSpawn;
 
 /// A directory short enough to hold a socket.
 ///
@@ -107,31 +107,31 @@ fn exchange(
     listener.set_nonblocking(false).unwrap();
 
     let logs = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_waylode-hook"));
     command
         .arg("notify")
         .arg(event)
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .env(
-            gitpulse_lib::alerts::bridge::SOCKET_ENV,
+            waylode_lib::alerts::bridge::SOCKET_ENV,
             dir.socket().as_os_str(),
         )
-        .env_remove(gitpulse_lib::alerts::bridge::SESSION_ENV)
-        .env_remove(gitpulse_lib::hooks::AGENT_KIND_ENV)
+        .env_remove(waylode_lib::alerts::bridge::SESSION_ENV)
+        .env_remove(waylode_lib::hooks::AGENT_KIND_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(session) = session {
-        command.env(gitpulse_lib::alerts::bridge::SESSION_ENV, session);
+        command.env(waylode_lib::alerts::bridge::SESSION_ENV, session);
     }
     if let Some(agent) = agent {
-        command.env(gitpulse_lib::hooks::AGENT_KIND_ENV, agent);
+        command.env(waylode_lib::hooks::AGENT_KIND_ENV, agent);
     }
     let mut child = command.spawn_locked().expect("spawn gitpulse-hook");
     // The hook is blocked reading stdin for this long, so anything it stamps
     // "at entry" must be older than `stdin_at`, taken just before the write.
     std::thread::sleep(stdin_delay);
-    let stdin_at = gitpulse_lib::alerts::bridge::order_stamp_ns();
+    let stdin_at = waylode_lib::alerts::bridge::order_stamp_ns();
     child
         .stdin
         .take()
@@ -228,7 +228,7 @@ fn the_installed_hook_reaches_the_socket_and_the_app_accepts_what_it_sends() {
         Some("claude"),
     )
     .expect("a report reached the socket");
-    let notice = gitpulse_lib::alerts::bridge::parse_report(&bytes)
+    let notice = waylode_lib::alerts::bridge::parse_report(&bytes)
         .expect("the app's own parser accepts what the binary sent");
     assert_eq!(notice.key, "term-7-1a");
     assert_eq!(notice.label, "Claude Code");
@@ -248,7 +248,7 @@ fn every_event_the_shipped_manifest_routes_survives_the_process_boundary() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("plugins/gitpulse/hooks/hooks.json");
+        .join("plugins/waylode/hooks/hooks.json");
     let parsed: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
     let mut checked = 0;
@@ -261,17 +261,17 @@ fn every_event_the_shipped_manifest_routes_survives_the_process_boundary() {
                     continue;
                 }
                 let event = words.next().expect("notify names its event");
-                let role = gitpulse_lib::alerts::bridge::event(event)
+                let role = waylode_lib::alerts::bridge::event(event)
                     .unwrap_or_else(|| {
                         panic!("the manifest routes {event}, which the app does not know")
                     })
                     .role;
                 let payload = claude_payload("/Users/me/work");
-                if role == gitpulse_lib::alerts::bridge::Role::Banner {
+                if role == waylode_lib::alerts::bridge::Role::Banner {
                     // A banner is worth sending from any session, GitPulse's or not.
                     let bytes = report_through_socket(event, &payload, None, Some("codex"))
                         .unwrap_or_else(|| panic!("{event} sent nothing"));
-                    let notice = gitpulse_lib::alerts::bridge::parse_report(&bytes)
+                    let notice = waylode_lib::alerts::bridge::parse_report(&bytes)
                         .unwrap_or_else(|e| panic!("{event} was refused by the app: {e}"));
                     assert_eq!(notice.label, "Codex");
                     assert!(notice.key.starts_with("hook-codex-"), "{}", notice.key);
@@ -283,7 +283,7 @@ fn every_event_the_shipped_manifest_routes_survives_the_process_boundary() {
                             .unwrap_or_else(|| {
                                 panic!("{event} sent nothing from a GitPulse session")
                             });
-                    let notice = gitpulse_lib::alerts::bridge::parse_report(&bytes)
+                    let notice = waylode_lib::alerts::bridge::parse_report(&bytes)
                         .unwrap_or_else(|e| panic!("{event} was refused by the app: {e}"));
                     assert_eq!(notice.label, "Codex");
                     assert_eq!(notice.key, "term-3-9c");
@@ -335,12 +335,12 @@ fn a_socket_that_is_not_there_costs_the_turn_nothing() {
     let dir = ShortDir::new("absent");
     let logs = tempfile::tempdir().unwrap();
     let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+    let output = Command::new(env!("CARGO_BIN_EXE_waylode-hook"))
         .arg("notify")
         .arg("agent_completed")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .env(
-            gitpulse_lib::alerts::bridge::SOCKET_ENV,
+            waylode_lib::alerts::bridge::SOCKET_ENV,
             dir.socket().as_os_str(),
         )
         .stdin(Stdio::piped())
@@ -371,7 +371,7 @@ fn a_socket_that_is_not_there_costs_the_turn_nothing() {
 
 /// What the app's own parser reads as a report's `seq`.
 fn seq_of(bytes: &[u8]) -> u64 {
-    gitpulse_lib::alerts::bridge::parse_report_stamped(bytes)
+    waylode_lib::alerts::bridge::parse_report_stamped(bytes)
         .expect("the app's own parser accepts what the binary sent")
         .1
         .expect("the report carries a seq")
@@ -379,7 +379,7 @@ fn seq_of(bytes: &[u8]) -> u64 {
 
 #[test]
 fn two_real_hook_spawns_produce_a_monotone_seq_on_the_bridges_clock() {
-    let before = gitpulse_lib::alerts::bridge::order_stamp_ns();
+    let before = waylode_lib::alerts::bridge::order_stamp_ns();
     let first = report_through_socket(
         "turn_finished",
         &claude_payload("/Users/me/GitPulse"),
@@ -394,7 +394,7 @@ fn two_real_hook_spawns_produce_a_monotone_seq_on_the_bridges_clock() {
         Some("claude"),
     )
     .expect("the second report reached the socket");
-    let after = gitpulse_lib::alerts::bridge::order_stamp_ns();
+    let after = waylode_lib::alerts::bridge::order_stamp_ns();
     let (first, second) = (seq_of(&first), seq_of(&second));
     assert!(
         before <= first && first < second && second <= after,

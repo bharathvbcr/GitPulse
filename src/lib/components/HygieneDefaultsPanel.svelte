@@ -90,7 +90,7 @@
       </li>
       <li>
         <strong class="text-textSecondary">The scheduled cleaner below</strong> — every
-        repository under its own roots, including ones not open in GitPulse. It keeps its own
+        repository under its own roots, including ones not open in Waylode. It keeps its own
         retention because the schedule runs without this window.
       </li>
     </ul>

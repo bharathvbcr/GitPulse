@@ -7,9 +7,9 @@
 
 mod common;
 use common::run_git;
-use gitpulse_lib::storage::repo_tuning::{inspect, IndexReadState, RepoTuningReport};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use waylode_lib::storage::repo_tuning::{inspect, IndexReadState, RepoTuningReport};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -171,13 +171,13 @@ fn registration_and_tuning_keys_come_from_git_s_own_config() {
     assert_eq!(untracked.value.as_deref(), Some("true"));
     assert_eq!(
         untracked.origin,
-        Some(gitpulse_lib::engine::git_reader::ConfigScope::Global),
+        Some(waylode_lib::engine::git_reader::ConfigScope::Global),
         "{report:?}"
     );
     let fsmonitor = report.key("core.fsmonitor").unwrap();
     assert_eq!(
         fsmonitor.origin,
-        Some(gitpulse_lib::engine::git_reader::ConfigScope::Local)
+        Some(waylode_lib::engine::git_reader::ConfigScope::Local)
     );
 }
 
@@ -247,7 +247,7 @@ fn detection_spawns_no_git_process() {
 
 #[test]
 fn a_real_split_index_is_found_in_the_index_file_and_refuses_many_files() {
-    use gitpulse_lib::storage::repo_tuning::{recommend, GitEnv, TuningChange};
+    use waylode_lib::storage::repo_tuning::{recommend, GitEnv, TuningChange};
     let _g = serial();
     let dir = repo_with_files(25_000);
     run_git(dir.path(), &["update-index", "--split-index"]);

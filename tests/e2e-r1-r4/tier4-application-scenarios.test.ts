@@ -47,9 +47,11 @@ import {
   type MenuStateFixture,
 } from "./helpers/fixtures";
 
-const LOGO_TRUNK_FRAGMENT = "M24.04 9.25A10.5";
-const LEGACY_PLUGIN_LOGO_SHA256 =
-  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
+const LOGO_TRUNK_FRAGMENT = "M23.8 9.0A10.5";
+const RETIRED_LOGO_SHA256S = new Set([
+  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1",
+  "1cf0341b1cc7b556701b5bfb17c3ed02b2eba2e87863928b4de8e1cc7225fd3b",
+]);
 const PATHS = { caseInsensitive: false };
 
 function assertMenuRequestMatches(
@@ -634,24 +636,24 @@ describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () =>
     }, 120_000);
   });
 
-  describe("[Tier 4] [R1] S5: End-to-end GitPulse brand logo audit across system, in-app, and menu bar surfaces", () => {
-    it("verifies current G-ring mark across PNG/ICNS/SVG assets, notifications-logo.html, status-popover.html, and tray.rs", async () => {
+  describe("[Tier 4] [R1] S5: End-to-end Waylode brand logo audit across system, in-app, and menu bar surfaces", () => {
+    it("verifies current Way-Arc mark across PNG/ICNS/SVG assets, notifications-logo.html, status-popover.html, and tray.rs", async () => {
       // 1. Asset audit
-      const pluginLogo = readPngInfo("plugins/gitpulse/assets/logo.png");
+      const pluginLogo = readPngInfo("plugins/waylode/assets/logo.png");
       const icon128x2 = readPngInfo("src-tauri/icons/128x128@2x.png");
       const icon512 = readPngInfo("src-tauri/icons/icon.png");
       expect(pluginLogo.width).toBe(256);
       expect(pluginLogo.height).toBe(256);
       expect(pluginLogo.colorType).toBe(6);
       expect(pluginLogo.bitDepth).toBe(8);
-      expect(pluginLogo.sha256).not.toBe(LEGACY_PLUGIN_LOGO_SHA256);
+      expect(RETIRED_LOGO_SHA256S.has(pluginLogo.sha256)).toBe(false);
       expect(icon128x2.width).toBe(256);
       expect(icon128x2.height).toBe(256);
       expect(icon512.width).toBe(512);
       expect(icon512.height).toBe(512);
 
-      expect(readRepoFile("public/gitpulse-icon.svg")).toContain(LOGO_TRUNK_FRAGMENT);
-      expect(readRepoFile("public/gitpulse-mark.svg")).toContain(LOGO_TRUNK_FRAGMENT);
+      expect(readRepoFile("public/waylode-icon.svg")).toContain(LOGO_TRUNK_FRAGMENT);
+      expect(readRepoFile("public/waylode-mark.svg")).toContain(LOGO_TRUNK_FRAGMENT);
       expect(readRepoFile("index.html")).toContain(LOGO_TRUNK_FRAGMENT);
 
       // 2. All 4 in-app notification surfaces in Chrome (dark & light)

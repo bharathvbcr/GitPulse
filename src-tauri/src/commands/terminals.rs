@@ -319,6 +319,41 @@ pub async fn cmd_terminal_kill(
     Ok(outcome)
 }
 
+/// What `cmd_mavi_close_thread_children` did.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaviThreadChildrenClosed {
+    /// Orchestrated children of the thread that were stopped.
+    pub closed: usize,
+    /// Children left running because the user protected them.
+    pub skipped_protected: usize,
+}
+
+/// Stops every live terminal child the Mavi thread `thread_key` spawned (the
+/// children owned by `ext-mavi-<thread_key>`), leaving protected sessions
+/// running. The page calls it when the user forgets or deletes a thread, never
+/// on interrupt or stop. An invalid key is an error; children of any other
+/// owner are never touched.
+#[tauri::command(async)]
+pub async fn cmd_mavi_close_thread_children(
+    app: AppHandle,
+    state: State<'_, crate::terminal::TerminalSessions>,
+    thread_key: String,
+) -> Result<MaviThreadChildrenClosed, String> {
+    let owner = crate::terminal::orchestrate::mavi_owner_key(&thread_key)
+        .ok_or_else(|| "That is not a Mavi thread key.".to_string())?;
+    let ui = crate::terminal::orchestrate::AppOrchestrateUiSink::new(app);
+    let summary =
+        crate::terminal::control_async(&state, "mavi_close_thread_children", move |state| {
+            crate::terminal::orchestrate::close_owner_children(state, &ui, &owner)
+        })
+        .await?;
+    Ok(MaviThreadChildrenClosed {
+        closed: summary.closed,
+        skipped_protected: summary.skipped_protected,
+    })
+}
+
 /// Terminal hosts left running by an earlier GitPulse version (an older
 /// protocol) that still hold sessions, asked again now: each with its sessions,
 /// or why they could not be listed. Empty when there are none. Their sessions

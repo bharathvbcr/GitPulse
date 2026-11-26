@@ -56,7 +56,7 @@ export function claudeModelLabel(id: string): string {
 export function claudeCredentialProblem(status: ClaudeCredentialStatus): string | null {
   if (status.accountError) return `~/.anthropic-accounts could not be read: ${status.accountError}`;
   if (status.account || status.keySaved) return null;
-  return "No Claude credential: no ~/.anthropic-accounts registry and no key saved in GitPulse.";
+  return "No Claude credential: no ~/.anthropic-accounts registry and no key saved in Waylode.";
 }
 
 function text(value: unknown): string | null {

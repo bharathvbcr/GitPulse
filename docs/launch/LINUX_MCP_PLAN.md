@@ -1,7 +1,7 @@
 # Linux `gitpulse-mcp` and `gitpulse-hook`: plan
 
 Read-only planning pass, 2026-11-23. Nothing here is built. The goal: Claude Code sessions on
-Linux, in the cloud, over SSH and on BYOK runner boxes, get GitPulse Insights and DevMap tools.
+Linux, in the cloud, over SSH and on BYOK runner boxes, get Waylode Insights and DevMap tools.
 
 Some answers below are incomplete. `gitpulse_insights` timed out. DevMap answered with
 `walk_incomplete` set, so the impact counts are lower bounds. The claim that DevCouncil `v0.2.3`
@@ -9,7 +9,7 @@ Some answers below are incomplete. `gitpulse_insights` timed out. DevMap answere
 
 ## 1. Build the CLIs without Tauri, using a `desktop` cargo feature
 
-Both bins link `gitpulse_lib`, which depends on `tauri` unconditionally. That pulls in
+Both bins link `waylode_lib`, which depends on `tauri` unconditionally. That pulls in
 `framework/tauri` with GTK3 and `webkit2gtk`, plus `rfd`.
 
 `mcp/`, `hooks/` and `repository_trust.rs` have no direct tauri use. About 60 of the 592 source
@@ -59,7 +59,7 @@ callers.
 
 ## 3. Schema parity
 
-DevCouncil `main` and GitPulse's vendored copy are both at `CURRENT_SCHEMA_VERSION = 29`. **No
+DevCouncil `main` and Waylode's vendored copy are both at `CURRENT_SCHEMA_VERSION = 29`. **No
 DevCouncil release tag contains schema 29 yet**, so a new tag (v0.2.4 or later) has to ship
 first. Then:
 

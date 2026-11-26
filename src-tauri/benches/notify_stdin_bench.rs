@@ -57,7 +57,6 @@ mod common;
 #[cfg(unix)]
 mod imp {
     use super::common::{interleave, Case, Report, Sample};
-    use gitpulse_lib::procguard::LockedSpawn;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
@@ -65,6 +64,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use waylode_lib::procguard::LockedSpawn;
 
     /// Calls per sample; the sample is their median.
     const CALLS: usize = 20;
@@ -141,14 +141,14 @@ mod imp {
         let mut command = Command::new(hook);
         command
             .args(["notify", "tool_finished"])
-            .env(gitpulse_lib::logging::LOG_DIR_ENV, logs)
-            .env(gitpulse_lib::alerts::bridge::SOCKET_ENV, socket)
-            .env_remove(gitpulse_lib::alerts::bridge::SESSION_ENV)
+            .env(waylode_lib::logging::LOG_DIR_ENV, logs)
+            .env(waylode_lib::alerts::bridge::SOCKET_ENV, socket)
+            .env_remove(waylode_lib::alerts::bridge::SESSION_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         if session {
-            command.env(gitpulse_lib::alerts::bridge::SESSION_ENV, "term-bench-1");
+            command.env(waylode_lib::alerts::bridge::SESSION_ENV, "term-bench-1");
         }
         let mut child = command.spawn_locked().expect("spawn gitpulse-hook");
         let mut stdin = child.stdin.take().expect("stdin");
@@ -171,7 +171,7 @@ mod imp {
     pub fn main() {
         let new = std::env::var_os("GITPULSE_BENCH_HOOK")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_gitpulse-hook")));
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_waylode-hook")));
         // An empty value is unset: a wrapper that exports the variable empty
         // must not make the bench try to run a hook named "".
         let base = std::env::var_os("GITPULSE_BENCH_BASE_HOOK")

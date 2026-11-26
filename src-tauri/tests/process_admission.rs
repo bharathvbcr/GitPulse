@@ -9,7 +9,7 @@ use common::{env, shipped_binaries};
 
 use std::path::Path;
 
-use gitpulse_lib::engine::process::{
+use waylode_lib::engine::process::{
     current_admission_name, run_process_as_background, run_process_with_shared_spawn_budget,
 };
 
@@ -49,21 +49,21 @@ fn leading_switches(bin: &str) -> Vec<String> {
         .skip(1)
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with("//"))
-        .take_while(|line| line.starts_with("gitpulse_lib::engine::process::run_process_"))
+        .take_while(|line| line.starts_with("waylode_lib::engine::process::run_process_"))
         .map(str::to_string)
         .collect()
 }
 
-const BACKGROUND_SWITCH: &str = "gitpulse_lib::engine::process::run_process_as_background();";
+const BACKGROUND_SWITCH: &str = "waylode_lib::engine::process::run_process_as_background();";
 const SHARED_BUDGET_SWITCH: &str =
-    "gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();";
+    "waylode_lib::engine::process::run_process_with_shared_spawn_budget();";
 
 /// The binaries whose work is optional must make the switch, and make it
 /// before anything else in `main` can start a thread.
 #[test]
 fn the_agent_server_and_the_daemon_run_as_background() {
     let binaries = shipped_binaries();
-    for bin in ["src/bin/gitpulse-mcp.rs", "src/bin/gitpulsed.rs"] {
+    for bin in ["src/bin/waylode-mcp.rs", "src/bin/wayloded.rs"] {
         assert!(
             binaries.contains(bin),
             "{bin} is no longer a shipped binary"
@@ -75,7 +75,7 @@ fn the_agent_server_and_the_daemon_run_as_background() {
     }
     // The app and the hooks keep the default: the hook gates the user's own
     // agent tool calls, and the app is what the user is looking at.
-    for bin in ["src/main.rs", "src/bin/gitpulse-hook.rs"] {
+    for bin in ["src/main.rs", "src/bin/waylode-hook.rs"] {
         let source = std::fs::read_to_string(manifest_dir().join(bin)).unwrap();
         assert!(!source.contains("run_process_as_background"), "{bin}");
     }
@@ -87,11 +87,11 @@ fn the_agent_server_and_the_daemon_run_as_background() {
 #[test]
 fn the_agent_server_waits_for_background_budget_and_the_daemon_does_not() {
     const AWAIT_SWITCH: &str =
-        "gitpulse_lib::engine::process::run_process_awaiting_background_budget();";
-    assert!(leading_switches("src/bin/gitpulse-mcp.rs")
+        "waylode_lib::engine::process::run_process_awaiting_background_budget();";
+    assert!(leading_switches("src/bin/waylode-mcp.rs")
         .iter()
         .any(|s| s == AWAIT_SWITCH));
-    assert!(!leading_switches("src/bin/gitpulsed.rs")
+    assert!(!leading_switches("src/bin/wayloded.rs")
         .iter()
         .any(|s| s == AWAIT_SWITCH));
 }
@@ -126,14 +126,14 @@ fn a_process_that_opts_in_draws_from_the_per_user_spawn_budget() {
         .set("HOME", home.path())
         .set("XDG_CONFIG_HOME", home.path().join(".config"))
         .set("APPDATA", home.path().join("AppData"));
-    let config = gitpulse_lib::tool_config::default_config_dir().expect("config dir");
+    let config = waylode_lib::tool_config::default_config_dir().expect("config dir");
     assert!(
         config.starts_with(home.path()),
         "the premise failed: the record would not land in the temp home ({})",
         config.display()
     );
     run_process_with_shared_spawn_budget();
-    gitpulse_lib::engine::git_cli::git_global(&["--version"]).expect("git runs");
+    waylode_lib::engine::git_cli::git_global(&["--version"]).expect("git runs");
     let record = std::fs::read_dir(&config)
         .map(|entries| entries.count())
         .unwrap_or(0);
@@ -396,7 +396,7 @@ fn every_integration_suite_that_calls_the_library_lifts_the_spawn_rate_cap_or_sa
         }
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let source = std::fs::read_to_string(&path).unwrap();
-        if !strip_non_code(&source).contains("gitpulse_lib") {
+        if !strip_non_code(&source).contains("waylode_lib") {
             continue;
         }
         checked += 1;
@@ -435,7 +435,7 @@ fn the_unmetered_allowlist_names_real_suites_with_reasons() {
         let source = std::fs::read_to_string(manifest_dir().join("tests").join(name))
             .unwrap_or_else(|e| panic!("{name} is listed but cannot be read: {e}"));
         assert!(
-            strip_non_code(&source).contains("gitpulse_lib"),
+            strip_non_code(&source).contains("waylode_lib"),
             "{name} no longer calls the library, so it needs no entry"
         );
     }
@@ -450,7 +450,7 @@ fn a_real_lift_is_seen_however_it_is_spelled() {
         "fn f() {\n    common::unmetered_spawns();\n}\n"
     ));
     assert!(lifts_the_cap(
-        "fn f() {\n    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();\n}\n"
+        "fn f() {\n    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();\n}\n"
     ));
     assert!(!lifts_the_cap("fn f() {\n    let _ = 1;\n}\n"));
 }

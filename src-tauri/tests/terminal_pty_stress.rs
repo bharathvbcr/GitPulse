@@ -3,14 +3,14 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{
-    acknowledge_output, kill_session, resize_session, spawn_session, write_to_session, KillOrigin,
-    TerminalSessions,
-};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{
+    acknowledge_output, kill_session, resize_session, spawn_session, write_to_session, KillOrigin,
+    TerminalSessions,
+};
 
 /// A session registry whose sessions record to the ledger through the library's
 /// spawn gate (`session-spawn-ledger`, 14 spawns in this suite), which this
@@ -24,7 +24,7 @@ fn terminals() -> TerminalSessions {
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("PTY test cleanup incomplete: {error}");
         }
     }
@@ -45,7 +45,7 @@ fn take_output(payload: &str) -> (String, Vec<u8>) {
         "reserved credit must equal the emitted chunk"
     );
     assert!(
-        (1..=gitpulse_lib::terminal::OUTPUT_CHUNK_BYTES).contains(&reserved),
+        (1..=waylode_lib::terminal::OUTPUT_CHUNK_BYTES).contains(&reserved),
         "reserved length {reserved} is outside one read"
     );
     (data["id"].as_str().unwrap().to_owned(), bytes)
@@ -66,7 +66,7 @@ fn repo() -> tempfile::TempDir {
 #[test]
 fn immediate_output_and_exit_status_survive_spawn() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -92,7 +92,7 @@ fn immediate_output_and_exit_status_survive_spawn() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "printf '世界 hello'; exit 37".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let exit: serde_json::Value =
@@ -111,7 +111,7 @@ fn immediate_output_and_exit_status_survive_spawn() {
 #[test]
 fn a_shell_killed_by_a_signal_reports_the_signal_and_no_exit_code() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -136,7 +136,7 @@ fn a_shell_killed_by_a_signal_reports_the_signal_and_no_exit_code() {
             // Core dumps off, so a crashing shell leaves nothing behind.
             Some(vec!["-c".into(), format!("ulimit -c 0; kill -{signal} $$")]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(app.handle()),
+            waylode_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         let exit: serde_json::Value =
@@ -157,7 +157,7 @@ fn a_shell_killed_by_a_signal_reports_the_signal_and_no_exit_code() {
 #[test]
 fn output_flood_is_backpressured_then_drains_without_loss() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -171,7 +171,7 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
     });
     let dir = repo();
     let spawned = spawn_session(app.handle(), &state, dir.path().to_str().unwrap(), 24, 80,
-        Some("/bin/sh".into()), Some(vec!["-c".into(), "i=0; while [ $i -lt 32768 ]; do printf 0123456789abcdef0123456789abcdef; i=$((i+1)); done".into()]), None, gitpulse_lib::terminal::OutputSink::events(app.handle())).unwrap();
+        Some("/bin/sh".into()), Some(vec!["-c".into(), "i=0; while [ $i -lt 32768 ]; do printf 0123456789abcdef0123456789abcdef; i=$((i+1)); done".into()]), None, waylode_lib::terminal::OutputSink::events(app.handle())).unwrap();
     // Receive without acknowledging until the stream goes quiet. Quiet after
     // the producer demonstrably ran is the observable "blocked on flow
     // control"; a producer that ignored backpressure would instead deliver
@@ -227,7 +227,7 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
 #[test]
 fn interactive_round_trips_do_not_accumulate_polling_delays() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -244,7 +244,7 @@ fn interactive_round_trips_do_not_accumulate_polling_delays() {
         app.handle(), &state, dir.path().to_str().unwrap(), 24, 80,
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "stty -echo; i=0; while [ $i -lt 512 ]; do printf .; read -r line || exit 91; i=$((i+1)); done".into()]),
-        None, gitpulse_lib::terminal::OutputSink::events(app.handle())).unwrap();
+        None, waylode_lib::terminal::OutputSink::events(app.handle())).unwrap();
     let started = Instant::now();
     for round in 0..512 {
         let (_id, bytes) = take_output(&receive.recv_timeout(Duration::from_secs(3)).unwrap());
@@ -265,7 +265,7 @@ fn interactive_round_trips_do_not_accumulate_polling_delays() {
 #[test]
 fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -287,7 +287,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
         Some("/bin/sh".into()),
         args.clone(),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     receive.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -311,7 +311,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
         Some("/bin/sh".into()),
         args,
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     resize_session(&state, &b.id, 40, 120).unwrap();
@@ -328,7 +328,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
 #[test]
 fn a_nonreading_terminal_bounds_input_wait_without_requiring_close() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -349,7 +349,7 @@ fn a_nonreading_terminal_bounds_input_wait_without_requiring_close() {
             "stty -echo -icanon; printf ready; sleep 30".into(),
         ]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     ready_receive.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -370,7 +370,7 @@ fn a_nonreading_terminal_bounds_input_wait_without_requiring_close() {
 #[test]
 fn close_terminates_a_hup_ignoring_foreground_process_and_is_idempotent() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -395,7 +395,7 @@ fn close_terminates_a_hup_ignoring_foreground_process_and_is_idempotent() {
             "trap '' HUP TERM; printf ready; while :; do sleep 1; done".into(),
         ]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     receive.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -407,7 +407,7 @@ fn close_terminates_a_hup_ignoring_foreground_process_and_is_idempotent() {
 #[test]
 fn full_capacity_can_close_and_immediately_replace_without_a_false_limit() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -422,7 +422,7 @@ fn full_capacity_can_close_and_immediately_replace_without_a_false_limit() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "sleep 30".into()]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(app.handle()),
+            waylode_lib::terminal::OutputSink::events(app.handle()),
         )
     };
     let mut sessions = Vec::new();
@@ -440,13 +440,13 @@ fn full_capacity_can_close_and_immediately_replace_without_a_false_limit() {
         }
         sessions[index] = replacement.expect("a completed close must release native capacity");
     }
-    gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&state).unwrap();
 }
 
 #[test]
 fn closing_after_stdio_eof_still_reaps_the_live_child() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -460,20 +460,20 @@ fn closing_after_stdio_eof_still_reaps_the_live_child() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exec 0<&- 1>&- 2>&-; sleep 30".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(100));
     let start = Instant::now();
     kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
     assert!(start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
-    gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&state).unwrap();
 }
 
 #[test]
 fn binary_mouse_input_reaches_the_pty_without_utf8_reencoding() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -497,20 +497,20 @@ fn binary_mouse_input_reaches_the_pty_without_utf8_reencoding() {
             "stty raw -echo; printf ready; dd bs=1 count=5 2>/dev/null | od -An -tx1".into(),
         ]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let mut output = Vec::new();
     while !String::from_utf8_lossy(&output).contains("ready") {
         output.extend(receive.recv_timeout(Duration::from_secs(3)).unwrap());
     }
-    gitpulse_lib::terminal::write_binary_to_session(&state, &session.id, "\u{1b}[M\u{80}\u{ff}")
+    waylode_lib::terminal::write_binary_to_session(&state, &session.id, "\u{1b}[M\u{80}\u{ff}")
         .unwrap();
     while !output.contains(&b'\n') {
         match receive.recv_timeout(Duration::from_secs(3)) {
             Ok(bytes) => output.extend(bytes),
             Err(error) => {
-                let _ = gitpulse_lib::terminal::shutdown_sessions(&state);
+                let _ = waylode_lib::terminal::shutdown_sessions(&state);
                 panic!(
                     "binary PTY output: {:?}; {error}",
                     String::from_utf8_lossy(&output)
@@ -526,20 +526,20 @@ fn binary_mouse_input_reaches_the_pty_without_utf8_reencoding() {
         .map(|part| u8::from_str_radix(part, 16).unwrap())
         .collect();
     assert_eq!(bytes, [0x1b, 0x5b, 0x4d, 0x80, 0xff]);
-    gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&state).unwrap();
 }
 
 #[test]
 fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     // The window is full when the next event no longer fits, which leaves
     // up to one event unused: an event is up to `OUTPUT_CHUNK_BYTES`.
-    const NEAR_FULL: usize = 512 * 1024 - gitpulse_lib::terminal::OUTPUT_CHUNK_BYTES;
+    const NEAR_FULL: usize = 512 * 1024 - waylode_lib::terminal::OUTPUT_CHUNK_BYTES;
     let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let received = total.clone();
     let (send, receive) = mpsc::channel();
@@ -563,7 +563,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
             "while :; do printf 0123456789abcdef; done".into(),
         ]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     // Setup, not the assertion: this only waits for the window to reach its
@@ -581,7 +581,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     let pending = total.load(std::sync::atomic::Ordering::SeqCst);
     assert!((NEAR_FULL..=512 * 1024).contains(&pending));
     kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
-    gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&state).unwrap();
 }
 
 mod common;

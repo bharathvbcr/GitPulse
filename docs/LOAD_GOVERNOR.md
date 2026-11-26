@@ -1,8 +1,8 @@
 # Load governor
 
-GitPulse runs agents. On the Mac this was built on, agents and the tools they
+Waylode runs agents. On the Mac this was built on, agents and the tools they
 start brought the machine down three times in one week. The host-load governor
-is GitPulse's answer, built as a series of cards. This page describes the
+is Waylode's answer, built as a series of cards. This page describes the
 series and what each card owns. It then covers the part that exists today, the
 **sensor** (card 1): what it measures, how other processes read it, where its
 limits are, and what has been verified.
@@ -17,7 +17,7 @@ limits are, and what has been verified.
 - **Windows reports unavailable.** No sensor runs there. Readers see the
   sensor as dead, and Health says "ungoverned: no sensor".
 - **Cursor and Codex get advice only.** Their sessions are counted (Codex by
-  executable), but GitPulse holds no lease over them.
+  executable), but Waylode holds no lease over them.
 - **"Time slots" means a priority queue with leases, not calendar booking.**
   That queue is card 1d's.
 
@@ -30,7 +30,7 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
   GitPulse.app's coalition), and an `rg` memguard killed at 40.8 GiB (V, its
   log).
 - **A foreign orphan.** A `/usr/bin/grep` at 21–22 GiB ran at 100 % CPU for
-  19–22 h with no parent (V). No layer below GitPulse catches that shape. The
+  19–22 h with no parent (V). No layer below Waylode catches that shape. The
   sensor now detects it (see Orphans).
 - **The panics.** The two on 10-02 were launchd SIGBUS, probably the OS or
   hardware (I). The one on 10-07 was a watchdog timeout with the compressor
@@ -39,15 +39,15 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
 - **Sessions were undercounted.** Insights counted 5 of 7 live Claude
   sessions. The cause (V, 2026-10-10): Claude Code writes its session registry
   under the session's own `CLAUDE_CONFIG_DIR`, and this host runs sessions
-  under several. GitPulse read one directory.
+  under several. Waylode read one directory.
 
 ## Ownership
 
 | Trigger | Owner | Notes |
 |---|---|---|
-| One process over 32 GiB, or pressure level 4 for 3 samples | memguard | GitPulse never kills a single process for its footprint. |
+| One process over 32 GiB, or pressure level 4 for 3 samples | memguard | Waylode never kills a single process for its footprint. |
 | A `mac_heavy.sh` job tree over its RSS cap | mac_heavy | Card 4 exempts trees carrying `MAC_HEAVY_LABEL`. |
-| The **sum** of a GitPulse-launched tree | Card 4 (supervisor) | Advise by default; enforce is opt-in. |
+| A tree's processes while **memory** is short, and a runaway subtree that keeps making it worse | Card 4 (pressure relief, `sysload::relief`) | Slow and freeze by default, with a setting (`host_load_supervisor`: off, advise, act). Terminate (rung C) is opt-in (`host_load_supervisor_terminate`) and ends only a tree the relief itself froze, at the cap or on a person's click; observed agents and untrusted repositories are only ever offered a pause. See Pressure relief. |
 | Admission and shedding | Cards 1b and 1c, one verdict (`sysload::governor`) | See Admission and shedding. |
 | Leases, the hook, advice | Cards 1d, 3 | **The sensor only measures and publishes.** They consume the same verdict. |
 
@@ -61,12 +61,12 @@ in Health. That signal is re-checked on the live process before it is sent
 |---|---|---|
 | 1 (sensor) | This page: sampler, `host-load.v1`, sensor states, sessions by process scan, `GITPULSE_RUN_ID`, memguard health, orphans, Health | Implemented |
 | 1b | Admission of agent launches on the sensor state | Implemented (see Admission and shedding) |
-| 1c | Shedding GitPulse's own background and reactive work | Implemented (see Admission and shedding) |
+| 1c | Shedding Waylode's own background and reactive work | Implemented (see Admission and shedding) |
 | 1d | Leases and the priority queue ("time slots"), and idle-session advice and parking | Implemented (see Build leases and idle sessions). The shim cutover is the owner's |
 | 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases are card 1d's. `gitpulse_system_load` and launch-environment caps are not |
 | Per-call gate cost | The hook's per-call budget | Separate card |
 | Startup churn | The startup git-spawn burst | Separate card |
-| 4 | Tree-sum supervisor and launched-orphan stop, advise by default | Not started |
+| 4 | Pressure relief: slow and freeze by default; terminate is opt-in | Implemented: slowing, freezing, offers for observed agents and untrusted repositories, and rung C (opt-in terminate of a tree it froze; see Pressure relief). The launched-orphan stop is not built |
 | 5 | Disk-write budget; consumes the per-tree write rate | Not started |
 
 ## Sensor states
@@ -119,7 +119,7 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
 
 - **Header:** MAGIC `GPHL`, VERSION (1), length, flags, sequence.
 - **Writer identity:** pid, process start time, binary path and version, so
-  Health can say *which* GitPulse is sampling when a dev build and the
+  Health can say *which* Waylode is sampling when a dev build and the
   installed app coexist.
 - **`host_load.enabled`:** carried in the flags, so hooks never read
   settings and a flip reaches every reader on the next tick.
@@ -272,7 +272,7 @@ beside it, in the same directory, that keeps them.
 
 ## Where it runs
 
-Only in the GitPulse app process. `lib.rs::run` starts the sampler from its
+Only in the Waylode app process. `lib.rs::run` starts the sampler from its
 setup (`start_host_load_sampler`). `tests/host_load_sampler_scope.rs` pins that
 this is the only start, and that no other shipped binary (`gitpulsed`,
 `gitpulse-mcp`, `gitpulse-hook`) reaches it.
@@ -349,12 +349,12 @@ the same kind is a wrapper's target (Codex's npm shim starting the native
 `codex`), not a second session. A Claude run from a shell under another session
 is its own session.
 
-**Launched vs observed.** Every PTY GitPulse starts carries
+**Launched vs observed.** Every PTY Waylode starts carries
 `GITPULSE_SESSION_ID`; a task attempt's also carries `GITPULSE_RUN_ID`.
 `GITPULSE_RUN_ID` is the launch table's environment half
 (`terminal_command::launch_env`, beside `policy()`'s flags). The PTY spawn path
 sets it after the caller's own environment, so an IPC caller cannot file a
-session under another run. It is *removed* from plain terminals, so a GitPulse
+session under another run. It is *removed* from plain terminals, so a Waylode
 started inside an attempt does not hand that attempt's id to every shell tab.
 
 A process belongs to the launched tree of its nearest ancestor-or-self carrying
@@ -416,7 +416,7 @@ log's modification time. Health warns on a governed platform when:
 - its log path cannot be read; or
 - it has not written for more than twice its `-heartbeat` interval.
 
-GitPulse never starts, restarts or signals memguard.
+Waylode never starts, restarts or signals memguard.
 
 ## Orphans (advise only)
 
@@ -426,9 +426,9 @@ A foreign process is listed as an orphan when all of these hold:
 - it belongs to this user;
 - its working directory is in a git checkout;
 - it has spent at least 80 % of its life on a CPU, over more than 30 minutes;
-- it is in no session and no GitPulse launch, and is not memguard.
+- it is in no session and no Waylode launch, and is not memguard.
 
-GitPulse launches that outlive their run are card 4's, not listed here. Health
+Waylode launches that outlive their run are card 4's, not listed here. Health
 lists each orphan with **Terminate**, which takes two clicks. The backend then
 re-checks everything on the live process: same pid and start time, still this
 user's, still parented by launchd, still no launch id or session, still
@@ -440,7 +440,7 @@ host cannot draw, or anything changed refuses and signals nothing.
 Security impact: `cmd_host_load_terminate_orphan` is granted to the main
 window, so any script that reaches the IPC bridge can ask for it. The two
 clicks are DOM and are not the boundary; the native dialog is, as for the
-other grants that widen what GitPulse will do (repository trust, tool paths).
+other grants that widen what Waylode will do (repository trust, tool paths).
 The signal is SIGTERM to a process this user already owns and could `kill`
 from a shell; no access is widened beyond that. The other three host-load
 grants (`cmd_host_load_status`, `cmd_host_load_settings`,
@@ -502,14 +502,14 @@ sets them they follow this computer's memory (see Disk guards).
 |---|---|---|---|---|
 | `compressor_segments` | `vm.compressor.segment.total / vm.compressor.segment.limit` | refuse | 0.60 | 0.80 |
 | `swap` | swap USED / PHYSICAL memory (never swap total: macOS grows swap on demand, so the total reads 0 after boot) | refuse | 0.50x | 0.75x |
-| `low_disk` | free space on the volume holding GitPulse's state; lower is worse | refuse | below the larger of 20 GiB and half of physical memory (32 GiB on a 64 GiB Mac) | below the larger of 10 GiB and a quarter of it (16 GiB on a 64 GiB Mac) |
+| `low_disk` | free space on the volume holding Waylode's state; lower is worse | refuse | below the larger of 20 GiB and half of physical memory (32 GiB on a 64 GiB Mac) | below the larger of 10 GiB and a quarter of it (16 GiB on a 64 GiB Mac) |
 | `disk_filling` | how fast that free space is falling, as minutes until the severe floor (see Disk guards) | refuse | under 30 minutes | under 10 minutes |
 | `thermal` | `NSProcessInfo.thermalState` | shed | serious | critical (refuse mode only) |
 | `cpu_load` | 1-minute load average / logical CPUs | shed | 3.0 | 6.0 |
 | `battery` | running on battery | off | on battery | never |
 
 Modes: **off** ignores the input; **shed** lets it raise the tier to Elevated at
-most (GitPulse slows its own background work, launches are admitted);
+most (Waylode slows its own background work, launches are admitted);
 **refuse** lets it reach Severe too (reactive work is shed and launches are
 refused). Refusal is still subject to `host_load.govern_launches`: with that
 off nothing ever refuses.
@@ -566,8 +566,8 @@ spawns no git child (a pure IPC read) is not shed by this card.
 ## The command gate
 
 On 2026-11-14 this Mac hung with swap at 0.9x RAM and a load of 120 on 18
-cores, under sessions GitPulse only observes, so launch admission never touched
-them. The only GitPulse code that runs inside those sessions is the plugin's
+cores, under sessions Waylode only observes, so launch admission never touched
+them. The only Waylode code that runs inside those sessions is the plugin's
 `PreToolUse` `command-gate` hook, so the hook reads the app's published verdict
 (`PublishedVerdict`, above) and acts on it. It never samples the host and never
 re-derives a threshold: it refuses what the governor refuses to admit.
@@ -582,7 +582,7 @@ gate are combined, so the harness's 5 s budget expiring cannot drop it.
 | heavy | not admitted; sensor fresh or stale-recent | `enforce`: **deny** with a reason; `advise`: the same text as context |
 | heavy | elevated, admitted | one line of advice, with the capped form |
 | heavy | clear | nothing |
-| heavy | no verdict: sensor stale-old or dead, no snapshot, a record with no verdict (an older GitPulse), measurement switched off | one line: **not** load-checked, and why, said once per session per distinct reason (an exclusive `loadnote-<session>-<reason>` marker in the same private directory as the loop breaker's; the line says it will not repeat). With no session id, or a directory that cannot keep the marker, it is said every time, never dropped. Never a refusal |
+| heavy | no verdict: sensor stale-old or dead, no snapshot, a record with no verdict (an older Waylode), measurement switched off | one line: **not** load-checked, and why, said once per session per distinct reason (an exclusive `loadnote-<session>-<reason>` marker in the same private directory as the loop breaker's; the line says it will not repeat). With no session id, or a directory that cannot keep the marker, it is said every time, never dropped. Never a refusal |
 | heavy, but the line could not be read | | the same "not load-checked" line, once per session |
 | `grep -r` with `-z`/`-a`/`--null-data` or no `--exclude-dir`; `rg -uu`/`--no-ignore` with no `-g '!…'`; `go test ./...` or `-fuzz` with no `-timeout`; `python` with `train` or `bench` in its argv | elevated or severe | one line of advice. Never a refusal; silent on a quiet host |
 
@@ -713,7 +713,7 @@ build's own process exits. State is under `<config>/GitPulse/leases/`:
 - `paths/leasepath-<session>` and `leasemiss-*` markers (see below).
 
 Service order is `(priority, slots the session already holds, enqueue time,
-pid)`, with priority GitPulse terminal, then task run, then observed session.
+pid)`, with priority Waylode terminal, then task run, then observed session.
 A waiter takes a free slot only when its rank is below the number of free
 slots. The board reads the queue before the slots and a grant re-counts after
 it takes a file, releasing if it went over, so a race can only under-grant.
@@ -797,7 +797,7 @@ build's own children, and a proxy's child (rustup's `cargo`) are not counted.
 
 ### How a session reaches the wrapper
 
-- GitPulse terminal and task-run PTYs for an agent launcher get `lease-bin`
+- Waylode terminal and task-run PTYs for an agent launcher get `lease-bin`
   first on `PATH` and `GITPULSE_LEASE_BIN` (`sysload::lease::launch_env`), and
   only when the `cargo` and `go` links resolve to a file that answers as a
   lease wrapper.
@@ -841,7 +841,7 @@ makes it **not known**, never idle:
    Finished) for at least `host_load_idle.idle_after_s` (default 900);
 2. its whole process tree used under 5% of one core over the last tick (a
    first tick, or an unreadable member, is unknown);
-3. where GitPulse holds the PTY, the terminal has been quiet for the same time;
+3. where Waylode holds the PTY, the terminal has been quiet for the same time;
 4. it holds no build slot and is not queued.
 
 A PTY that is quiet is not enough, and neither is a low CPU reading: an agent
@@ -852,8 +852,8 @@ and sessions with no hook reports are always "not known".
 conversation so the existing reopen offer ("Resume") brings it back. It is not
 SIGSTOP. It is offered, and enforced by the backend, once a session has been
 idle for `host_load_idle.park_after_s` (default 3600). Only a terminal that
-GitPulse launched as that agent can be parked: a plain shell tab with `claude`
-typed into it carries a GitPulse session id too, and closing it would close the
+Waylode launched as that agent can be parked: a plain shell tab with `claude`
+typed into it carries a Waylode session id too, and closing it would close the
 shell, so it is refused, as is a terminal that hosts two agents. It is a click in Health, then a
 native system dialog that page script cannot answer, with the session checked
 again before the dialog and after it. The session's row is marked for the
@@ -865,14 +865,14 @@ for reopening, because neither the terminal's listing (which marks a session
 as ending before its first signal) nor the agent's process (alive through its
 hangup grace) tells that case from a slow close. It is **not reachable over MCP** and
 nothing is parked on its own. An observed session is never parked, and Codex
-cannot be resumed from GitPulse, so neither is offered.
+cannot be resumed from Waylode, so neither is offered.
 
 ### Owner action: the shim cutover
 
-GitPulse does not edit `~/.claude-bin/cargo`, `~/.zshenv` or any other file
+Waylode does not edit `~/.claude-bin/cargo`, `~/.zshenv` or any other file
 outside its own config. Until the owner puts `<config>/GitPulse/lease-bin`
 ahead of `~/.claude-bin` on `PATH` (or has the shim delegate to
-`gitpulse-hook lease -- cargo`), builds from a shell GitPulse did not start are
+`gitpulse-hook lease -- cargo`), builds from a shell Waylode did not start are
 gated by the shim's own slots and not by this. `bun run mcp:doctor` has a
 `lease:` row. It first runs the link's target with `--version`: a target that
 answers without `lease` is `stale` (it would exit 0 without building) and
@@ -885,7 +885,7 @@ is `unverifiable`, not ok.
 
 On this machine `~/.zshenv` re-prepends `~/.claude-bin` for every zsh, so the
 row honestly reports `shadowed` until the owner moves that line behind the
-lease folder (or `~/.zprofile` reorders it), or retires the shim. GitPulse does
+lease folder (or `~/.zprofile` reorders it), or retires the shim. Waylode does
 not edit either file. Until then a session is gated through the env-file line
 alone, and a build from a shell that line does not reach is not.
 
@@ -903,6 +903,436 @@ alone, and a build from a shell that line does not reach is not.
   measured against real sessions.
 - No automatic reclaim of build caches and no automatic park exist.
 
+## Pressure relief (card 4)
+
+On 2026-11-24 the Mac hung for two hours on memory-compressor exhaustion and
+about eighteen agent sessions in Waylode terminals were lost. The governor
+shed Waylode's own work and refused new launches; nothing acted on the agent
+trees already running. The relief (`sysload::relief`) does, and it is the one
+card that touches an agent's processes. It kills nothing for its footprint, and
+memguard (above) stays the only thing that ends a process for it: **Waylode
+never kills a single process for its footprint.** The one thing it can end is a
+tree *it froze itself*, on a host that is still exhausted, when the person opted
+in or clicked End (rung C, below): that is card 4's row, not memguard's.
+
+It runs on the elected sensor writer's sampler tick (2 s), from the scan that
+tick just made, with no spawn gate, no `manvi use` probe and no subprocess:
+only the in-process scan, `setpriority(2)` and `kill(2)`. A Mac with no Manvi,
+or one whose Manvi probe is deferred under load, is relieved the same.
+
+### Trigger
+
+Only the memory inputs count: memory pressure, compressor thrash, compressor
+segments and swap (`governor::memory_sample`, read straight from the sample, not
+from the governor's held binding, which keeps naming whichever input entered
+the tier). A Severe held by CPU load, thermals, the battery or a filling disk
+never acts.
+
+| Rung | When | Does |
+|---|---|---|
+| A, slow | Memory-bound Elevated or worse for 3 samples **with a cause**; released after 5 samples below Elevated or without one | `PRIO_DARWIN_BG` on every non-exempt process of every agent session, launched or observed |
+| B, freeze | Memory-bound Severe for 30 consecutive samples (60 s) **and** worsening | `SIGSTOP` of one subtree per session, at most three on the host |
+
+**A cause for rung A** is the kernel's memory-pressure level at Warn or worse,
+compressor thrash, compressor segments at their Elevated level, or swap or
+segments *rising* across the last 15 samples (`SLOW_TREND_SAMPLES`). Swap
+*level* is not one: it stays high long after a recovery, so a high flat swap
+under a Normal kernel slows nobody, and slowing already in force is put back.
+
+**Worsening for rung B** is swap in use or compressor segments still rising
+across the 60 s window (the median of the last 5 readings over the median of the
+first 5, by at least 256 MiB of swap or 1 percentage point of the segment limit:
+`SWAP_RISE_BYTES`, `SEGMENT_RISE_POINTS`), **or pinned at the edge for the whole
+window**: the kernel level Critical, compressor thrash, or segments at 95 % of
+their limit (`PINNED_SEGMENT_PCT`), where flat is still failing. A freeze begun
+that way is not ended by "flat" while it stays pinned. **Pinned alone may start
+one freeze per Severe episode**: a host pinned by something unrelated (the kernel
+at Critical, segments at 95 %) would otherwise have the same builds frozen again
+about a minute after every ten-minute cap, for ever. After any resume of such a
+freeze (the cap, flat, the watchdog) rung B needs a fresh rise (the rule above,
+over a new 60 s window) or the tier leaving Severe and coming back; and a process
+a freeze stopped is never the root of another freeze in the same episode (a
+person's resume without hold-off clears that). A pinned run is forgotten only
+after three consecutive samples below the edge (`PINNED_BREAK_SAMPLES`), so a
+kernel level that flickers does not restart the minute. **Swap level never counts
+for either**: a high but flat swap is not a reason. Five consecutive samples
+below Severe end a Severe run; one dip does not restart the minute. An unreadable
+swap or segment reading never starts a freeze and never holds one.
+
+### Selection (rung B)
+
+Only a **GitPulse-launched** session (its tree carries a launch id) in a
+**trusted** repository (`repository_trust::require` on the session's checkout,
+which starts no `git`). In it, the single heaviest eligible *subtree* by
+footprint sum, at least 256 MiB, **below a shell that is positively an agent's
+tool-command shell and a direct child of the agent**: never the agent, never
+that shell. Every other direct child of the agent (an MCP server's stdio
+process, a launcher, a helper) and everything under it is outside the search.
+A tool shell is told by its arguments: Claude Code's Bash tool starts
+`/bin/zsh -c source <config>/shell-snapshots/snapshot-zsh-….sh …`, and macOS
+shows the arguments of `/bin/zsh` (an Apple platform binary) though not its
+environment. A shell whose arguments are unreadable, or carry no such mark, is
+not entered. No equivalent mark is verified for Codex's or Antigravity's shells,
+so their sessions are slowed and never frozen.
+
+### Exemptions
+
+One predicate (`Scanner::throttle_exempt` in `procscan`) serves both rungs and
+the steward's slowdown: the session root, `memguard`, Waylode's, Manvi's,
+ptyd's and devmap's binaries, an IDE host's non-agent children, Manvi worker
+trees. Rung B adds, and **one exempt member spares the whole subtree**:
+
+- `git` processes, and any process whose working directory is in a worktree
+  with a live `index.lock` (the nearest `.git` directory, or the gitdir a linked
+  worktree's `.git` file names);
+- **build-lease waiters**, read from the lease board (`lease::Dir::board`: each
+  waiter's locked ticket), because `procscan` cannot see a descriptor lock. A
+  waiter anywhere in the subtree or in the chain above it spares it. A board
+  that cannot be read in full freezes nothing;
+- trees whose environment carries `MAC_HEAVY_LABEL` (a non-empty value), read
+  from `KERN_PROCARGS2` on the subtree's root, its first 24 members and the
+  shells above it; each process's environment is read once per (pid, start
+  time) and kept. **Limit:** macOS hides the environment of Apple platform
+  binaries (`/bin/bash`, `/usr/bin/git`), so the marker is found on the program
+  that carries it (`cargo`, `go`, `rustc`), not on the script that started it.
+  An environment that cannot be read spares the subtree: unknown is never clear;
+- MCP servers: any process named `*mcp*`, and everything under a direct child of
+  the agent that is not an identified tool shell (see Selection);
+- the shells that are direct children of the agent, and a process whose working
+  directory cannot be read.
+
+**Build-lease holders are eligible while the lease board is refusing.** A holder
+(the `F_GETLK` owner of a slot, or a tree whose environment carries
+`GITPULSE_LEASE_HELD` or `CARGO_SLOT_HELD`, any non-empty value) is spared while
+the board takes builds, and eligible once `lease::capacity(..).refuses` is true
+(the verdict is Severe, or not admitting launches): a build nobody can replace
+is what is worth stopping. The board knows a holder is alive because a slot is
+an `fcntl` record lock the OS drops when its process dies and `F_GETLK` names
+the process holding it, so a stopped holder still holds it. **The first tick the
+board stops refusing, every frozen holder is continued**, without waiting for
+the memory to flatten or the 15 samples. A waiter and a `MAC_HEAVY_LABEL` job
+stay spared throughout.
+
+The same predicate (exempt, git, MCP, waiter, held markers, `index.lock`,
+environment and directory readable) judges a process that forks under a frozen
+subtree afterwards; one that fails it is left running.
+
+### Recovery
+
+A freeze never lasts indefinitely. It ends at the first of:
+
+- worsening flat for 15 samples (swap may stay high), unless the host is pinned
+  at the edge (kernel Critical, thrash, segments at 95 %);
+- the tier below Severe for 5 samples;
+- the lease board taking builds again, for a frozen build that held a slot;
+- **10 minutes** on the monotonic clock (`FREEZE_CAP`). At the cap the subtree
+  resumes and is not refrozen until a whole new Severe minute with
+  deterioration, **unless the person opted in to rung C** (below), in which case
+  the paused tree is ended instead. The cap hit is counted (`cap_hits`) and said
+  in `last_action`.
+
+Processes that forked under a frozen subtree before their parent stopped are
+stopped on the following ticks; a subtree whose own process ended is let go. Any
+kill path must `SIGCONT` first: a signal to a stopped process waits for the
+continue.
+
+### Rung C: ending a paused tree (opt-in)
+
+Rung C acts on host exhaustion **plus a tree rung B froze**, which is card 4's
+row above; it is not memguard's footprint rule, and the line "Waylode never
+kills a single process for its footprint" stands: nothing is ended because of
+how big it is, only because the host is still failing ten minutes after the
+relief stopped it, and the person said so (the setting) or clicked **End**.
+
+Two things start it, and nothing else:
+
+1. **The cap, with the opt-in.** `host_load_supervisor_terminate` (Settings →
+   "When a paused build is still paused after 10 minutes, end it instead of
+   resuming it", off by default, only meaningful in `act`, stored beside
+   `host_load_supervisor`, never inside `host_load`; an unreadable value is
+   *no*). At `FREEZE_CAP`, a tree *the relief itself* froze, for its whole ten
+   minutes, is ended. A tree a person's **Pause** froze is never ended by the
+   cap, opt-in or not: the confirm they answered says it resumes, so it is
+   resumed as before (they can still click **End**). So is one frozen later,
+   which has not had its ten minutes. Not opted in, the cap behaves exactly as it always did (resume), and
+   the pause banner offers **End it**.
+2. **A person's request** (`host-relief-terminate.request`, below), whatever the
+   opt-in says: the click is the consent.
+
+The ladder, per tree, never on the tick's own wait: re-read that the tree's
+first process still reads as **stopped by us** (one that reads as running was
+continued by somebody; it is not ours to end and is resumed instead), then **each
+member is read again** and only one that still reads as stopped, and that the
+journal lists as `was_running`, is a target (a member somebody continued, or
+stopped by hand, is left alone and recorded as a failure). **`SIGCONT` the
+targets** (a signal to a stopped process waits for the continue,
+`terminal/jobs.rs`), read each once more (one somebody stopped in between gets no
+`SIGTERM`), `SIGTERM`, then a grace of 10 s (`TERMINATE_GRACE`) counted on the
+tick's monotonic clock, then `SIGKILL` for what survived. Every signal goes
+through `procguard::signal::signal_process` (pid **and start time** must still
+match) and only to a member the journal still lists as `was_running`: the agent
+root, its tool shell, a process somebody else stopped (`left`) and anything the
+relief did not stop are never signalled. The tree leaves the frozen list at
+once; its journal entries stay until the kill pass is over, so a crash in between
+replays only `SIGCONT`.
+
+**Asked to end is not ended.** After `SIGTERM` the tree is in `ending` (the
+published `ending: FrozenTree[]`, `since_ms` is when it was asked). It moves to
+`ended` only when the kill pass has confirmed every process it signalled gone:
+early if `SIGTERM` was enough, otherwise after the grace and `SIGKILL`, re-read
+`KILL_CONFIRM` (2 s) later. A survivor of `SIGKILL`, a process that cannot be
+read, or one somebody else stopped is recorded in `failures` ("was not confirmed
+ended"), never as ended; nothing at all signalled is a failure too. A person's
+**Resume** in the grace (the journal entries go) cancels it: it is neither killed
+nor ended. The setting leaving `act` or going off, or Waylode stopping, abandons
+the pending kill. `ending` is optional with a default, like `ended`. `last_action`
+has kind `terminate`; the command-gate hook tells the agent whose build it was
+that it was "asked to end" while the status says `ending`, and "ended by memory
+protection" (and must not be re-run, nor another started, until pressure clears)
+only for `ended`, while the status is fresh and the episode lasts (the supervisor
+forgets both when the Severe episode ends).
+
+Residual: the kill pass is driven by the tick, not the watchdog. A sampler that
+stalls between `SIGTERM` and the grace leaves a SIGTERM-ignoring process running
+(it is continued, no longer stopped) until the next tick; nothing is left
+*stopped*. A phase-1 reader meeting `kind: "terminate"` in `last_action` finds
+the file Unreadable (loud, not silent).
+
+### Offers and the two request files
+
+Rung B never freezes an agent Waylode did not launch (the Claude desktop app, a
+terminal started elsewhere: an *observed* session) or one in an untrusted
+repository. When it would have picked a tree there (the same screening, the same
+"worsening for 60 s" trigger), it publishes the tree as an **offer**:
+`offers: FrozenTree[]` in `host-relief.v1.json` (`advised_only: true`, plus
+`why: "observed" | "untrusted"`; both fields are optional with a default, so a
+phase-1 reader still reads the file, and `version` is unchanged). At most 8, newest
+pass replacing the last, forgotten when the Severe run ends. An offer is activity
+(a dead writer's offers go stale like a pause), never a rung and never counted
+as paused.
+
+- A banner "Memory is running out. Pause `<command>` under the agent in
+  `<repo>`?" (once per offered tree, at most one every 60 s) with **Pause it**;
+  Health lists the offers with **Pause**, behind a confirm. An *untrusted* offer
+  is advice only: a banner with **Settings** and no pause, a Health note, and
+  the supervisor refuses a pause request for it even if the repository is trusted
+  later.
+- `host-relief-pause.request` pauses exactly that tree through the normal freeze
+  path: it must match an offer the supervisor currently holds (`observed`), the
+  screening is run again on the present table (parameterised `select_in_session`,
+  not a copy), state is read, the journal is written with `was_running` before
+  the stop, the bounds of one per session and three per host apply, and the pause
+  follows every normal resume rule (flat, calmed, the cap, the watchdog, a
+  person's resume). In `advise` or `off` there is no pause.
+
+The two request files follow the resume request's contract (private 0600, atomic,
+`at_ms`, a 2-minute expiry, read and deleted by one `take_*` call per tick) and
+name their target by `pid`, `start_us` and `since_ms` (when that pause or offer
+began; a request without it never matches): a request for a tree the supervisor is
+not holding (paused for terminate, offered for pause), with a stale start time,
+naming an earlier pause or offer of the same process (a banner or Health row left
+on screen must not end a later freeze), or expired, is ignored and recorded as
+`refused`. An offer keeps the time it was first offered across passes, so its
+identity survives refreshes. The banner buttons carry the tree
+in the banner's identifier (`<prefix>:<pid>:<start_us>:<since_ms>`), parsed by one pure
+function, and write the file off the notification delegate's thread. IPC:
+`cmd_host_relief_request_terminate` and `cmd_host_relief_request_pause`, main
+window only.
+
+Security impact: neither IPC sends a signal; each leaves one small file in
+Waylode's own config directory. The files are *not* behind the IPC grant: any
+process of the same user, a paused agent included, can write them. They can only
+name what the supervisor itself published, and it acts only on a tree it holds
+(paused, for terminate; offered and observed, for pause), after the expiry, the
+identity check, the screening and the bounds above. The resume request's old
+property, "it can only end a pause, never start one", is therefore no longer
+true: a same-user process can now ask for an observed tree to be paused, or a
+paused tree to be ended. That widens nothing a same-user process could not do with
+`kill`; it is stated here because it is a change in what a file can ask for.
+
+**Crash safety.** Before a `SIGSTOP` (or a priority change) the process is
+written to a private journal, `<config>/relief/journal.v1.json` (pid, start
+time, session, time, rung); a journal write that fails means no signal. The
+journal is replayed (`SIGCONT`, priority restored) when a sampler wins the
+writer election, when the relief is dropped (a sampler stop or panic), and from
+the app's teardown, before the terminals close. An entry is cleared only after
+its resume was attempted. Signals go through `procguard::signal::signal_process`,
+which refuses a recycled pid by its start time; a refusal or any failed signal
+is recorded in `failures` and `failure_count`, never as done.
+
+**A second line that needs no file.** The journal is written on the sampler's
+thread, and a stalled disk is what a host short of memory has. The relief also
+keeps an in-memory copy of what is frozen (pid, start time, since) behind a lock
+of its own, and a watchdog thread continues what is past the cap plus 60 s, or
+everything when the tick has not advanced for 60 s (a hung sampler, or one that
+lost the writer election with a freeze standing). The teardown waits at most 2 s
+for a tick that is mid-action, then continues from that copy and leaves the
+journal for the next start. A journal a *live* Waylode wrote stays that
+Waylode's, whatever its age: its own watchdog continues what it stopped, and a
+second Waylode that guessed at the entries by age could continue a process the
+user had paused.
+
+**Only what the relief stopped is the relief's to continue.** Immediately
+before each stop the process's state is read from the OS (`SSTOP` on macOS,
+`T` on Linux), and again just before the signal. A process that is already
+stopped (a Ctrl-Z job, a debugger) is somebody else's: it is left alone, is
+not journaled, and no resume path (the cap, a person's request, the watchdog,
+the shutdown, a replay) ever continues it. A subtree whose first process is
+stopped already, or whose state cannot be read, is not frozen at all. Every
+journal entry carries `was_running: true`, set only after that read; a replay
+or a request acts only on such entries, so an entry without it (an older
+writer's) is never continued. The watchdog's copy takes a process only after
+its stop was delivered, so a tick that hangs *between* a delivered stop and
+that one append leaves the journal (and the shutdown replay) as the only record.
+
+**Residuals, stated plainly.** (1) A stop somebody layers *on top of ours* (a
+Ctrl-Z on a process we already stopped) cannot be told from ours: the state read
+sees "stopped" either way, so our resume continues it. (2) The state is read
+before the journal is written and again immediately before each stop (a late
+joiner is read again after its journal write, which can take seconds under
+pressure); that narrows the window in which a person's stop is mistaken for
+running, and cannot close it: a stop landing between the last read and the
+`SIGSTOP` is ours. (3) The watchdog's and the tick's reconcile can lag by one
+tick: a subtree the watchdog continued is still in the relief's record until the
+next tick drops it. (4) A journal write that fails after the relief took an
+entry out of its own record (somebody else stopped that process meanwhile)
+leaves the file listing it: the entry is marked *not ours*, no replay (election,
+drop, teardown) continues or restores it, and the write is retried every tick
+until it takes. (5) Only Act spends builds: `advise` records what it would
+freeze but never marks it spent, and a change of mode either way starts the
+episode's accounts afresh. (6) A candidate whose first process somebody else
+stopped is left out with its whole subtree and the next-heaviest is chosen (at
+most 8 re-selections per pass). (7) A build frozen earlier in an episode is
+chosen again only on a fresh rise (not pinned alone) *and* when it has itself
+grown by 1 GiB since it was frozen (`REFREEZE_GROWTH_BYTES`); otherwise it stays
+exempt for the episode. (8) An unreadable sample lets a freeze go as it always
+did (a blind sensor never holds a process stopped) but neither advances nor
+resets the count that ends an *episode*, so a blind spell cannot clear what the
+episode spent.
+
+**When the watchdog continued a freeze.** It records what it continued, and the
+next tick's first step drops those subtrees from the relief's own record, the
+journal and the snapshot (`last_action` says the watchdog continued it), and
+holds rung B off as after a cap. A late child of a subtree whose first process
+reads as running is never stopped, whoever continued it. If the watchdog thread
+could not start, that is a `failures` entry, not only a log line.
+
+### Slowing has one owner
+
+Every priority change Waylode makes to an agent's process goes through the
+relief's ledger. The steward's slowdown (`slow_critical`, opt-in, needs Manvi)
+now delegates to it (`relief::steward_throttle`): it may slow what the relief
+has not, and it cannot put back what the relief slowed. Before this, a steward
+tick with Manvi unconfigured restored every priority it knew of, which would
+have undone rung A. The steward keeps its lease, its pacing and its directive
+text; the relief releases rung A itself when pressure eases. The ledger is
+per namespace (the app's relief and the steward share one), and no priority
+change runs with it locked.
+
+### Setting and status
+
+`host_load_supervisor` in `tools.json`: `off` (nothing is done, and what was is
+put back), `advise` (decisions are computed and published, no signal and no
+priority change), `act` (the default; an unreadable value is `act`). It is a
+top-level sibling key like `host_load_idle`, host-wide: a per-repository
+override is not offered, because the relief acts on every agent session on the
+host and the same memory pressure bears down on a session that opted out.
+
+`sysload::relief::snapshot()` serves the state in process, read-only: mode,
+rung (none, slow, freeze), the memory binding and tier, the frozen subtrees
+(root pid and start time, session root, terminal session id, repository,
+command, footprint, since, advise-only), the slowed count, the last action
+(slow, freeze, resume, cap resume, refused), the latest signal failures with
+their pids and their count, and the cap hits. `host-load.v1` is unchanged.
+`sysload::relief::resume_all(hold_off_episode, reason)` resumes every frozen
+subtree from any thread, through the journal and `signal_process` like every
+other resume, returns each pid's success or failure, and with `hold_off_episode`
+keeps the relief from freezing again until the memory tier has dropped below
+Severe. It waits at most 2 s for the action lock and then answers
+`busy: true` having done nothing; the request consumer (the sampler's own tick)
+keeps a request that found it busy and tries again each tick until the
+request's two-minute time to live is up, and then records that it was not
+carried out. The `supervisor` field of the host-load settings (`cmd_host_load_settings`
+and its save) carries the mode over IPC; it is stored only as
+`host_load_supervisor`, never inside `host_load`.
+
+### The published file and the resume request
+
+The relief publishes `host-relief.v1.json` beside `host-load.v1`
+(`sysload::relief_status`, whose module documentation is the contract), for the
+processes that cannot call it: the command-gate hook, the menu-bar glyph, the
+native banner and Health. The elected writer writes it **after the tick has
+released the action lock and the ledger** (the write is synced), every tick
+while it claims activity (a rung above none, a tree really paused, or a process
+really slowed), once on every change including the one back to rest, once at
+startup (so the last run's claim is replaced) and once at quit, and only if the
+file is this process's. `slowed` counts what was actually slowed (0 in `advise`,
+where `would_slow` carries the count); a tree the relief only chose in `advise`
+is `advised_only: true`; `since_ms` and the journal entries of one pause share a
+stamp; failures are the last 16, newest last.
+
+A banner or Health "Resume now" leaves `host-relief-resume.request`
+(`relief_status::request_resume`). The writer's tick takes it
+(`take_resume_request`: read and deleted, dropped when older than 2 minutes or
+not this user's) and resumes **only the pauses whose `since_ms` is at or before
+the request's `at_ms`**, through the journal like every resume, holding off a
+new freeze until the tier drops below Severe; a pause that began after the
+request stays frozen. It is recorded as the last action. The resume request can
+only end a pause; the two newer requests (below, "Offers and the two request
+files") can start one or end a process, and are bounded there.
+
+Only the writer's relief acts, and a journal belongs to the Waylode that wrote
+it: a process that lost the writer election and quits does not continue or
+restore what the writer's relief did (the steward's journal follows the same
+rule). Rung A runs at once when a slowing begins and then every fifth sample;
+a pass slows at most 256 new processes (2,048 in all) and the rest follow on the
+next. A slowed process that has left the scanned trees (its agent ended and it
+became launchd's child) is **put back** before it is forgotten, and a process
+that is gone leaves the ledger, the cap and the journal; the children that
+inherited the background from a slowed parent after the last pass are put back
+with it. A child counts as an inheritor only if it started after the pass that
+slowed its ancestor read the process table, it is not the steward's, and it is
+not under a process the steward owns **or one that put itself in the background**
+(`foreign`: the walk stops there, and its children are never inheritors; the set
+is kept until after the restore has used it); one that was already there and in
+the background was put there by something else, and stays. Residual: a descendant
+born after the slowing that put *itself* in the background, and that this relief
+never saw as foreign (it was not in a slowing pass), is put back with the rest.
+A process the OS refused once is not asked again until the slowing
+ends. Inheritors are not journaled by name, but the journal's stamps are enough
+for a best-effort, bounded sweep (one read of the process table, at most 256
+restores) at shutdown and at a startup replay, so a crash does not leave them
+in the background either. The sweep seeds only from the table row that is the
+very process a journal entry names (pid **and** start time): after a crash or a
+reboot a reused pid starts no walk, and its children are not restored.
+
+### Not verified
+
+- No run on a host under real memory exhaustion. The thresholds above (60 s,
+  256 MiB, 1 point, 15 samples, 10 minutes) are a starting guess; the trigger is
+  tested with fabricated samples and the signals with real child processes, not
+  with a machine that is actually failing.
+- Whether `SIGSTOP` of a build's subtree lowers pressure, rather than only
+  stopping new allocation, was not measured: a stopped process keeps its pages
+  until the kernel compresses or swaps them.
+- Linux: the sensor only advises there, so the relief never acts.
+- Selection was run read-only on this host's real trees (no signals): GitPulse-
+  launched Claude sessions showed root-child shells and launch ids, and
+  `KERN_PROCARGS2` returned environments. Every heavy subtree was then barred by
+  `GITPULSE_LEASE_HELD` (the builds running at the time), which is why holders
+  became eligible while the board refuses; a positive pick on a real tree was not
+  observed. A Codex session's root is its wrapper, so its shells are
+  grandchildren of the root and are never candidates.
+- Apple platform binaries show an empty environment (a shell read back with 0
+  variables), so a marker is found only on the non-Apple program that carries it.
+  Their **arguments** are readable: a `/bin/zsh -c source …/shell-snapshots/
+  snapshot-…` read back whole, which is what identifies an agent's tool shell.
+- The tick's per-process cost on this host was measured read-only (see
+  `measure_the_per_process_cost_of_a_priority_pass`), not under load.
+- A `resume_all` that lands between a tick's reading and its action is closed by
+  taking the action lock before the generation is read; the interleaving itself
+  is tested only by holding that lock, not by a scheduler that forces it.
+
 ## Health and the status bar
 
 Health → **Host load** (machine-wide, under every repository's Health) shows:
@@ -913,7 +1343,7 @@ Health → **Host load** (machine-wide, under every repository's Health) shows:
 - the readings;
 - Claude and Codex sessions, launched and observed;
 - launched trees with footprint and write rate;
-- the five heaviest processes GitPulse did not start, with the 6 s lag note;
+- the five heaviest processes Waylode did not start, with the 6 s lag note;
 - the memguard line and its warnings;
 - orphans;
 - the governor: which classes are shed and why, whether launches are refused and for how long, **Admit anyway**, and "ungoverned" when the sensor is stale-old or dead;
@@ -942,12 +1372,12 @@ leaves the switch on and costs no other setting.
 
 **Settings → Agents → Host load → "Refuse agent launches when the machine is
 overloaded"** (`host_load.govern_launches`, on by default, written only when
-off). Off still sheds GitPulse's own work under load but never refuses a
+off). Off still sheds Waylode's own work under load but never refuses a
 launch; it is what the 30-minute notice flips.
 
 **Settings → Agents → Host load inputs.** One row per input (swap, memory
 compressor, CPU load, heat, battery power, free disk space), each its own
-Settings search entry: a mode ("Off", "Slow GitPulse's background work", "Also
+Settings search entry: a mode ("Off", "Slow Waylode's background work", "Also
 refuse agent launches"), its two thresholds with units, the live reading beside
 it ("now 0.12x"), and a per-row reset. "Reset to defaults" in the Host load card
 resets them all. A value that fails validation is refused with the rule it

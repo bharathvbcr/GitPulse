@@ -220,7 +220,7 @@ fn adv_brief_names_an_unknown_binding_count_when_another_error_holds_the_code() 
 fn adv_ledger_events_schema_declares_history_only_bindings_unknown() {
     let tool = crate::mcp::tools()
         .into_iter()
-        .find(|t| t["name"] == "gitpulse_ledger_events")
+        .find(|t| t["name"] == "waylode_ledger_events")
         .expect("tool");
     assert!(
         tool["outputSchema"]["properties"]["history_only_bindings_unknown"].is_object(),

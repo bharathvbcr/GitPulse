@@ -97,7 +97,7 @@ export function stashActionConsequence(action: StashAction): string {
     case "pop":
       return "Restores these changes into your working tree and removes the stash entry.";
     case "drop":
-      return "Deletes this stash entry without restoring anything. The changes it holds are not recoverable from GitPulse.";
+      return "Deletes this stash entry without restoring anything. The changes it holds are not recoverable from Waylode.";
   }
 }
 

@@ -798,7 +798,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         message:
           `${found.label}\n` +
           `Model: ${found.selection.model}\n\n` +
-          "GitPulse found this server running on this machine. Your staged changes or commit " +
+          "Waylode found this server running on this machine. Your staged changes or commit " +
           "will be sent to it. Nothing has been sent yet.",
         confirmLabel: "Send and remember",
         cancelLabel: "Don't send",

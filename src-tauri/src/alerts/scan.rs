@@ -196,6 +196,11 @@ pub enum TelemetryEvent {
     Osc7501Clear,
     Osc7501Probe,
     LoopbackUrl(String),
+    /// An interactive agent dialog is waiting on the user (see
+    /// [`Scanner::observe_prompt_line`]); `detail` is the command it names.
+    AgentPrompt {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +256,27 @@ pub struct Scanner {
     line_overflowed: bool,
     last_loopback_url: Option<String>,
     last_osc_title: Option<String>,
+    /// Whether to watch for an agent's interactive permission dialog.
+    agent_prompts: bool,
+    /// A "Requesting permission for:" line was seen and its question has not
+    /// been: the command lines collected so far, and how many lines passed.
+    prompt_arm: Option<PromptArm>,
+}
+
+/// Marker lines of agy's command permission dialog, as the CLI renders it
+/// (ANSI stripped): a request line, the command, the question, numbered options.
+const PROMPT_REQUEST: &str = "Requesting permission for:";
+const PROMPT_QUESTION: &str = "Run this command?";
+const PROMPT_OPTION: &str = "1. Yes, run command";
+/// Lines between the request and its question before the request is dropped.
+const MAX_PROMPT_LINES: u8 = 16;
+/// Bytes of command text kept for a prompt's detail.
+const MAX_PROMPT_DETAIL_BYTES: usize = 480;
+
+#[derive(Debug, Default)]
+struct PromptArm {
+    detail: String,
+    lines: u8,
 }
 
 impl Default for Scanner {
@@ -274,7 +300,55 @@ impl Scanner {
             line_overflowed: false,
             last_loopback_url: None,
             last_osc_title: None,
+            agent_prompts: true,
+            prompt_arm: None,
         }
+    }
+
+    /// Turns the agent-dialog detector on or off. On by default; a session
+    /// whose agent already reports its prompts through hooks turns it off.
+    pub fn set_agent_prompts(&mut self, enabled: bool) {
+        self.agent_prompts = enabled;
+        if !enabled {
+            self.prompt_arm = None;
+        }
+    }
+
+    /// Reads one finished screen line (ANSI already stripped into `line_buf`).
+    /// The dialog spans lines, so an armed state carries between them; it is
+    /// bounded by [`MAX_PROMPT_LINES`] and [`MAX_PROMPT_DETAIL_BYTES`], and
+    /// lives in the scanner so a split between two reads cannot lose it.
+    fn observe_prompt_line(&mut self) {
+        if !self.agent_prompts {
+            return;
+        }
+        let line = String::from_utf8_lossy(&self.line_buf);
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(PROMPT_REQUEST) {
+            let mut arm = PromptArm::default();
+            push_prompt_detail(&mut arm.detail, rest.trim());
+            self.prompt_arm = Some(arm);
+            return;
+        }
+        let Some(arm) = self.prompt_arm.as_mut() else {
+            return;
+        };
+        let option = line.trim_start_matches('>').trim_start();
+        if line == PROMPT_QUESTION || option.starts_with(PROMPT_OPTION) {
+            let detail = std::mem::take(&mut arm.detail);
+            self.prompt_arm = None;
+            self.record_telemetry(TelemetryEvent::AgentPrompt { detail });
+            return;
+        }
+        if line.is_empty() {
+            return;
+        }
+        arm.lines += 1;
+        if arm.lines > MAX_PROMPT_LINES {
+            self.prompt_arm = None;
+            return;
+        }
+        push_prompt_detail(&mut arm.detail, line);
     }
 
     /// Signals this scanner produced but could not return within a feed's cap.
@@ -356,7 +430,10 @@ impl Scanner {
                     })
                 }
                 0x1b => self.state = State::Escape,
-                b'\r' | b'\n' => self.flush_line_token(true),
+                b'\r' | b'\n' => {
+                    self.observe_prompt_line();
+                    self.flush_line_token(true);
+                }
                 b' ' | b'\t' | b')' | b']' | b'>' | b'"' | b'\'' => {
                     self.flush_line_token(false);
                     if !self.line_overflowed && self.line_buf.len() < MAX_LINE_SCAN_BYTES {
@@ -943,6 +1020,23 @@ fn decode_osc7501_b64(encoded: &str) -> Option<String> {
     (!clean.is_empty()).then_some(clean)
 }
 
+/// Appends `line` to a prompt's command text, space separated, within
+/// [`MAX_PROMPT_DETAIL_BYTES`] and on a character boundary.
+fn push_prompt_detail(detail: &mut String, line: &str) {
+    if line.is_empty() || detail.len() >= MAX_PROMPT_DETAIL_BYTES {
+        return;
+    }
+    if !detail.is_empty() {
+        detail.push(' ');
+    }
+    for ch in line.chars() {
+        if detail.len() + ch.len_utf8() > MAX_PROMPT_DETAIL_BYTES {
+            break;
+        }
+        detail.push(ch);
+    }
+}
+
 /// Extracts a valid `http(s)://localhost:<port>` / `127.0.0.1:<port>` /
 /// `[::1]:<port>` URL from ANSI-stripped ground bytes.
 fn extract_loopback_url(bytes: &[u8]) -> Option<String> {
@@ -1433,5 +1527,49 @@ mod tests {
                 }),
             ]
         );
+    }
+    /// What agy 1.5 renders for a command permission dialog, as recorded in a
+    /// real host transcript: colour, erase-to-end-of-line and CRLF line ends.
+    const AGY_DIALOG: &str = "\x1b[33;1mCommand\x1b[m\x1b[K\r\n\
+\x1b[37;1mRequesting permission for:\x1b[m\x1b[K\r\n\
+\x1b[37m   git -C /w/repo diff --\x1b[m\x1b[K\r\n\
+\x1b[37mdocs/ARCHITECTURE.md\x1b[m\r\n\r\n\
+\x1b[1mRun this command?\x1b[m\x1b[K\r\n\
+\x1b[94m> 1. Yes, run command\x1b[K\x1b[m\r\n\
+  2. Yes, and always allow in this conversation\r\n  4. No, cancel\r\n";
+
+    fn prompt_events(events: &[TelemetryEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .filter(|text| text.contains("AgentPrompt"))
+            .collect()
+    }
+
+    #[test]
+    fn an_agy_permission_dialog_is_one_agent_prompt_however_the_reads_split() {
+        for chunk in [AGY_DIALOG.len(), 7, 1] {
+            let mut scanner = Scanner::new();
+            let mut events = Vec::new();
+            for piece in AGY_DIALOG.as_bytes().chunks(chunk) {
+                scanner.feed(piece);
+                events.extend(scanner.drain_telemetry());
+            }
+            let prompts = prompt_events(&events);
+            assert_eq!(prompts.len(), 1, "chunk {chunk}: {events:?}");
+            assert!(prompts[0].contains("git -C /w/repo diff --"), "{prompts:?}");
+            assert!(prompts[0].contains("docs/ARCHITECTURE.md"), "{prompts:?}");
+        }
+    }
+
+    #[test]
+    fn text_that_only_mentions_the_dialog_is_not_a_prompt() {
+        let mut scanner = Scanner::new();
+        // The marker mid-line (a shell echoing a command, a diff), the question
+        // with no request before it, and a request that is never asked.
+        scanner.feed(b"$ printf 'Requesting permission for:' && echo 'Run this command?'\r\n");
+        scanner.feed(b"Run this command?\r\n> 1. Yes, run command\r\n");
+        scanner.feed(b"Requesting permission for:\r\n   ls\r\n$ \r\n");
+        assert!(prompt_events(&scanner.drain_telemetry()).is_empty());
     }
 }

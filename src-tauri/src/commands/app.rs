@@ -373,6 +373,101 @@ pub async fn cmd_host_load_admit_anyway() -> Result<String, IpcError> {
     .await
 }
 
+/// What the pressure-relief supervisor has published (`host-relief.v1.json`):
+/// absent, fresh, stale or unreadable, never a bare "nothing paused" for a
+/// file that could not be read. Read-only.
+#[tauri::command(async)]
+pub async fn cmd_host_relief_status(
+) -> Result<crate::sysload::relief_status::ReliefOutcome, IpcError> {
+    off_thread(|| {
+        let dir = crate::sysload::relief_status::default_dir().ok_or_else(|| {
+            CommandError::from("there is no per-user config directory".to_string())
+        })?;
+        Ok(crate::sysload::relief_status::read_status(&dir))
+    })
+    .await
+}
+
+/// A person's "Resume all" in Health: leaves `host-relief-resume.request` for
+/// the supervisor, which resumes every process it paused on its next tick.
+///
+/// Security impact: this widens nothing a person could not already do. It
+/// writes one small file in GitPulse's own per-user config directory and sends
+/// no signal itself; what the supervisor does with it is resume processes it
+/// stopped, which only ever ends a pause. This IPC is granted to the main
+/// window only. The request file it writes is not behind that grant: any
+/// process of the same user, an agent whose build was paused included, can write
+/// the same file, so what the supervisor does with a request is its own
+/// decision to bound.
+#[tauri::command(async)]
+pub async fn cmd_host_relief_request_resume() -> Result<(), IpcError> {
+    off_thread(|| {
+        crate::sysload::relief_status::request_resume("health").map_err(|error| {
+            CommandError::from(format!("the resume request was not written: {error}"))
+        })
+    })
+    .await
+}
+
+/// A person's "End" in Health, after its confirmation: leaves
+/// `host-relief-terminate.request` naming one paused tree by pid and start time.
+///
+/// Security impact: this IPC is granted to the main window only, and it sends
+/// no signal itself. What it can make the supervisor do is end a process tree
+/// the supervisor itself stopped (never an arbitrary pid: a request for any
+/// other tree is ignored and recorded), which a person could do by hand with
+/// `kill`. The request file is not behind the grant: any process of the same
+/// user can write it, so the supervisor bounds what it does with one (the pid
+/// and start time must match a tree it currently holds paused, the request
+/// expires in two minutes, and only processes it journaled as running are
+/// signalled).
+#[tauri::command(async)]
+pub async fn cmd_host_relief_request_terminate(
+    pid: u32,
+    start_us: u64,
+    since_ms: u64,
+) -> Result<(), IpcError> {
+    off_thread(move || {
+        let id = crate::sysload::relief_status::TreeId {
+            pid,
+            start_us,
+            since_ms,
+        };
+        crate::sysload::relief_status::request_terminate("health", id).map_err(|error| {
+            CommandError::from(format!("the end request was not written: {error}"))
+        })
+    })
+    .await
+}
+
+/// A person's "Pause" on an offer in Health, after its confirmation: leaves
+/// `host-relief-pause.request` naming one offered tree by pid and start time.
+///
+/// Security impact: the same shape as [`cmd_host_relief_request_terminate`]. No
+/// signal is sent here; the supervisor pauses only a tree it is currently
+/// offering (an observed session's, never an untrusted repository's), after
+/// screening it again and within its per-session and per-host limits, and the
+/// pause ends by every normal resume rule. This IPC is granted to the main
+/// window only.
+#[tauri::command(async)]
+pub async fn cmd_host_relief_request_pause(
+    pid: u32,
+    start_us: u64,
+    since_ms: u64,
+) -> Result<(), IpcError> {
+    off_thread(move || {
+        let id = crate::sysload::relief_status::TreeId {
+            pid,
+            start_us,
+            since_ms,
+        };
+        crate::sysload::relief_status::request_pause("health", id).map_err(|error| {
+            CommandError::from(format!("the pause request was not written: {error}"))
+        })
+    })
+    .await
+}
+
 /// The host-load kill switch, as stored.
 #[tauri::command(async)]
 pub async fn cmd_host_load_settings() -> Result<crate::tool_config::HostLoadSettings, IpcError> {

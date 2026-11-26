@@ -451,7 +451,7 @@
   }
   function trust(run: TaskRun) {
     return act(run, { label: "Trusting", mutates: true }, async () => {
-      if (!(await trustAttemptCheckout(run))) say(run.id, "note", `${run.cwd} is not open in GitPulse. Show terminal opens it and asks.`);
+      if (!(await trustAttemptCheckout(run))) say(run.id, "note", `${run.cwd} is not open in Waylode. Show terminal opens it and asks.`);
     });
   }
   function showSession(run: TaskRun, record: TerminalSessionRecord) {
@@ -695,7 +695,7 @@
         <button class="gp-btn" data-size="sm" type="button" onclick={() => merge(run)} disabled={!mayMutate} data-testid="agent-merge" title="Merges this run's branch into the main worktree's branch and removes its worktree. You are asked first.">{target ? `Merge into ${target}` : "Merge into main worktree"}</button>
         <button class="gp-btn" data-size="sm" type="button" onclick={() => discard(run)} disabled={!mayMutate} data-testid="agent-discard" title="Removes this run's worktree. You are told how many uncommitted files are lost, and asked first.">Discard worktree</button>
       {/if}
-      {#if canRelease(run)}<button class="gp-btn" data-size="sm" type="button" onclick={() => release(run)} disabled={!mayMutate} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released. The worktree and its changes stay on disk.">Release checkout</button>{/if}
+      {#if canRelease(run)}<button class="gp-btn" data-size="sm" type="button" onclick={() => release(run)} disabled={!mayMutate} title="Frees the checkout if the agent and the Waylode that launched it have both stopped. A running agent is never released. The worktree and its changes stay on disk.">Release checkout</button>{/if}
       {#if run.session_id && run.kind === "managed"}<button class="gp-btn" data-size="sm" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
     </div>
 
@@ -791,7 +791,7 @@
       </button>
       {#if !gate.ok && gate.reason}<span class="meta gate">{gate.reason}</span>{/if}
     </div>
-    <p class="meta">The agent starts in the background and you stay on this task; it is listed above with a Show terminal button. An agent with the GitPulse MCP server moves this task to Done — or to Review, saying what remains — when it finishes. Its process ending never does.</p>
+    <p class="meta">The agent starts in the background and you stay on this task; it is listed above with a Show terminal button. An agent with the Waylode MCP server moves this task to Done — or to Review, saying what remains — when it finishes. Its process ending never does.</p>
   </div>
 
   <div class="history-heading">

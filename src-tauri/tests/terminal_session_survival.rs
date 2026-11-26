@@ -11,16 +11,16 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{
-    acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
-    session_transcript, spawn_session, KillOrigin, OutputSink, TerminalSessions, TranscriptRead,
-    RING_BYTES,
-};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{
+    acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
+    session_transcript, spawn_session, KillOrigin, OutputSink, TerminalSessions, TranscriptRead,
+    RING_BYTES,
+};
 
 mod common;
 
@@ -36,14 +36,14 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("PTY test cleanup incomplete: {error}");
         }
     }
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -76,7 +76,7 @@ struct View {
 impl View {
     fn new(stall: Duration) -> Self {
         let app = tauri::test::mock_builder()
-            .build(gitpulse_lib::context())
+            .build(waylode_lib::context())
             .unwrap();
         let state = common::terminals();
         state.set_output_stall_timeout(stall);
@@ -171,7 +171,7 @@ impl View {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), script]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(self.app.handle()),
+            waylode_lib::terminal::OutputSink::events(self.app.handle()),
         )
         .unwrap();
         (session.id, read_pid(&pidfile, Duration::from_secs(5)))
@@ -322,7 +322,7 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
         &id,
         30,
         100,
-        gitpulse_lib::terminal::OutputSink::events(view.app.handle()),
+        waylode_lib::terminal::OutputSink::events(view.app.handle()),
     )
     .unwrap();
     assert!(wait_until(Duration::from_secs(5), || view
@@ -368,7 +368,7 @@ fn stalls_detaches_and_attaches_under_load_never_end_a_session() {
                     id,
                     24,
                     80 + round as u16,
-                    gitpulse_lib::terminal::OutputSink::events(view.app.handle()),
+                    waylode_lib::terminal::OutputSink::events(view.app.handle()),
                 )
                 .unwrap();
             }
@@ -381,7 +381,7 @@ fn stalls_detaches_and_attaches_under_load_never_end_a_session() {
     for (_, pid) in &sessions {
         assert!(alive(*pid));
     }
-    gitpulse_lib::terminal::shutdown_sessions(&view.state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&view.state).unwrap();
     for (_, pid) in &sessions {
         assert!(wait_until(Duration::from_secs(2), || !alive(*pid)));
     }

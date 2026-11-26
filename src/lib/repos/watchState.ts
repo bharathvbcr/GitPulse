@@ -113,14 +113,14 @@ export function describeWatch(state: WatchState): string {
     case "parked":
       return (
         "Live updates are paused for this repository: more repositories are open " +
-        "than GitPulse watches at once, and it was used least recently. Opening it " +
+        "than Waylode watches at once, and it was used least recently. Opening it " +
         "reads it in full and resumes live updates."
       );
     case "degraded":
       return (
-        `GitPulse is not receiving live filesystem updates for this repository` +
+        `Waylode is not receiving live filesystem updates for this repository` +
         (state.reason ? ` (${state.reason})` : "") +
-        `. It is refreshing on a timer instead, so changes made outside GitPulse ` +
+        `. It is refreshing on a timer instead, so changes made outside Waylode ` +
         `may take a few seconds to appear.`
       );
   }

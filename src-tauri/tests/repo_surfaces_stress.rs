@@ -6,16 +6,16 @@
 //! addressed by a position that shifts whenever anyone touches it — so it is
 //! the surface where a race does not merely fail, it destroys the wrong work.
 
-use gitpulse_lib::engine::stash::{self, StashAction};
-use gitpulse_lib::engine::submodules::{self, SubmoduleChange};
-use gitpulse_lib::engine::{remotes, RemoteChange};
-use gitpulse_lib::ipc_error::CommandError;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::engine::stash::{self, StashAction};
+use waylode_lib::engine::submodules::{self, SubmoduleChange};
+use waylode_lib::engine::{remotes, RemoteChange};
+use waylode_lib::ipc_error::CommandError;
+use waylode_lib::procguard::LockedSpawn;
 
 fn run_git(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -39,7 +39,7 @@ fn init_repo() -> TempDir {
     // contention, not the production spawn rate. Every test starts here and
     // the suite shares one process gate, so a parallel run otherwise spends
     // the burst and defers git mid-listing.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().expect("tempdir");
     run_git(dir.path(), &["init", "-b", "main"]);
     run_git(dir.path(), &["config", "user.email", "t@example.com"]);

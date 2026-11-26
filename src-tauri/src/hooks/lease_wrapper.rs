@@ -46,26 +46,19 @@ use crate::sysload::lease::{
 use crate::sysload::Clock;
 use crate::tool_config::LeaseMode;
 
-/// The subcommand: `gitpulse-hook lease -- cargo build`.
+/// The subcommand: `waylode-hook lease -- cargo build`.
 pub const SUBCOMMAND: &str = "lease";
 
-/// Set to the slot number for everything a leased build starts, so a nested
-/// `cargo` passes straight through instead of waiting on its own parent.
-pub const HELD_ENV: &str = "GITPULSE_LEASE_HELD";
-
-/// The shell shim's own "already gated" marker (`~/.claude-bin/cargo`).
-pub const SHIM_HELD_ENV: &str = "CARGO_SLOT_HELD";
-
-/// Set on the sessions GitPulse launches to the folder of `cargo` / `go`
-/// links, which their PATH starts with.
-pub const BIN_ENV: &str = "GITPULSE_LEASE_BIN";
+pub use super::lease_env::{BIN_ENV, HELD_ENV, LEGACY_BIN_ENV, LEGACY_HELD_ENV, SHIM_HELD_ENV};
 
 /// Test seams: the polling and announcing intervals, in milliseconds (clamped
 /// to a sane range). Real runs set neither. The directory and the program are
 /// found from `HOME` and `PATH`, which a test controls too, so they have no
 /// seam of their own.
-pub const POLL_ENV: &str = "GITPULSE_LEASE_POLL_MS";
-pub const ANNOUNCE_ENV: &str = "GITPULSE_LEASE_ANNOUNCE_MS";
+pub const POLL_ENV: &str = "WAYLODE_LEASE_POLL_MS";
+pub const LEGACY_POLL_ENV: &str = "GITPULSE_LEASE_POLL_MS";
+pub const ANNOUNCE_ENV: &str = "WAYLODE_LEASE_ANNOUNCE_MS";
+pub const LEGACY_ANNOUNCE_ENV: &str = "GITPULSE_LEASE_ANNOUNCE_MS";
 
 /// Programs the wrapper is installed in front of.
 pub const PROGRAMS: [&str; 2] = ["cargo", "go"];
@@ -413,9 +406,10 @@ pub fn resolve_program(
         }
         let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
         let is_wrapper = Some(&canonical) == own.as_ref()
-            || canonical
-                .file_name()
-                .is_some_and(|f| f.to_string_lossy().starts_with("gitpulse-hook"));
+            || canonical.file_name().is_some_and(|f| {
+                let s = f.to_string_lossy();
+                s.starts_with("waylode-hook") || s.starts_with("gitpulse-hook")
+            });
         if is_wrapper {
             continue;
         }
@@ -540,9 +534,8 @@ impl Ports for LivePorts {
     }
 }
 
-fn env_ms(name: &str, default: Duration, min: u64, max: u64) -> Duration {
-    std::env::var(name)
-        .ok()
+fn env_ms(primary: &str, legacy: &str, default: Duration, min: u64, max: u64) -> Duration {
+    crate::env_compat::var_compat(primary, legacy)
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(default, |ms| Duration::from_millis(ms.clamp(min, max)))
 }
@@ -558,8 +551,14 @@ fn template(label: String) -> LeaseRecord {
         .map(|f| f.ppid)
         .and_then(|ppid| crate::sysload::procscan::probe_one(ppid).map(|p| (p.pid, p.start_us)))
         .unwrap_or((0, 0));
-    let terminal = std::env::var(crate::terminal::TERMINAL_SESSION_ENV).ok();
-    let run = std::env::var(crate::sysload::RUN_ID_ENV).ok();
+    let terminal = crate::env_compat::var_compat(
+        crate::terminal::TERMINAL_SESSION_ENV,
+        crate::terminal::LEGACY_TERMINAL_SESSION_ENV,
+    );
+    let run = crate::env_compat::var_compat(
+        crate::sysload::RUN_ID_ENV,
+        crate::sysload::LEGACY_RUN_ID_ENV,
+    );
     let ancestor = (terminal.is_none() && run.is_none())
         .then(|| agent_ancestor(me))
         .flatten();
@@ -640,14 +639,14 @@ fn run(program: &str, args: &[OsString]) -> i32 {
     if let Some(config) = &config {
         skip.push(lease::bin_dir(config));
     }
-    if let Some(bin) = std::env::var_os(BIN_ENV) {
+    if let Some(bin) = crate::env_compat::var_os_compat(BIN_ENV, LEGACY_BIN_ENV) {
         skip.push(PathBuf::from(bin));
     }
     let real =
         std::env::var_os("PATH").and_then(|path| resolve_program(program, &path, &skip, &own_exe));
     let Some(real) = real else {
         say_stderr(&format!(
-            "gitpulse-hook lease: no {program} found on PATH (past GitPulse's own link); nothing was run"
+            "waylode-hook lease: no {program} found on PATH (past Waylode's own link); nothing was run"
         ));
         return 127;
     };
@@ -660,7 +659,8 @@ fn run(program: &str, args: &[OsString]) -> i32 {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let nested = std::env::var_os(HELD_ENV).is_some() || std::env::var_os(SHIM_HELD_ENV).is_some();
+    let nested = crate::env_compat::var_os_compat(HELD_ENV, LEGACY_HELD_ENV).is_some()
+        || std::env::var_os(SHIM_HELD_ENV).is_some();
     let booked = std::env::var_os("MAC_HEAVY_LABEL").is_some_and(|v| !v.is_empty());
     let settings = crate::tool_config::host_load_leases();
     let is_leased = leased(program, &words);
@@ -686,8 +686,14 @@ fn run(program: &str, args: &[OsString]) -> i32 {
         slots: settings.slots,
         wait_max: Duration::from_secs(settings.wait_max_s),
         wait_hard: Duration::from_secs(settings.wait_hard_s),
-        poll: env_ms(POLL_ENV, Duration::from_secs(2), 5, 10_000),
-        announce: env_ms(ANNOUNCE_ENV, Duration::from_secs(30), 5, 3_600_000),
+        poll: env_ms(POLL_ENV, LEGACY_POLL_ENV, Duration::from_secs(2), 5, 10_000),
+        announce: env_ms(
+            ANNOUNCE_ENV,
+            LEGACY_ANNOUNCE_ENV,
+            Duration::from_secs(30),
+            5,
+            3_600_000,
+        ),
     };
     let mut ports = LivePorts {
         cwd: tpl.cwd.clone(),
@@ -761,13 +767,14 @@ fn run(program: &str, args: &[OsString]) -> i32 {
     let slot = grant
         .as_ref()
         .map_or_else(|| "overflow".to_string(), |g| g.slot.to_string());
-    set.push((HELD_ENV, slot));
+    set.push((HELD_ENV, slot.clone()));
+    set.push((LEGACY_HELD_ENV, slot));
     if let Some(grant) = &grant {
         if let Err(error) = grant.keep_for_exec() {
             // The descriptor would close at exec and take the lock with it:
             // the build would run holding nothing. Say so.
             say_stderr(&format!(
-                "gitpulse: did NOT keep the build slot across exec ({error}); this build runs without holding one"
+                "waylode: did NOT keep the build slot across exec ({error}); this build runs without holding one"
             ));
         }
     }
@@ -778,7 +785,7 @@ fn run(program: &str, args: &[OsString]) -> i32 {
 
 fn finish(error: std::io::Error, real: &Path) -> i32 {
     say_stderr(&format!(
-        "gitpulse-hook lease: could not run {}: {error}",
+        "waylode-hook lease: could not run {}: {error}",
         real.display()
     ));
     if error.kind() == std::io::ErrorKind::NotFound {
@@ -966,7 +973,7 @@ pub fn route_session(
     let bin = lease::bin_dir(config);
     if let Some(problem) = lease::links_problem(&bin, None) {
         return Route::Skipped(format!(
-            "the cargo and go links in {} do not work ({problem}): GitPulse has not made them, or they are stale (is the app running, and is gitpulse-hook beside it?)",
+            "the cargo and go links in {} do not work ({problem}): Waylode has not made them, or they are stale (is the app running, and is waylode-hook beside it?)",
             bin.display()
         ));
     }

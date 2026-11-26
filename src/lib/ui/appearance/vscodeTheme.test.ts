@@ -124,7 +124,7 @@ describe("clearHueFromAccent", () => {
 });
 
 describe("importVsCodeThemeText", () => {
-  it("converts a JSONC VS Code theme into a contrast-safe gitpulse-theme/1 palette", () => {
+  it("converts a JSONC VS Code theme into a contrast-safe waylode-theme/1 palette", () => {
     const jsonc = `{
       // VS Code dark theme
       "name": "Midnight Sky (url(x) clean?)",
@@ -142,7 +142,7 @@ describe("importVsCodeThemeText", () => {
     const result = importThemeText(jsonc);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.theme.schema).toBe("gitpulse-theme/1");
+    expect(result.theme.schema).toBe("waylode-theme/1");
     expect(result.theme.appearance).toBe("dark");
     expect(result.theme.colors.base).toBe("#121622");
 

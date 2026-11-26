@@ -200,7 +200,7 @@ describe("dispatchNativeMenu", () => {
 
 describe("repoWindowTitle", () => {
   it("formats repo and branch for Mission Control / the Window menu", () => {
-    expect(repoWindowTitle(null, null)).toBe("GitPulse");
+    expect(repoWindowTitle(null, null)).toBe("Waylode");
     expect(repoWindowTitle("/Users/acme/gitpulse", "main")).toBe(
       "gitpulse — main",
     );

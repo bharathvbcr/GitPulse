@@ -23,17 +23,17 @@
 // integration tests here use, and keeps the two from drifting apart again.
 #![cfg(unix)]
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
 
-use gitpulse_lib::devmap;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+use waylode_lib::devmap;
 
 fn git(repo: &Path, args: &[&str]) {
     // `devmap` reaches the library's git gate in this process.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)

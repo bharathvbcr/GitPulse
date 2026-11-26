@@ -23,9 +23,11 @@ use std::path::PathBuf;
 pub use proto::PROTOCOL;
 
 /// The host's executable, found beside the app's own (`Contents/MacOS`).
-pub const BINARY: &str = "gitpulse-ptyd";
+pub const BINARY: &str = "waylode-ptyd";
 /// An explicit path to the host executable, for development builds and tests.
-pub const BINARY_ENV: &str = "GITPULSE_PTYD";
+pub const BINARY_ENV: &str = "WAYLODE_PTYD";
+/// Legacy environment variable for [`BINARY_ENV`].
+pub const LEGACY_BINARY_ENV: &str = "GITPULSE_PTYD";
 /// Where receipts live inside the host directory.
 const RECEIPTS_DIR: &str = "receipts";
 /// Where each session's saved output lives inside the host directory.

@@ -83,11 +83,11 @@ fn only_the_app_starts_the_sampler() {
 fn no_shipped_binary_but_the_app_reaches_the_sampler() {
     for bin in common::shipped_binaries() {
         let source = std::fs::read_to_string(crate_dir().join(&bin)).unwrap();
-        let reaches_run = source.contains("gitpulse_lib::run()");
+        let reaches_run = source.contains("waylode_lib::run()");
         assert_eq!(
             reaches_run,
             bin == "src/main.rs",
-            "{bin}: only the app binary may call gitpulse_lib::run(), which starts the sampler"
+            "{bin}: only the app binary may call waylode_lib::run(), which starts the sampler"
         );
         assert!(
             !source.contains("sysload::start"),

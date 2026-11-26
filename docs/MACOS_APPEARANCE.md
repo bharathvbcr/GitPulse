@@ -1,6 +1,6 @@
 # macOS appearance
 
-GitPulse automatically applies a Mac appearance profile through `isMacOS()`
+Waylode automatically applies a Mac appearance profile through `isMacOS()`
 and the `html.macos` class. iPhones, iPads, and desktop-mode iPads are excluded.
 Windows and Linux keep the standard appearance and transition timings.
 
@@ -316,7 +316,7 @@ to Diagnostics (source `native-rendering`).
   no dependency was added). `NSGlassEffectView` is a public AppKit class in the
   macOS 26 SDK headers, so this is not private API; the only private piece in the
   window path is Tauri's `macos-private-api`, already on for the transparent
-  window. The wrapper swallows its result, so GitPulse gates on
+  window. The wrapper swallows its result, so Waylode gates on
   `NSAppKitVersionNumber >= 2685` (the number the library gates on) before
   calling, and afterwards reads the content view for the glass view's tag.
   Only that observation reports "In effect". Below macOS 26, or if the view is
@@ -334,7 +334,7 @@ to Diagnostics (source `native-rendering`).
   switching the feature at run time reports it changed while the running page
   stays at 60 Hz (and a page already at 120 Hz stays there), and a launch with
   the preference on runs at about 120 Hz. So a 120 Hz change takes effect the
-  next time GitPulse starts, and the row says so. Boot always sends one request,
+  next time Waylode starts, and the row says so. Boot always sends one request,
   even with both switches off, so the feature is put back to WebKit's default.
 - **Measured** (`tmp/overhaul/G`, real debug app window, fresh launch per arm,
   counterbalanced A B C D D C B A A B C D; A = both off, B = 120 Hz, C = glass,

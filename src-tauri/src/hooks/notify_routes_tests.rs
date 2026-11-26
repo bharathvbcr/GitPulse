@@ -31,15 +31,13 @@ fn table() -> Vec<(String, String, String, bool)> {
 }
 
 fn manifest() -> Value {
-    serde_json::from_str(include_str!("../../../plugins/gitpulse/hooks/hooks.json"))
+    serde_json::from_str(include_str!("../../../plugins/waylode/hooks/hooks.json"))
         .expect("hooks.json is JSON")
 }
 
 fn injected() -> Value {
-    crate::workbench::claude_hook::settings_hooks(std::path::Path::new(
-        "/opt/gitpulse/gitpulse-hook",
-    ))
-    .expect("the injected settings build")
+    crate::workbench::claude_hook::settings_hooks(std::path::Path::new("/opt/waylode/waylode-hook"))
+        .expect("the injected settings build")
 }
 
 /// The command line a handler runs: its `command` in shell form, and the
@@ -257,7 +255,7 @@ fn the_routed_names_and_events_must_match_in_both_directions() {
     let mut copy = manifest()["hooks"].clone();
     copy["Notification"].as_array_mut().unwrap().push(json!({
         "matcher": "made_up",
-        "hooks": [{"type": "command", "command": "gitpulse-hook notify made_up", "timeout": 5}]
+        "hooks": [{"type": "command", "command": "waylode-hook notify made_up", "timeout": 5}]
     }));
     let found = problems(&copy, &routes, true);
     assert_eq!(found, vec!["a route reports made_up, which EVENTS lacks"]);

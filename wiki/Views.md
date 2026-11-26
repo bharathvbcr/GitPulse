@@ -1,6 +1,6 @@
 # Views
 
-GitPulse has **five views**: Work, Mavi, Code, History and Insights. Each holds sections (lenses) on one subject. Tasks, Fleet, the Agents plane and the terminal dock are workspace surfaces outside those four views.
+Waylode has **five views**: Work, Mavi, Code, History and Insights. Each holds sections (lenses) on one subject. Tasks, Fleet, the Agents plane and the terminal dock are workspace surfaces outside those four views.
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them. Work → Overview's cleanup and policy activity, Remote's issue import and release publishing, and Tasks go through Manvi; Code → Map uses DevCouncil's `devmap` module.
 
@@ -72,7 +72,7 @@ The Tasks button beside Fleet opens global and saved-workspace scopes over the s
 
 ### Agents plane (`Command/Ctrl+Shift+A`)
 
-The agent checkouts, terminals and task attempts your open repositories are holding, drawn as one tree: a terminal that continues an attempt, and a child session, nest under their parent. It also holds the agent inbox. Live sessions that GitPulse did not launch are detected from the process table and reported by `gitpulse_sessions` and `gitpulse_insights`, and Work → Overview shows them against their worktree. See the [agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md).
+The agent checkouts, terminals and task attempts your open repositories are holding, drawn as one tree: a terminal that continues an attempt, and a child session, nest under their parent. It also holds the agent inbox. Live sessions that Waylode did not launch are detected from the process table and reported by `gitpulse_sessions` and `gitpulse_insights`, and Work → Overview shows them against their worktree. See the [agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md).
 
 ### Fleet (`Command/Ctrl+Shift+F`)
 

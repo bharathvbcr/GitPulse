@@ -12,24 +12,24 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::sysload::{
-    Binding, Clock, PublishedVerdict, Reading, Snapshot, SnapshotWriter, Tier, WriterIdentity,
-    SNAPSHOT_FILE_NAME,
-};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::sysload::{
+    Binding, Clock, PublishedVerdict, Reading, Snapshot, SnapshotWriter, Tier, WriterIdentity,
+    SNAPSHOT_FILE_NAME,
+};
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 const SESSION: &str = "7b1f5c2e-1111-4222-8333-944455556666";
 
 /// Where `tool_config::default_config_dir` puts the snapshot for this `HOME`.
 fn config_dir(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/GitPulse")
+        home.join("Library/Application Support/Waylode")
     } else {
-        home.join(".config").join("gitpulse")
+        home.join(".config").join("waylode")
     }
 }
 
@@ -111,7 +111,7 @@ impl World {
         .to_string();
         let mut child = Command::new(HOOK)
             .arg("command-gate")
-            .env(gitpulse_lib::logging::LOG_DIR_ENV, &self.logs)
+            .env(waylode_lib::logging::LOG_DIR_ENV, &self.logs)
             .env("HOME", &self.home)
             .env("TMPDIR", &self.tmp)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
@@ -239,9 +239,7 @@ fn no_snapshot_or_no_verdict_is_said_never_refused_and_never_silent() {
         .unwrap()
         .contains("did NOT load-check"));
     // A writer that carries no verdict (an older GitPulse).
-    world.publish(Reading::Unavailable(
-        gitpulse_lib::sysload::Why::Unsupported,
-    ));
+    world.publish(Reading::Unavailable(waylode_lib::sysload::Why::Unsupported));
     let (_, out) = world.ask("cargo test", "default", "toolu_2");
     let out = parsed(&out);
     assert!(
@@ -317,7 +315,7 @@ fn the_session_brief_carries_one_load_line_read_from_the_snapshot() {
     .to_string();
     let mut child = Command::new(HOOK)
         .arg("session-brief")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, &world.logs)
+        .env(waylode_lib::logging::LOG_DIR_ENV, &world.logs)
         .env("HOME", &world.home)
         .env("TMPDIR", &world.tmp)
         .env("XDG_CONFIG_HOME", world.home.join(".config"))
@@ -431,7 +429,7 @@ fn a_heavy_command_with_all_slots_held_is_told_it_will_queue() {
 fn session_brief_writes_lease_path_to_claude_env_file() {
     let world = World::new();
     let config = config_dir(&world.home);
-    gitpulse_lib::sysload::lease::ensure_links(&config, Path::new(HOOK)).unwrap();
+    waylode_lib::sysload::lease::ensure_links(&config, Path::new(HOOK)).unwrap();
     let repo = world.home.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     assert!(Command::new("git")
@@ -450,7 +448,7 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
     .to_string();
     let mut child = Command::new(HOOK)
         .arg("session-brief")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, &world.logs)
+        .env(waylode_lib::logging::LOG_DIR_ENV, &world.logs)
         .env("HOME", &world.home)
         .env("TMPDIR", &world.tmp)
         .env("XDG_CONFIG_HOME", world.home.join(".config"))

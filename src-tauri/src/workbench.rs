@@ -1277,7 +1277,7 @@ fn upgrade_owned_profile(store: &Store, profile: &Path) -> Result<(), WorkbenchE
 
 /// What a person is told when Manvi's worker refuses because the profile has
 /// not been upgraded: the host owns that step, so the way out is to let it.
-const SCHEMA_UPGRADE_REQUIRED: &str = "The task profile is on an older schema and Manvi's worker does not upgrade a shared profile. GitPulse upgrades it, after a backup, the first time it opens the profile: restart GitPulse, and see Diagnostics if it reports the upgrade failed.";
+const SCHEMA_UPGRADE_REQUIRED: &str = "The task profile is on an older schema and Manvi's worker does not upgrade a shared profile. Waylode upgrades it, after a backup, the first time it opens the profile: restart Waylode, and see Diagnostics if it reports the upgrade failed.";
 
 fn worker_error(profile: &Path, error: crate::harness::HarnessError) -> WorkbenchError {
     match error {

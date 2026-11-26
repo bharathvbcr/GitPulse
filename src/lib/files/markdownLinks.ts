@@ -37,7 +37,7 @@ export interface MarkdownNote {
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
 const REFUSED_SCHEME =
-  "GitPulse opens http, https and mailto links, and files inside this repository.";
+  "Waylode opens http, https and mailto links, and files inside this repository.";
 
 /**
  * Decides what activating `href` in a rendered note may do.
@@ -50,7 +50,7 @@ const REFUSED_SCHEME =
  */
 export function resolveMarkdownLink(href: string, note: MarkdownNote | null): MarkdownLinkAction {
   const raw = href.trim();
-  if (!raw || raw === "#") return { kind: "refused", reason: "This link has no destination GitPulse can open." };
+  if (!raw || raw === "#") return { kind: "refused", reason: "This link has no destination Waylode can open." };
   if (raw.length > MAX_URL_LENGTH) return { kind: "refused", reason: "This link is too long to open." };
   if (raw.startsWith("#")) {
     const id = decode(raw.slice(1));
@@ -72,13 +72,13 @@ export function resolveMarkdownLink(href: string, note: MarkdownNote | null): Ma
     // `?query` or `?q#frag` on the note itself.
     return fragment ? { kind: "fragment", id: fragment } : { kind: "refused", reason: "This link names no file." };
   }
-  if (decoded.endsWith("/")) return { kind: "refused", reason: `${decoded} is a folder; GitPulse opens files.` };
+  if (decoded.endsWith("/")) return { kind: "refused", reason: `${decoded} is a folder; Waylode opens files.` };
 
   const folder = note.path.includes("/") ? note.path.slice(0, note.path.lastIndexOf("/")) : "";
   const target = decoded.startsWith("/") ? decoded.slice(1) : folder ? `${folder}/${decoded}` : decoded;
   const resolved = resolveRepoFile(note.repoPath, { path: target, line: null, column: null });
   if (!resolved) {
-    return { kind: "refused", reason: `${decoded} is outside this repository — GitPulse only opens files inside it.` };
+    return { kind: "refused", reason: `${decoded} is outside this repository — Waylode only opens files inside it.` };
   }
   return { kind: "file", path: resolved.path, fragment };
 }

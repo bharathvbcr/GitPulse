@@ -8,10 +8,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 
 const SURFACE_TOOLS: [&str; 4] = [
-    "gitpulse_status",
-    "gitpulse_insights",
-    "gitpulse_ledger_events",
-    "gitpulse_change_context",
+    "waylode_status",
+    "waylode_insights",
+    "waylode_ledger_events",
+    "waylode_change_context",
 ];
 
 fn trusted_repo() -> (tempfile::TempDir, String) {
@@ -121,7 +121,7 @@ fn adv_every_surface_validates_against_its_declared_output_schema() {
 fn adv_a_served_insights_document_meets_the_schema_that_declares_served_by() {
     let (_dir, repo) = trusted_repo();
     let document = resources::served_document(&crate::insights::snapshot(&repo), 1234);
-    let schema = schema_of("gitpulse_insights");
+    let schema = schema_of("waylode_insights");
     assert_eq!(
         schema["properties"]["served_by"]["properties"]["source"]["enum"],
         json!(["app"]),
@@ -145,7 +145,7 @@ fn adv_a_served_insights_document_meets_the_schema_that_declares_served_by() {
     );
     let described = tools()
         .into_iter()
-        .find(|tool| tool["name"] == "gitpulse_insights")
+        .find(|tool| tool["name"] == "waylode_insights")
         .expect("tool")["description"]
         .as_str()
         .unwrap_or_default()
@@ -169,7 +169,7 @@ fn adv_new_fields_are_declared_in_the_manifest_tool_schemas() {
             .unwrap_or_else(|| panic!("{name} missing from the manifest"))
             .clone()
     };
-    let events = &find("gitpulse_ledger_events")["outputSchema"]["properties"];
+    let events = &find("waylode_ledger_events")["outputSchema"]["properties"];
     for field in [
         "as_of",
         "last_catch_up",
@@ -191,7 +191,7 @@ fn adv_new_fields_are_declared_in_the_manifest_tool_schemas() {
             "ledger_events schema lacks {field}"
         );
     }
-    for tool in ["gitpulse_status", "gitpulse_insights"] {
+    for tool in ["waylode_status", "waylode_insights"] {
         let ledger = &find(tool)["outputSchema"]["properties"]["ledger"]["properties"];
         for field in [
             "stale",
@@ -206,7 +206,7 @@ fn adv_new_fields_are_declared_in_the_manifest_tool_schemas() {
             );
         }
     }
-    let ctx = &find("gitpulse_change_context")["outputSchema"]["properties"];
+    let ctx = &find("waylode_change_context")["outputSchema"]["properties"];
     assert!(ctx["ledger_freshness"]["properties"]["stale"].is_object());
 }
 
@@ -227,7 +227,7 @@ fn adv_a_budget_cut_page_keeps_its_freshness_and_stays_in_budget() {
         .expect("row");
     }
     let payload = handle_tool_call(
-        "gitpulse_ledger_events",
+        "waylode_ledger_events",
         &json!({ "repo_path": repo, "limit": 300 }),
     )
     .expect("page");
@@ -327,7 +327,7 @@ fn adv_every_mcp_read_path_on_a_read_only_ledger_never_writes_and_never_hangs() 
             Err(_) => report.push(format!("{tool}: PANIC")),
             Ok(Err(e)) => report.push(format!("{tool}: Err({e}) in {elapsed:?}")),
             Ok(Ok(v)) => {
-                let facet = if tool == "gitpulse_ledger_events" {
+                let facet = if tool == "waylode_ledger_events" {
                     &v
                 } else {
                     &v["ledger"]
@@ -399,7 +399,7 @@ fn adv_every_mcp_read_path_on_a_ledger_locked_by_another_process_is_bounded() {
         match r {
             Err(_) => panics.push(tool),
             Ok(Ok(v)) => {
-                let facet = if tool == "gitpulse_ledger_events" {
+                let facet = if tool == "waylode_ledger_events" {
                     &v
                 } else {
                     &v["ledger"]

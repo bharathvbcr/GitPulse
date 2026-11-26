@@ -155,7 +155,17 @@ describe("host-gated settings", () => {
       expect(unsupported.has(id)).toBe(true);
     }
     // Everything else in Appearance is portable CSS and stays.
-    for (const id of ["theme", "accent", "density", "corner-style", "font-ui", "font-mono", "theme-file"]) {
+    for (const id of [
+      "theme",
+      "appearance.logoStyle",
+      "appearance.logoPalette",
+      "accent",
+      "density",
+      "corner-style",
+      "font-ui",
+      "font-mono",
+      "theme-file",
+    ]) {
       expect(unsupported.has(id)).toBe(false);
     }
   });
@@ -240,5 +250,7 @@ describe("search on a host missing a capability", () => {
 
   it("defaults to gating nothing when no capability set is supplied", () => {
     expect(matchSettings("dock accessory").settings).toContain("hide-dock");
+    expect(matchSettings("logo mark").settings).toContain("appearance.logoStyle");
+    expect(matchSettings("cobalt lodestar oxblood gilded").settings).toContain("appearance.logoPalette");
   });
 });

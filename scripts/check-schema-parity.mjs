@@ -262,7 +262,7 @@ export function schemasAt(devcouncil, rev, run = spawnSync) {
   return out;
 }
 
-export const TOOL_NAMES_READER = "GitPulse devmap tools (vs devmap-serve TOOL_NAMES)";
+export const TOOL_NAMES_READER = "Waylode devmap tools (vs devmap-serve TOOL_NAMES)";
 const UPSTREAM_TOOLS_FILE = "devmap-serve/src/mcp.rs";
 const GITPULSE_TOOLS_FILE = path.join("src-tauri", "src", "mcp", "devmap_parity.rs");
 
@@ -495,7 +495,7 @@ export function contractRow(reader, copy, ownerCheckout) {
 }
 
 /**
- * An installed `gitpulse-mcp`: what its manifest says it reads. A binary from
+ * An installed `waylode-mcp`: what its manifest says it reads. A binary from
  * before the manifest named dc-store and the workbench reports only the store,
  * and is unverifiable for the other two rather than assumed to match.
  *
@@ -519,7 +519,7 @@ async function serverReading(reader, bin, absent, timeoutMs) {
   // A binary built before the manifest named `stackLeaseFormatVersion` is
   // unverifiable for the lease format, never assumed to match.
   return schemas.lease === undefined
-    ? { reader, keys: ALL_KEYS, schemas, note: "the gitpulse-mcp manifest does not name its stack lease format" }
+    ? { reader, keys: ALL_KEYS, schemas, note: "the waylode-mcp manifest does not name its stack lease format" }
     : { reader, keys: ALL_KEYS, schemas };
 }
 
@@ -594,9 +594,9 @@ function checkout(name, override) {
  * @returns {Promise<{ owner: Required<Schemas> | null, ownerError: string | null, devcouncil: string | null, rows: Row[] }>}
  */
 export async function collect({ app, timeoutMs, env = process.env }) {
-  const devcouncil = checkout("DevCouncil", env.GITPULSE_DEVCOUNCIL_ROOT);
+  const devcouncil = checkout("DevCouncil", env.WAYLODE_DEVCOUNCIL_ROOT ?? env.GITPULSE_DEVCOUNCIL_ROOT);
   if (devcouncil === null) {
-    return { owner: null, ownerError: "no DevCouncil checkout (set GITPULSE_DEVCOUNCIL_ROOT)", devcouncil, rows: [] };
+    return { owner: null, ownerError: "no DevCouncil checkout (set WAYLODE_DEVCOUNCIL_ROOT or GITPULSE_DEVCOUNCIL_ROOT)", devcouncil, rows: [] };
   }
   /** @type {Required<Schemas>} */
   let owner;
@@ -610,25 +610,25 @@ export async function collect({ app, timeoutMs, env = process.env }) {
   /** @type {Reading[]} */
   const readings = [];
   try {
-    readings.push({ reader: "GitPulse vendored crates", keys: ALL_KEYS, schemas: schemasInTree(REPO_ROOT, VENDORED_PREFIX) });
+    readings.push({ reader: "Waylode vendored crates", keys: ALL_KEYS, schemas: schemasInTree(REPO_ROOT, VENDORED_PREFIX) });
   } catch (err) {
-    readings.push({ reader: "GitPulse vendored crates", keys: ALL_KEYS, error: err instanceof Error ? err.message : String(err) });
+    readings.push({ reader: "Waylode vendored crates", keys: ALL_KEYS, error: err instanceof Error ? err.message : String(err) });
   }
   readings.push(devmapReading());
   readings.push(dcstoreReading());
   readings.push(await serverReading(`${SERVER_BIN} (PATH)`, resolveOnPath(SERVER_BIN), "not on PATH", timeoutMs));
   readings.push(await serverReading(
-    `GitPulse.app (its bundled ${SERVER_BIN})`,
+    `Waylode.app (its bundled ${SERVER_BIN})`,
     path.join(app, "Contents", "MacOS", SERVER_BIN),
     `no ${app}`,
     timeoutMs,
   ));
-  const manvi = checkout("Manvi", env.GITPULSE_MANVI_ROOT);
+  const manvi = checkout("Manvi", env.WAYLODE_MANVI_ROOT ?? env.GITPULSE_MANVI_ROOT);
   readings.push(pinReading("Manvi pin (scripts/module-pins.txt)", devcouncil, head, manvi, path.join("scripts", "module-pins.txt"), manviPin));
-  readings.push(pinReading("Jarvis pin (upstream.lock.json)", devcouncil, head, checkout("Jarvis", env.GITPULSE_JARVIS_ROOT), "upstream.lock.json", jarvisPin));
+  readings.push(pinReading("Jarvis pin (upstream.lock.json)", devcouncil, head, checkout("Jarvis", env.WAYLODE_JARVIS_ROOT ?? env.GITPULSE_JARVIS_ROOT), "upstream.lock.json", jarvisPin));
 
   const rows = readings.map((reading) => judge(owner, reading));
-  rows.push(contractRow("GitPulse copy of Manvi's serve contract", path.join(REPO_ROOT, SERVE_CONTRACT), manvi));
+  rows.push(contractRow("Waylode copy of Manvi's serve contract", path.join(REPO_ROOT, SERVE_CONTRACT), manvi));
   rows.push(toolNamesRowAt(devcouncil, vendoredDevmapRev()));
   return { owner, ownerError: null, devcouncil, rows };
 }
@@ -638,7 +638,7 @@ export function usage() {
     name: "check-schema-parity",
     summary: "Ask every installed reader which DevCouncil schemas it reads, and compare them with what DevCouncil writes.",
     flags: [
-      { flag: "--app <path>", description: "The GitPulse.app bundle to ask (default /Applications/GitPulse.app)" },
+      { flag: "--app <path>", description: "The Waylode.app bundle to ask (default /Applications/Waylode.app)" },
       { flag: "--timeout <ms>", description: `Per-server handshake budget (default ${DEFAULT_TIMEOUT_MS})` },
       { flag: "--json", description: "Machine-readable result" },
       { flag: "--help, -h", description: "Show this message" },
@@ -652,7 +652,7 @@ export function usage() {
  * @returns {{ app: string, timeoutMs: number, json: boolean } | { error: string }}
  */
 export function parseArgs(argv) {
-  let app = "/Applications/GitPulse.app";
+  let app = "/Applications/Waylode.app";
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   let json = false;
   for (let i = 0; i < argv.length; i++) {

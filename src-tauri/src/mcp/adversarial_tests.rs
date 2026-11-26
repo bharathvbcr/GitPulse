@@ -17,7 +17,7 @@ fn wire_bytes(id: Value, result: Value) -> usize {
         + 1
 }
 
-/// `gitpulse_list_tasks` pages by an opaque offset cursor and says so with
+/// `waylode_list_tasks` pages by an opaque offset cursor and says so with
 /// `has_more`. Cutting its `tasks` for the byte budget must not leave a cursor
 /// that points past the rows that were just dropped.
 #[test]

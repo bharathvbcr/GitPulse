@@ -164,10 +164,10 @@ function formatFailure({ source, failure }: SourcedFailure): string {
  * tell an empty section from one that was cut.
  */
 export function formatFirebaseDiagnostics(input: FirebaseDiagnosticsInput): string {
-  const lines: string[] = ["GitPulse Firebase diagnostics"];
+  const lines: string[] = ["Waylode Firebase diagnostics"];
   if (input.generatedAt !== null) lines.push(`Generated: ${isoTime(input.generatedAt)}`);
   lines.push(
-    `GitPulse: ${input.appVersion}`,
+    `Waylode: ${input.appVersion}`,
     `Repository: ${input.repoPath ?? "none open"}`,
     `Project: ${describeProject(input)}`,
     `Backend: ${input.backendId || "none selected"}`,

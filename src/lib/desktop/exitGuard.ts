@@ -14,7 +14,7 @@ export function waitForGitIdle(activity: Readable<Activity>, timeoutMs = 120_000
     const timer = setTimeout(() => {
       settled = true;
       stop?.();
-      reject(new Error("Git actions are still running. GitPulse will remain open; try quitting when they finish."));
+      reject(new Error("Git actions are still running. Waylode will remain open; try quitting when they finish."));
     }, timeoutMs);
     stop = activity.subscribe((value) => {
       if (gitActionCount(value) !== 0) return;

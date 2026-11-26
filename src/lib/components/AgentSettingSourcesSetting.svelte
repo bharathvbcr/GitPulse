@@ -92,7 +92,7 @@
     {/each}
   </div>
   <p class="text-textMuted text-micro leading-snug mt-1" data-testid="agent-setting-sources-note">
-    Which settings files Claude Code loads when GitPulse starts it in a terminal, for task runs and new Claude tabs alike.
+    Which settings files Claude Code loads when Waylode starts it in a terminal, for task runs and new Claude tabs alike.
     Turning off the repository and local sources stops a repository's own settings from widening an agent's permissions, but also drops that repository's allow-lists and hooks.
     Instructions in CLAUDE.md are read either way. Managed sessions always load your user settings only.
   </p>

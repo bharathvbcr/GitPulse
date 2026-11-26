@@ -478,7 +478,7 @@ fn commit_graph_lock_report(locks: &[PathBuf]) -> String {
 fn commit_graph_lock_remedy(locks: &[PathBuf]) -> String {
     format!(
         "{}. If no git process is running in this repository, delete that file yourself; \
-         GitPulse never removes a commit-graph lock",
+         Waylode never removes a commit-graph lock",
         commit_graph_lock_report(locks)
     )
 }
@@ -1090,7 +1090,7 @@ impl GitWriter {
         }
         if plan.is_empty() {
             return Err(format!(
-                "{path} holds only ignored files or nested repositories; GitPulse does not delete those"
+                "{path} holds only ignored files or nested repositories; Waylode does not delete those"
             ).into());
         }
         gate(&plan)?;
@@ -4016,7 +4016,7 @@ fn unpublished_push_remote(repo: &Path) -> Result<String, CommandError> {
         return Ok(only.clone());
     }
     Err(format!(
-        "This branch has no upstream. GitPulse cannot choose among remotes {} — specify one to push.",
+        "This branch has no upstream. Waylode cannot choose among remotes {} — specify one to push.",
         remotes.join(", ")
     ).into())
 }
@@ -4057,14 +4057,14 @@ fn require_force_if_includes(
                 let (min_major, min_minor, _) = crate::engine::git_cli::MIN_GIT_VERSION;
                 format!(
                     "Force push is refused because this Git ({major}.{minor}.{patch}) is below \
-                     GitPulse's minimum, Git {min_major}.{min_minor}. {} Update Git, then \
-                     restart GitPulse.",
+                     Waylode's minimum, Git {min_major}.{min_minor}. {} Update Git, then \
+                     restart Waylode.",
                     preflight.message.as_deref().unwrap_or_default()
                 )
                 .into()
             }
             _ => "Force push needs `--force-if-includes`, which requires Git 2.30 or newer, and \
-                  this Git is older. Update Git, then restart GitPulse."
+                  this Git is older. Update Git, then restart Waylode."
                 .to_string()
                 .into(),
         });

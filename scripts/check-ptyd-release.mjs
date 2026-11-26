@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * Release-link `gitpulse-ptyd` the way the app bundle builds it, then check
+ * Release-link `waylode-ptyd` the way the app bundle builds it, then check
  * that the terminal host carries none of the app's window runtime.
  *
- * Why it exists: the host shares `gitpulse_lib` with the GUI. Release LTO
+ * Why it exists: the host shares `waylode_lib` with the GUI. Release LTO
  * (`lto = "thin"`, `codegen-units = 1`) once folded the engine's
  * `dyn SessionObserver` calls into the GUI's one implementor,
  * `workbench::terminal_run::RunObserver<Wry>`, inside the copy the host links.
  * The host's own LTO had already dropped the window stack that code needs, so
- * `gitpulse-ptyd` failed to link with 199 undefined `tao`/`wry`/AppKit
+ * `waylode-ptyd` failed to link with 199 undefined `tao`/`wry`/AppKit
  * symbols, while every debug build, test and `ci:local` gate passed. Only a
  * release link of this binary shows it; `terminal::NoObserver` is the fix.
  *
@@ -48,7 +48,7 @@ export function defaultBinaryPath(env = process.env) {
   const targetDir = env.CARGO_TARGET_DIR
     ? path.resolve(REPO_ROOT, env.CARGO_TARGET_DIR)
     : path.join(REPO_ROOT, "src-tauri", "target");
-  return path.join(targetDir, "release", "gitpulse-ptyd");
+  return path.join(targetDir, "release", "waylode-ptyd");
 }
 
 /**
@@ -66,7 +66,7 @@ export function parseArgs(argv) {
     if (arg === "--binary") {
       const next = argv[i + 1];
       if (!next || next.startsWith("-")) {
-        return { ok: false, error: "--binary requires a path to an already-built release gitpulse-ptyd" };
+        return { ok: false, error: "--binary requires a path to an already-built release waylode-ptyd" };
       }
       binary = path.resolve(next);
       i += 1;
@@ -104,7 +104,7 @@ export function forbiddenSymbols(nmOutput) {
 }
 
 /**
- * Inspect an already-built `gitpulse-ptyd` binary with `nm` and verify no
+ * Inspect an already-built `waylode-ptyd` binary with `nm` and verify no
  * app-runtime symbols leaked into it. Fails closed (exit 2) if `nm` fails or
  * lists zero symbols (for example, a fully stripped binary where symbol
  * inspection cannot prove absence).
@@ -144,7 +144,7 @@ export function inspectBinary(binaryPath, runNm) {
   if (offenders.length > 0) {
     return {
       code: 1,
-      message: `FAIL: gitpulse-ptyd carries ${offenders.length} app-runtime symbol(s), e.g. ${offenders.slice(0, 3).join(", ")}`,
+      message: `FAIL: waylode-ptyd carries ${offenders.length} app-runtime symbol(s), e.g. ${offenders.slice(0, 3).join(", ")}`,
       offenders,
     };
   }
@@ -165,9 +165,9 @@ export function main(argv = process.argv.slice(2)) {
   if (parsed.help) {
     console.log(formatUsage({
       name: "check-ptyd-release",
-      summary: "Verify release gitpulse-ptyd links cleanly and carries no app-runtime symbols.",
+      summary: "Verify release waylode-ptyd links cleanly and carries no app-runtime symbols.",
       flags: [
-        { flag: "--binary <path>", description: "inspect an already-built release gitpulse-ptyd binary without rebuilding" },
+        { flag: "--binary <path>", description: "inspect an already-built release waylode-ptyd binary without rebuilding" },
       ],
       exits: "0 clean; 1 link failed or forbidden symbols present; 2 check could not run",
     }));
@@ -183,7 +183,7 @@ export function main(argv = process.argv.slice(2)) {
     // The bundle's own cargo invocation (scripts/tauri.mjs -> tauri build), narrowed to this binary.
     const build = spawnSync(
       "cargo",
-      ["build", "--manifest-path", MANIFEST, "--release", "--locked", "--features", "tauri/custom-protocol", "--bin", "gitpulse-ptyd"],
+      ["build", "--manifest-path", MANIFEST, "--release", "--locked", "--features", "tauri/custom-protocol", "--bin", "waylode-ptyd"],
       { stdio: ["ignore", "inherit", "pipe"], encoding: "utf8", timeout: BUILD_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 },
     );
     if (build.error) {
@@ -195,8 +195,8 @@ export function main(argv = process.argv.slice(2)) {
       const undefinedSymbols = /Undefined symbols/.test(build.stderr ?? "");
       console.error(
         undefinedSymbols
-          ? "FAIL: gitpulse-ptyd does not link in release: undefined symbols (see above)"
-          : `FAIL: the release build of gitpulse-ptyd exited ${build.status}`,
+          ? "FAIL: waylode-ptyd does not link in release: undefined symbols (see above)"
+          : `FAIL: the release build of waylode-ptyd exited ${build.status}`,
       );
       return 1;
     }

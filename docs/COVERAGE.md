@@ -2,7 +2,7 @@
 
 The Coverage page reads local coverage artifacts and shows line hits against
 source files. Select **Claude Code** or **Codex**, then use **Generate coverage**
-(or **Improve coverage** for a measured report). GitPulse opens its terminal dock and creates a
+(or **Improve coverage** for a measured report). Waylode opens its terminal dock and creates a
 new agent session in the selected checkout, supplying the previewed prompt as a
 literal CLI argument. Existing sessions stay open. The agent keeps its configured
 permissions; authentication, approval prompts and execution errors appear in the
@@ -18,7 +18,7 @@ clipped context; prompts are limited to 16,000 UTF-8 bytes.
 The task asks the agent to inspect repository instructions, test configuration and
 CI commands, run real tests, and export per-file, per-line records to paths the
 scanner accepts. HTML reports, summary-only JSON, raw profiling data and Python's
-binary `.coverage` database need an export step. GitPulse reads LCOV, Cobertura,
+binary `.coverage` database need an export step. Waylode reads LCOV, Cobertura,
 Go coverprofiles, Istanbul/NYC JSON, JaCoCo and Clover for their supported language
 families. Prefer the paths shown for the specific repository; monorepo outputs
 must preserve each suite's data and resolve source paths inside the checkout.
@@ -57,7 +57,7 @@ or partial line details remain explicit. Uncheck **Focus on …** to return to t
 repository task. Changing selection updates the focused prompt.
 
 The status strip distinguishes measured, unmeasured, partial and failed scans.
-**Last scanned** is when GitPulse read the report. Artifact generation timestamps
+**Last scanned** is when Waylode read the report. Artifact generation timestamps
 and test outcomes are unavailable to the scanner, so it explicitly shows
 **Artifact age unknown**. A failed rescan retains the previous snapshot with a
 stale label and **Try again** action.
