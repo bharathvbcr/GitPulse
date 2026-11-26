@@ -1034,6 +1034,8 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
 
             // Only the inline refresh of a copied store reports an outcome.
             let mut devmap_refresh: Option<Value> = None;
+            // Why a stacked (zero-copy) lane came out without a shared store.
+            let mut zero_copy_refused: Option<String> = None;
             let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) = if !sparse
                 .is_empty()
             {
@@ -1066,26 +1068,54 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 let path = add_worktree(&repo, target_str, Some(&branch), base.as_deref(), false)
                     .map_err(CommandError::into_message)?;
                 let mut zc_seeded = false;
-                if let Ok(family) = resolve_worktree_family(&repo, &path) {
-                    let selection = CacheSelection::default();
-                    let (_, dev_res) = std::thread::scope(|scope| {
-                        let c = scope.spawn(waylode_lib::engine::process::carry_admission(|| {
-                            if share_cache {
-                                let _ = clone_ignored_caches(
-                                    &family.anchor,
-                                    &family.worktree,
-                                    &selection,
-                                );
+                match resolve_worktree_family(&repo, &path) {
+                    Err(e) => {
+                        zero_copy_refused = Some(format!(
+                            "could not resolve the worktree family: {}",
+                            e.into_message()
+                        ));
+                    }
+                    Ok(family) => {
+                        let selection = CacheSelection::default();
+                        let (_, dev_res) = std::thread::scope(|scope| {
+                            let c =
+                                scope.spawn(waylode_lib::engine::process::carry_admission(|| {
+                                    if share_cache {
+                                        let _ = clone_ignored_caches(
+                                            &family.anchor,
+                                            &family.worktree,
+                                            &selection,
+                                        );
+                                    }
+                                }));
+                            let d =
+                                scope.spawn(waylode_lib::engine::process::carry_admission(|| {
+                                    provision_worktree_devmap_zero_copy(
+                                        &family.anchor,
+                                        &family.worktree,
+                                    )
+                                }));
+                            let _ = c.join();
+                            ((), d.join())
+                        });
+                        // A lane without a shared store is still a usable lane,
+                        // but the caller is told why it got one, not just `false`.
+                        match dev_res {
+                            Ok(Ok(p)) => {
+                                zc_seeded = p.seeded && p.zero_copy_base_ref;
+                                if !zc_seeded {
+                                    zero_copy_refused = Some(format!(
+                                    "the donor store was not shared (seeded: {}, zero-copy base ref: {})",
+                                    p.seeded, p.zero_copy_base_ref
+                                ));
+                                }
                             }
-                        }));
-                        let d = scope.spawn(waylode_lib::engine::process::carry_admission(|| {
-                            provision_worktree_devmap_zero_copy(&family.anchor, &family.worktree)
-                        }));
-                        let _ = c.join();
-                        ((), d.join().ok().and_then(Result::ok))
-                    });
-                    if let Some(p) = dev_res {
-                        zc_seeded = p.seeded && p.zero_copy_base_ref;
+                            Ok(Err(e)) => zero_copy_refused = Some(e.into_message()),
+                            Err(_) => {
+                                zero_copy_refused =
+                                    Some("zero-copy provisioning panicked".to_string());
+                            }
+                        }
                     }
                 }
                 (path, zc_seeded, zc_seeded, None)
@@ -1178,6 +1208,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 "devmap_seeded": devmap_seeded,
                 "devmap_refresh": devmap_refresh,
                 "zero_copy_devmap": zero_copy_devmap,
+                "zero_copy_refused": zero_copy_refused,
                 "sparse_cone": sparse_cone,
                 "lane_claim": lane_claim,
                 "command_output": cmd_out,

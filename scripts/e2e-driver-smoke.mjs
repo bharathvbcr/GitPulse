@@ -25,6 +25,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -80,6 +82,19 @@ export function defaultSeedBinary(platform = process.platform, env = process.env
 }
 
 /**
+ * The `tauri:options.webviewOptions` for a session: on Windows, the isolated
+ * WebView2 profile folder, which tauri-driver forwards to Edge WebDriver as
+ * `ms:edgeOptions.webviewOptions` (the documented way to choose it).
+ *
+ * @param {string} profileRoot
+ * @param {NodeJS.Platform} [platform]
+ * @returns {{ userDataFolder: string } | undefined}
+ */
+export function webviewOptionsFor(profileRoot, platform = process.platform) {
+  return platform === "win32" ? { userDataFolder: path.join(profileRoot, "webview2") } : undefined;
+}
+
+/**
  * Builds an isolated process environment so the E2E run never reads or writes
  * the developer's or runner's real GitPulse config, data, cache, gitconfig, or
  * WebView2 user-data folder.
@@ -106,9 +121,19 @@ export function buildIsolatedEnv(profileRoot, baseEnv, platform = process.platfo
   };
   if (platform === "win32") {
     env.USERPROFILE = home;
-    env.APPDATA = config;
-    env.LOCALAPPDATA = data;
-    env.WEBVIEW2_USER_DATA_FOLDER = path.join(profileRoot, "webview2");
+    // The app resolves its data directory through the known-folder API,
+    // which derives AppData from the profile, not from these variables.
+    // Point both at the folders that lookup would find under the isolated
+    // USERPROFILE (runSmoke creates them), so either route lands on the same
+    // existing directory: a missing one left tauri logging "failed to
+    // resolve the app local data directory: unknown path".
+    env.APPDATA = path.join(home, "AppData", "Roaming");
+    env.LOCALAPPDATA = path.join(home, "AppData", "Local");
+    // The WebView2 profile goes to Edge WebDriver as
+    // webviewOptions.userDataFolder (webviewOptionsFor), never through
+    // WEBVIEW2_USER_DATA_FOLDER: that variable overrides the folder the
+    // driver chose for the app, and session creation then hung for 60 s.
+    delete env.WEBVIEW2_USER_DATA_FOLDER;
   } else {
     env.XDG_CONFIG_HOME = config;
     env.XDG_DATA_HOME = data;
@@ -221,8 +246,8 @@ export class WebDriverClient {
     }
   }
 
-  /** @param {string} application @param {string[]} [args] */
-  async createSession(application, args = []) {
+  /** @param {string} application @param {string[]} [args] @param {{ userDataFolder: string } | undefined} [webviewOptions] */
+  async createSession(application, args = [], webviewOptions = undefined) {
     const result = await this.request(
       "POST",
       "/session",
@@ -232,6 +257,7 @@ export class WebDriverClient {
             "tauri:options": {
               application,
               args,
+              ...(webviewOptions ? { webviewOptions } : {}),
             },
           },
         },
@@ -255,6 +281,39 @@ export class WebDriverClient {
   async executeScript(script, args = [], timeoutMs = 30_000) {
     if (!this.sessionId) throw new Error("No active WebDriver session");
     return this.request("POST", `/session/${this.sessionId}/execute/sync`, { script, args }, timeoutMs);
+  }
+
+  /**
+   * Waits until the webview has left its initial blank document for the app's
+   * own page, and returns `{ href, ready }` for it.
+   *
+   * WebView2 hands the session over while it is still on that initial document
+   * (origin `://`). A script started there is destroyed when the app's page
+   * replaces it, and msedgedriver answers it at once with "script timeout"
+   * (run 45844814075: the probe began at .494, `Page.frameNavigated` to
+   * `http://tauri.localhost/` came at .751, the error at .757). WebKitGTK hands
+   * it over on the app's page already, so this returns on the first look there.
+   *
+   * @param {number} [timeoutMs]
+   * @param {(ms: number) => Promise<void>} [pause]
+   */
+  async waitForAppDocument(timeoutMs = 20_000, pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+    const deadline = Date.now() + timeoutMs;
+    let last = "nothing answered";
+    while (Date.now() < deadline) {
+      try {
+        const state = await this.executeScript("return { href: location.href, ready: document.readyState };", [], 5_000);
+        last = JSON.stringify(state);
+        if (state && typeof state.href === "string" && /^(https?|tauri):/i.test(state.href) && state.ready !== "loading") {
+          return state;
+        }
+      } catch (error) {
+        // A navigation in flight can fail the look itself; the next one sees where it landed.
+        last = error instanceof Error ? error.message : String(error);
+      }
+      await pause(150);
+    }
+    throw new Error(`the app's page did not load in the webview within ${timeoutMs} ms (last: ${last})`);
   }
 
   /** @param {string} script @param {unknown[]} [args] @param {number} [timeoutMs] */
@@ -402,8 +461,29 @@ function commandAvailable(program) {
  */
 export function buildPtyProbeCommand(prefix, suffix, platform = process.platform, env = process.env) {
   if (platform === "win32") {
-    const comspec = (env.COMSPEC || "powershell.exe").toLowerCase();
-    if (comspec.includes("powershell") || comspec.includes("pwsh")) {
+    // The app's own default (`default_shell`): COMSPEC, else PowerShell. Windows
+    // spells it `ComSpec`, and a copied environment object is not
+    // case-insensitive the way `process.env` is, so look it up by any case.
+    const key = Object.keys(env).find((name) => name.toUpperCase() === "COMSPEC");
+    return ptyProbeForShell(prefix, suffix, platform, (key && env[key]) || "powershell.exe");
+  }
+  return ptyProbeForShell(prefix, suffix, platform, "");
+}
+
+/**
+ * [`buildPtyProbeCommand`] for the shell the app reports it started
+ * (`cmd_terminal_spawn`'s `shell`): PowerShell and cmd.exe read different
+ * syntax, and typing the wrong one only prints an error.
+ * @param {string} prefix
+ * @param {string} suffix
+ * @param {NodeJS.Platform} platform
+ * @param {string} shell
+ * @returns {string[]}
+ */
+export function ptyProbeForShell(prefix, suffix, platform, shell) {
+  if (platform === "win32") {
+    const name = shell.toLowerCase();
+    if (name.includes("powershell") || name.includes("pwsh")) {
       return [`Write-Output ("${prefix}" + "${suffix}")\r`];
     }
     return [`set "_gp_m=${suffix}"\r`, `echo ${prefix}%_gp_m%\r`];
@@ -507,6 +587,107 @@ function findOrphanProcesses(marker) {
     .map((line) => line.trim());
 }
 
+/**
+ * The Edge WebDriver, app and WebView2 browser processes on Windows, each as
+ * "pid name parent command-line" with the command line cut at 700 characters,
+ * at most 24 rows. A failed query is reported as such, not as no processes.
+ * @returns {string[]}
+ */
+function windowsAttachProcesses() {
+  // PowerShell 7 (pwsh, on every GitHub Windows image) exposes CommandLine on
+  // Get-Process, which starts far faster than a CIM query: the CIM form ran
+  // past its 15 s bound on a runner and showed nothing.
+  const ps = "Get-Process -Name msedgedriver,gitpulse,msedgewebview2 -ErrorAction SilentlyContinue | Select-Object -First 24 | ForEach-Object { \"$($_.Id) $($_.ProcessName) parent=$($_.Parent.Id) $($_.CommandLine)\" }";
+  const res = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+    encoding: "utf8",
+    timeout: 45_000,
+  });
+  if (res.error) return [`(process query failed: ${res.error.message.slice(0, 300)})`];
+  const rows = String(res.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (line.length > 700 ? `${line.slice(0, 700)}…` : line));
+  // pwsh exits 1 when any named process is absent, even with the error
+  // silenced, so a non-zero status with rows is still an answer. Only one
+  // with nothing printed is reported as the query failing.
+  if (rows.length === 0 && res.status !== 0) {
+    return [`(process query found nothing; exit ${res.status}: ${String(res.stderr ?? "").trim().slice(0, 300)})`];
+  }
+  return rows;
+}
+
+/**
+ * Application event log entries from the last 15 minutes that name gitpulse
+ * (an "Application Error" crash record carries the exception code and the
+ * faulting module), at most 6, each cut at 900 characters.
+ * @returns {string[]}
+ */
+function windowsAppEvents() {
+  const ps =
+    "Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-15)} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'gitpulse' } | Select-Object -First 6 | ForEach-Object { \"$($_.TimeCreated.ToString('s')) $($_.ProviderName) $($_.Id): $($_.Message -replace '\\s+',' ')\" }";
+  const res = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", timeout: 45_000 });
+  if (res.error) return [`(event query failed: ${res.error.message.slice(0, 300)})`];
+  return String(res.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (line.length > 900 ? `${line.slice(0, 900)}…` : line));
+}
+
+/**
+ * A `.cmd` in `dir` that starts `driver` with every argument tauri-driver
+ * gives it plus `--verbose --log-path=<log>`. Returns the wrapper's path.
+ * @param {string} driver
+ * @param {string} dir
+ * @param {string} log
+ * @returns {string}
+ */
+export function windowsLoggingDriver(driver, dir, log) {
+  const wrapper = path.join(dir, "msedgedriver-logged.cmd");
+  writeFileSync(wrapper, `@echo off\r\n"${driver}" %* --verbose "--log-path=${log}"\r\n`);
+  return wrapper;
+}
+
+/**
+ * The last `count` lines of `file`, each cut at 400 characters; a missing or
+ * unreadable file says so.
+ * @param {string} file
+ * @param {number} count
+ * @returns {string[]}
+ */
+function tailFile(file, count) {
+  try {
+    const lines = readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+    return lines.slice(-count).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l));
+  } catch (error) {
+    return [`(${file}: ${error instanceof Error ? error.message : String(error)})`];
+  }
+}
+
+/**
+ * The last 40 lines of each of up to 4 files in `dir`, headed by the file
+ * name. A missing or unreadable directory says so.
+ * @param {string} dir
+ * @returns {string[]}
+ */
+function logTails(dir) {
+  let names;
+  try {
+    names = readdirSync(dir).sort().slice(0, 4);
+  } catch (error) {
+    return [`(${dir}: ${error instanceof Error ? error.message : String(error)})`];
+  }
+  return names.flatMap((name) => {
+    try {
+      const lines = readFileSync(path.join(dir, name), "utf8").split(/\r?\n/).filter(Boolean);
+      return [`--- ${name} (${lines.length} lines, last 40)`, ...lines.slice(-40).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l))];
+    } catch (error) {
+      return [`--- ${name}: ${error instanceof Error ? error.message : String(error)}`];
+    }
+  });
+}
+
 /** @param {SmokeOptions} opts */
 async function runSmoke(opts) {
   if (process.platform === "darwin") {
@@ -551,6 +732,9 @@ async function runSmoke(opts) {
   }
   writeFileSync(path.join(profileRoot, "gitconfig"), "[init]\n\tdefaultBranch = main\n");
   const env = buildIsolatedEnv(profileRoot, process.env);
+  for (const dir of [env.APPDATA, env.LOCALAPPDATA]) {
+    if (process.platform === "win32" && dir) mkdirSync(dir, { recursive: true });
+  }
 
   initFixtureRepo(repoAlpha, "hello.txt", "line 1\nline 2\n", env);
   initFixtureRepo(repoBeta, "beta.txt", "beta repo\n", env);
@@ -560,7 +744,16 @@ async function runSmoke(opts) {
   const nativePort = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   const driverArgs = ["--port", String(port), "--native-port", String(nativePort)];
-  if (opts.nativeDriver) driverArgs.push("--native-driver", opts.nativeDriver);
+  // Edge WebDriver logs only with --verbose --log-path, and tauri-driver passes
+  // it no flags of its own, so on Windows it is started through a wrapper that
+  // adds them. Both sit in the artifacts folder: it is uploaded, and the
+  // shutdown check reads any process naming the work folder as a leak.
+  const edgeDriverLog = path.join(opts.artifactsDir, "msedgedriver.log");
+  const driverForTauri =
+    process.platform === "win32" && opts.nativeDriver
+      ? windowsLoggingDriver(opts.nativeDriver, opts.artifactsDir, edgeDriverLog)
+      : opts.nativeDriver;
+  if (driverForTauri) driverArgs.push("--native-driver", driverForTauri);
 
   let driverStdout = "";
   let driverStderr = "";
@@ -591,11 +784,15 @@ async function runSmoke(opts) {
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
-  /** @type {{ platform: string, display: string, startedAt: string, scenarios: Array<{ name: string, ok: boolean, ms: number, detail?: string }>, screenshots: Array<{ name: string, path: string, bytes: number }> }} */
+  /** @type {{ platform: string, display: string, startedAt: string, ok: boolean, exitCode: number | null, scenarios: Array<{ name: string, ok: boolean, ms: number, detail?: string }>, screenshots: Array<{ name: string, path: string, bytes: number }> }} */
   const summary = {
     platform: process.platform,
     display,
     startedAt: new Date().toISOString(),
+    // The verdict, written last: a run that never finished has `ok: false`,
+    // so a wrapper that loses the exit code (gsudo) can still tell.
+    ok: false,
+    exitCode: null,
     scenarios: [],
     screenshots: [],
   };
@@ -648,7 +845,8 @@ async function runSmoke(opts) {
     );
 
     await step("cold-start", async () => {
-      await client.createSession(opts.binary, [repoAlpha]);
+      await client.createSession(opts.binary, [repoAlpha], webviewOptionsFor(profileRoot));
+      await client.waitForAppDocument();
       const boot = await client.executeAsyncScript(`
         const done = arguments[arguments.length - 1];
         const deadline = Date.now() + 20000;
@@ -763,11 +961,20 @@ async function runSmoke(opts) {
       const suffix = randomUUID().slice(0, 8);
       const marker = `${prefix}${suffix}`;
       const probeLines = buildPtyProbeCommand(prefix, suffix, process.platform, env);
+      // On Windows the page types for the shell the app reports it started.
+      const probeByShell =
+        process.platform === "win32"
+          ? {
+              powershell: ptyProbeForShell(prefix, suffix, "win32", "powershell.exe"),
+              cmd: ptyProbeForShell(prefix, suffix, "win32", "cmd.exe"),
+            }
+          : null;
       const result = await client.executeAsyncScript(
         `
         const repoPath = arguments[0];
         const marker = arguments[1];
-        const probeLines = arguments[2];
+        const defaultProbeLines = arguments[2];
+        const probeByShell = arguments[3];
         const done = arguments[arguments.length - 1];
         (async () => {
           let sessionId = null;
@@ -777,20 +984,36 @@ async function runSmoke(opts) {
             const cbId = window.__TAURI_INTERNALS__.transformCallback((raw) => {
               const msg = raw && typeof raw === "object" && "message" in raw ? raw.message : raw;
               let text = "";
+              // Flow control counts bytes, not decoded characters.
+              let bytes = 0;
               if (msg instanceof ArrayBuffer) {
+                bytes = msg.byteLength;
                 text = decoder.decode(new Uint8Array(msg));
               } else if (ArrayBuffer.isView(msg)) {
+                bytes = msg.byteLength;
                 text = decoder.decode(new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength));
               } else if (Array.isArray(msg)) {
+                bytes = msg.length;
                 text = decoder.decode(Uint8Array.from(msg));
               } else if (typeof msg === "string") {
+                bytes = new TextEncoder().encode(msg).length;
                 text = msg;
               } else if (msg && typeof msg === "object" && typeof msg.data_b64 === "string") {
                 try { text = atob(msg.data_b64); } catch { text = msg.data_b64; }
+                bytes = text.length;
               }
               if (text) collected += text;
-              if (sessionId && text.length > 0) {
-                window.__TAURI_INTERNALS__.invoke("cmd_terminal_ack", { sessionId, bytes: text.length }).catch(() => {});
+              if (sessionId && bytes > 0) {
+                window.__TAURI_INTERNALS__.invoke("cmd_terminal_ack", { sessionId, bytes }).catch(() => {});
+              }
+              // This page stands in for the terminal (xterm.js in the app), so it
+              // answers what a terminal answers. Windows' ConPTY is created with
+              // PSEUDOCONSOLE_INHERIT_CURSOR: it asks for the cursor position
+              // (ESC [ 6 n) and reads no input until the reply arrives.
+              if (sessionId && text.includes("\\x1b[6n")) {
+                window.__TAURI_INTERNALS__
+                  .invoke("cmd_terminal_write", { sessionId, data: "\\x1b[1;1R", binary: false })
+                  .catch(() => {});
               }
             });
             const spawned = await window.__TAURI_INTERNALS__.invoke("cmd_terminal_spawn", {
@@ -800,6 +1023,10 @@ async function runSmoke(opts) {
               onOutput: "__CHANNEL__:" + cbId,
             });
             sessionId = spawned.id;
+            const shellName = String(spawned.shell || "");
+            const probeLines = probeByShell
+              ? (/powershell|pwsh/i.test(shellName) ? probeByShell.powershell : probeByShell.cmd)
+              : defaultProbeLines;
             // Wait briefly for initial shell prompt/banner (cold cmd.exe/PowerShell
             // on Windows can take >400ms before reading ConPTY input).
             const readyDeadline = Date.now() + 3000;
@@ -821,9 +1048,24 @@ async function runSmoke(opts) {
               await new Promise((r) => setTimeout(r, 150));
             }
             const matched = collected.includes(marker);
-            await window.__TAURI_INTERNALS__.invoke("cmd_terminal_kill", { sessionId });
+            // Both outcomes are reported: a Close that fails must not hide
+            // whether the round trip itself worked, nor the other way round.
+            let closeError = null;
+            try {
+              await window.__TAURI_INTERNALS__.invoke("cmd_terminal_kill", { sessionId });
+            } catch (err) {
+              closeError = String(err);
+            }
             if (!matched) {
-              done({ ok: false, error: "PTY output did not contain marker " + marker + "; got " + collected.slice(-300) });
+              done({
+                ok: false,
+                error: "PTY output did not contain marker " + marker + "; got " + JSON.stringify(collected.slice(-300)) +
+                  (closeError ? "; Close then failed too: " + closeError : ""),
+              });
+              return;
+            }
+            if (closeError) {
+              done({ ok: false, error: "the round trip worked, but Close failed: " + closeError });
               return;
             }
             done({ ok: true, sessionId, bytes: collected.length });
@@ -835,7 +1077,7 @@ async function runSmoke(opts) {
           }
         })();
         `,
-        [repoAlpha, marker, probeLines],
+        [repoAlpha, marker, probeLines, probeByShell],
       );
       if (!result?.ok) throw new Error(result?.error ?? "Terminal PTY round-trip failed");
       await snap("03-terminal-pty");
@@ -970,6 +1212,22 @@ async function runSmoke(opts) {
     if (driverStderr.trim()) {
       console.error(`tauri-driver stderr:\n${driverStderr.trim()}`);
     }
+    if (process.platform === "win32") {
+      // Edge WebDriver logs nothing here, so show what it was attaching to:
+      // whether a WebView2 browser process exists, and with which
+      // --remote-debugging-port and --user-data-dir.
+      const rows = windowsAttachProcesses();
+      console.error(`WebView2 attach processes (${rows.length}):\n${rows.join("\n") || "(none)"}`);
+      // The app has been seen gone with its WebView2 children orphaned and no
+      // line on stderr: say whether Windows recorded it crashing, and what
+      // the app's own log files hold.
+      const events = windowsAppEvents();
+      console.error(`Application event log, gitpulse (${events.length}):\n${events.join("\n") || "(none)"}`);
+      console.error(`App log files:\n${logTails(path.join(profileRoot, "logs")).join("\n") || "(none)"}`);
+      if (driverForTauri !== opts.nativeDriver) {
+        console.error(`Edge WebDriver log (last 60 lines):\n${tailFile(edgeDriverLog, 60).join("\n") || "(empty)"}`);
+      }
+    }
     if (error instanceof Error) console.error(`E2E smoke failed: ${error.message}`);
   } finally {
     clearTimeout(overallTimer);
@@ -989,6 +1247,8 @@ async function runSmoke(opts) {
     }
     driverProc.stdout?.destroy();
     driverProc.stderr?.destroy();
+    summary.exitCode = exitCode;
+    summary.ok = exitCode === 0 && summary.scenarios.length > 0 && summary.scenarios.every((s) => s.ok);
     writeFileSync(path.join(opts.artifactsDir, "summary.json"), JSON.stringify(summary, null, 2));
     if (!opts.keepTemp) {
       try {

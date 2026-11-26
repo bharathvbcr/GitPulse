@@ -27,6 +27,78 @@ fn refused(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
 }
 
+/// How long a Windows rename waits for a transient refusal to pass.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_RENAME_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Windows refuses to rename a file another handle has open without delete
+/// sharing: `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32) or
+/// `ERROR_LOCK_VIOLATION` (33). Opening a file only to check it, as
+/// `session_log::rotate_live` does before claiming the live log, is enough to
+/// cause this. POSIX renames an open file without complaint. The refusal ends
+/// when that handle closes.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_transient_windows_refusal(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Run `operation` on a name that a concurrent caller may be renaming, and
+/// on Windows wait out the refusals that race gives (see
+/// [`is_transient_windows_refusal`]) for at most two seconds. Elsewhere it
+/// runs once: POSIX neither refuses a rename because of an open handle nor an
+/// open because of a rename in flight.
+///
+/// The race goes both ways on Windows. A rename is refused while another
+/// handle holds the file without delete sharing, which every `safe_fs` open
+/// does. An open is refused while a rename is in flight, because `std`'s
+/// rename holds the file with `DELETE` access and `safe_fs` opens do not
+/// share delete. [`PinnedDir::rename_child`] runs its rename through this; a
+/// caller that opens a name it then renames, such as
+/// `session_log::rotate_live`, runs that open through it too.
+pub fn through_a_racing_rename<T>(operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    {
+        rename_through_transient_refusals(
+            operation,
+            is_transient_windows_refusal,
+            WINDOWS_RENAME_BUDGET,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let mut operation = operation;
+        operation()
+    }
+}
+
+/// Run `rename`, repeating it while `transient` calls its error one that
+/// passes by itself, for at most `budget`.
+///
+/// A refusal that is not transient, or one still standing when the budget
+/// ends, is returned as the last attempt's error, so a destination that really
+/// is refused fails (only after the wait) and never reads as success. When the
+/// handle that blocked the rename belonged to a racer that then moved the
+/// source away, the retry ends in `NotFound`, which callers already read as
+/// "someone else claimed it".
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rename_through_transient_refusals<T>(
+    mut rename: impl FnMut() -> io::Result<T>,
+    transient: impl Fn(&io::Error) -> bool,
+    budget: std::time::Duration,
+) -> io::Result<T> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut delay = std::time::Duration::from_millis(1);
+    loop {
+        match rename() {
+            Err(error) if transient(&error) && std::time::Instant::now() + delay < deadline => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn check_child_name(name: &OsStr) -> io::Result<()> {
     let mut components = Path::new(name).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -183,7 +255,8 @@ impl PinnedDir {
         }
         #[cfg(windows)]
         {
-            std::fs::rename(self.path.join(from), self.path.join(to))
+            let (from, to) = (self.path.join(from), self.path.join(to));
+            through_a_racing_rename(|| std::fs::rename(&from, &to))
         }
     }
 
@@ -841,6 +914,134 @@ fn open_regular_child(
     }
 }
 
+/// Which file a handle or a path names: the volume and the file's index on it.
+///
+/// Unix reads device and inode. Windows reads the volume serial number and the
+/// 128-bit file id (`FILE_ID_INFO`); a volume that cannot answer that falls
+/// back to the 64-bit index `GetFileInformationByHandle` gives. A rename keeps
+/// it and a copy, a replacement by rename or a delete-and-recreate does not,
+/// which is what separates "the same file" from "a file that looks the same"
+/// when length and modification time cannot (`CopyFile` keeps the time, and
+/// NTFS stamps writes coarsely). This is the one owner: callers that need to
+/// know whether a file was replaced take it from here rather than from
+/// `std::os::unix::fs::MetadataExt`, which is absent on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    volume: u64,
+    index: u128,
+}
+
+impl FileIdentity {
+    /// The identity of an open file.
+    pub fn of_file(file: &File) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            Ok(Self {
+                volume: metadata.dev(),
+                index: u128::from(metadata.ino()),
+            })
+        }
+        #[cfg(windows)]
+        {
+            windows_identity(file)
+        }
+    }
+
+    /// The identity of the file at `path` (symlinks followed, as
+    /// `std::fs::metadata` does). On Windows the file is opened for attribute
+    /// access only, with every share mode, so asking never blocks a rename or
+    /// delete of it by another process.
+    pub fn of_path(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(path)?;
+            Ok(Self {
+                volume: metadata.dev(),
+                index: u128::from(metadata.ino()),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_READ_ATTRIBUTES; FILE_SHARE_READ | WRITE | DELETE;
+            // FILE_FLAG_BACKUP_SEMANTICS so a directory can be asked too.
+            let file = std::fs::OpenOptions::new()
+                .access_mode(0x80)
+                .share_mode(0x1 | 0x2 | 0x4)
+                .custom_flags(0x0200_0000)
+                .open(path)?;
+            windows_identity(&file)
+        }
+    }
+
+    /// The identity as `(device, index low 64 bits, index high 64 bits)`, for
+    /// a record that stores the three as plain integers. The high half is zero
+    /// on Unix and on NTFS.
+    pub fn parts(&self) -> (u64, u64, u64) {
+        (self.volume, self.index as u64, (self.index >> 64) as u64)
+    }
+
+    /// The inverse of [`parts`](Self::parts).
+    pub fn from_parts(volume: u64, index_low: u64, index_high: u64) -> Self {
+        Self {
+            volume,
+            index: (u128::from(index_high) << 64) | u128::from(index_low),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_identity(file: &File) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    // FILE_ID_INFO: the volume serial number and a 128-bit file id.
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+    // FILE_INFO_BY_HANDLE_CLASS::FileIdInfo (18 in windows-sys); the struct is
+    // a u64 and a FILE_ID_128, 24 bytes.
+    const FILE_ID_INFO_CLASS: i32 = 18;
+    const _: [(); 24] = [(); std::mem::size_of::<FileIdInfo>()];
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut std::ffi::c_void,
+            class: i32,
+            information: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let mut information = std::mem::MaybeUninit::<FileIdInfo>::uninit();
+    // SAFETY: File owns a live handle; `information` is writable storage of
+    // exactly the size passed, and is read only after the call succeeded.
+    let answered = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_ID_INFO_CLASS,
+            information.as_mut_ptr().cast(),
+            std::mem::size_of::<FileIdInfo>() as u32,
+        )
+    } != 0;
+    if answered {
+        // SAFETY: the successful call initialized every field.
+        let information = unsafe { information.assume_init() };
+        return Ok(FileIdentity {
+            volume: information.volume_serial_number,
+            index: u128::from_le_bytes(information.file_id),
+        });
+    }
+    // A filesystem that has no 128-bit id still has the 64-bit index.
+    let information = windows_information(file)?;
+    Ok(FileIdentity {
+        volume: u64::from(information.volume),
+        index: (u128::from(information.index_high) << 32) | u128::from(information.index_low),
+    })
+}
+
 /// Whether the handle held and the file now at the name are one file.
 ///
 /// unix compares device and inode. Windows compares volume serial and file
@@ -865,9 +1066,7 @@ fn same_identity(
     named_file: &File,
     _named: &std::fs::Metadata,
 ) -> io::Result<bool> {
-    let a = windows_information(held_file)?;
-    let b = windows_information(named_file)?;
-    Ok(a.volume == b.volume && a.index_high == b.index_high && a.index_low == b.index_low)
+    Ok(FileIdentity::of_file(held_file)? == FileIdentity::of_file(named_file)?)
 }
 
 #[cfg(windows)]
@@ -975,4 +1174,216 @@ fn windows_information(file: &File) -> io::Result<WindowsInformation> {
     }
     // SAFETY: the successful call initialized every field.
     Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(test)]
+mod rename_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    fn sharing_violation() -> io::Error {
+        io::Error::from_raw_os_error(32)
+    }
+
+    #[test]
+    fn a_transient_refusal_is_waited_out_and_the_rename_then_succeeds() {
+        let calls = Cell::new(0);
+        let result = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 4 {
+                    Err(sharing_violation())
+                } else {
+                    Ok(())
+                }
+            },
+            is_transient_windows_refusal,
+            Duration::from_secs(2),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            calls.get(),
+            4,
+            "succeeds on the first attempt after the refusal passes"
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_outlasts_the_budget_is_the_error_never_success() {
+        let calls = Cell::new(0);
+        let started = std::time::Instant::now();
+        let error = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                Err::<(), _>(sharing_violation())
+            },
+            is_transient_windows_refusal,
+            Duration::from_millis(100),
+        )
+        .expect_err("a refusal that never passes must fail");
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert!(calls.get() > 1, "it retried");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded by its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_racer_that_moved_the_source_ends_the_retry_as_not_found() {
+        let calls = Cell::new(0);
+        let error = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err::<(), _>(sharing_violation())
+                } else {
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                }
+            },
+            is_transient_windows_refusal,
+            Duration::from_secs(2),
+        )
+        .expect_err("the source is gone");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// An open that meets a rename in flight is retried like a rename is, and
+    /// hands back what it opened: `rotate_live` checks the live log through
+    /// this before claiming it, and that open was the step overlapping
+    /// SessionEnd reports failed on with os error 32.
+    #[test]
+    fn an_open_that_meets_a_rename_in_flight_is_waited_out_and_returns_its_value() {
+        let calls = Cell::new(0);
+        let opened = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(sharing_violation())
+                } else {
+                    Ok("the opened file")
+                }
+            },
+            is_transient_windows_refusal,
+            Duration::from_secs(2),
+        )
+        .expect("the open succeeds once the rename has finished");
+        assert_eq!(opened, "the opened file");
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// Off Windows the operation runs once: a POSIX open or rename is never
+    /// refused for a racing handle, so an error there is the answer.
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_a_racing_rename_is_not_retried() {
+        let calls = Cell::new(0);
+        let error = through_a_racing_rename(|| -> io::Result<()> {
+            calls.set(calls.get() + 1);
+            Err(sharing_violation())
+        })
+        .expect_err("returned as is");
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn only_access_sharing_and_lock_refusals_are_transient() {
+        for code in [5, 32, 33] {
+            assert!(is_transient_windows_refusal(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        let not_transient = [
+            io::Error::from_raw_os_error(2),
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::other("anything else"),
+        ];
+        for error in not_transient {
+            assert!(!is_transient_windows_refusal(&error), "{error:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_identity_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-fileid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_copy_with_the_same_length_and_time_is_another_file() {
+        let dir = scratch("copy");
+        let original = dir.join("a.bin");
+        std::fs::write(&original, b"same bytes").unwrap();
+        let copy = dir.join("b.bin");
+        // `std::fs::copy` keeps the modification time on Windows and the
+        // length everywhere: nothing the metadata shows tells them apart.
+        std::fs::copy(&original, &copy).unwrap();
+        assert_ne!(
+            FileIdentity::of_path(&original).unwrap(),
+            FileIdentity::of_path(&copy).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_keeps_the_identity_and_a_replacement_by_rename_changes_it() {
+        let dir = scratch("rename");
+        let original = dir.join("a.bin");
+        std::fs::write(&original, b"first").unwrap();
+        let before = FileIdentity::of_path(&original).unwrap();
+        let moved = dir.join("moved.bin");
+        std::fs::rename(&original, &moved).unwrap();
+        assert_eq!(before, FileIdentity::of_path(&moved).unwrap());
+
+        let impostor = dir.join("impostor.bin");
+        std::fs::write(&impostor, b"first").unwrap();
+        // The original stays on disk under another name, so its index cannot
+        // be reused by the replacement.
+        std::fs::rename(&impostor, dir.join("a.bin")).unwrap();
+        assert_ne!(before, FileIdentity::of_path(&dir.join("a.bin")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handle_and_its_path_agree_and_a_missing_path_is_an_error() {
+        let dir = scratch("handle");
+        let path = dir.join("a.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(
+            FileIdentity::of_file(&file).unwrap(),
+            FileIdentity::of_path(&path).unwrap()
+        );
+        assert!(FileIdentity::of_path(&dir.join("absent")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_parts_round_trip_including_a_128_bit_index() {
+        let identity = FileIdentity::from_parts(7, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888);
+        assert_eq!(
+            identity.parts(),
+            (7, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888)
+        );
+        assert_ne!(
+            identity,
+            FileIdentity::from_parts(7, 0x1111_2222_3333_4444, 0)
+        );
+    }
 }

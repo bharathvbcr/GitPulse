@@ -351,6 +351,44 @@ describe("check:workflows", () => {
     }
   });
 
+  // Two ledger tests hold the write lock from the real `sqlite3` CLI, which the
+  // Windows image lacks. The Chocolatey feed answered 504 once, so a single
+  // `choco install` is not enough: the step must retry and then fail loudly.
+  it("puts sqlite3 on PATH on the Windows Rust shards, retrying a failed install, after the manvi build", () => {
+    const ci = readFileSync(fileURLToPath(new URL("../.github/workflows/ci.yml", import.meta.url)), "utf8");
+    const body = ci.slice(ci.search(/^jobs:\s*$/m));
+    const heads = [...body.matchAll(/^ {2}([a-z0-9-]+):\s*$/gm)];
+    const at = heads.findIndex((head) => head[1] === "rust-test-windows");
+    expect(at, "rust-test-windows exists").toBeGreaterThan(-1);
+    const job = body.slice(heads[at].index, heads[at + 1]?.index ?? body.length);
+    const step = job.indexOf("- name: Install sqlite3");
+    const test = job.indexOf("- name: Rust Unit & Integration Tests (nextest shard)");
+    expect(step, "rust-test-windows installs sqlite3").toBeGreaterThan(-1);
+    expect(test, "the tests run after sqlite3").toBeGreaterThan(step);
+    // A step that fails skips every later one, so a feed outage here must not
+    // take the manvi build down with it.
+    expect(step, "sqlite3 comes after the manvi build").toBeGreaterThan(job.indexOf("- name: Keep the manvi build"));
+    const sqlite = job.slice(step, test);
+    expect(sqlite).toContain("choco install sqlite");
+    expect(sqlite, "retries").toMatch(/for \(\$i = 1; \$i -le \$attempts; \$i\+\+\)/);
+    expect(sqlite, "bounded").toMatch(/\$attempts = \d+/);
+    expect(sqlite, "verifies the CLI answers").toContain("sqlite3 -version");
+    expect(sqlite, "fails loudly after the last attempt").toMatch(/throw "sqlite3 could not be installed/);
+  });
+
+  it("builds and tests the desktop app with one feature set, so no test step rebuilds the smoke binary in dev mode", () => {
+    // `cargo test --test gtk_runtime` also builds the `gitpulse` bin. Without
+    // tauri/custom-protocol it recompiled tauri in dev mode and overwrote
+    // target/debug/gitpulse, so the real-binary smoke launched an app that
+    // waited on the dev server (#app never appeared on any platform).
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const invocations = [...e2e.matchAll(/cargo (?:build|test) --manifest-path src-tauri\/Cargo\.toml(?:[^\n]*\\\n)*[^\n]*/g)].map(m => m[0]);
+    expect(invocations.length, "finds the app build and both runtime test steps").toBeGreaterThanOrEqual(5);
+    for (const call of invocations) {
+      expect(call, `every app cargo step keeps the bundled frontend: ${call}`).toContain("--features tauri/custom-protocol");
+    }
+  });
+
   it("keeps e2e-desktop.yml safe on Windows (shell: bash, cygpath, WebView2 msedgedriver matching) and Linux (X11 + Wayland)", () => {
     const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
     const linux = e2e.slice(e2e.indexOf("\n  e2e-linux:"), e2e.indexOf("\n  e2e-windows:"));
@@ -398,6 +436,57 @@ describe("check:workflows", () => {
     expect(windows).toContain("Publish Windows E2E Summary");
     expect(windows).toContain("if-no-files-found: warn");
     expect(windows).toContain("retention-days: 14");
+  });
+
+  it("never lets a runtime-directory cleanup replace a Linux E2E step's own result", () => {
+    // D-Bus activated the document portal, which FUSE-mounted
+    // $XDG_RUNTIME_DIR/doc; the trap's `rm -rf` failed on the live mount and
+    // failed a step whose tests had all passed (run on 17e968915).
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const cleanups = [...e2e.matchAll(/cleanup\(\) \{\n([\s\S]*?)\n\s*\}\n\s*trap cleanup EXIT/g)].map((m) => m[1]);
+    expect(cleanups.length).toBeGreaterThanOrEqual(3);
+    for (const body of cleanups) {
+      expect(body).toMatch(/rc=\$\?/);
+      expect(body).toMatch(/fusermount3? -u "\$XDG_RUNTIME_DIR\/doc"/);
+      expect(body).toMatch(/rm -rf "\$XDG_RUNTIME_DIR" [^\n]*\|\|/);
+      expect(body.trimEnd().endsWith('exit "$rc"')).toBe(true);
+    }
+  });
+
+  it("runs the Windows tauri-driver smoke de-elevated, after proving the de-elevation carries", () => {
+    // WebView2 150+ drops WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS for an elevated
+    // host, so an elevated smoke never gets --remote-debugging-port.
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const windows = e2e.slice(e2e.indexOf("\n  e2e-windows:"));
+    const prepare = windows.slice(windows.indexOf("- name: Prepare a De-elevated E2E Run"), windows.indexOf("- name: Real-Binary tauri-driver E2E Smoke (Windows)"));
+    const smoke = windows.slice(windows.indexOf("- name: Real-Binary tauri-driver E2E Smoke (Windows)"), windows.indexOf("- name: Publish Windows E2E Summary"));
+    expect(prepare, "the prepare step exists and precedes the smoke").toContain("choco install gsudo --version $env:GSUDO_VERSION");
+    expect(prepare).toMatch(/GSUDO_VERSION: "\d+\.\d+\.\d+"/);
+    // Narrower than the upstream workaround's grant to Everyone.
+    expect(prepare).toContain('/grant "${env:USERNAME}:(OI)(CI)F"');
+    expect(prepare).not.toMatch(/\/grant\s+"?Everyone:/);
+    // Each of these fails the prepare step by name instead of as a session timeout.
+    expect(prepare).toContain("Medium Mandatory Level");
+    expect(prepare).toContain("GITPULSE_GSUDO_PROBE");
+    expect(prepare).toContain("gsudo changed the working directory");
+    // gsudo by name: a `sudo` alias can resolve to Windows' own sudo.exe.
+    expect(smoke).toContain("gsudo --integrity Medium node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows");
+    expect(smoke).not.toMatch(/^\s*node scripts\/e2e-driver-smoke\.mjs/m);
+    // gsudo returned 0 for a child that exited 7: the step's verdict is the
+    // smoke's own summary, removed first so a stale one cannot pass the step.
+    expect(smoke).not.toContain("exit $LASTEXITCODE");
+    expect(smoke).toContain("Remove-Item $summaryFile");
+    expect(smoke).toMatch(/\$summary\.ok -ne \$true\)[\s\S]*exit 1/);
+  });
+
+  it("writes the smoke's verdict into summary.json, false until a finished run says otherwise", () => {
+    const smoke = readFileSync(fileURLToPath(new URL("./e2e-driver-smoke.mjs", import.meta.url)), "utf8");
+    expect(smoke).toMatch(/startedAt: new Date\(\)\.toISOString\(\),[\s\S]{0,200}ok: false,/);
+    expect(smoke).toContain("summary.ok = exitCode === 0 && summary.scenarios.length > 0 && summary.scenarios.every((s) => s.ok);");
+    const verdict = smoke.indexOf("summary.ok = exitCode");
+    const write = smoke.indexOf('writeFileSync(path.join(opts.artifactsDir, "summary.json")');
+    expect(verdict, "the verdict is set before the summary is written").toBeGreaterThan(0);
+    expect(write).toBeGreaterThan(verdict);
   });
 
   it("keeps DEVMAP_REV, MANVI_REV, NEXTEST_VERSION, TAURI_DRIVER_VERSION, BUN_VERSION, and Node major identical across workflows, package.json, and Containerfile.linux-test", () => {

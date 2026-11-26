@@ -1178,6 +1178,8 @@ mod tests {
                 .unwrap();
         }
 
+        // Only the Unix symlink case below adds to it.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut repos = vec![
             serde_json::json!({"name": "missing", "root": missing_repo}),
             serde_json::json!({"name": "damaged", "root": damaged_repo}),

@@ -146,12 +146,18 @@ pub(crate) const RELIEF_OFFER_PREFIX: &str = "gitpulse.relief.offer";
 pub(crate) const RELIEF_ADVICE_PREFIX: &str = "gitpulse.relief.advice";
 
 /// The relief banners' buttons, by the identifier each is registered under.
+/// Only macOS registers banner buttons.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) const RELIEF_RESUME_ACTION: &str = "relief-resume";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) const RELIEF_TERMINATE_ACTION: &str = "relief-terminate";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) const RELIEF_PAUSE_ACTION: &str = "relief-pause";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) const RELIEF_SETTINGS_ACTION: &str = "relief-settings";
 
 /// What a press on a relief banner asks for.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReliefTap {
     /// Resume everything.
@@ -170,6 +176,7 @@ pub(super) enum ReliefTap {
 /// it is registered with, and the tree comes only from the banner's own
 /// identifier, parsed by `relief_status::banner_target`: an identifier that
 /// does not name a plausible tree is [`ReliefTap::Ignore`], never a guess.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn relief_tap(category: &str, action: &str, native: &str) -> ReliefTap {
     use crate::sysload::relief_status::banner_target;
     let target = |prefix: &str, make: fn(crate::sysload::relief_status::TreeId) -> ReliefTap| {
@@ -194,6 +201,7 @@ fn relief_banner_wanted(preferences: &Settings, window_visible: bool) -> bool {
 
 /// The identity a relief banner's Settings button is forwarded under when the
 /// banner was answered by a launch that only passes requests on.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const RELIEF_SETTINGS_ID: &str = "gitpulse.relief.settings";
 
 /// How long the banner's Snooze defers a notice. The activity inbox's own

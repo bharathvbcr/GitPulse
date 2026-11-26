@@ -1037,6 +1037,103 @@ pub fn action_for_argv(argv: &[&str]) -> String {
 #[derive(Default)]
 pub(crate) struct Slot {
     conn: Mutex<Option<Live>>,
+    /// When the connection was last handed to a caller, in milliseconds on
+    /// [`idle_clock_ms`]'s clock. Read by [`close_idle`].
+    last_used_ms: std::sync::atomic::AtomicU64,
+}
+
+/// How long a ledger connection may sit unused before it is closed.
+///
+/// An open connection holds `ledger.sqlite`, `-wal` and `-shm` open, and on
+/// Windows an open file cannot be deleted: the main checkout's folder could not
+/// be deleted or moved for as long as GitPulse ran. Closed, the next use reopens
+/// it, which costs one `open`. A WAL database checkpoints and drops its `-wal`
+/// when its last connection closes; the anchor's file identity, which is what
+/// the consolidation memory is checked against, does not change.
+const IDLE_CLOSE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Milliseconds since the first call in this process, never going backwards.
+fn idle_clock_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Closes every registered connection unused for at least `idle_for` as of
+/// `now_ms` (only the one at database path `only`, when given), and reports
+/// `(closed, still_open)`.
+///
+/// A slot another thread holds, or whose lock is taken, is in use and left
+/// alone. Closing empties the slot rather than removing it, as a failed open
+/// does, so the next caller reopens through the ordinary path.
+fn close_idle(idle_for: std::time::Duration, now_ms: u64, only: Option<&Path>) -> (usize, usize) {
+    let idle_ms = u64::try_from(idle_for.as_millis()).unwrap_or(u64::MAX);
+    let Ok(reg) = registry().lock() else {
+        return (0, 0);
+    };
+    let (mut closed, mut still_open) = (0, 0);
+    for (path, slot) in reg.iter() {
+        if only.is_some_and(|only| only != path) {
+            continue;
+        }
+        let Ok(mut guard) = slot.conn.try_lock() else {
+            still_open += 1;
+            continue;
+        };
+        if guard.is_none() {
+            continue;
+        }
+        let last = slot.last_used_ms.load(std::sync::atomic::Ordering::Acquire);
+        if std::sync::Arc::strong_count(slot) == 1 && now_ms.saturating_sub(last) >= idle_ms {
+            *guard = None;
+            closed += 1;
+        } else {
+            still_open += 1;
+        }
+    }
+    (closed, still_open)
+}
+
+/// True while a closer is scheduled.
+static IDLE_CLOSER_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Schedules [`close_idle`] after a connection was used, unless one is already
+/// scheduled. The closer sleeps one window at a time and ends once nothing is
+/// open, so an idle process keeps no thread for it.
+///
+/// Not armed in this crate's unit tests: they share the registry across
+/// parallel tests, and a connection closed between one test's cold and warm
+/// read changes what that test counts. They call [`close_idle`] directly.
+fn arm_idle_close() {
+    if cfg!(test) {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    if IDLE_CLOSER_ARMED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned =
+        crate::supervisor::spawn_once("ledger-idle-close", "ledger idle close", || loop {
+            std::thread::sleep(IDLE_CLOSE_AFTER);
+            let (_, still_open) = close_idle(IDLE_CLOSE_AFTER, idle_clock_ms(), None);
+            if still_open > 0 {
+                continue;
+            }
+            IDLE_CLOSER_ARMED.store(false, Ordering::Release);
+            // A use that ran between the pass and the store found the closer
+            // armed and did not arm another: take its connection over.
+            let reopened = registry().lock().is_ok_and(|reg| {
+                reg.values()
+                    .any(|slot| slot.conn.try_lock().map_or(true, |g| g.is_some()))
+            });
+            if !reopened || IDLE_CLOSER_ARMED.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        });
+    if let Err(error) = spawned {
+        IDLE_CLOSER_ARMED.store(false, Ordering::Release);
+        log::warn!(target: "ledger", "idle ledger connections will stay open: {error}");
+    }
 }
 
 /// An open connection and the identity of the file it was opened on.
@@ -1769,10 +1866,16 @@ fn with_conn<T>(
             file: file_id(&db_path),
         });
     }
-    match guard.as_ref() {
+    let result = match guard.as_ref() {
         Some(live) => f(&live.conn),
         None => Err(LedgerError::new("open_failed", "ledger connection missing")),
-    }
+    };
+    // Stamped after `f`, so a long call does not look idle the moment it ends.
+    slot.last_used_ms
+        .store(idle_clock_ms(), std::sync::atomic::Ordering::Release);
+    drop(guard);
+    arm_idle_close();
+    result
 }
 
 /// Runs `f` on this process's already-open connection to the ledger, or returns
@@ -1796,7 +1899,10 @@ fn with_live_conn<T>(
     if live.file.is_some() && file_id(&db_path) != live.file {
         return None;
     }
-    Some(f(&live.conn))
+    let result = f(&live.conn);
+    slot.last_used_ms
+        .store(idle_clock_ms(), std::sync::atomic::Ordering::Release);
+    Some(result)
 }
 
 /// One read-only fallback connection at a time, for a process with no live one:
@@ -2188,8 +2294,62 @@ fn insert_with(conn: &Connection, event: &Prepared, sql: &str) -> Result<Option<
 // holds such a string redacted.
 
 /// The persisted key for a worktree or transcript path.
+///
+/// One key per directory whichever way it is spelled. On Windows a live
+/// checkout canonicalizes to `\\?\C:\...`, while git, a caller, and the
+/// fallback for a worktree that has since been removed spell it `C:\...`;
+/// digesting the raw bytes gave one directory two keys, so a member's rows
+/// could be counted as a departed worktree's, and a departed one's as a
+/// member's. The stored paths keep their verbatim spelling (trust and
+/// containment are built on it); only the key is spelling-blind. Off Windows
+/// the plain spelling is the path itself, so no stored key changes there.
 pub(crate) fn transcript_key(path: &Path) -> String {
-    format!("{:016x}", ids::fnv1a64(path.as_os_str().as_encoded_bytes()))
+    let digest = match path.to_str() {
+        Some(text) => ids::fnv1a64(crate::engine::process::plain_path_text(text).as_bytes()),
+        None => ids::fnv1a64(path.as_os_str().as_encoded_bytes()),
+    };
+    format!("{digest:016x}")
+}
+
+#[cfg(test)]
+mod transcript_key_tests {
+    use super::{ids, transcript_key};
+    use std::path::Path;
+
+    /// Keys already stored on macOS and Linux stay valid: off Windows the key
+    /// is still the digest of the path's own bytes.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_plain_path_keeps_the_key_it_always_had() {
+        let path = "/Users/someone/repo/.gitpulse/worktrees/lane";
+        assert_eq!(
+            transcript_key(Path::new(path)),
+            format!("{:016x}", ids::fnv1a64(path.as_bytes()))
+        );
+    }
+
+    /// A worktree that is live (`\\?\`) and the same worktree once removed
+    /// (plain) are one key.
+    #[cfg(windows)]
+    #[test]
+    fn the_verbatim_and_plain_spellings_of_one_directory_share_a_key() {
+        let plain = r"C:\Users\someone\repo\.gitpulse\worktrees\lane";
+        assert_eq!(
+            transcript_key(Path::new(&format!(r"\\?\{plain}"))),
+            transcript_key(Path::new(plain))
+        );
+        assert_eq!(
+            transcript_key(Path::new(plain)),
+            format!("{:016x}", ids::fnv1a64(plain.as_bytes())),
+            "a plain key stored before this change still matches"
+        );
+        assert_ne!(
+            transcript_key(Path::new(plain)),
+            transcript_key(Path::new(
+                r"C:\Users\someone\repo\.gitpulse\worktrees\other"
+            )),
+        );
+    }
 }
 
 /// What transcript catch-up has already done for one worktree.
@@ -7401,6 +7561,46 @@ mod tests {
             held.contains_key(&ledger_path(&live)),
             "a live repository's connection was dropped"
         );
+    }
+
+    /// An idle connection is closed, which releases the ledger's files (on
+    /// Windows an open file cannot be moved or deleted, so neither could the
+    /// checkout holding it), and the next use reopens it. Scoped to this test's
+    /// own database: the registry is shared with every parallel test.
+    #[test]
+    fn an_idle_connection_is_closed_and_the_next_use_reopens_it() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap().to_owned();
+        append(draft(&repo, "git.commit")).expect("append");
+        let db = ledger_path(&repo);
+        let open = |db: &Path| {
+            registry()
+                .lock()
+                .unwrap()
+                .get(db)
+                .is_some_and(|slot| slot.conn.lock().unwrap().is_some())
+        };
+        assert!(open(&db));
+
+        // Just used: not idle under the window.
+        let now = idle_clock_ms();
+        assert_eq!(close_idle(IDLE_CLOSE_AFTER, now, Some(&db)), (0, 1));
+        assert!(open(&db), "a connection in use was closed");
+
+        let later = now + u64::try_from(IDLE_CLOSE_AFTER.as_millis()).unwrap();
+        assert_eq!(close_idle(IDLE_CLOSE_AFTER, later, Some(&db)), (1, 0));
+        assert!(!open(&db), "the idle connection is still open");
+        assert!(
+            with_live_conn(&repo, |_| Ok(())).is_none(),
+            "a closed slot must not read as live"
+        );
+        // Nothing holds the file now, on any platform.
+        let moved = db.with_extension("moved");
+        std::fs::rename(&db, &moved).expect("a closed ledger can be moved");
+        std::fs::rename(&moved, &db).expect("and moved back");
+
+        append(draft(&repo, "git.commit")).expect("the next use reopens");
+        assert!(open(&db));
     }
 
     #[test]

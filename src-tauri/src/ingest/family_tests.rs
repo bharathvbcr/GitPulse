@@ -854,13 +854,13 @@ fn a_removed_git_worktree_keeps_its_path_and_never_takes_the_main_task() {
             &[edit_line_at(&w, "G1", &now_stamp(), &format!("{w}/a.rs"))],
         );
         catch_up_into_bounded(&anchor, &anchor, None);
+        // A live member is recorded under the ledger's spelling of it
+        // (`\\?\C:\...` on Windows); once removed, a call is recorded under the
+        // spelling its own cwd carries.
+        let live = ledger::canonical_repo(&w);
         assert_eq!(
             rows(),
-            vec![(
-                Some(w.clone()),
-                format!("{w}/a.rs"),
-                Some("T-W".to_string())
-            )]
+            vec![(Some(live), format!("{w}/a.rs"), Some("T-W".to_string()))]
         );
 
         git_in(&base, &["worktree", "remove", "--force", &w]);
@@ -2129,7 +2129,7 @@ fn an_unresolved_pass_then_a_resolved_pass_records_each_call_once() {
         assert_eq!(
             nested.rows(),
             vec![(
-                Some(w.clone()),
+                Some(ledger::canonical_repo(&w)),
                 format!("{w}/a.rs"),
                 Some("T-W".to_string())
             )]

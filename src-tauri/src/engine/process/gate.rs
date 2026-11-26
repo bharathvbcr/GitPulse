@@ -2005,7 +2005,7 @@ thread_local! {
 /// Runs `body` with every spawn on this thread admitted by `gate`: the way a
 /// caller that reaches the gate through [`run_observed`] (a devmap read) is
 /// tested against a bucket it cannot spend.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn with_gate_for_test<T>(gate: &'static SpawnGate, body: impl FnOnce() -> T) -> T {
     let _restore = std::mem::DropGuard::new(GATE_FOR_THIS_THREAD.replace(Some(gate)), |prev| {
         GATE_FOR_THIS_THREAD.set(prev);

@@ -151,7 +151,7 @@
         "src/scope/fs.rs": "13f7132cc2cb4c2985a97bb5a60bfb5551e712992eec0977445de861e7440c15",
         "src/scope/mod.rs": "f72963f21cdfddeac4a60dd6609765b699ec86cbde293314a55f09779c4583b1",
         "src/state.rs": "2a6982ffa78274c476d2af7af785c94f36a033de030fa382cd727b18595481b8",
-        "src/test/mock_runtime.rs": "429c8d639e08fb6a1b8a82bf3d75e29983d0aa443a520bc24a41b3e4c717f384",
+        "src/test/mock_runtime.rs": "04cb711b1081b3196d51083ee5b303c2b829b43309102ba1928c4299de19157f",
         "src/test/mod.rs": "99dbbe5445c5a8619624b2a3d9ff90ca95d4f4bdcd431e1f5e11157d431c4618",
         "src/tray/mod.rs": "ff073c5dec626463e013e133bed97553fce3f7b9fa1b007dd6e16a5886ced052",
         "src/tray/plugin.rs": "b59e76ce21cb806037744997af9d15e13bc023aeb9a4755506429847f86aab43",
@@ -179,7 +179,7 @@
         },
         "src/test/mock_runtime.rs": {
           "upstream": "ef04c3634879fd347d994c73666becbe85fe5001347e73ac5d35cde64dc05ee5",
-          "patched": "429c8d639e08fb6a1b8a82bf3d75e29983d0aa443a520bc24a41b3e4c717f384"
+          "patched": "04cb711b1081b3196d51083ee5b303c2b829b43309102ba1928c4299de19157f"
         },
         "src/webview/webview_window.rs": {
           "upstream": "5cf28b52b0ed7179926b1087df08d8765bf2c31805fb532f9260908a57422230",

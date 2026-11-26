@@ -1167,10 +1167,26 @@ const MAX_PATH_BYTES: usize = 4096;
 /// its trailing separators. The one test for every path a call is attributed
 /// by, so a call is never attributable by one reading and not by another.
 fn within_cap(path: &str) -> bool {
-    path.trim_end_matches('/').len() <= MAX_PATH_BYTES
+    path.trim_end_matches(separator_of(path)).len() <= MAX_PATH_BYTES
 }
-/// Where isolation worktrees live below a checkout.
+
+/// The separator `path` is written with. `/` for everything but a Windows path
+/// spelled with `\` throughout (`C:\repo\a`), which has no `/` in it: that is
+/// what Windows tools write, and `\` is then its one separator. A path that
+/// mixes the two keeps `/` as its separator, so its `\` stays a name character
+/// and a `C:\repo/a` is read by no function here as one place spelled two ways.
+fn separator_of(path: &str) -> char {
+    if path.contains('\\') && !path.contains('/') && WindowsForm::of(path).is_some() {
+        '\\'
+    } else {
+        '/'
+    }
+}
+
+/// Where isolation worktrees live below a checkout, spelled with `/`.
 const WORKTREES_DIR: &str = "/.claude/worktrees/";
+/// The same, spelled with `\`, for a Windows cwd written with `\` throughout.
+const WORKTREES_DIR_BACKSLASH: &str = "\\.claude\\worktrees\\";
 
 /// A worktree that has been removed, found from a call's `cwd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1194,24 +1210,37 @@ pub struct Departed<'c, 'r> {
 /// gone), so a deleted plain subdirectory stays with the live root around it.
 ///
 /// The call's own path must also lie under the removed worktree. A cwd with an
-/// empty, `.` or `..` segment anywhere, a NUL, a backslash, a Windows verbatim
-/// prefix (`//?/`), or more than 4096 bytes is never read as departed.
+/// empty, `.` or `..` segment anywhere, a NUL, a Windows verbatim prefix
+/// (`//?/`), or more than 4096 bytes is never read as departed, nor is one that
+/// mixes `/` with `\` (see [`separator_of`]). A Windows cwd written with `\`
+/// throughout (`C:\repo\.claude\worktrees\w`) is read the same way with `\` as
+/// its separator, and its root is a slice of that text like any other.
 ///
 /// The live root may have matched the cwd through another spelling (its real
 /// path, its case-folded form, its Windows form), so the root's text is not a
 /// prefix of the cwd. The cwd is cut after as many of its own components as the
 /// matching spelling has, which those checks make the same count.
 pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &RootSet<'r>) -> Option<Departed<'c, 'r>> {
-    let cwd = call.cwd.trim_end_matches('/');
+    let separator = separator_of(&call.cwd);
+    let marker = if separator == '/' {
+        WORKTREES_DIR
+    } else {
+        WORKTREES_DIR_BACKSLASH
+    };
+    let cwd = call.cwd.trim_end_matches(separator);
     // Almost every call: nothing below its root has the shape.
-    if !within_cap(cwd) || !within_cap(candidate_path(call)) || !cwd.contains(WORKTREES_DIR) {
+    if !within_cap(cwd) || !within_cap(candidate_path(call)) || !cwd.contains(marker) {
         return None;
     }
-    let body = cwd.trim_start_matches('/');
-    let segments: Vec<&str> = body.split('/').collect();
-    let plain =
-        |segment: &&str| !matches!(*segment, "" | "." | "..") && !segment.contains(['\0', '\\']);
-    if !segments.iter().all(plain) || (cwd.starts_with("//") && segments[0] == "?") {
+    let body = cwd.trim_start_matches(separator);
+    let segments: Vec<&str> = body.split(separator).collect();
+    let plain = |segment: &&str| {
+        !matches!(*segment, "" | "." | "..") && !segment.contains(['\0', '\\', '/'])
+    };
+    let verbatim = cwd
+        .strip_prefix(separator)
+        .is_some_and(|rest| rest.starts_with(separator));
+    if !segments.iter().all(plain) || (verbatim && segments[0] == "?") {
         return None;
     }
     let (depth, host) = deepest_match(cwd, roots)?;
@@ -2053,6 +2082,55 @@ mod tests {
         ] {
             assert_eq!(departed_in(cwd, &[r"C:\Repo"]), None, "{cwd}");
         }
+    }
+
+    /// What Claude Code on Windows writes: `\` throughout, no `/` anywhere. It
+    /// is cut by components exactly as the forward-slash spelling is, whatever
+    /// the case or the prefix of the root that matched it.
+    #[test]
+    fn a_pure_backslash_windows_cwd_is_cut_by_components_like_a_forward_slash_one() {
+        let wt = r"C:\Repo\.claude\worktrees\w";
+        assert_eq!(departed_in(wt, &[r"C:\Repo"]), Some(wt.to_string()));
+        // Below the worktree, the cut is still at the worktree.
+        let below = r"C:\Repo\.claude\worktrees\w\src\deep";
+        assert_eq!(departed_in(below, &[r"C:\Repo"]), Some(wt.to_string()));
+        // Trailing separators, a lower-case spelling of the root, a verbatim root.
+        let trailing = format!(r"{wt}\");
+        assert_eq!(departed_in(&trailing, &[r"c:\repo"]), Some(wt.to_string()));
+        assert_eq!(departed_in(wt, &[r"\\?\C:\REPO\"]), Some(wt.to_string()));
+        let unc = r"\\srv\share\repo\.claude\worktrees\w";
+        assert_eq!(
+            departed_in(unc, &[r"\\SRV\Share\Repo"]),
+            Some(unc.to_string())
+        );
+        // A call that names its file with `\` too is read the same way.
+        let call = command_in(wt, Some(r"C:\Repo\.claude\worktrees\w\a.rs"));
+        assert_eq!(
+            departed_root(&call, &RootSet::new(&[r"C:\Repo"])).map(|d| d.root),
+            Some(wt)
+        );
+        // A live worktree of that name is not departed, and a path that is not
+        // under the worktree it names is not read as one.
+        assert_eq!(departed_in(wt, &[r"C:\Repo", wt]), None);
+        let elsewhere = command_in(wt, Some(r"C:\Other\a.rs"));
+        assert_eq!(
+            departed_root(&elsewhere, &RootSet::new(&[r"C:\Repo"])),
+            None
+        );
+        // A cwd with an empty, `.` or `..` segment, or a verbatim prefix, never is.
+        for cwd in [
+            r"C:\Repo\..\Repo\.claude\worktrees\w",
+            r"C:\Repo\.\.claude\worktrees\w",
+            r"C:\Repo\\.claude\worktrees\w",
+            r"\\?\C:\Repo\.claude\worktrees\w",
+        ] {
+            assert_eq!(departed_in(cwd, &[r"C:\Repo"]), None, "{cwd}");
+        }
+        // Off a Windows spelling a backslash is a name character.
+        assert_eq!(
+            departed_in(r"\rooted\.claude\worktrees\w", &[r"\rooted"]),
+            None
+        );
     }
 
     #[cfg(unix)]

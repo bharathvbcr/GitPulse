@@ -968,11 +968,7 @@ fn main() {
     // Reported either way, so a guarantee that could not be armed is in the
     // log rather than assumed.
     let signals = waylode_lib::procguard::install_signal_handlers();
-    if signals.is_armed() {
-        log::info!(target: "setup", "{}", signals.describe());
-    } else {
-        log::warn!(target: "setup", "{}", signals.describe());
-    }
+    signals.log_setup();
 
     if let Some(args) = command {
         exit_reaping(run_one_shot(&args));

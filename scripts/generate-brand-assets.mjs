@@ -15,12 +15,18 @@
  * Usage:
  *   node scripts/generate-brand-assets.mjs          generate/update all assets
  *   node scripts/generate-brand-assets.mjs --check  exit 1 if any generated output differs
+ *
+ * PNG, ICO and ICNS outputs are compared by what they hold (pixels, chunk
+ * metadata, container entries), not by their compressed bytes: deflate output
+ * differs between zlib builds, so the same image written by Node 26 and Node 22
+ * is not byte-identical, and a byte check fails on every machine whose Node
+ * differs from the one that last wrote the assets.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { deflateSync } from "node:zlib";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { deflateSync, inflateSync } from "node:zlib";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SPEC_PATH = path.join(REPO_ROOT, "brand", "waylode-mark.json");
@@ -661,6 +667,119 @@ function updateIndexHtml(existingHtml, spec) {
   );
 }
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/**
+ * A length-prefixed part, so concatenated parts cannot run into each other.
+ * @param {Buffer} buf
+ * @returns {Buffer}
+ */
+function framed(buf) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(buf.length, 0);
+  return Buffer.concat([len, buf]);
+}
+
+/**
+ * What a PNG holds, independent of how its pixels were compressed: every
+ * chunk but IDAT as written, then the IDAT stream inflated. `null` when the
+ * bytes are not a well-formed PNG.
+ * @param {Buffer} buf
+ * @returns {Buffer | null}
+ */
+function pngContent(buf) {
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
+  const parts = [];
+  const idat = [];
+  let at = 8;
+  let ended = false;
+  while (at + 12 <= buf.length) {
+    const len = buf.readUInt32BE(at);
+    const type = buf.toString("ascii", at + 4, at + 8);
+    const end = at + 12 + len;
+    if (end > buf.length) return null;
+    const data = buf.subarray(at + 8, at + 8 + len);
+    if (type === "IDAT") idat.push(data);
+    else parts.push(framed(Buffer.from(type, "ascii")), framed(data));
+    at = end;
+    if (type === "IEND") {
+      ended = true;
+      break;
+    }
+  }
+  if (!ended || at !== buf.length) return null;
+  try {
+    parts.push(framed(Buffer.from("IDAT", "ascii")), framed(inflateSync(Buffer.concat(idat))));
+  } catch {
+    return null;
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * What an `.ico` of PNG entries holds: each entry's fixed fields (size,
+ * colours, planes, depth) and its PNG's content. The byte size and offset
+ * fields follow the compression and are left out.
+ * @param {Buffer} buf
+ * @returns {Buffer | null}
+ */
+function icoContent(buf) {
+  if (buf.length < 6 || buf.readUInt16LE(0) !== 0 || buf.readUInt16LE(2) !== 1) return null;
+  const count = buf.readUInt16LE(4);
+  if (buf.length < 6 + count * 16) return null;
+  const parts = [framed(buf.subarray(0, 6))];
+  for (let i = 0; i < count; i++) {
+    const base = 6 + i * 16;
+    const size = buf.readUInt32LE(base + 8);
+    const offset = buf.readUInt32LE(base + 12);
+    if (offset + size > buf.length) return null;
+    const png = pngContent(buf.subarray(offset, offset + size));
+    if (!png) return null;
+    parts.push(framed(buf.subarray(base, base + 8)), framed(png));
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * What an `.icns` of PNG elements holds: each element's type and its PNG's
+ * content, in order. Element and file lengths follow the compression.
+ * @param {Buffer} buf
+ * @returns {Buffer | null}
+ */
+function icnsContent(buf) {
+  if (buf.length < 8 || buf.toString("ascii", 0, 4) !== "icns") return null;
+  const parts = [];
+  let at = 8;
+  while (at + 8 <= buf.length) {
+    const type = buf.toString("ascii", at, at + 4);
+    const len = buf.readUInt32BE(at + 4);
+    if (len < 8 || at + len > buf.length) return null;
+    const png = pngContent(buf.subarray(at + 8, at + len));
+    if (!png) return null;
+    parts.push(framed(Buffer.from(type, "ascii")), framed(png));
+    at += len;
+  }
+  return at === buf.length ? Buffer.concat(parts) : null;
+}
+
+/**
+ * Whether two versions of a generated asset hold the same thing: identical
+ * bytes, or, for PNG, ICO and ICNS, the same content (see `pngContent`).
+ * @param {string} relPath
+ * @param {Buffer} current
+ * @param {Buffer} expected
+ * @returns {boolean}
+ */
+export function sameAssetContent(relPath, current, expected) {
+  if (current.equals(expected)) return true;
+  const ext = path.extname(relPath).toLowerCase();
+  const content = ext === ".png" ? pngContent : ext === ".ico" ? icoContent : ext === ".icns" ? icnsContent : null;
+  if (!content) return false;
+  const a = content(current);
+  const b = content(expected);
+  return a !== null && b !== null && a.equals(b);
+}
+
 /**
  * Sync or verify a target file. Returns `true` when already up-to-date.
  * @param {string} relPath
@@ -672,7 +791,7 @@ function syncFile(relPath, expected, checkOnly) {
   const abs = path.join(REPO_ROOT, relPath);
   const expectedBuf = Buffer.isBuffer(expected) ? expected : Buffer.from(expected, "utf8");
   const currentBuf = existsSync(abs) ? readFileSync(abs) : null;
-  if (currentBuf && currentBuf.equals(expectedBuf)) return true;
+  if (currentBuf && sameAssetContent(relPath, currentBuf, expectedBuf)) return true;
   if (checkOnly) return false;
   mkdirSync(path.dirname(abs), { recursive: true });
   writeFileSync(abs, expectedBuf);
@@ -782,4 +901,6 @@ function main() {
   }
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

@@ -2,6 +2,7 @@
 //! the correct behaviour for a break the review found; all are fixed.
 
 use super::*;
+use crate::engine::process::deferral_retry::process_jitter;
 
 const MARKER_DIR: &str = "hostile deferred under load after 1s";
 

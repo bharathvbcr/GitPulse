@@ -6,6 +6,7 @@
 //! flows through this seam without importing `git_cli`.
 
 mod clock;
+pub(crate) mod deferral_retry;
 mod env;
 mod gate;
 #[cfg(unix)]
@@ -36,15 +37,17 @@ mod scrubbed_env_adversarial_tests;
 #[cfg(test)]
 mod tests;
 
+/// Public for integration tests, which hand git paths it must be able to open.
+pub use env::canonicalize_plain;
 pub use env::find_external_tool_with;
 #[cfg(any(windows, test))]
 pub(crate) use env::simplified_windows_path;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use env::XCRUN_GIT_SHIM;
 pub(crate) use env::{
-    build_capture_command, canonicalize_plain, extended_child_path, external_tool_fallback_dirs,
-    find_external_tool, find_in_dirs, pin_git_environment, plain_path_text,
-    resolve_spawn_program_in, resolve_spawn_program_with, PathSource,
+    build_capture_command, extended_child_path, external_tool_fallback_dirs, find_external_tool,
+    find_in_dirs, pin_git_environment, plain_path_text, resolve_spawn_program_in,
+    resolve_spawn_program_with, PathSource,
 };
 #[cfg(test)]
 pub(crate) use env::{
@@ -89,9 +92,13 @@ pub(in crate::engine::process) use gate::{
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(crate) use gate::{
     frozen_gate, leak_gate, refusal_message, rev_parse_launches_from, spawn_log, spent_gate,
-    take_post_action_credit, with_background_budget_wait, with_gate_for_test, Refusal, SpawnGate,
+    take_post_action_credit, with_background_budget_wait, Refusal, SpawnGate,
     POST_ACTION_CREDIT_SPAWNS, SLOT_WAIT_SUFFIX,
 };
+// Its only callers are the devmap read-budget tests, which spawn real children
+// and are unix-only.
+#[cfg(all(test, unix))]
+pub(crate) use gate::with_gate_for_test;
 
 #[cfg(all(test, unix))]
 pub(crate) use gate::hold_credit_open;

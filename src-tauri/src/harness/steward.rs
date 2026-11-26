@@ -6332,34 +6332,30 @@ mod tests {
         let mut deps = base_deps(tmp.path());
 
         // A distinct live OS process represents the elected primary GitPulse
-        // writer. Windows reads no process start time, so no writer there can
-        // be shown live: the record names a pid that is not this one and a
-        // start time nothing can match, and is cleared as stale.
-        #[cfg(unix)]
-        let (mut guard_child, foreign_pid, foreign_start_us) = {
-            use crate::procguard::LockedSpawn;
-            struct ChildKillGuard(std::process::Child);
-            impl Drop for ChildKillGuard {
-                fn drop(&mut self) {
-                    let _ = self.0.kill();
-                    let _ = self.0.wait();
-                }
+        // writer; its start time is read the way the lease reader reads it.
+        use crate::procguard::LockedSpawn;
+        struct ChildKillGuard(std::process::Child);
+        impl Drop for ChildKillGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
             }
-            let child = ChildKillGuard(
-                std::process::Command::new("/bin/sleep")
-                    .arg("30")
-                    .spawn_locked()
-                    .expect("spawn sleep"),
-            );
-            let pid = child.0.id();
-            let start_us = crate::sysload::process_start_us(pid).expect("live child start_us");
-            (child, pid, start_us)
-        };
-        #[cfg(not(unix))]
-        let (foreign_pid, foreign_start_us) = (std::process::id().wrapping_add(1), 1u64);
+        }
+        #[cfg(unix)]
+        let mut sleeper = std::process::Command::new("/bin/sleep");
+        #[cfg(unix)]
+        sleeper.arg("30");
+        #[cfg(windows)]
+        let mut sleeper = std::process::Command::new("ping");
+        #[cfg(windows)]
+        sleeper.args(["-n", "30", "127.0.0.1"]);
+        let mut guard_child = ChildKillGuard(sleeper.spawn_locked().expect("spawn sleeper"));
+        let foreign_pid = guard_child.0.id();
+        let foreign_start_us =
+            crate::sysload::process_start_us(foreign_pid).expect("live child start_us");
         assert_ne!(foreign_pid, std::process::id());
-        // Whether a foreign writer's lease is believed live, and so kept.
-        let kept = cfg!(unix);
+        // A live foreign writer's lease is kept.
+        let kept = true;
 
         let foreign_record = ActiveThrottleRecord {
             version: LEASE_VERSION,
@@ -6420,11 +6416,8 @@ mod tests {
         );
 
         // Once the foreign writer exits, passive cleanup reclaims the stale lease file.
-        #[cfg(unix)]
-        {
-            let _ = guard_child.0.kill();
-            let _ = guard_child.0.wait();
-        }
+        let _ = guard_child.0.kill();
+        let _ = guard_child.0.wait();
         clear_active_throttle_if_owned_or_stale(tmp.path(), deps.now_ms)
             .expect("stale clear succeeds");
         assert!(
@@ -7680,12 +7673,12 @@ Trailing note {done}."#;
     }
 
     /// Where the lease goes when this platform can read its own process start
-    /// time: the file a tick publishes. Windows reads none (`process_start_us`
-    /// answers `None` for every pid), so a tick there publishes no lease and
-    /// says so in its warnings, and the command hook has nothing to trust.
+    /// time: the file a tick publishes. A platform that reads none (neither
+    /// Unix nor Windows) publishes no lease and says so in its warnings, and
+    /// the command hook has nothing to trust.
     fn published_lease(dir: &Path, rec: &StewardTickRecord) -> Option<ActiveThrottleRecord> {
         let file = dir.join(STEWARD_SUBDIR).join(ACTIVE_FILE);
-        if cfg!(unix) {
+        if cfg!(any(unix, windows)) {
             let raw = fs::read(&file).unwrap();
             return Some(serde_json::from_slice(&raw).unwrap());
         }

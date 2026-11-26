@@ -18,7 +18,8 @@
 //! entry, was invisible (5 of 7 live sessions counted, 2026-10-09).
 //!
 //! Each kind reports whether it could look. Where there is no process scan
-//! (Windows) the registry is the detector again, and a kind with no detector
+//! (any platform but macOS, Linux and 64-bit Windows) the registry is the
+//! detector again, and a kind with no detector
 //! is reported as unknown, never as zero sessions: "we cannot see Codex
 //! sessions" and "no Codex session is running" are different facts.
 

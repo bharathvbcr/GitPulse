@@ -49,18 +49,7 @@ use crate::tool_config::LeaseMode;
 /// The subcommand: `waylode-hook lease -- cargo build`.
 pub const SUBCOMMAND: &str = "lease";
 
-/// Set to the slot number for everything a leased build starts, so a nested
-/// `cargo` passes straight through instead of waiting on its own parent.
-pub const HELD_ENV: &str = "WAYLODE_LEASE_HELD";
-pub const LEGACY_HELD_ENV: &str = "GITPULSE_LEASE_HELD";
-
-/// The shell shim's own "already gated" marker (`~/.claude-bin/cargo`).
-pub const SHIM_HELD_ENV: &str = "CARGO_SLOT_HELD";
-
-/// Set on the sessions Waylode launches to the folder of `cargo` / `go`
-/// links, which their PATH starts with.
-pub const BIN_ENV: &str = "WAYLODE_LEASE_BIN";
-pub const LEGACY_BIN_ENV: &str = "GITPULSE_LEASE_BIN";
+pub use super::lease_env::{BIN_ENV, HELD_ENV, LEGACY_BIN_ENV, LEGACY_HELD_ENV, SHIM_HELD_ENV};
 
 /// Test seams: the polling and announcing intervals, in milliseconds (clamped
 /// to a sane range). Real runs set neither. The directory and the program are

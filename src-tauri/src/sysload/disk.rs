@@ -148,8 +148,56 @@ pub fn physical_memory() -> Option<u64> {
     None
 }
 
-/// Windows has no reader here: unknown, so nothing is skipped on a guess.
-#[cfg(not(unix))]
+/// Free bytes available to the calling user and total capacity of the volume
+/// holding `path`, from `GetDiskFreeSpaceExW`. A failure carries the class of
+/// the Win32 error, the way the unix reader carries the errno's.
+#[cfg(windows)]
+pub fn volume_bytes(path: &Path) -> (Reading<u64>, Reading<u64>) {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let failed = (
+        Reading::Unavailable(Why::Failed),
+        Reading::Unavailable(Why::Failed),
+    );
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // An empty path would be read as the current drive's root, and an interior
+    // NUL would end the name early: neither names the volume asked about.
+    if wide.is_empty() || wide.contains(&0) {
+        return failed;
+    }
+    // A UNC name must end in a separator; a directory name may.
+    if !matches!(wide.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/')) {
+        wide.push(u16::from(b'\\'));
+    }
+    wide.push(0);
+    let (mut free, mut total, mut total_free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 name that outlives the call,
+    // and each out-pointer targets a live, writable u64.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut total_free) };
+    if ok == 0 {
+        let why = Why::of_errno(std::io::Error::last_os_error().raw_os_error());
+        return (Reading::Unavailable(why), Reading::Unavailable(why));
+    }
+    (
+        Reading::Value(free),
+        if total > 0 {
+            Reading::Value(total)
+        } else {
+            Reading::Unavailable(Why::Failed)
+        },
+    )
+}
+
+/// No reader on this platform: unknown, so nothing is skipped on a guess.
+#[cfg(not(any(unix, windows)))]
 pub fn volume_bytes(_path: &Path) -> (Reading<u64>, Reading<u64>) {
     (
         Reading::Unavailable(Why::Unsupported),
@@ -157,10 +205,11 @@ pub fn volume_bytes(_path: &Path) -> (Reading<u64>, Reading<u64>) {
     )
 }
 
-/// Windows has no reader here: unknown, so nothing is skipped on a guess.
+/// The real reader off Unix: [`volume_bytes`]. An unreadable volume is
+/// `Unavailable`, never a number.
 #[cfg(not(unix))]
-pub fn free_bytes(_path: &Path) -> Reading<u64> {
-    volume_bytes(_path).0
+pub fn free_bytes(path: &Path) -> Reading<u64> {
+    volume_bytes(path).0
 }
 
 /// What bound the cache copy.
@@ -220,7 +269,7 @@ fn gib(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_real_volume_reads_a_value_and_a_missing_path_does_not() {
         let dir = tempfile::tempdir().unwrap();

@@ -148,7 +148,7 @@ jobs:
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
           export LIBGL_ALWAYS_SOFTWARE=1
           xvfb-run -a -s "-screen 0 1440x960x24" dbus-run-session -- \
-            cargo test --manifest-path src-tauri/Cargo.toml --locked --test gtk_runtime -- --nocapture
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --test gtk_runtime -- --nocapture
 
       - name: Native GTK/WebKit Runtime Smoke (Headless Wayland)
         if: ${{ !cancelled() }}
@@ -177,7 +177,13 @@ jobs:
             fi
             kill "$wpid" 2>/dev/null || true
             wait "$wpid" 2>/dev/null || true
-            rm -rf "$XDG_RUNTIME_DIR"
+            # D-Bus may activate the document portal, which FUSE-mounts
+            # $XDG_RUNTIME_DIR/doc; rm cannot remove a live mount ("Is a
+            # directory"), and a cleanup must never replace the step's own
+            # result, so the step exits with what it ran to.
+            fusermount3 -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || fusermount -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || echo "::warning::could not remove $XDG_RUNTIME_DIR" >&2
+            exit "$rc"
           }
           trap cleanup EXIT
           for _ in $(seq 1 50); do
@@ -191,7 +197,7 @@ jobs:
             exit 1
           fi
           dbus-run-session -- \
-            cargo test --manifest-path src-tauri/Cargo.toml --locked --test gtk_runtime -- --nocapture
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --test gtk_runtime -- --nocapture
 
       - name: Native WebKitGTK UI Regressions (X11)
         if: ${{ !cancelled() }}
@@ -253,7 +259,13 @@ jobs:
             fi
             kill "$wpid" 2>/dev/null || true
             wait "$wpid" 2>/dev/null || true
-            rm -rf "$XDG_RUNTIME_DIR"
+            # D-Bus may activate the document portal, which FUSE-mounts
+            # $XDG_RUNTIME_DIR/doc; rm cannot remove a live mount ("Is a
+            # directory"), and a cleanup must never replace the step's own
+            # result, so the step exits with what it ran to.
+            fusermount3 -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || fusermount -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || echo "::warning::could not remove $XDG_RUNTIME_DIR" >&2
+            exit "$rc"
           }
           trap cleanup EXIT
           for _ in $(seq 1 50); do
@@ -309,7 +321,13 @@ jobs:
             fi
             kill "$wpid" 2>/dev/null || true
             wait "$wpid" 2>/dev/null || true
-            rm -rf "$XDG_RUNTIME_DIR"
+            # D-Bus may activate the document portal, which FUSE-mounts
+            # $XDG_RUNTIME_DIR/doc; rm cannot remove a live mount ("Is a
+            # directory"), and a cleanup must never replace the step's own
+            # result, so the step exits with what it ran to.
+            fusermount3 -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || fusermount -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || echo "::warning::could not remove $XDG_RUNTIME_DIR" >&2
+            exit "$rc"
           }
           trap cleanup EXIT
           for _ in $(seq 1 50); do
@@ -515,7 +533,7 @@ jobs:
       - name: Native Windows WebView2 Runtime Smoke
         if: ${{ !cancelled() }}
         shell: bash
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --test windows_runtime -- --nocapture --test-threads=1
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --test windows_runtime -- --nocapture --test-threads=1
 
       - name: Native WebView2 UI Regressions
         if: ${{ !cancelled() }}
@@ -532,10 +550,65 @@ jobs:
             node scripts/browser-regressions.mjs --native --harness diagnostics
           fi
 
+      # WebView2 Runtime 150+ ignores WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS for an
+      # elevated host (MicrosoftEdge/WebView2Feedback#5645, tauri-apps/wry#1782).
+      # This runner is elevated, so msedgedriver's --remote-debugging-port never
+      # reached the app and every session failed with "DevToolsActivePort file
+      # doesn't exist". The smoke runs at medium integrity instead.
+      - name: Prepare a De-elevated E2E Run
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          GSUDO_VERSION: "2.6.1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install gsudo --version $env:GSUDO_VERSION --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco install gsudo failed ($LASTEXITCODE)" }
+          $exe = Get-ChildItem 'C:\Program Files\gsudo', "$env:ChocolateyInstall\lib\gsudo" -Recurse -Filter gsudo.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw 'gsudo.exe was not found after the install' }
+          Add-Content -Path $env:GITHUB_PATH -Value $exe.DirectoryName
+          # The de-elevated token keeps Administrators only as a deny-only SID,
+          # so what the elevated steps wrote is not its to read or write. Grant
+          # this user, not Everyone.
+          icacls $env:GITHUB_WORKSPACE /grant "${env:USERNAME}:(OI)(CI)F" /C /Q | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "icacls failed ($LASTEXITCODE)" }
+          # Fail here, by name, rather than as the same session timeout, if any
+          # of what the smoke relies on does not carry across.
+          $groups = & $exe.FullName --integrity Medium whoami /groups
+          if (-not ($groups -match 'Medium Mandatory Level')) { throw "gsudo did not de-elevate: $($groups -match 'Mandatory Level')" }
+          # gsudo's exit code does not carry the child's here (a child that
+          # exited 7 came back as 1 through cmd and as 0 through node), so the
+          # smoke step takes its verdict from summary.json, never from it.
+          # gsudo re-runs its command through this shell, which re-parses an
+          # inline script (`node -e 'console.log(...)'` lost its quotes and ran
+          # `process.env...` as a command), so the probe is a file whose path
+          # needs no quoting, and it answers in JSON.
+          $env:GITPULSE_GSUDO_PROBE = 'carried'
+          $probe = Join-Path $env:RUNNER_TEMP 'gsudo-probe.mjs'
+          Set-Content -Path $probe -Encoding utf8 -Value 'console.log(JSON.stringify({ probe: process.env.GITPULSE_GSUDO_PROBE ?? "", cwd: process.cwd() }))'
+          $answer = "$(& $exe.FullName --integrity Medium node $probe)".Trim()
+          try { $seen = $answer | ConvertFrom-Json } catch { throw "the gsudo probe did not answer in JSON: '$answer'" }
+          if ($seen.probe -ne 'carried') { throw "gsudo did not carry the environment (saw '$($seen.probe)')" }
+          if ($seen.cwd -ne (Get-Location).Path) { throw "gsudo changed the working directory ('$($seen.cwd)')" }
+          Write-Output "gsudo $env:GSUDO_VERSION de-elevates: $($groups -match 'Mandatory Level')"
+
       - name: Real-Binary tauri-driver E2E Smoke (Windows)
         if: ${{ !cancelled() }}
-        shell: bash
-        run: node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows
+        shell: pwsh
+        run: |
+          $summaryFile = '.gitpulse/scratch/e2e-windows/summary.json'
+          Remove-Item $summaryFile -ErrorAction SilentlyContinue
+          gsudo --integrity Medium node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows
+          $wrapperCode = $LASTEXITCODE
+          # The verdict is the smoke's own, written last: a run that died before
+          # writing it, or that wrote ok: false, fails whatever gsudo returned.
+          $summary = $null
+          if (Test-Path $summaryFile) { $summary = Get-Content $summaryFile -Raw | ConvertFrom-Json }
+          if ($null -eq $summary -or $summary.ok -ne $true) {
+            Write-Output "Windows smoke failed: summary ok=$($summary.ok) exitCode=$($summary.exitCode) (gsudo returned $wrapperCode)"
+            exit 1
+          }
+          Write-Output "Windows smoke passed: $(@($summary.scenarios).Count) scenarios (gsudo returned $wrapperCode)"
 
       - name: Publish Windows E2E Summary
         if: always()

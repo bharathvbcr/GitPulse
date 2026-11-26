@@ -364,7 +364,7 @@
           // ---- agent checkouts ----------------------------------------------------------
           const agents = $('[data-testid="fleet-open-agents"]', rowOf("alpha"));
           check("the agent count is pluralised and names the kinds", () =>
-            words(agents) === "2 agents" && agents.title === "Agent checkouts: Claude Code, GitPulse task. Show them in Agents.");
+            words(agents) === "2 agents" && agents.title === "Agent checkouts: Claude Code, Waylode task. Show them in Agents.");
           agents.click();
           await until(() => get(interfaceStore).globalSurface === "agents");
           await settle();

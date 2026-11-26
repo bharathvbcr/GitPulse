@@ -8355,9 +8355,11 @@ mod mapping_tests {
     fn simplecov_resultset_and_json_formatter_yield_line_data() {
         let repo = git_repo();
         write(repo.path(), "lib/widget.rb", &lines(4));
-        let abs = repo.path().join("lib/widget.rb").display().to_string();
+        // A JSON string literal, so a Windows path's backslashes are escaped.
+        let abs = serde_json::Value::from(repo.path().join("lib/widget.rb").display().to_string())
+            .to_string();
         let resultset = format!(
-            r#"{{"RSpec":{{"coverage":{{"{abs}":{{"lines":[null,1,0,3]}}}},"timestamp":1}}}}"#
+            r#"{{"RSpec":{{"coverage":{{{abs}:{{"lines":[null,1,0,3]}}}},"timestamp":1}}}}"#
         );
         let map = parse(CoverageFormat::SimpleCov, &resultset, repo.path(), "");
         assert_eq!(map["lib/widget.rb"].get(&2), Some(&1));
@@ -8370,10 +8372,10 @@ mod mapping_tests {
 
         // The JSON formatter's `coverage.json`, served through the Istanbul
         // spec name, and the legacy bare-array form.
-        let formatter = format!(r#"{{"meta":{{}},"coverage":{{"{abs}":{{"lines":[1,null,0]}}}}}}"#);
+        let formatter = format!(r#"{{"meta":{{}},"coverage":{{{abs}:{{"lines":[1,null,0]}}}}}}"#);
         let map = parse(CoverageFormat::Istanbul, &formatter, repo.path(), "");
         assert_eq!(map["lib/widget.rb"].get(&1), Some(&1));
-        let legacy = format!(r#"{{"RSpec":{{"coverage":{{"{abs}":[1,null,0]}}}}}}"#);
+        let legacy = format!(r#"{{"RSpec":{{"coverage":{{{abs}:[1,null,0]}}}}}}"#);
         let map = parse(CoverageFormat::SimpleCov, &legacy, repo.path(), "");
         assert_eq!(map["lib/widget.rb"].get(&3), Some(&0));
     }

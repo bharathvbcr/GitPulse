@@ -3,7 +3,9 @@
 
 use super::tests::{filed, git_repo, live, person_edits, profile};
 use super::{complete_task, resend, resolve};
-use crate::workbench::verification_gate::{current_head, landed_on_default, EVIDENCE_TYPE};
+use crate::workbench::verification_gate::{
+    checkout_of, current_head, landed_on_default, EVIDENCE_TYPE,
+};
 use dc_store::Store;
 use serde_json::{json, Value};
 
@@ -829,4 +831,39 @@ fn attack_a_repository_with_no_checkout_is_a_read_error_not_a_yes() {
     assert!(answer.is_err(), "{answer:?}");
     let answer = landed_on_default("https://example.com/r.git", &"ab".repeat(20));
     assert!(answer.is_err(), "{answer:?}");
+}
+
+/// The identity a repository resolves to names its git directory, spelled as
+/// the platform's repository identity spells it (`\\?\C:\...\.git` on
+/// Windows); the checkout is the directory holding it, not the git directory.
+#[test]
+fn a_repository_identity_names_the_checkout_that_holds_its_git_dir() {
+    let repo = committed_repo();
+    let identity = resolve(repo.path().to_str().unwrap()).unwrap().identity;
+    let checkout = checkout_of(&identity).expect("a local checkout");
+    assert_eq!(
+        std::fs::canonicalize(&checkout).unwrap(),
+        std::fs::canonicalize(repo.path()).unwrap(),
+        "{identity}"
+    );
+}
+
+/// Both separators before `.git` name the checkout on Windows, where either
+/// can spell a path; only the one that is a separator does elsewhere.
+#[test]
+fn checkout_of_reads_the_git_dir_by_path_component() {
+    let repo = committed_repo();
+    let dir = repo.path().to_str().unwrap();
+    assert_eq!(
+        checkout_of(&format!("local:{dir}/.git")).as_deref(),
+        Some(dir)
+    );
+    assert_eq!(checkout_of(&format!("local:{dir}")).as_deref(), Some(dir));
+    assert_eq!(checkout_of(&format!("local:{dir}/missing/.git")), None);
+    assert_eq!(checkout_of("https://example.com/r.git"), None);
+    #[cfg(windows)]
+    assert_eq!(
+        checkout_of(&format!("local:{dir}\\.git")).as_deref(),
+        Some(dir)
+    );
 }

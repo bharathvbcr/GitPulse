@@ -327,6 +327,17 @@ fn classify<'a>(
 /// knows, is still a sequencer git will resume, so it is reported as a
 /// cherry-pick with a warning: a probe that could not tell must not look idle.
 fn sequencer_kind(sequencer: &Path, warnings: &mut Vec<String>) -> Option<OperationKind> {
+    // Something that is not a directory sits where git keeps one. Opening
+    // `<file>/todo` answers "not a directory" on Unix, a failed read, but
+    // "path not found" on Windows, which reads as no step left: idle. Say it
+    // here so both are the same warned cherry-pick.
+    if !sequencer.is_dir() {
+        warnings.push(format!(
+            "{} is not a directory; assuming a cherry-pick",
+            sequencer.display()
+        ));
+        return Some(OperationKind::CherryPick);
+    }
     let before = warnings.len();
     let todo = read_control_head(&sequencer.join("todo"), SEQUENCER_HEAD_BYTES, warnings);
     let Some((todo, truncated)) = todo else {
@@ -1385,6 +1396,24 @@ mod tests {
         // so nothing a concurrent test spawns can land here.
         let spawned = crate::engine::process::spawn_log::spawns_in(&root);
         assert!(spawned.is_empty(), "spawned: {spawned:?}");
+    }
+
+    /// A `sequencer` that is a file, not a directory, is still a parked
+    /// operation that says why it could not be read, whatever the OS answers
+    /// to opening a path beneath a file.
+    #[test]
+    fn a_sequencer_that_is_a_file_is_a_warned_cherry_pick() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::write(root.join(".git").join("sequencer"), "deadbeef\n").unwrap();
+        let paths = resolve_control_paths(&root).unwrap();
+        let mut warnings = Vec::new();
+        let (kind, _) = classify(&root, &paths, &mut warnings).unwrap().unwrap();
+        assert_eq!(kind, OperationKind::CherryPick);
+        assert!(
+            warnings.iter().any(|w| w.contains("is not a directory")),
+            "{warnings:?}"
+        );
     }
 
     /// The kind alone is the kind the full report names, for every probe, and

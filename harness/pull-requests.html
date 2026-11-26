@@ -198,7 +198,7 @@
           button(form, "Open pull request…").click();
           await until(() => !!prompt());
           check("create says it never pushes, before sending", () =>
-            prompt().options.message.includes("GitPulse does not push") && sent.length === 3);
+            prompt().options.message.includes("Waylode does not push") && sent.length === 3);
           completePrompt(true);
           await until(() => sent.length === 4 && created !== null);
           check("and sends the branch's base and title", () =>

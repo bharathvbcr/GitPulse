@@ -12,7 +12,10 @@ import {
   detectDisplayBackend,
   main,
   parseArgs,
+  ptyProbeForShell,
   remainingBudgetMs,
+  webviewOptionsFor,
+  windowsLoggingDriver,
 } from "./e2e-driver-smoke.mjs";
 
 const TINY_PNG_BASE64 = Buffer.from([
@@ -48,11 +51,16 @@ describe("e2e-driver-smoke", () => {
     expect(linux.GIT_CONFIG_NOSYSTEM).toBe("1");
     expect(linux.WEBKIT_DISABLE_DMABUF_RENDERER).toBe("1");
 
-    const win = buildIsolatedEnv("C:\\temp\\e2e-p", { PATH: "C:\\Windows" }, "win32");
+    const win = buildIsolatedEnv("C:\\temp\\e2e-p", { PATH: "C:\\Windows", WEBVIEW2_USER_DATA_FOLDER: "C:\\runner\\wv2" }, "win32");
     expect(win.USERPROFILE).toBe(path.join("C:\\temp\\e2e-p", "home"));
-    expect(win.APPDATA).toBe(path.join("C:\\temp\\e2e-p", "config"));
-    expect(win.LOCALAPPDATA).toBe(path.join("C:\\temp\\e2e-p", "data"));
-    expect(win.WEBVIEW2_USER_DATA_FOLDER).toBe(path.join("C:\\temp\\e2e-p", "webview2"));
+    // AppData sits where the known-folder lookup finds it under USERPROFILE.
+    expect(win.APPDATA).toBe(path.join("C:\\temp\\e2e-p", "home", "AppData", "Roaming"));
+    expect(win.LOCALAPPDATA).toBe(path.join("C:\\temp\\e2e-p", "home", "AppData", "Local"));
+    // The profile is the driver's to place (webviewOptions.userDataFolder);
+    // the env override, set here or inherited, made session creation hang.
+    expect("WEBVIEW2_USER_DATA_FOLDER" in win).toBe(false);
+    expect(webviewOptionsFor("C:\\temp\\e2e-p", "win32")).toEqual({ userDataFolder: path.join("C:\\temp\\e2e-p", "webview2") });
+    expect(webviewOptionsFor("/tmp/e2e-p", "linux")).toBeUndefined();
   });
 
   it("detects display backend accurately across X11, Wayland, Windows, and headless Linux", () => {
@@ -75,9 +83,35 @@ describe("e2e-driver-smoke", () => {
   it("resolves default binaries honoring CARGO_TARGET_DIR and rejects bad ports/timeouts", () => {
     expect(defaultAppBinary("linux", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "waylode"));
     expect(defaultAppBinary("win32", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "waylode.exe"));
-    expect(defaultSeedBinary("linux", { CARGO_TARGET_DIR: "/target" }, "/repo")).toBe(path.join("/target", "debug", "examples", "e2e_seed_trust"));
+    expect(defaultSeedBinary("linux", { CARGO_TARGET_DIR: "/target" }, "/repo")).toBe(path.resolve("/target", "debug", "examples", "e2e_seed_trust"));
     expect(() => parseArgs(["--port", "0"])).toThrow(/1\.\.65535/);
     expect(() => parseArgs(["--timeout", "5"])).toThrow(/30 and 900/);
+  });
+
+  it("wraps Edge WebDriver so it logs verbosely to a file, passing every argument through", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "gp-e2e-wrap-"));
+    try {
+      const log = path.join(dir, "msedgedriver.log");
+      const wrapper = windowsLoggingDriver("C:\\drivers\\msedgedriver.exe", dir, log);
+      expect(wrapper).toBe(path.join(dir, "msedgedriver-logged.cmd"));
+      expect(readFileSync(wrapper, "utf8")).toBe(`@echo off\r\n"C:\\drivers\\msedgedriver.exe" %* --verbose "--log-path=${log}"\r\n`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("hands Edge WebDriver the WebView2 profile as tauri:options.webviewOptions", async () => {
+    const bodies: unknown[] = [];
+    const fakeFetch: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("/session")) bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ value: { sessionId: "sess-w" } }), { status: 200 });
+    };
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    const webviewOptions = webviewOptionsFor("C:\\p", "win32");
+    expect(await client.createSession("C:\\gp\\gitpulse", [], webviewOptions)).toBe("sess-w");
+    expect(bodies).toEqual([
+      { capabilities: { alwaysMatch: { "tauri:options": { application: "C:\\gp\\gitpulse", args: [], webviewOptions: { userDataFolder: path.join("C:\\p", "webview2") } } } } },
+    ]);
   });
 
   it("speaks W3C WebDriver HTTP for session creation, script execution, screenshots, and teardown", async () => {
@@ -99,6 +133,7 @@ describe("e2e-driver-smoke", () => {
     const base = "http://127.0.0.1:4444";
     const client = new WebDriverClient(base, fakeFetch);
     expect(await client.createSession("/bin/gitpulse", ["/tmp/repo"])).toBe("sess-123");
+    expect(seen.find(s => s.url.endsWith("/session"))?.body).toEqual({ capabilities: { alwaysMatch: { "tauri:options": { application: "/bin/gitpulse", args: ["/tmp/repo"] } } } });
     expect(await client.executeScript("return 1", [])).toEqual({ ok: true });
     const dir = mkdtempSync(path.join(tmpdir(), "gp-e2e-unit-"));
     try {
@@ -118,6 +153,38 @@ describe("e2e-driver-smoke", () => {
       `GET ${base}/session/sess-123/screenshot`,
       `DELETE ${base}/session/sess-123`,
     ]);
+  });
+
+  it("waits for the app's page before probing: WebView2 hands the session over on its blank first document", async () => {
+    // As msedgedriver answered in run 45844814075: blank, a look lost to the
+    // navigation, the app's page still loading, then loaded.
+    const answers: Array<{ status: number; value: unknown }> = [
+      { status: 200, value: { href: "about:blank", ready: "complete" } },
+      { status: 500, value: { error: "javascript error", message: "Execution context was destroyed." } },
+      { status: 200, value: { href: "http://tauri.localhost/", ready: "loading" } },
+      { status: 200, value: { href: "http://tauri.localhost/", ready: "complete" } },
+    ];
+    let looks = 0;
+    const fakeFetch: typeof fetch = async () => {
+      const answer = answers[Math.min(looks++, answers.length - 1)];
+      return new Response(JSON.stringify({ value: answer.value }), { status: answer.status });
+    };
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    client.sessionId = "sess-w";
+    const pauses: number[] = [];
+    const state = await client.waitForAppDocument(20_000, async (ms) => { pauses.push(ms); });
+    expect(state).toEqual({ href: "http://tauri.localhost/", ready: "complete" });
+    expect(looks).toBe(4);
+    expect(pauses).toHaveLength(3);
+  });
+
+  it("names the last answer when the app's page never loads, instead of probing a blank document", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ value: { href: "about:blank", ready: "complete" } }), { status: 200 });
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    client.sessionId = "sess-w";
+    await expect(client.waitForAppDocument(30, async () => { await new Promise((r) => setTimeout(r, 10)); }))
+      .rejects.toThrow(/did not load in the webview within 30 ms \(last: .*about:blank/);
   });
 
   it("enforces the overall --timeout budget on WebDriver requests", async () => {
@@ -143,6 +210,24 @@ describe("e2e-driver-smoke", () => {
     const winPs = buildPtyProbeCommand(prefix, suffix, "win32", { COMSPEC: "powershell.exe" });
     expect(winPs.join("")).not.toContain(marker);
     expect(winPs[0].endsWith("\r") && !winPs[0].endsWith("\r\n")).toBe(true);
+  });
+
+  it("reads Windows' ComSpec in any case, the way the app's default shell does", () => {
+    // Windows spells it `ComSpec`; a copied environment object is not
+    // case-insensitive, and the probe fell back to PowerShell syntax for the
+    // cmd.exe the app started (E2E run on 17e968915).
+    const viaComSpec = buildPtyProbeCommand("P_", "s", "win32", { ComSpec: "C:\\Windows\\system32\\cmd.exe" });
+    expect(viaComSpec).toEqual(ptyProbeForShell("P_", "s", "win32", "cmd.exe"));
+    expect(buildPtyProbeCommand("P_", "s", "win32", {})).toEqual(ptyProbeForShell("P_", "s", "win32", "powershell.exe"));
+  });
+
+  it("types for the shell the app reports it started", () => {
+    const cmd = ptyProbeForShell("P_", "s", "win32", "C:\\Windows\\system32\\cmd.exe");
+    expect(cmd.join("")).toContain("%_gp_m%");
+    for (const shell of ["powershell.exe", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"]) {
+      expect(ptyProbeForShell("P_", "s", "win32", shell)[0]).toContain("Write-Output");
+    }
+    expect(ptyProbeForShell("P_", "s", "linux", "/bin/zsh")[0]).toContain("printf");
   });
 
   it("matches every CLI invocation in .github/workflows/e2e-desktop.yml", () => {

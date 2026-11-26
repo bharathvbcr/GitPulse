@@ -213,9 +213,9 @@ const JOURNAL_FILE: &str = "journal.v1.json";
 /// build is a holder of the lease board, and is eligible for rung B only while
 /// the board is refusing new builds.
 const LEASE_MARKERS: [&str; 3] = [
-    crate::hooks::lease_wrapper::HELD_ENV,
-    crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
-    crate::hooks::lease_wrapper::SHIM_HELD_ENV,
+    crate::hooks::lease_env::HELD_ENV,
+    crate::hooks::lease_env::LEGACY_HELD_ENV,
+    crate::hooks::lease_env::SHIM_HELD_ENV,
 ];
 /// `mac_heavy.sh`'s marker: a heavy job a person started, never frozen.
 const HEAVY_MARKER: &str = "MAC_HEAVY_LABEL";
@@ -689,6 +689,8 @@ pub(crate) enum Signal {
 }
 
 /// What became of a signal that was not refused.
+/// Only Unix delivers signals; elsewhere every signal is refused.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Delivery {
     Delivered,
@@ -794,6 +796,8 @@ impl Actuator for OsActuator {
 /// The real probe: the OS for working directories and environments, the lease
 /// directory under `config` for builds.
 pub(crate) struct OsProbe {
+    /// Read for the lease board, which is Unix-only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub config: PathBuf,
 }
 
@@ -2560,7 +2564,7 @@ impl Relief {
 
     /// Reads this relief's process table from `table` instead of the scan the
     /// sampler hands in: a test's seam.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_table(
         mut self,
         table: std::sync::Arc<dyn Fn() -> ReliefTable + Send + Sync>,

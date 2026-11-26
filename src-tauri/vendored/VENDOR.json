@@ -229,7 +229,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-analyze",
-        "commit": "2acef200df69622b459278e1d88745bfb393d043"
+        "commit": "135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1"
       },
       "omitted": [
         "tests/",
@@ -272,7 +272,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-extract",
-        "commit": "2acef200df69622b459278e1d88745bfb393d043"
+        "commit": "135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1"
       },
       "omitted": [
         "tests/",
@@ -344,7 +344,7 @@
         "src/heritage.rs": "aa2a8d05f44ac7cd885e78714fbd965cf66aa70bf1fb5f7f866fddaca7b038ec",
         "src/jsobjects.rs": "8ae27c903f692c298ec2ca92bb8d6c2403a9be243509921afa13a4878de839ec",
         "src/jvmfacts.rs": "79b09eada7dfe96cb71056fa60b4b9a04363f2713f52e94cf7fe3039275317d8",
-        "src/kotlinloss.rs": "55b93c66537fb4144e24b3a20d667b506b3809af379f62515c45279eff2b32ae",
+        "src/kotlinloss.rs": "92417727cccb56e8e3a0562b2484d6b48e1c51f73690d88cc83a0d2bfcd6333e",
         "src/kotlinsemi.rs": "afe63012f7721f6743ac6a85653a030143e89104f28a76da9e8efb8486faeaf4",
         "src/langcalls/csharp.rs": "cccad4267800c472c1a43bd06b460a5c42e3143d1ee97f0ec8329ebbc531a05c",
         "src/langcalls/dart.rs": "bbd82289bd96b106d4ccb361453f61deed1861ab69084a8cc7083cd1df4025b0",
@@ -364,7 +364,7 @@
         "src/langcalls/shell.rs": "02d745e342e6fb38297fde16e1ec406f5305e6fca9cce0dfb9ae8db422a5f561",
         "src/langcalls/solidity.rs": "cb31515fbd5be4a9235225a6479a000e494600b7f1f249716f7e52269c725c90",
         "src/langcalls/sql.rs": "e4cd7539e4f30dfa540d7e9eb8439874cc1b2759d812db9dbf35af57138e68b2",
-        "src/langcalls/swift.rs": "9957d3496c0ebbd5b13acc7afde46910bf0c43f58b6291c4d861afff8b71817f",
+        "src/langcalls/swift.rs": "1b7013d08e9c236c2d69783d615e266db8f834a0c1437153970ac25de5d10ad3",
         "src/langdecl/access.rs": "009751a9a4f4f93d0cbda2efc2caa0117679be41753b44c301337c4e3df3e291",
         "src/langdecl/dart.rs": "1fea3675cf743b5b34b82d61ae4e7e4048b7beb81a4b1d7267322e1e7b2d0b24",
         "src/langdecl/erlang.rs": "1bc157e9c61ca49861f6918c0000c184fdde557474c78528779b0573d2a15d5b",
@@ -374,7 +374,7 @@
         "src/langdecl/nix.rs": "231cbbe0ed2ca5f5f1d0d72226e020376b1fc2f53a94454a8c2e3b01ce7f1e00",
         "src/langdecl/pascal.rs": "61d44d89a6a13b17ddb53f03da3201865bd971b828c5b17ea4e0737013fc1c99",
         "src/langdecl/r.rs": "3d6dff0b2432bae475c040665e790720890cd06f46568395612b9ee23340e5c4",
-        "src/langdecl/ruby.rs": "89ea1f85398de094f36b6b3d225b35856578c903794d948d0847d1078f703702",
+        "src/langdecl/ruby.rs": "3e0290db9359ef1c5ef5407e20a8a41b8b49ed6e8a49f0164d3883fbf7da6ad2",
         "src/langdecl/solidity.rs": "696df03a24f1856fdb1dbfbcbc8cb697b5ff999b19caa72e3b270eacf91ab98d",
         "src/langdecl/swift.rs": "dd0105fe7d8fa4c8821f35ddf83f9554f18773427f29c486b33f73efe69248f6",
         "src/langfields.rs": "152555709532faabbc0be5c6524300154c9808207240f548959c1b4adae136e7",
@@ -392,21 +392,22 @@
         "src/langimports/php.rs": "b2dd2a45debff31a8dcac23e629b1fd8fb36688e0988c0e1df2c92db7ec6291c",
         "src/langimports/r.rs": "dbbf366b0df0e5cf31487fdbcdea201a4e858bbed8c938f1479b5fe4130b2f08",
         "src/langimports/ruby.rs": "d8a20501f0e9dcca12508bb56e1276c3c0388249d4de35442c01c14b11c4cbc0",
-        "src/langimports/rust.rs": "ef852e93e78b6ed5a9d292674782222049515b8f9b2be320d0a569f7e0d727fa",
+        "src/langimports/rust.rs": "e122909eff8a266ed99e1850bd53935b1ef2991adc76ebc0ef52363e1d86d7f5",
         "src/langimports/scala.rs": "bf9547407a203103ddef0c4cdaa72daa353f632115131ca973ac43e105786a1e",
         "src/langimports/shell.rs": "cf2c81b8824adebfd2767ec2126ec0ab86b4f558911251d83c246e9b6f7165ac",
         "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
         "src/langimports/swift.rs": "7e7e09d2a5557f886724cd538e8a0abebc41a5292f4d3538f3e2ae5b56da538f",
-        "src/languages.rs": "9f5f130c5e63256ee6833cf754fc53e47458e1e4e706b915bb474e9f6ba67f05",
+        "src/languages.rs": "939dbb9fa118df607f06e00a02da9afa2d2130947024c1dbe93ba2cfca5c9d49",
         "src/lean.rs": "9c1d668f89acfc7790b87f8ab46b60f80a646d849c3429427e84e56b594c94c0",
-        "src/lib.rs": "df43ff3f0a6ed618d9f271be1fac123ef77f06a182a3cee7f7bc6905d50d3508",
-        "src/literals.rs": "c97a2b995388e56095c26e573aff8bfc225299a3ecda08e5e7d464b4e188a62f",
+        "src/lib.rs": "d270f597ae149b8af916c460e2e8715025dfdd876c17d8dd92b38510a1cb5dab",
+        "src/literals.rs": "0819af8a5190d2643c32673b0dd11d203ffb75c13ab017f1d553a4b659e3c309",
         "src/markup.rs": "523018ecf091b703c6fa30f488d742c05957b641ab35919c97036c6a38e074a2",
         "src/model.rs": "eded92be428d4895afafed0a3ee4f513779bd5d1a5d169b75d965a3db01d75b5",
         "src/notebook.rs": "9f57b4cb2966ef23d99012760912e97887dbba902cff6e335138b15dbc691bf3",
-        "src/parent_index.rs": "3117a0e489e04f71e5a7879a0a3c14a8515ec10e35df529e3f05a9c950748311",
+        "src/parent_index.rs": "ea5d28f7310ddee2b2424146939e9ee33ab5abe838f1056c70552897b53c8b47",
         "src/parse_repair.rs": "a52150973bd0bfc9b9ccb0f52cfaa8f7a55c35473f0343dd70332f79deede8a8",
         "src/paths.rs": "522e9af0d0ec0f8203c895fe6b9190abcd584ccf2305fa09e2c2b421a9adb493",
+        "src/process.rs": "980dfcb77fd3a1c5f2f87bd12bc1f8112df63e99f220ff6f97eee231945045fb",
         "src/progress.rs": "fbff48599312b685349a379bc4233d7879bc3a9c79c1d75c61381e9b3ac3c096",
         "src/pyfacts.rs": "4ffb899182370c48374d7f12f8c56f72f690c636436a193c12adbfd3defb272d",
         "src/pyload.rs": "115c883e7924cb0f89dcdca04f079fd654d683cc4e42cf39ae392090b4b91d9e",
@@ -414,7 +415,7 @@
         "src/returns.rs": "4dd3406ef1feb1715589e421f740674bac6f7248dc224b8eb10aa41e0ad62553",
         "src/rustlocal.rs": "40430e7e320f7854791cea1be5610a68c6a338ef6e31b1c0bbbe41573aab64a3",
         "src/rustsig.rs": "7a01fe8c360e5fc9da8d4e723652d960c721f0025e8d7c1b72b5f11499f73c8e",
-        "src/safe_fs.rs": "4716d9f0c62e6453005cebc377306451088a1b8bf01f808f03b3a7d1374d7eec",
+        "src/safe_fs.rs": "af11450750792e78c3145821821a6ff06ee0db2fba02109ee41640b0589f8541",
         "src/secret.rs": "c43e8af018ecdb8d30e9d9512083fe2ff276ee2a9e59d3836340ad7c82e102f2",
         "src/sqlddl.rs": "2d339e2f6a7af5413f3b99a1026f951688e58b696cfc2ae52eb2ff0e7703ad6e",
         "src/sveltetext.rs": "eba43d34b4e137ca6f23dfd6152877a6f49fab912abc63c784c8916fcb08d6c8",
@@ -426,12 +427,12 @@
         "src/treesitter/cfamily.rs": "992a6c7470f6f329c20a1b5e5b479acf03165c77f60996a4f5b9ab2c9b04f31e",
         "src/treesitter/cfg_copies.rs": "29054c3f35a1872a32fa53451235cd8212dad6b047f86403e0b3e3fcbf3d4c1a",
         "src/treesitter/entry.rs": "fbc4a6db10a4f5c6bac8b06268630c75be0320b4554a07381192a28af556ddef",
-        "src/treesitter/extract_node.rs": "ada5a8f47e2b531957c7c5eb0a7205dc424a6f7c557d1d45e3ea77af37810280",
-        "src/treesitter/lang_helpers.rs": "50d6acb8800d12a0bca9cea9fa009dd562aab293d345d511712a00195e69c349",
+        "src/treesitter/extract_node.rs": "5b5796cf7231b011deaa2873fe3784f0de8fcc9eadf26bcfabe78cf90d6aebe3",
+        "src/treesitter/lang_helpers.rs": "588ceedafca055e1b651cd447f51de55f3c994c74cfb4a6e55f3d41625f464cd",
         "src/treesitter/parent_work_regression.rs": "be792fb521cd90538097a115cb1a929af30a0de1b792dddb636c580cf27aff29",
         "src/treesitter/probe_deadlines_and_nesting_caps.rs": "dac899e328f7fe3570c2a130409d38180a98342be7035ad1df58d07b04cb8b11",
-        "src/treesitter/references.rs": "b707daa07fbfcf1a46350be6329e18934b7859f67979eff3f7bccc8e2a22dddb",
-        "src/treesitter/rust_use.rs": "2e2098c78342b5ec34fd32e009bc3948eea41c369ca00b2895c3ef3b653068c6",
+        "src/treesitter/references.rs": "5db4c2b1de3a7b09859c1092bbf01b36077339832b5fa250832c34bac6c74e68",
+        "src/treesitter/rust_use.rs": "de9608212cc10bb13a7435386948854aad173b0f056171e3407a4842745dadce",
         "src/treesitter/scope_locals.rs": "70091dc7b94be48707c36fc1f7d1a914544c4f8776acbd34416246316ec48db0",
         "src/treesitter/tests.rs": "4b7b1120ea45c83539b5fb899528b1925ea741bae58930f7f62cb7e106059e99",
         "src/treesitter/walk.rs": "2af990b334ce3cf1711b7e51bf1ed19957112c906cd705080db9c392e2380f20",
@@ -447,7 +448,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-query",
-        "commit": "2acef200df69622b459278e1d88745bfb393d043"
+        "commit": "135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1"
       },
       "omitted": [
         "tests/",
@@ -540,7 +541,7 @@
         "src/escape.rs": "d87b290b8613736bf735d4424495b33dfbbda99e1d944abb5507ef63a9b8b27e",
         "src/evidence.rs": "413d5ef7345fb3dbb34306553db3c5290fb9f607e247f1d5fd8794f82f852ba5",
         "src/export.rs": "7fd87c98fd1ca3e851f637cf9118b3f8bc1163f4e342525c22f5348b86ad543f",
-        "src/federate.rs": "a04cbfb3faecdbe557c5c426bd1d363d2771c88ff1133e063fb11889a5f22f7e",
+        "src/federate.rs": "407c06e0073474971997bdbd062afb34085dec5bdafc860f18574e07d7790527",
         "src/freshness.rs": "fd4289f97b7961abf6cf9b313bd582dda4a2bfbb5c48a0802f81877289ba106a",
         "src/guides.rs": "76d7aefe514ba26bd276d8c12f533974886bb248796c4893b3c4910191bd077b",
         "src/host.rs": "9341d12d28352ff73fbe4e7dc8a2004bf664471b115e67feca14473e5ef3b7ae",
@@ -556,10 +557,10 @@
         "src/page.rs": "e55f303192ef0828c6ea6d5cff596e9ee38f3da39db97307e2e185d8966d008f",
         "src/query_match.rs": "80565dc42f60058ba11a05d7019dceda6e38fef4ad6dc7357d000cd538ffc159",
         "src/rung.rs": "8aaa8ae55a5064ab0cabc26f6fb7de4987f1e1205f5bea4e51a9dc663b741d3e",
-        "src/scope.rs": "894b46b3af72daea975facfa2ab9449818d3c83b90d452f30d2d0b02235d2e63",
+        "src/scope.rs": "31c2adc5f606e180d8707e868ef7ea4e4d1412d856cd96a11adb9a597e6826cf",
         "src/semantic.rs": "96a6cb9cc84f6e40fb810c5763b47d272da7ddf1418f23a5e8df066b0d543078",
         "src/snapshots.rs": "6f4b9f52346bbd89f2059f5e718fe439891595e3f09ecc37214b82b60174377a",
-        "src/stacked.rs": "c15af6ffabccb13b5dd194f1823e9e97c15ea1a74c5e999fa4d6b20186fa29f3",
+        "src/stacked.rs": "f631016e0ee3abfe816921c3b5719e1126ddea35a8e318800ac6fbfacc70c4c6",
         "src/stat_memo.rs": "c9906d2f189c95ee291ddd6e6168cfd27df4ae9d0e10907803fd681b1636891e",
         "src/tests/inventory_reader.rs": "47467493c0bf1dfa4be29417942557e6dd63dd0541d225001853d5d96aa3789f",
         "src/viz.rs": "18fa04635ad46f092887e01da0b2b7e2dbd9cc25672f8bf647ca0c9f45a62de1",
@@ -572,7 +573,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-resolve",
-        "commit": "2acef200df69622b459278e1d88745bfb393d043"
+        "commit": "135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1"
       },
       "omitted": [
         "tests/",
@@ -594,7 +595,7 @@
         "src/builtins.rs": "058443d4d607c1a9125d8b33a97610aa6591f3218d36f91784f0e3513466cd2e",
         "src/importpath.rs": "a725ad08160f85edfc2365c637bda9e80e982d356a44f53724ed23d7b0c2fa6b",
         "src/lib.rs": "f955dc6e843be8d25865489b56279bc86457ffb503c086c8cd155d37de5afc8b",
-        "src/lsp.rs": "5e38dc5db24a5b523ee5478b1acf3bcdec4cd5d7af6f04e746fcabc8b42fd4af",
+        "src/lsp.rs": "7d461f9239c31eb124fe3dfb7f843b45b5521162efcff84af65757c0857ad765",
         "src/model.rs": "7bf0c1c83f4498d292773802474da0422859eb8527e100d2bdd4abe4a180f4cc",
         "src/resolver/candidates.rs": "d2fc826fdd9e817c0b5229fdb17881e6f4f9c9d377e2fdef022d17a07de839a8",
         "src/resolver/dispatch.rs": "1b91fe73f97e12686b702978ed6060a5d7fd3b193476a97c1beb6f4a1a4145df",
@@ -604,7 +605,7 @@
         "src/resolver/import_path.rs": "b3ae83d4121c001266ec90c8ea1a6f831e332959b9a40691bf71b9853937c29b",
         "src/resolver/import_resolution_tests.rs": "f296e44d1185e746034ef9584f4705ae0b45963a75306afa3bba31841e754efc",
         "src/resolver/imports.rs": "33e73d3a81358b2631fb9855026e80992723705cf24ca25ea4b46b784615afba",
-        "src/resolver/index.rs": "7854ba38f45965677fd731be56316b87a292dfe61beee6f7d3815c2fa5dfb151",
+        "src/resolver/index.rs": "50caf6ae9180d50b04439745fca8c9dc7f23c370f9bf74da1cb40f821876c6b3",
         "src/resolver/jsobjects.rs": "1ee5f735c509a35c48b3b0ce10f2cd09c4202363550159a68ecd68d5524197b2",
         "src/resolver/ladder_tests.rs": "cc6c786331b97f91f56e397e189bf0c19dbb5ed1b502b3342e177694024fbd17",
         "src/resolver/parallel_sort_tests.rs": "3f41faac160877acfee8732e0f9c3adb0a440bfb25d34cc0c7f24a6d9ae4df86",
@@ -612,7 +613,7 @@
         "src/resolver/receiver_types.rs": "da7cf467e04ce9df3d7cf74005c4c2da28c837e9e779e637ad81c4fa4ab39068",
         "src/resolver/reference_resolution_tests.rs": "553ab760bac21a77699f3685ab06148c422ca897b9de7e7518e02a3cf6cfdc06",
         "src/resolver/references.rs": "e144cfa6724500964701bd442ff2ba0baeecb572b1a44c59060da6012c22bcef",
-        "src/resolver/resolve_all.rs": "07d99d36e3860e1b5389c7b43b8c2f4c26e6c9bb0951cdd4733c309483fba24b",
+        "src/resolver/resolve_all.rs": "5948efc5576cd6e0c8f2b6ba60eb8b68165ba24c96b067e1a010a2171d74db9a",
         "src/resolver/rust_modules.rs": "c2e13f88604366796046d2eb49afda8d4117f9cde7572c0468536b8f92842ce5",
         "src/resolver/rust_site_scope.rs": "b023e5a3c44ab52d48ea6b0f7eff16eea28a2a9a56dcb94c65bc5d22a59c85d8",
         "src/resolver/scope.rs": "e981e40ea947f23aca5284675cd083cf7b1944aa9d7068fb3324bf56e5beab20",
@@ -620,7 +621,7 @@
         "src/resolver/ts_mapping.rs": "f626ac50e7af9dd57746d21d8a1767b52a7dd432f1cb13371a0812c34f76acf9",
         "src/resolver/unresolved.rs": "122c9dacf6ec87559f043649f43103aad2e14473cd5897eda31595b2361fdccf",
         "src/resolver/value_types.rs": "7930df832a130f88b3ac1d547076af82dee79be78e1daddf3f4cd6c418cd9918",
-        "src/resolver.rs": "8b2ed961a5591dc52aea62ade40345fa3b397046677a3795ed9a5196ba8dc12a"
+        "src/resolver.rs": "f2a9f5f25891a66c21c3fcba1d89b7433bf8c871166c9a94ebf4181d4ffb5c07"
       }
     },
     {
@@ -629,7 +630,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-store",
-        "commit": "2acef200df69622b459278e1d88745bfb393d043"
+        "commit": "135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1"
       },
       "omitted": [
         "tests/",
@@ -681,10 +682,10 @@
         "src/delta.rs": "ef1b2e7af63f0606bae5662810d16f49a6e8b3e1688633ec17405e8b9dabe8b6",
         "src/edge_index.rs": "cdf1fb54ca7a87b68f085f92abbc14bf87dada6077578355d4518a320f0a532c",
         "src/extract_cache.rs": "b8cdf05c24b49477bf898da23290bef4b5347da3190e704679baf668c4bc1b18",
-        "src/lib.rs": "20d7f8c72430cc7ecf8d3e2dbda932c9c9d40dd4da1e9af8c9ac5f01cfbda065",
-        "src/payload_codec.rs": "eaaaee97b72ba7d8ec3af46800d6ec17501dec6cf37772fa9a37a43dcea3800f",
+        "src/lib.rs": "1ec20b0ea318fc4e42ab2305ab43ef8558743798a6cfd4c9fc437ed8abdae9a6",
+        "src/payload_codec.rs": "862de96c2c1b7d918831ad54898b3b2c05084b915896d11d65139bfefc7f0876",
         "src/schema.rs": "edf73e1387d38e6aeb5b4dc79564d104128857e9c3fe8873c6a84715e63d2ed6",
-        "src/seed.rs": "b08b94ca79e98147b68023b0b0fc218204d5fe1508e7b5bd954fe4e8fe22301c"
+        "src/seed.rs": "c9a1ed22470d869f1026dac02ab2b9bd36636954e597ea53b1c329d9637bad46"
       }
     },
     {

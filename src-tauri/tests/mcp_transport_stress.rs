@@ -387,10 +387,6 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
         .status_locked()
         .unwrap();
     assert!(init.success());
-    let executable = std::env::current_exe()
-        .unwrap()
-        .to_string_lossy()
-        .replace('\'', "'\"'\"'");
     let wrapper_dir = fixture.path().join("bin");
     std::fs::create_dir_all(&wrapper_dir).unwrap();
     let orig_path = std::env::var_os("PATH").unwrap_or_default();
@@ -398,6 +394,11 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Shell-quoted for the sh wrapper; the Windows .cmd wrapper quotes its own.
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\'', "'\"'\"'");
         let real_git_escaped = real_git.to_string_lossy().replace('\'', "'\"'\"'");
         let wrapper_path = wrapper_dir.join("git");
         let script = format!(

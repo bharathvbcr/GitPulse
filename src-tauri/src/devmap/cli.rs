@@ -444,6 +444,19 @@ pub(crate) fn bind_test_binary(path: impl Into<String>) -> TestBinaryBinding {
     TestBinaryBinding(serial)
 }
 
+/// Binds the devmap binary the product itself resolves, for tests that need a
+/// real index build. It resolves with the serial already held: no other test
+/// can have a stub bound then, so the answer is never another test's fake, and
+/// the serial is taken once (a second guard on top of [`bind_test_binary`]'s
+/// would deadlock). Panics when no devmap is installed.
+#[cfg(test)]
+pub(crate) fn bind_resolved_test_binary() -> TestBinaryBinding {
+    let serial = crate::test_support::env::env_serial();
+    let resolved = resolve_binary().expect("real devmap binary installed");
+    set_test_binary(Some(resolved.path));
+    TestBinaryBinding(serial)
+}
+
 /// A `devmap status --json` answer that parsed, for a test that is about what
 /// the decision logic does with it.
 #[cfg(all(test, unix))]
@@ -746,8 +759,9 @@ impl ReadBudget {
         }
     }
 
-    /// (total, background) slots held now.
-    #[cfg(test)]
+    /// (total, background) slots held now. Its tests spawn real children and
+    /// are unix-only.
+    #[cfg(all(test, unix))]
     fn held_now(&self) -> (usize, usize) {
         let held = self
             .held
@@ -848,7 +862,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn with_read_budget<T>(budget: &'static ReadBudget, wait: Duration, body: impl FnOnce() -> T) -> T {
     let _restore = std::mem::DropGuard::new(
         (
@@ -3126,6 +3140,7 @@ exit 2
     }
 
     /// A budget shaped as the process's own, leaked so a test can hold slots.
+    #[cfg(unix)]
     fn production_shaped_budget() -> &'static ReadBudget {
         Box::leak(Box::new(ReadBudget::new(READ_SLOTS, BACKGROUND_READ_SLOTS)))
     }

@@ -3718,21 +3718,6 @@ mod tests {
         assert_eq!(list_lanes(anchor.to_str().unwrap()).unwrap().len(), 1);
     }
 
-    fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            for rel in [".local/bin/devmap", ".cargo/bin/devmap"] {
-                let candidate = home.join(rel);
-                if candidate.is_file() {
-                    return crate::devmap::cli::bind_test_binary(
-                        candidate.to_string_lossy().into_owned(),
-                    );
-                }
-            }
-        }
-        let resolved = crate::devmap::cli::resolve_binary().expect("real devmap binary installed");
-        crate::devmap::cli::bind_test_binary(resolved.path)
-    }
-
     fn seed_clean_indexed_anchor_with_csr() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path();
@@ -3761,7 +3746,7 @@ mod tests {
             ],
         );
 
-        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        let canon_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         crate::test_support::trust_repo(&canon_anchor);
         crate::devmap::ensure_state_dir_excluded(&canon_anchor);
 
@@ -3891,7 +3876,7 @@ mod tests {
 
     #[test]
     fn radar_detects_cross_file_1hop_caller_callee_collision_over_zero_copy_csr() {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let anchor_dir = seed_clean_indexed_anchor_with_csr();
         let anchor = anchor_dir.path();
 
@@ -4120,12 +4105,15 @@ mod tests {
         fs::write(&lease_path, b"{ not json").unwrap();
 
         let radar = scan_parallel_agent_radar(anchor.to_str().unwrap()).unwrap();
-        let wt_canon = wt.canonicalize().unwrap();
+        let wt_canon = crate::engine::process::canonicalize_plain(&wt).unwrap();
         let failed = radar
             .scan_errors
             .iter()
             .find(|e| {
-                Path::new(&e.worktree).canonicalize().ok().as_deref() == Some(wt_canon.as_path())
+                crate::engine::process::canonicalize_plain(Path::new(&e.worktree))
+                    .ok()
+                    .as_deref()
+                    == Some(wt_canon.as_path())
             })
             .unwrap_or_else(|| panic!("scan failure must be surfaced: {radar:?}"));
         assert!(!failed.error.is_empty());

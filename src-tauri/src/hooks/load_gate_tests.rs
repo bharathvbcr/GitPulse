@@ -1535,9 +1535,10 @@ fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relativ
         .invalidating(crate::tool_config::invalidate_cache);
     let here = root.path().to_string_lossy().into_owned();
     let free = gather_live(&here).disk.free_bytes;
-    // Windows has no free-space reader (`sysload::free_bytes` is Unsupported):
-    // the answer there is unknown, never a number guessed from another source.
-    if cfg!(unix) {
+    // Unix reads free space with statvfs and Windows with GetDiskFreeSpaceExW
+    // (`sysload::disk`). A platform with neither reads unknown, never a number
+    // guessed from another source.
+    if cfg!(any(unix, windows)) {
         assert!(free.is_some_and(|bytes| bytes > 0), "{free:?}");
     } else {
         assert_eq!(free, None, "no reader: unknown");
@@ -1551,7 +1552,7 @@ fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relativ
     assert_eq!(gather_live("relative/dir").disk.free_bytes, None);
     assert_eq!(
         gather_live("").disk.free_bytes.is_some(),
-        cfg!(unix),
+        cfg!(any(unix, windows)),
         "no cwd given: the process's own directory, where a reader exists"
     );
 }

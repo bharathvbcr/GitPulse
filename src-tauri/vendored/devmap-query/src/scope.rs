@@ -395,17 +395,38 @@ fn normalise_prefix(raw: &str) -> anyhow::Result<String> {
     Ok(path)
 }
 
+/// `X:/...`: a Windows drive-letter path after its separators were normalised.
+fn drive_prefixed(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+/// A Windows verbatim spelling (`//?/C:/x`, from `canonicalize`) and the plain
+/// one (`C:/x`) name one place; compare them as the plain one.
+fn without_verbatim(path: &str) -> &str {
+    match path.strip_prefix("//?/") {
+        Some(rest) if drive_prefixed(rest) => rest,
+        _ => path,
+    }
+}
+
 /// An absolute prefix made relative to the indexed root; a relative one as is.
+///
+/// The recorded root is spelled with the platform's separators (and, on
+/// Windows, a `\\?\` verbatim prefix), while a prefix arrives already
+/// normalised to `/`, so both are brought to one spelling before comparing.
 pub(crate) fn relative_to_root(prefix: &str, repo_root: Option<&str>) -> anyhow::Result<String> {
-    if !prefix.starts_with('/') {
+    let prefix = without_verbatim(prefix);
+    if !(prefix.starts_with('/') || drive_prefixed(prefix)) {
         return Ok(prefix.to_string());
     }
-    let Some(root) = repo_root.map(|root| root.trim_end_matches('/')) else {
+    let Some(root) = repo_root.map(|root| root.replace('\\', "/")) else {
         anyhow::bail!(
             "paths entry {prefix:?} is absolute and this index recorded no repository root to \
              make it relative to; pass it repository-relative"
         );
     };
+    let root = without_verbatim(root.trim_end_matches('/'));
     if prefix == root {
         anyhow::bail!(
             "paths entry {prefix:?} is the repository root itself; omit `paths` instead of passing it"

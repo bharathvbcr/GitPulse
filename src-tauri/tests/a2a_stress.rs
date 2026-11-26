@@ -46,6 +46,26 @@ fn call(tool: &str, args: &[(&str, String)]) -> (i32, Value, String) {
     )
 }
 
+/// Why a call failed: its exit code and its output without the `WARN [...]`
+/// log lines a Windows child prints first. Filtering only `[setup]` left a
+/// `[spawn_gate]` summary in the 300 characters shown, so the actual error
+/// still went unread; when nothing but log lines was printed, those are shown.
+fn failure_reason(code: i32, raw: &str) -> String {
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|line| !line.contains(" WARN ["))
+        .collect();
+    let shown = if lines.is_empty() {
+        raw.to_owned()
+    } else {
+        lines.join(" | ")
+    };
+    format!(
+        "exit {code}: {}",
+        shown.chars().take(300).collect::<String>()
+    )
+}
+
 fn s(x: impl ToString) -> String {
     x.to_string()
 }
@@ -496,7 +516,11 @@ fn concurrent_senders_in_separate_processes_lose_nothing() {
                         code,
                         v["message"]["seq"].as_u64(),
                         t.elapsed().as_millis(),
-                        if code == 0 { String::new() } else { raw },
+                        if code == 0 {
+                            String::new()
+                        } else {
+                            failure_reason(code, &raw)
+                        },
                     ));
                 }
                 res
@@ -610,7 +634,11 @@ fn concurrent_large_senders_lose_nothing() {
                         (
                             code,
                             t.elapsed().as_millis(),
-                            raw.chars().take(160).collect::<String>(),
+                            if code == 0 {
+                                String::new()
+                            } else {
+                                failure_reason(code, &raw)
+                            },
                         )
                     })
                     .collect::<Vec<_>>()

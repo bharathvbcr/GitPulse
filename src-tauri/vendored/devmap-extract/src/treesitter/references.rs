@@ -160,7 +160,7 @@ pub(super) fn rust_macro_member_name(node: Node, lang: &str) -> bool {
     lang == "rust"
         && node.kind() == "identifier"
         && bounded_parent(node).is_some_and(|parent| parent.kind() == "token_tree")
-        && node.prev_sibling().is_some_and(|prev| prev.kind() == ".")
+        && crate::parent_index::prev_sibling_of(node).is_some_and(|prev| prev.kind() == ".")
 }
 
 /// Grammar keys with a language-specific arm in `extract_node`.
@@ -375,13 +375,47 @@ pub(super) fn c_declarator_declaration(node: Node) -> Option<Node> {
 /// that merely shares the spelling: a free function `minute`, or a property
 /// `size` of the type the expression is written inside.
 pub(super) fn swift_leading_dot_member(node: Node, source: &str) -> bool {
-    let Some(parent) = bounded_parent(node) else {
-        return false;
-    };
-    parent.kind() == "prefix_expression"
-        && source
-            .get(parent.start_byte()..node.start_byte())
-            .is_some_and(|operator| operator.trim() == ".")
+    swift_leading_dot_prefix(node, source).is_some()
+}
+
+/// The `.` prefix of the Swift leading-dot chain that `node` is the base of:
+/// for `caption` in `.caption.weight(.medium)`, the `prefix_expression` that
+/// spells the leading dot.
+///
+/// tree-sitter-swift 0.7.3 bound the dot to the first member alone, so
+/// `.a.b.c` parsed as `navigation(navigation(prefix(., a), b), c)` and the
+/// base's parent was the prefix. 0.7.4 binds every prefix operator over the
+/// whole member chain up to the first argument list —
+/// `prefix(., navigation(navigation(a, b), c))` — so the base sits under one
+/// or more `navigation_expression`s, each holding it (or the chain built on
+/// it) as its `target`, before the prefix. Both shapes are climbed here, so a
+/// leading-dot base is never read as a bare name of the same spelling.
+pub(crate) fn swift_leading_dot_prefix<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    // Bounded like `swift_sum_tail`: a chain longer than this is not climbed.
+    for _ in 0..=16 {
+        let parent = bounded_parent(current)?;
+        if parent
+            .child_by_field_name("target")
+            .is_none_or(|target| target.id() != current.id())
+        {
+            return None;
+        }
+        match parent.kind() {
+            "navigation_expression" => current = parent,
+            "prefix_expression" => {
+                return source
+                    .get(parent.start_byte()..current.start_byte())
+                    .is_some_and(|operator| operator.trim() == ".")
+                    .then_some(parent);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The type a Swift leading-dot expression is written against, when the source

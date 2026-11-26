@@ -735,6 +735,7 @@ pub fn banner_id(prefix: &str, id: TreeId) -> String {
 
 /// The tree a banner identifier made by [`banner_id`] names, or `None` for an
 /// identifier that names none (or one that does not parse).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn banner_target(native: &str, prefix: &str) -> Option<TreeId> {
     let rest = native.strip_prefix(prefix)?.strip_prefix(':')?;
     let mut parts = rest.split(':');

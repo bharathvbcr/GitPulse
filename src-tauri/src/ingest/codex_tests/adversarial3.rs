@@ -120,7 +120,7 @@ fn f03_claude_entry_budget_and_depth_bound_forget_no_claude_cursor() {
     std::fs::create_dir_all(&deep).unwrap();
     std::fs::write(deep.join("x.jsonl"), "").unwrap();
     for i in 0..3000 {
-        std::fs::create_dir_all(claude.path().join(format!("wide/{i}"))).unwrap();
+        std::fs::create_dir_all(claude.path().join_parts(&format!("wide/{i}"))).unwrap();
     }
     let out = with_roots(Some(claude.path()), Some(codex.path()), || pair.pass());
     assert!(has_cursor(&pair, &kept), "{out:?}");
@@ -185,7 +185,9 @@ fn g02_a_file_renamed_from_the_claude_root_into_the_codex_root_is_not_double_cou
     let w1 = pair.wt[0].clone();
     let claude = tempfile::tempdir().unwrap();
     let codex = tempfile::tempdir().unwrap();
-    let old = claude.path().join("p/rollout-2026-09-01T12-00-00-G2.jsonl");
+    let old = claude
+        .path()
+        .join_parts("p/rollout-2026-09-01T12-00-00-G2.jsonl");
     write_lines(&old, &[session_meta("G2", &w1), run(1, "ls", &w1)]);
     with_roots(Some(claude.path()), Some(codex.path()), || pair.pass());
     let before = rows(&w1).len();

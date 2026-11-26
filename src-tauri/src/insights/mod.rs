@@ -660,13 +660,10 @@ fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
 pub const DEFERRED_FIELD: &str = "deferred";
 pub const RETRY_AFTER_FIELD: &str = "retry_after_ms";
 
-/// The soonest a deferred read is worth repeating: one refill interval of the
-/// spawn rate budget (the time it takes to mint one token), rounded up. The
-/// budget refills at a fixed rate, so this is derived from it rather than
-/// guessed; it is a floor, not a promise that the next attempt is admitted.
+/// The soonest a deferred read is worth repeating; see
+/// [`crate::engine::process::deferral_retry::retry_after_ms`].
 pub fn deferral_retry_after_ms() -> u64 {
-    let (_burst, per_sec) = crate::engine::process::production_spawn_rate();
-    1000u64.div_ceil(u64::from(per_sec.max(1)))
+    crate::engine::process::deferral_retry::retry_after_ms()
 }
 
 /// One `; `-separated piece of an error: the gate's refusal, or one that

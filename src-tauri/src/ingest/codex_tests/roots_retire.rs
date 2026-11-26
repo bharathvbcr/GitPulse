@@ -41,11 +41,11 @@ fn fixture() -> Fixture {
     let w1 = pair.wt[0].clone();
     let claude = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
-    let root_a = scratch.path().join("a/sessions");
+    let root_a = scratch.path().join_parts("a/sessions");
     let root_b = scratch.path().join("b");
     let rollout_a = rollout(&root_a, "A", &w1);
     rollout(&root_b, "B", &w1);
-    let deleted_claude = claude.path().join("p/D.jsonl");
+    let deleted_claude = claude.path().join_parts("p/D.jsonl");
     write_lines(
         &deleted_claude,
         &[claude_edit(&w1, "D", 1, &format!("{w1}/d.rs"))],

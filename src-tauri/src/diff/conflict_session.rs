@@ -180,6 +180,31 @@ fn hash(repo: &Path, bytes: &[u8]) -> Result<String, CommandError> {
     .map_err(CommandError::from)
 }
 
+/// What names one version of a parked-step file on Windows, standing where
+/// Unix has `(dev, ino, ctime)`: the volume and file id its handle reports and
+/// NTFS `ChangeTime`, which no user-level call can set back. A handle that
+/// cannot say falls back to the creation and last-write times, tagged so the
+/// two shapes never hash alike.
+#[cfg(windows)]
+fn windows_identity(path: &Path, meta: &fs::Metadata) -> (&'static str, u64, [u8; 16], u64, u64) {
+    use std::os::windows::fs::MetadataExt;
+    let from_handle = fs::File::open(path).ok().and_then(|file| {
+        let (volume, id) = crate::fs_entry::windows_file_identity(&file).ok()?;
+        let changed = crate::fs_entry::windows_change_time(&file)
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(("id", volume, id, u64::try_from(changed.as_nanos()).ok()?, 0))
+    });
+    from_handle.unwrap_or((
+        "times",
+        0,
+        [0; 16],
+        meta.creation_time(),
+        meta.last_write_time(),
+    ))
+}
+
 fn operation(repo: &Path) -> Result<String, CommandError> {
     let dir = resolve_git_dir(repo)?;
     let mut parts = vec![git(repo, &["rev-parse", "--verify", "HEAD"])?];
@@ -214,7 +239,9 @@ fn operation(repo: &Path) -> Result<String, CommandError> {
                     use std::os::unix::fs::MetadataExt;
                     (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
                 };
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                let identity = windows_identity(&path, &meta);
+                #[cfg(not(any(unix, windows)))]
                 let identity = (0u64, 0u64, 0i64, 0i64);
                 parts.push(
                     serde_json::to_vec(&(bytes, modified, identity)).map_err(|e| e.to_string())?,
@@ -504,6 +531,17 @@ impl IndexLock {
         }
         #[cfg(not(unix))]
         {
+            // On Windows the volume and file id say whether the name still
+            // reaches the file this handle holds. When our own handle can say,
+            // the name must say the same: a name whose id cannot be read is
+            // not shown to be ours. Where our handle cannot say (and
+            // everywhere else) only the creation time and length remain.
+            #[cfg(windows)]
+            if let Ok(held) = crate::fs_entry::windows_file_identity(&self.file) {
+                return Ok(fs::File::open(&self.path)
+                    .and_then(|file| crate::fs_entry::windows_file_identity(&file))
+                    .is_ok_and(|reached| reached == held));
+            }
             Ok(owned.created().map_err(|error| error.to_string())?
                 == named.created().map_err(|error| error.to_string())?
                 && owned.len() == named.len())
@@ -1514,5 +1552,40 @@ mod tests {
                 .staged
         );
         assert_eq!(index_mode(&repo), "160000");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_identity_tests {
+    use super::*;
+
+    /// With no `dev`/`ino`/`ctime`, a parked-step file replaced by one with the
+    /// same bytes and the same modified time read as the same operation, so a
+    /// resolution made against the old step was applied to the new one.
+    #[test]
+    fn a_parked_step_file_replaced_with_the_same_bytes_and_mtime_is_another_operation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        crate::test_support::git_in(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("file"), b"base\n").unwrap();
+        crate::test_support::git_in(&repo, &["add", "file"]);
+        crate::test_support::git_in(&repo, &["commit", "-m", "base"]);
+        let marker = repo.join(".git").join("MERGE_HEAD");
+        fs::write(&marker, b"abc\n").unwrap();
+        let modified = fs::metadata(&marker).unwrap().modified().unwrap();
+        let before = operation(&repo).unwrap();
+        assert_eq!(operation(&repo).unwrap(), before, "a read changes nothing");
+
+        // Longer than the NTFS timestamp tick, so ChangeTime moves.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        fs::remove_file(&marker).unwrap();
+        fs::write(&marker, b"abc\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_ne!(operation(&repo).unwrap(), before);
     }
 }

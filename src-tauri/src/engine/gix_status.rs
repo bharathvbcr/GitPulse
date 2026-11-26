@@ -622,6 +622,12 @@ fn run_status_with_interrupt(
     // git's order: every tracked change by path, then every untracked path.
     // Status lists keep the order they parse, so one sort over both would put
     // `?? .cache/x` ahead of `M  README.md` where git lists it after.
+    // A conflicted path has only stage 1-3 entries, and where gix's walk looks
+    // the index up exactly (Linux, or core.ignorecase=false) it also reports
+    // the file on disk as untracked. git lists a conflict once. Only conflicts
+    // are dropped: a staged deletion whose file came back is `D ` and `??`, in
+    // git as here.
+    untracked.retain(|path| !tracked.get(path).is_some_and(|row| row.conflicted));
     let mut rows: Vec<(String, char, char, Option<String>)> =
         Vec::with_capacity(tracked.len() + untracked.len());
     for (path, row) in tracked {
@@ -724,6 +730,34 @@ mod tests {
         match porcelain_v1_z(root, None).expect("status") {
             GixStatus::Fallback(reason) => assert_eq!(reason, "split_index"),
             GixStatus::Porcelain(text) => panic!("expected fallback, got porcelain {text:?}"),
+        }
+    }
+
+    /// A delete/modify conflict leaves the path with stage 1 and 3 entries and
+    /// its theirs-side file on disk. git lists it once, `DU`; gix's walk also
+    /// reported it untracked wherever the index lookup is exact (Linux, or any
+    /// repository with core.ignorecase=false), which listed `?? a.txt` too.
+    #[test]
+    fn a_conflicted_path_is_never_also_listed_untracked() {
+        let dir = git_repo();
+        let root = dir.path();
+        git_in(root, &["config", "--local", "core.ignorecase", "false"]);
+        std::fs::write(root.join("a.txt"), "base\n").unwrap();
+        git_in(root, &["add", "a.txt"]);
+        git_in(root, &["commit", "-q", "-m", "base"]);
+        git_in(root, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(root.join("a.txt"), "theirs\n").unwrap();
+        git_in(root, &["commit", "-q", "-am", "modify"]);
+        git_in(root, &["checkout", "-q", "-"]);
+        git_in(root, &["rm", "-q", "a.txt"]);
+        git_in(root, &["commit", "-q", "-m", "delete"]);
+        assert!(
+            crate::test_support::git_merge_in(root, &["merge", "-q", "other"]),
+            "the merge must conflict"
+        );
+        match porcelain_v1_z(root, None).expect("status") {
+            GixStatus::Porcelain(text) => assert_eq!(text, "DU a.txt\0", "{text:?}"),
+            GixStatus::Fallback(reason) => panic!("expected porcelain, fell back: {reason}"),
         }
     }
 

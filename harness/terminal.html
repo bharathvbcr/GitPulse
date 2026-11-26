@@ -1559,14 +1559,14 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
               await dockMenu("terminal-session-count");
               const legacyRegion = await waitFor(() => visible('[data-testid="legacy-sessions"]')[0]);
               check("a session in the previous version's host is listed apart, as not shown here", () =>
-                Boolean(legacyRegion) && legacyRegion.textContent.includes("previous GitPulse version's terminal host") && legacyRegion.textContent.includes("old build"));
+                Boolean(legacyRegion) && legacyRegion.textContent.includes("previous Waylode version's terminal host") && legacyRegion.textContent.includes("old build"));
               legacyRegion.querySelector('[data-testid="legacy-session-output"]')?.click();
               await waitFor(() => visible('[data-testid="legacy-session-output-view"]')[0]);
               check("Show output reads it through the legacy command, masked, and shows the text", () =>
                 report.legacyReads?.[0]?.protocol === 4 && report.legacyReads[0].redact === true && visible('[data-testid="legacy-session-output-view"]')[0].textContent.includes("legacy output marker"));
               legacyRegion.querySelector('[data-testid="legacy-session-stop"]')?.click();
               const stopAsked = await waitFor(() => get(promptState));
-              check("Stop asks first, naming the previous host", () => stopAsked?.options.message.includes("previous GitPulse version's terminal host"));
+              check("Stop asks first, naming the previous host", () => stopAsked?.options.message.includes("previous Waylode version's terminal host"));
               completePrompt(true);
               await waitFor(() => visible('[data-testid="legacy-sessions"]').length === 0);
               check("Stop goes through the legacy kill with its protocol, and never through cmd_terminal_kill", () =>

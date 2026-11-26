@@ -457,11 +457,17 @@
       if (grow < 50) loopBox.style.width = `${8 + grow}px`;
     });
     looping.observe(loopBox);
+    // The notice arrives with a later rendering update. WebKitGTK under Xvfb
+    // with CPU rendering never showed it inside the old fixed 250 ms window
+    // (macOS WebKit and Chrome do), so wait for the event itself, bounded,
+    // and report how far the loop got: 0 callbacks means no frame ran.
+    const probeDeadline = performance.now() + 3000;
     await sleep(250);
+    while (!genuineShapes.length && performance.now() < probeDeadline) await sleep(50);
     looping.disconnect();
     loopBox.remove();
     window.removeEventListener("error", captureGenuine);
-    check("genuine ResizeObserver loop emitted a window error", genuineShapes.length > 0, JSON.stringify(genuineShapes.slice(0, 3)));
+    check("genuine ResizeObserver loop emitted a window error", genuineShapes.length > 0, JSON.stringify({observerCallbacks: grow, shapes: genuineShapes.slice(0, 3)}));
     const genuine = genuineShapes[0] || null;
     check("recorded genuine observer ErrorEvent shape", !!genuine, JSON.stringify(genuine));
     const {installGlobalDiagnostics} = await import("../src/lib/diagnostics/diagnostics.ts");

@@ -72,13 +72,17 @@ export function resolveCrossEnv(
   if (platform !== "darwin") {
     return { env, addedLlvmBin: null, addedLldBin: null, addedBins: [] };
   }
+  // Only a macOS PATH is rewritten here, so its rules are POSIX's whatever host
+  // runs this (a Windows test host would otherwise split on `;` and join with
+  // `\`, and never see the entries of a `:`-separated PATH).
+  const posix = path.posix;
   const currentPath = env.PATH ?? "";
-  const pathEntries = currentPath.split(path.delimiter).filter(Boolean);
+  const pathEntries = currentPath.split(posix.delimiter).filter(Boolean);
   /**
    * @param {string[]} dirs
    * @param {string} tool
    */
-  const hasTool = (dirs, tool) => dirs.some((dir) => pathExists(path.join(dir, tool)));
+  const hasTool = (dirs, tool) => dirs.some((dir) => pathExists(posix.join(dir, tool)));
 
   /** @type {string | null} */
   let addedLlvmBin = null;
@@ -91,7 +95,7 @@ export function resolveCrossEnv(
   if (needsCoreLlvm) {
     for (const dir of HOMEBREW_LLVM_BIN_DIRS) {
       if (pathEntries.includes(dir)) continue;
-      if (pathExists(path.join(dir, "clang-cl"))) {
+      if (pathExists(posix.join(dir, "clang-cl"))) {
         addedLlvmBin = dir;
         addedBins.push(dir);
         break;
@@ -103,7 +107,7 @@ export function resolveCrossEnv(
   if (!hasTool(effectiveEntries, "lld-link")) {
     for (const dir of HOMEBREW_LLD_BIN_DIRS) {
       if (effectiveEntries.includes(dir)) continue;
-      if (pathExists(path.join(dir, "lld-link"))) {
+      if (pathExists(posix.join(dir, "lld-link"))) {
         addedLldBin = dir;
         addedBins.push(dir);
         break;
@@ -114,8 +118,8 @@ export function resolveCrossEnv(
   if (addedBins.length === 0) {
     return { env, addedLlvmBin: null, addedLldBin: null, addedBins: [] };
   }
-  const prefix = addedBins.join(path.delimiter);
-  const nextPath = currentPath ? `${prefix}${path.delimiter}${currentPath}` : prefix;
+  const prefix = addedBins.join(posix.delimiter);
+  const nextPath = currentPath ? `${prefix}${posix.delimiter}${currentPath}` : prefix;
   return {
     env: { ...env, PATH: nextPath },
     addedLlvmBin,

@@ -32,7 +32,7 @@ fn a1a_a_stale_cursor_behind_recorded_rows_replays_them() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     let lines = [
         edit(w1, 1, "a.rs"),
         edit(w1, 2, "b.rs"),
@@ -74,7 +74,7 @@ fn a1b_a_rewrite_that_shifts_bytes_replays_the_unchanged_lines_stated_limit() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(
         &lpath,
         &[
@@ -141,7 +141,7 @@ fn a1d_a_rewrite_that_grows_past_the_cursor_and_keeps_the_tail_loses_its_new_lin
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(
         &lpath,
         &[
@@ -175,7 +175,7 @@ fn a1c_forget_then_the_file_returns_with_one_more_line_records_exactly_that_line
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(&lpath, &[edit(w1, 1, "a.rs"), edit(w1, 2, "b.rs")]);
     with_roots(Some(claude.path()), None, || {
         pair.pass();
@@ -196,7 +196,7 @@ fn a2a_one_file_through_a_symlinked_root_is_not_recorded_twice() {
     let real = holder.path().join("real");
     let link = holder.path().join("link");
     write_lines(
-        &real.join("slug/C.jsonl"),
+        &real.join_parts("slug/C.jsonl"),
         &[edit(w1, 1, "a.rs"), edit(w1, 2, "b.rs")],
     );
     std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -216,7 +216,7 @@ fn a2b_two_identical_calls_in_one_line_stay_two_rows_after_a_reset() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     let file = format!("{w1}/same.rs");
     let block = serde_json::json!({"type":"tool_use","name":"Edit","input":{"file_path":file}});
     let line = serde_json::json!({
@@ -324,7 +324,7 @@ fn a3_a_reset_over_100k_rows_is_correct_and_timed() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     let lines: Vec<String> = (0..100_000u32)
         .map(|i| edit(w1, i % 60, &format!("f{i}.rs")))
         .collect();
@@ -354,7 +354,7 @@ fn a3b_a_session_shared_across_worktrees_resets_each_without_cross_talk() {
     let pair = Pair::new();
     let [w1, w2] = &pair.wt;
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     let mut lines = Vec::new();
     for i in 0..3000u32 {
         lines.push(edit(w1, i % 60, &format!("one{i}.rs")));
@@ -389,7 +389,7 @@ fn a4_a_foreign_writer_holding_the_lock_delays_the_pass_without_losing_or_duplic
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(&lpath, &[edit(w1, 1, "a.rs"), edit(w1, 2, "b.rs")]);
     with_roots(Some(claude.path()), None, || {
         pair.pass();
@@ -422,7 +422,7 @@ fn a5_a_reset_with_half_the_file_recorded_records_exactly_the_other_half() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(
         &lpath,
         &[
@@ -456,7 +456,7 @@ fn a6_a_skipped_duplicate_is_visible_nowhere_in_the_pass_result() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(&lpath, &[edit(w1, 1, "a.rs"), edit(w1, 2, "b.rs")]);
     let (clean, reset) = with_roots(Some(claude.path()), None, || {
         let clean = pair.pass();

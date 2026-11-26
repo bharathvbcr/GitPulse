@@ -616,6 +616,17 @@ pub(crate) fn canonical_slash_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(plain)
 }
 
+/// Binds the devmap binary the product itself resolves (`GITPULSE_DEVMAP_BIN`,
+/// saved config, the app bin dir, then `PATH`, with `.exe` and `USERPROFILE`
+/// handled on Windows) for the life of the returned guard. The tests that need
+/// a real index build used to probe `$HOME/.local/bin` first: that has no
+/// `.exe`, is dead on Windows, and could prefer a stale copy over the one the
+/// product would run. Panics when no devmap is installed.
+#[cfg(test)]
+pub(crate) fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
+    crate::devmap::cli::bind_resolved_test_binary()
+}
+
 /// An absolute path that names no directory. `unix` is written the Unix way
 /// (`/gone/a`); on Windows it gains a drive (`C:\gone\a`), because `/gone` has
 /// no root there and is refused as a relative path.
@@ -974,6 +985,28 @@ pub(crate) fn write(dir: &Path, rel: &str, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(dest, content).unwrap();
+}
+
+/// `remove_dir_all` that waits out a Windows sharing violation (os error 32),
+/// access denied (5) or non-empty directory (145): a handle another thread or
+/// process closed a moment ago (a scanner, an exiting child) still pins the
+/// entry, and a delete that races it fails though nothing is wrong. Other
+/// failures, and a pin that outlasts the bound (about 5 s), are returned.
+/// Where a directory deletes at once this is exactly `remove_dir_all`.
+#[cfg(test)]
+pub(crate) fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for _ in 0..50u32 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 145)) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("fifty attempts all failed"))
 }
 
 /// Commits `message` with author and committer dated `epoch`.

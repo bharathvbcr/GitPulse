@@ -1290,7 +1290,9 @@ fn a_stored_line_is_a_deferral_only_by_the_drivers_own_prefix_and_the_anchored_s
 fn rev_parses_in(repo: &std::path::Path) -> usize {
     // The log keys on the cwd as the caller spelled it: a card names its
     // worktree by canonical path, a direct caller by the tempdir's.
-    let canonical = std::fs::canonicalize(repo).unwrap();
+    // In the spelling git takes: the log keys a directory by it, so the verbatim
+    // `\\?\` form of one Windows directory would count every child twice.
+    let canonical = crate::engine::process::canonicalize_plain(repo).unwrap();
     let mut spellings = vec![repo.to_path_buf()];
     if canonical != repo {
         spellings.push(canonical);

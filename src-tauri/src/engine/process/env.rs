@@ -674,7 +674,7 @@ pub(crate) fn simplified_windows_path(path: &str) -> Option<String> {
 /// becoming a path Windows would refuse to open.
 ///
 /// On every other platform this is `canonicalize`, unchanged.
-pub(crate) fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
+pub fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = path.canonicalize()?;
     Ok(match canonical.to_str() {
         Some(text) => PathBuf::from(plain_path_text(text)),

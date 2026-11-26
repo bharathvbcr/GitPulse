@@ -27,6 +27,30 @@ use super::*;
 /// factory declares an explicit nominal class/interface return type.
 pub const RESOLUTION_REUSE_EPOCH: &str = "5";
 
+/// How the reuse cache's per-file blobs are encoded on disk.
+///
+/// Part of the directory name beside the epoch, and moved with any change of
+/// encoding. Two encodings must never share a directory: they would share its
+/// one `generation.json` binding, and a binary that writes one encoding prunes
+/// only its own files. A build by an older binary would then rebind the
+/// directory while leaving the newer binary's blobs, from an earlier
+/// generation, behind for that newer binary to trust. A separate directory per
+/// encoding means each binary removes the other's as an old one.
+///
+/// Unlike the epoch, this does not mark stored generations stale: the
+/// resolution rules did not change, only how a cached answer is written.
+///
+/// `zst`: each blob is the JSON of a [`ReusedFileResolution`] in a checksummed
+/// zstd frame (`<sha256 of the path>.json.zst`). Before it, the blobs were
+/// plain JSON in `resolution-reuse-<epoch>`, 168 MB for this repository's
+/// 1,297 files.
+pub const RESOLUTION_REUSE_FORMAT: &str = "zst";
+
+/// The reuse cache's directory name under the repository state directory.
+pub fn resolution_reuse_dir_name() -> String {
+    format!("resolution-reuse-{RESOLUTION_REUSE_EPOCH}-{RESOLUTION_REUSE_FORMAT}")
+}
+
 /// One file's resolution before the whole-tree post-pass.
 ///
 /// Package `MemberOf` edges and the inert-value rewrite read every file

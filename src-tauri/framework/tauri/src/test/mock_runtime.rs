@@ -821,7 +821,10 @@ impl<T: UserEvent> WindowDispatch<T> for MockWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
-    unimplemented!()
+    // GitPulse: the mock has no native window. Callers already treat an
+    // error as "no GTK window" (`if let Ok(w) = window.gtk_window()`); a
+    // panic here aborted every Linux mock app that builds a window with a menu.
+    Err(Error::WindowNotFound)
   }
 
   #[cfg(any(
@@ -832,7 +835,7 @@ impl<T: UserEvent> WindowDispatch<T> for MockWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn default_vbox(&self) -> Result<gtk::Box> {
-    unimplemented!()
+    Err(Error::WindowNotFound)
   }
 
   #[cfg(target_os = "android")]
