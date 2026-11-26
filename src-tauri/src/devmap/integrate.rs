@@ -109,7 +109,7 @@ pub fn probe_host_clis() -> Vec<HostCliStatus> {
 }
 
 /// Looks up a previously probed CLI path for `host`.
-pub fn host_cli_program<'a>(statuses: &'a [HostCliStatus], host: IntegrationHost) -> Option<&'a str> {
+pub fn host_cli_program(statuses: &[HostCliStatus], host: IntegrationHost) -> Option<&str> {
     statuses
         .iter()
         .find(|status| status.host == host)
@@ -423,10 +423,9 @@ pub fn preview(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
         Ok(binary) => binary,
         Err(e) => return IntegrationPlan::unavailable(host, repo_path, e),
     };
-    let cli_present =
-        probe_host_cli_with(host, &crate::engine::process::find_external_tool)
-            .program
-            .is_some();
+    let cli_present = probe_host_cli_with(host, &crate::engine::process::find_external_tool)
+        .program
+        .is_some();
     preview_with_context(host, &repo, &binary, cli_present)
 }
 

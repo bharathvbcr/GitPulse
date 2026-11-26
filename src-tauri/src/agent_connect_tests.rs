@@ -783,8 +783,14 @@ fn build_plan_uses_shared_host_preflight_seam_once() {
             .map(|c| (c.agent.as_str(), c.label.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            (IntegrationHost::Claude.as_str(), IntegrationHost::Claude.label()),
-            (IntegrationHost::Codex.as_str(), IntegrationHost::Codex.label()),
+            (
+                IntegrationHost::Claude.as_str(),
+                IntegrationHost::Claude.label()
+            ),
+            (
+                IntegrationHost::Codex.as_str(),
+                IntegrationHost::Codex.label()
+            ),
         ]
     );
 }
