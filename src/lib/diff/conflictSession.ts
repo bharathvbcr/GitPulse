@@ -1,7 +1,78 @@
+import { invoke } from "../ipc/invoke";
 import { recordEditorDrafts } from "../files/editorDraftRegistry";
 import { flushOnPageHide } from "../async/deferredWrite";
 import type { ConflictDocument, ConflictResolutionChoice } from "./conflict";
 import { isRecord } from "../record";
+
+export interface ConflictFileKey {
+  path: string;
+  base_oid: string;
+  ours_oid: string;
+  theirs_oid: string;
+  base_mode: string;
+  ours_mode: string;
+  theirs_mode: string;
+}
+
+export interface ProposalSessionFile {
+  file_path: string;
+  key: ConflictFileKey;
+  snapshot: ConflictSnapshot;
+  proposed_mode: string | null;
+  proposed_oid: string | null;
+  proposed_text: string | null;
+  proposed_marker_free: boolean;
+}
+
+export interface ProposalSessionSnapshot {
+  repo_path: string;
+  proposal_ref: string;
+  proposal_commit_oid: string;
+  tip_oid: string;
+  source_commit_oid: string;
+  resolver: string;
+  requested_by: string;
+  files: ProposalSessionFile[];
+}
+
+export type ProposalResolutionChoiceInput = "AcceptProposal" | { SessionChoice: ConflictFileChoice };
+
+export interface ProposalFileResolutionInput {
+  file_path: string;
+  revision: string | null;
+  choice: ProposalResolutionChoiceInput;
+}
+
+export interface BuildProposalTreeInput {
+  proposal_ref: string;
+  expected_proposal_commit_oid: string | null;
+  target_tip_oid: string | null;
+  resolutions: ProposalFileResolutionInput[];
+}
+
+export interface ResolvedProposalTree {
+  proposal_ref: string;
+  proposal_commit_oid: string;
+  target_tip_oid: string;
+  source_commit_oid: string;
+  tree_oid: string;
+  resolved_files: string[];
+  keys: ConflictFileKey[];
+}
+
+export async function loadConflictProposal(
+  repoPath: string,
+  proposalRef: string,
+): Promise<ProposalSessionSnapshot> {
+  return invoke<ProposalSessionSnapshot>("cmd_load_conflict_proposal", { repoPath, proposalRef });
+}
+
+export async function buildResolvedProposalTree(
+  repoPath: string,
+  request: BuildProposalTreeInput,
+): Promise<ResolvedProposalTree> {
+  return invoke<ResolvedProposalTree>("cmd_build_resolved_proposal_tree", { repoPath, request });
+}
 
 export interface ConflictStage {
   stage: number;

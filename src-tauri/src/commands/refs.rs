@@ -313,3 +313,40 @@ pub async fn cmd_undo_op_snapshot(
     })
     .await
 }
+
+#[tauri::command(async)]
+pub async fn cmd_restore_turn_checkpoint(
+    repo_path: String,
+    worktree_path: Option<String>,
+    checkpoint_ref: String,
+    force: Option<bool>,
+) -> Result<crate::engine::turn_checkpoint::TurnCheckpointRestore, IpcError> {
+    off_thread(move || {
+        let wt_str = worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&repo_path);
+        let argv = ["git", "read-tree", "--reset", "-u", &checkpoint_ref];
+        let _ = guard(&repo_path, &argv)?;
+        crate::engine::turn_checkpoint::restore_turn_checkpoint(
+            std::path::Path::new(&repo_path),
+            std::path::Path::new(wt_str),
+            &checkpoint_ref,
+            force.unwrap_or(false),
+        )
+        .map_err(CommandError::from)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_non_standard_ref_inventory(
+    repo_path: String,
+) -> Result<crate::ops::NonStandardRefInventory, IpcError> {
+    off_thread(move || crate::ops::non_standard_ref_inventory(&repo_path)).await
+}
+
+#[cfg(test)]
+#[path = "refs_tests.rs"]
+mod tests;

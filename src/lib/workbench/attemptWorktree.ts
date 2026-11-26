@@ -23,7 +23,8 @@ import { invoke } from "../ipc/invoke";
 import { interfaceStore } from "../stores/interfaceStore";
 import { askChoice, askConfirm } from "../stores/modalStore";
 import { repoStore, type MutationOutcome, type MutationTarget, type ResolvedRepo } from "../stores/repoStore";
-import type { MergeTeardownResult, WorktreeInfo } from "../branches/types";
+import type { HeldReason, MergeTeardownResult, WorktreeInfo } from "../branches/types";
+import type { PolicyVerdict } from "../stores/harnessStore";
 import { MergeTeardownFailure, readMergeTeardownError } from "../branches/mergeTeardown";
 import { MERGE_MODES } from "../branches/mergeSelection";
 import { familyFromCommonDir } from "../repos/repoFamily";
@@ -375,6 +376,232 @@ function mergedSentence(merged: MergeTeardownResult, squash: boolean): string {
 
 /** What an unattended merge did: the commit it merged and the line the board shows. */
 export interface VerifiedMerge { head: string; message: string; beforeOid: string; afterOid: string | null }
+
+export interface WorktreeMergeBatchLane {
+  worktree_path: string | null;
+  branch: string;
+  source_oid: string | null;
+  squash: boolean | null;
+  commit_message: string | null;
+  hot_files: string[] | null;
+  verify_in_scratch: boolean | null;
+}
+
+export interface WorktreeMergeBatchOutcome {
+  branch: string;
+  worktree_path: string | null;
+  ok: boolean;
+  already_landed: boolean;
+  source_oid: string | null;
+  landed_oid: string | null;
+  before_oid: string | null;
+  batch_tip: string | null;
+  checkout_advanced: boolean;
+  checkout_note: string | null;
+  green_ref_note: string | null;
+  worktree_removed: boolean;
+  removal_error: string | null;
+  branch_deleted: boolean;
+  branch_error: string | null;
+  error_code: string | null;
+  error: string | null;
+  conflict_paths: string[];
+  held_reason: HeldReason | null;
+}
+
+export interface WorktreeMergeBatchResult {
+  target_branch: string;
+  before_oid: string | null;
+  after_oid: string | null;
+  policy: PolicyVerdict;
+  outcomes: WorktreeMergeBatchOutcome[];
+}
+
+export type VerifiedBatchLaneInput = { run: AttemptRef; expectedHead: string; taskId?: string };
+export type VerifiedBatchLaneResult =
+  | { ok: true; merged: VerifiedMerge }
+  | { ok: false; cause: unknown };
+
+function batchOutcomeFailure(outcome: WorktreeMergeBatchOutcome): unknown {
+  const message = outcome.error || `Batch merge failed for ${outcome.branch}.`;
+  if (outcome.error_code === "conflict") {
+    return new MergeTeardownFailure({
+      code: "conflict",
+      message,
+      paths: outcome.conflict_paths,
+      total: outcome.conflict_paths.length,
+      rolled_back: true,
+      rollback_error: null,
+    });
+  }
+  if (outcome.error_code === "held" && outcome.held_reason) {
+    return new MergeTeardownFailure({
+      code: "held",
+      reason: outcome.held_reason,
+      message,
+      path: outcome.worktree_path,
+    });
+  }
+  if (outcome.error_code === "commit_hooks") {
+    return new MergeTeardownFailure({
+      code: "held",
+      reason: "commit_hooks",
+      message,
+      path: outcome.worktree_path,
+    });
+  }
+  if (outcome.error_code === "moved" && outcome.source_oid) {
+    return new MergeTeardownFailure({
+      code: "moved",
+      message,
+      branch: outcome.branch,
+      expected: "",
+      actual: outcome.source_oid,
+    });
+  }
+  if (outcome.error_code === "refused") {
+    return new MergeTeardownFailure({ code: "refused", message });
+  }
+  return new Error(message);
+}
+
+function formatBatchOutcomeSentence(outcome: WorktreeMergeBatchOutcome, targetBranch: string): string {
+  const landed = outcome.already_landed
+    ? `${outcome.branch} was already landed into ${targetBranch}`
+    : `Merged ${outcome.branch} into ${targetBranch}`;
+  const note = outcome.checkout_note ? ` ${outcome.checkout_note}` : "";
+  if (!outcome.worktree_removed) {
+    return `${landed}; cleanup pending: ${outcome.removal_error ?? "the worktree was not removed"}.${note}`;
+  }
+  const branchNote = !outcome.branch_deleted
+    ? ` The branch ${outcome.branch} was kept: ${outcome.branch_error ?? "no reason was given"}`
+    : "";
+  return `${landed}. The worktree was removed.${branchNote}${note}`;
+}
+
+/**
+ * Submits multiple verified attempt worktrees in one `cmd_worktree_merge_batch`
+ * request through Rust's global `LandQueueRegistry`. Falls back cleanly to
+ * single-item `mergeVerifiedAttempt` when `items.length === 1` or when custom
+ * per-task verifier hooks (`hasCustomVerifier`) apply.
+ */
+export async function mergeVerifiedAttemptBatch(
+  items: readonly VerifiedBatchLaneInput[],
+  options: { hasCustomVerifier?: boolean; verifyInScratch?: boolean } = {},
+): Promise<VerifiedBatchLaneResult[]> {
+  if (items.length === 0) return [];
+  if (items.length === 1 || options.hasCustomVerifier) {
+    const results: VerifiedBatchLaneResult[] = [];
+    for (const item of items) {
+      try {
+        const merged = await mergeVerifiedAttempt(item.run, item.expectedHead, item.taskId);
+        results.push({ ok: true, merged });
+      } catch (cause) {
+        results.push({ ok: false, cause });
+      }
+    }
+    return results;
+  }
+
+  const first = items[0];
+  if (!first.expectedHead) throw new Error("No verified head was named, so nothing is merged.");
+  const root = await mainCheckoutOf(first.run.cwd);
+  const live = await listAllLiveRuns();
+  if (!live.complete) throw new Error("Live runs couldn't all be read, so the main worktree cannot be shown free of other sessions.");
+  if (liveRunIn(root, live.runs)) throw new Error(`Another run is working in the main worktree ${root}, so nothing is merged into it.`);
+  if (!(await repoStore.trustRepo(root))) throw new Error("The repository is not trusted, so it is not merged.");
+
+  const opts = optionsForListing();
+  const list = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: root, depth: "dirty" });
+  const main = list.find((entry) => entry.is_main) ?? null;
+  const target = main?.branch ?? null;
+  if (!main || !target) throw new Error("The main worktree is not on a branch, so there is nothing to merge into.");
+  if (main.dirty_files === null || !Number.isInteger(main.dirty_files) || main.dirty_files < 0) {
+    throw new Error(`The main worktree ${root} couldn't be checked for uncommitted work, so nothing is merged into it.`);
+  }
+
+  const preflightErrors = new Map<number, unknown>();
+  const queuedMeta: { idx: number; item: VerifiedBatchLaneInput }[] = [];
+  const lanes: WorktreeMergeBatchLane[] = [];
+
+  for (let idx = 0; idx < items.length; idx += 1) {
+    const item = items[idx];
+    try {
+      if (!item.expectedHead) throw new Error("No verified head was named, so nothing is merged.");
+      const itemRoot = await mainCheckoutOf(item.run.cwd);
+      if (identityKey(itemRoot, opts) !== identityKey(root, opts)) {
+        throw new Error(`${item.run.cwd} belongs to ${itemRoot}, not ${root}.`);
+      }
+      const key = identityKey(item.run.cwd, opts);
+      const own = list.find((entry) => identityKey(entry.path, opts) === key);
+      if (!own) throw new Error(`${item.run.cwd} is no longer a worktree of ${root}. It may already have been merged or removed.`);
+      if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
+      if (own.head !== item.expectedHead) {
+        throw new Error(`The worktree moved to ${own.head.slice(0, 8)} after ${item.expectedHead.slice(0, 8)} was verified, so it is not merged.`);
+      }
+      if (own.dirty_files !== 0) {
+        throw new Error(own.dirty_files === null
+          ? "The worktree's uncommitted changes couldn't be counted, so it is not merged."
+          : `The worktree has ${plural(own.dirty_files, "uncommitted file")} no verdict covered, so it is not merged.`);
+      }
+      if (!(await repoStore.trustRepo(item.run.cwd))) {
+        throw new Error("The repository is not trusted, so it is not merged.");
+      }
+      queuedMeta.push({ idx, item });
+      lanes.push({
+        worktree_path: item.run.cwd,
+        branch: own.branch,
+        source_oid: item.expectedHead,
+        squash: false,
+        commit_message: null,
+        hot_files: null,
+        verify_in_scratch: options.verifyInScratch ?? true,
+      });
+    } catch (cause) {
+      preflightErrors.set(idx, cause);
+    }
+  }
+
+  const results: VerifiedBatchLaneResult[] = items.map((_, idx) => ({
+    ok: false,
+    cause: preflightErrors.get(idx) ?? new Error("Batch merge did not run."),
+  }));
+  if (lanes.length === 0) return results;
+
+  const batchResult = await invoke<WorktreeMergeBatchResult>("cmd_worktree_merge_batch", {
+    repoPath: root,
+    targetBranch: target,
+    lanes,
+    removeWorktrees: true,
+  });
+
+  for (let i = 0; i < queuedMeta.length; i += 1) {
+    const { idx, item } = queuedMeta[i];
+    const outcome = batchResult.outcomes[i];
+    if (!outcome || !outcome.ok) {
+      results[idx] = {
+        ok: false,
+        cause: outcome ? batchOutcomeFailure(outcome) : new Error("Batch merge produced no outcome."),
+      };
+      continue;
+    }
+    if (outcome.worktree_removed) await closeStranded(item.run.cwd);
+    results[idx] = {
+      ok: true,
+      merged: {
+        head: item.expectedHead,
+        message: formatBatchOutcomeSentence(outcome, batchResult.target_branch),
+        beforeOid: outcome.before_oid ?? batchResult.before_oid ?? "",
+        afterOid: outcome.batch_tip ?? outcome.landed_oid ?? batchResult.after_oid ?? null,
+      },
+    };
+  }
+  return results;
+}
+
+function optionsForListing() {
+  return options();
+}
 
 /**
  * Merges an attempt's branch for a caller that already holds the person's

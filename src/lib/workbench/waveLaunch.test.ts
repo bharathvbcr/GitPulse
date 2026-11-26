@@ -1034,4 +1034,66 @@ describe("DAG readiness ordering", () => {
     expect(w.launched).toEqual([]);
     expect(readinessCalls).toBe(1);
   });
+
+  it("submits multiple ready members through mergeBatch and falls back to merge for singletons", async () => {
+    const batchCalls: string[][] = [];
+    const soloCalls: string[] = [];
+    const w = world({
+      candidates: [[task("a"), task("b")], [task("c")]],
+      scopes: { a: ["src/a.ts"], b: ["src/b.ts"], c: ["src/c.ts"] },
+    });
+    const origMerge = w.deps.merge;
+    w.deps.merge = async (target) => {
+      soloCalls.push(target.taskId);
+      return origMerge(target);
+    };
+    w.deps.mergeBatch = async (targets) => {
+      batchCalls.push(targets.map((t) => t.taskId));
+      return Promise.all(
+        targets.map(async (target) => {
+          try {
+            const result = await origMerge(target);
+            return { ok: true as const, result };
+          } catch (cause) {
+            return { ok: false as const, cause };
+          }
+        }),
+      );
+    };
+
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 2 }, w.deps)).finished;
+    expect(done.state).toBe("done");
+    expect(batchCalls).toEqual([["a", "b"]]);
+    expect(soloCalls).toEqual(["c"]);
+    expect(w.merged).toEqual(["a", "b", "c"]);
+  });
+
+  it("isolates per-lane failures in mergeBatch while verifying clean lanes and halting on conflict", async () => {
+    const w = world({
+      candidates: [[task("a"), task("b")]],
+      scopes: { a: ["src/a.ts"], b: ["src/b.ts"] },
+    });
+    w.deps.mergeBatch = async (targets) =>
+      targets.map((t) =>
+        t.taskId === "a"
+          ? { ok: true as const, result: { message: "Merged a", beforeOid: "t0", afterOid: "t1" } }
+          : {
+              ok: false as const,
+              cause: new MergeTeardownFailure({
+                code: "conflict",
+                message: "conflict in src/b.ts",
+                paths: ["src/b.ts"],
+                total: 1,
+                rolled_back: true,
+                rollback_error: null,
+              }),
+            },
+      );
+
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(done.members.find((m) => m.taskId === "a")?.phase).toBe("merged");
+    expect(done.members.find((m) => m.taskId === "b")?.phase).toBe("held");
+    expect(w.posts).toEqual([{ id: "a", post: { base: "t0", head: "t1" } }]);
+  });
 });

@@ -317,6 +317,29 @@ struct RegistryInner {
 }
 
 /// Process-wide or test-scoped coordinator of per-`(repo_common_dir, target_branch)`
+/// Returns the process-wide shared [`LandQueueRegistry`].
+pub fn global_land_queue() -> &'static LandQueueRegistry {
+    LandQueueRegistry::global().as_ref()
+}
+
+#[derive(Clone)]
+enum RegistryRef {
+    Arc(Arc<LandQueueRegistry>),
+    Static(&'static LandQueueRegistry),
+}
+
+impl std::ops::Deref for RegistryRef {
+    type Target = LandQueueRegistry;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Arc(arc) => arc.as_ref(),
+            Self::Static(reg) => reg,
+        }
+    }
+}
+
+/// Process-wide registry of per-`(repo_common_dir, target_branch)`
 /// batched landing lanes.
 pub struct LandQueueRegistry {
     config: LandQueueConfig,
@@ -364,129 +387,30 @@ impl LandQueueRegistry {
     /// Submits `req` to the lane for `(repo_common_dir, target_branch)` and
     /// blocks until its outcome is ready or `req.cancel` fires while queued/running.
     pub fn submit(self: &Arc<Self>, req: LandRequest) -> Result<LandOutcome, LandError> {
-        if req
-            .cancel
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
-            return Err(LandError::Canceled);
-        }
-        let key = lane_key(&req.repo, &req.target_branch);
-        let (lane, entry) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if inner.closed {
-                return Err(LandError::Canceled);
-            }
-            let now = Instant::now();
-            let ttl = self.config.key_state_ttl;
-            inner
-                .key_states
-                .retain(|_, ks| now.saturating_duration_since(ks.idle_since) < ttl);
+        submit_inner(RegistryRef::Arc(Arc::clone(self)), req)
+    }
 
-            let entry_id = inner.next_entry_id;
-            inner.next_entry_id += 1;
-            let entry = Arc::new(QueueEntry {
-                id: entry_id,
-                req,
-                enqueued: now,
-                state: Mutex::new(EntryState::Queued),
-                outcome: Mutex::new(None),
-                done_cv: Condvar::new(),
-            });
+    /// Submits `req` to a `'static` [`LandQueueRegistry`] (such as [`global_land_queue`]).
+    pub fn submit_static(&'static self, req: LandRequest) -> Result<LandOutcome, LandError> {
+        submit_inner(RegistryRef::Static(self), req)
+    }
 
-            let (lane, spawn_worker) = if let Some(existing) = inner.lanes.get(&key) {
-                (Arc::clone(existing), false)
-            } else {
-                let initial_size = inner
-                    .key_states
-                    .remove(&key)
-                    .map(|ks| ks.max_size)
-                    .unwrap_or(self.config.initial_max_size)
-                    .clamp(1, self.config.hard_cap);
-                let created = Arc::new(Lane {
-                    key: key.clone(),
-                    queue: Mutex::new(VecDeque::new()),
-                    cv: Condvar::new(),
-                    max_size: Mutex::new(initial_size),
-                });
-                inner.lanes.insert(key.clone(), Arc::clone(&created));
-                (created, true)
-            };
+    /// Submits a batch of [`LandRequest`]s concurrently so they coalesce into
+    /// the same lane batch window, returning per-request outcomes in input order.
+    pub fn submit_batch(
+        self: &Arc<Self>,
+        requests: Vec<LandRequest>,
+    ) -> Vec<Result<LandOutcome, LandError>> {
+        submit_batch_inner(RegistryRef::Arc(Arc::clone(self)), requests)
+    }
 
-            {
-                let mut q = lane
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                q.push_back(Arc::clone(&entry));
-                lane.cv.notify_all();
-            }
-
-            if spawn_worker {
-                let registry = Arc::clone(self);
-                let worker_lane = Arc::clone(&lane);
-                std::thread::Builder::new()
-                    .name(format!("land-queue-{}", key.target_branch))
-                    .spawn(move || registry.run_lane(worker_lane))
-                    .map_err(|e| LandError::Failed {
-                        message: format!("failed to spawn land queue worker: {e}"),
-                    })?;
-            }
-            (lane, entry)
-        };
-
-        // Wait for delivery or cooperative cancellation.
-        // Lock hierarchy: `self.inner` -> `lane.queue` -> `entry.state` -> `entry.outcome`.
-        loop {
-            if entry.is_canceled() {
-                let mut q = lane
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut st = entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match *st {
-                    EntryState::Queued => {
-                        q.retain(|item| item.id != entry.id);
-                        *st = EntryState::Done;
-                        return Err(LandError::Canceled);
-                    }
-                    EntryState::Executing => {
-                        // Batch is already running and may still land.
-                        return Err(LandError::Canceled);
-                    }
-                    EntryState::Done => {
-                        drop(st);
-                        drop(q);
-                        return entry
-                            .outcome
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clone()
-                            .unwrap_or(Err(LandError::Canceled));
-                    }
-                }
-            }
-
-            let out_guard = entry
-                .outcome
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(res) = out_guard.as_ref() {
-                return res.clone();
-            }
-            let wait_slice = if entry.req.cancel.is_some() {
-                Duration::from_millis(5)
-            } else {
-                Duration::from_millis(250)
-            };
-            let _ = entry.done_cv.wait_timeout(out_guard, wait_slice);
-        }
+    /// Submits a batch of [`LandRequest`]s concurrently through a `'static`
+    /// [`LandQueueRegistry`] (such as [`global_land_queue`]).
+    pub fn submit_batch_static(
+        &'static self,
+        requests: Vec<LandRequest>,
+    ) -> Vec<Result<LandOutcome, LandError>> {
+        submit_batch_inner(RegistryRef::Static(self), requests)
     }
 
     pub fn close(&self) {
@@ -512,13 +436,13 @@ impl LandQueueRegistry {
         self.closed.load(Ordering::Acquire)
     }
 
-    fn run_lane(self: Arc<Self>, lane: Arc<Lane>) {
+    fn run_lane(registry: RegistryRef, lane: Arc<Lane>) {
         loop {
-            let Some(batch) = self.collect_batch(&lane) else {
+            let Some(batch) = registry.collect_batch(&lane) else {
                 return;
             };
             let started = Instant::now();
-            self.execute_batch(&lane.key, batch);
+            registry.execute_batch(&lane.key, batch);
             let took = started.elapsed();
 
             let mut max_size = lane
@@ -528,8 +452,8 @@ impl LandQueueRegistry {
             *max_size = adapt_batch_size(
                 *max_size,
                 took,
-                self.config.target_latency,
-                self.config.hard_cap,
+                registry.config.target_latency,
+                registry.config.hard_cap,
             );
         }
     }
@@ -2703,6 +2627,164 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+fn submit_inner(registry: RegistryRef, req: LandRequest) -> Result<LandOutcome, LandError> {
+    if req
+        .cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(LandError::Canceled);
+    }
+    let key = lane_key(&req.repo, &req.target_branch);
+    let (lane, entry) = {
+        let mut inner = registry
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.closed {
+            return Err(LandError::Canceled);
+        }
+        let now = Instant::now();
+        let ttl = registry.config.key_state_ttl;
+        inner
+            .key_states
+            .retain(|_, ks| now.saturating_duration_since(ks.idle_since) < ttl);
+
+        let entry_id = inner.next_entry_id;
+        inner.next_entry_id += 1;
+        let entry = Arc::new(QueueEntry {
+            id: entry_id,
+            req,
+            enqueued: now,
+            state: Mutex::new(EntryState::Queued),
+            outcome: Mutex::new(None),
+            done_cv: Condvar::new(),
+        });
+
+        let (lane, spawn_worker) = if let Some(existing) = inner.lanes.get(&key) {
+            (Arc::clone(existing), false)
+        } else {
+            let initial_size = inner
+                .key_states
+                .remove(&key)
+                .map(|ks| ks.max_size)
+                .unwrap_or(registry.config.initial_max_size)
+                .clamp(1, registry.config.hard_cap);
+            let created = Arc::new(Lane {
+                key: key.clone(),
+                queue: Mutex::new(VecDeque::new()),
+                cv: Condvar::new(),
+                max_size: Mutex::new(initial_size),
+            });
+            inner.lanes.insert(key.clone(), Arc::clone(&created));
+            (created, true)
+        };
+
+        {
+            let mut q = lane
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            q.push_back(Arc::clone(&entry));
+            lane.cv.notify_all();
+        }
+
+        if spawn_worker {
+            let worker_registry = registry.clone();
+            let worker_lane = Arc::clone(&lane);
+            std::thread::Builder::new()
+                .name(format!("land-queue-{}", key.target_branch))
+                .spawn(move || LandQueueRegistry::run_lane(worker_registry, worker_lane))
+                .map_err(|e| LandError::Failed {
+                    message: format!("failed to spawn land queue worker: {e}"),
+                })?;
+        }
+        (lane, entry)
+    };
+
+    // Wait for delivery or cooperative cancellation.
+    // Lock hierarchy: `self.inner` -> `lane.queue` -> `entry.state` -> `entry.outcome`.
+    loop {
+        if entry.is_canceled() {
+            let mut q = lane
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut st = entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match *st {
+                EntryState::Queued => {
+                    q.retain(|item| item.id != entry.id);
+                    *st = EntryState::Done;
+                    return Err(LandError::Canceled);
+                }
+                EntryState::Executing => {
+                    // Batch is already running and may still land.
+                    return Err(LandError::Canceled);
+                }
+                EntryState::Done => {
+                    drop(st);
+                    drop(q);
+                    return entry
+                        .outcome
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                        .unwrap_or(Err(LandError::Canceled));
+                }
+            }
+        }
+
+        let out_guard = entry
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(res) = out_guard.as_ref() {
+            return res.clone();
+        }
+        let wait_slice = if entry.req.cancel.is_some() {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(250)
+        };
+        let _ = entry.done_cv.wait_timeout(out_guard, wait_slice);
+    }
+}
+
+fn submit_batch_inner(
+    registry: RegistryRef,
+    mut requests: Vec<LandRequest>,
+) -> Vec<Result<LandOutcome, LandError>> {
+    if requests.is_empty() {
+        return Vec::new();
+    }
+    if requests.len() == 1 {
+        let req = requests.pop().expect("single request");
+        return vec![submit_inner(registry, req)];
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = requests
+            .into_iter()
+            .map(|req| {
+                let reg = registry.clone();
+                scope.spawn(move || submit_inner(reg, req))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(LandError::Failed {
+                        message: "land batch worker panicked".into(),
+                    })
+                })
+            })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3359,5 +3441,51 @@ mod tests {
             let res = h.join().unwrap();
             assert!(res.is_ok() || matches!(res, Err(LandError::Canceled)));
         }
+    }
+
+    #[test]
+    fn global_land_queue_and_submit_batch_isolate_failures() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let base = git(repo, &["rev-parse", "refs/heads/main"]);
+        let oid_a = make_branch_commit(repo, "batch-a", "a.txt", "alpha\n", &base);
+        let oid_b = make_branch_commit(repo, "batch-b", "b.txt", "beta\n", &base);
+
+        // Create a conflicting branch against main after advancing main on conflict.txt.
+        git(repo, &["checkout", "-q", "-b", "batch-conflict", &base]);
+        std::fs::write(repo.join("conflict.txt"), "branch side\n").unwrap();
+        git(repo, &["add", "conflict.txt"]);
+        git(repo, &["commit", "-q", "-m", "conflict branch"]);
+        let oid_conflict = git(repo, &["rev-parse", "HEAD"]);
+
+        git(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("conflict.txt"), "main side\n").unwrap();
+        git(repo, &["add", "conflict.txt"]);
+        git(repo, &["commit", "-q", "-m", "main conflict"]);
+
+        let registry = global_land_queue();
+        let outcomes = registry.submit_batch_static(vec![
+            LandRequest::new(repo, "batch-a", "main", oid_a),
+            LandRequest::new(repo, "batch-conflict", "main", oid_conflict),
+            LandRequest::new(repo, "batch-b", "main", oid_b),
+        ]);
+        assert_eq!(outcomes.len(), 3);
+        assert!(
+            outcomes[0].is_ok(),
+            "clean lane a failed: {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(outcomes[1], Err(LandError::Conflict { .. })),
+            "conflicting lane must fail cleanly: {:?}",
+            outcomes[1]
+        );
+        assert!(
+            outcomes[2].is_ok(),
+            "clean lane b failed: {:?}",
+            outcomes[2]
+        );
+        assert_eq!(git(repo, &["show", "main:a.txt"]), "alpha");
+        assert_eq!(git(repo, &["show", "main:b.txt"]), "beta");
     }
 }

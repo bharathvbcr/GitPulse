@@ -1,3 +1,4 @@
+import { invoke } from "../ipc/invoke";
 import type { PolicyVerdict } from "../stores/harnessStore";
 
 export interface BranchCleanupCandidate {
@@ -219,4 +220,31 @@ export interface OpUndoOutcome {
   restored_refs: number;
   head_before: string | null;
   head_after: string | null;
+}
+
+export interface NonStandardRefSample {
+  refname: string;
+  object_id: string;
+  timestamp: number | null;
+  age_secs: number | null;
+}
+
+export interface NonStandardRefNamespaceSummary {
+  namespace: string;
+  count: number;
+  oldest_timestamp: number | null;
+  newest_timestamp: number | null;
+  oldest_age_secs: number | null;
+  newest_age_secs: number | null;
+  samples: NonStandardRefSample[];
+  truncated: boolean;
+}
+
+export interface NonStandardRefInventory {
+  total_refs: number;
+  namespaces: NonStandardRefNamespaceSummary[];
+}
+
+export async function nonStandardRefInventory(repoPath: string): Promise<NonStandardRefInventory> {
+  return invoke<NonStandardRefInventory>("cmd_non_standard_ref_inventory", { repoPath });
 }

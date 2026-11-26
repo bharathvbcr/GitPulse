@@ -12,6 +12,7 @@ import {
   formatOmissionSummary,
   formatRelativeTurnTime,
   listTurnCheckpoints,
+  restoreTurnCheckpoint,
   totalOmittedFiles,
   type Omissions,
   type TurnCheckpointSummary,
@@ -58,13 +59,26 @@ function sampleTurn(overrides: Partial<TurnCheckpointSummary> = {}): TurnCheckpo
 }
 
 describe("turnCheckpoints IPC wrappers", () => {
-  it("calls list and diff commands with exact parameter names", async () => {
+  it("calls list, diff, and restore commands with exact parameter names", async () => {
     invoke.mockClear();
     await listTurnCheckpoints("/tmp/repo", 25);
     await diffTurnCheckpoint("/tmp/repo", "turn-001", "turn-000");
+    await restoreTurnCheckpoint("/tmp/repo", "refs/gitpulse/turns/key/001", {
+      worktreePath: "/tmp/wt",
+      force: true,
+    });
     expect(invoke.mock.calls).toEqual([
       ["cmd_list_turn_checkpoints", { repoPath: "/tmp/repo", limit: 25 }],
       ["cmd_diff_turn_checkpoint", { repoPath: "/tmp/repo", id: "turn-001", against: "turn-000" }],
+      [
+        "cmd_restore_turn_checkpoint",
+        {
+          repoPath: "/tmp/repo",
+          worktreePath: "/tmp/wt",
+          checkpointRef: "refs/gitpulse/turns/key/001",
+          force: true,
+        },
+      ],
     ]);
   });
 });
