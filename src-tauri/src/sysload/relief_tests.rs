@@ -36,6 +36,10 @@ struct Fake {
     /// `(pid, ppid, start_us)` of every process the host lists, for the
     /// replay's walk of inherited priorities.
     table: Arc<Mutex<Vec<(i32, i32, u64)>>>,
+    /// A process somebody stops by hand *between* two reads of its state: the
+    /// n-th read of it (n is the value) and every later one finds it stopped.
+    flip_on_read: Arc<Mutex<HashMap<i32, u32>>>,
+    reads: Arc<Mutex<HashMap<i32, u32>>>,
 }
 
 impl Fake {
@@ -172,7 +176,18 @@ impl Actuator for Fake {
 
     fn is_stopped(&self, pid: i32, start_us: u64) -> Result<bool, String> {
         match self.check(pid, start_us) {
-            Ok(()) => Ok(self.is_stopped_now(pid)),
+            Ok(()) => {
+                let flip = self.flip_on_read.lock().unwrap().get(&pid).copied();
+                if let Some(flip) = flip {
+                    let mut reads = self.reads.lock().unwrap();
+                    let n = reads.entry(pid).or_default();
+                    *n += 1;
+                    if *n >= flip {
+                        self.stopped.lock().unwrap().insert(pid);
+                    }
+                }
+                Ok(self.is_stopped_now(pid))
+            }
             Err(Ok(_)) => Err("process is no longer running".into()),
             Err(Err(why)) => Err(why),
         }
@@ -4031,5 +4046,7 @@ fn putting_back_leaves_alone_what_was_born_before_the_slowing_and_what_is_under_
     );
 }
 
+#[path = "relief_tests/review.rs"]
+mod review;
 #[path = "relief_tests/rung_c.rs"]
 mod rung_c;

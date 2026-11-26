@@ -230,6 +230,12 @@ pub const TERMINATE_GRACE: Duration = Duration::from_secs(10);
 /// Most offers published: each is screened (environments, working directories)
 /// when it is chosen.
 pub const MAX_OFFERS: usize = 8;
+/// A build that was frozen in this Severe episode is chosen again only after it
+/// has itself grown by this much since (and a fresh rise is under way).
+pub const REFREEZE_GROWTH_BYTES: u64 = 1 << 30;
+/// Most times one begin pass chooses again after leaving out candidates that
+/// somebody else had stopped.
+const MAX_RESELECT: usize = 8;
 /// Most ended trees kept in the status for the command-gate hook.
 const MAX_ENDED: usize = 16;
 /// A sampler tick that has not advanced for this long is a hung sampler (or a
@@ -407,6 +413,9 @@ pub(crate) struct Trigger {
     /// then needs a fresh rise (the deterioration rule) or a new episode.
     /// Cleared only where the episode ends, never by [`Trigger::ended`].
     pinned_spent: bool,
+    /// Consecutive samples that were readable and below Severe: what ends an
+    /// episode (an unreadable sample neither advances nor resets it).
+    known_calm_run: u32,
     /// The freeze [`Step::Begin`] asked for rested on pinned alone.
     begin_pinned_only: bool,
     /// A freeze has begun in this Severe episode.
@@ -440,9 +449,19 @@ impl Trigger {
         if tier == Some(Tier::Severe) {
             self.severe_run = self.severe_run.saturating_add(1);
             self.calm_run = 0;
+            self.known_calm_run = 0;
         } else {
+            // An unreadable sample (a stale or dead sensor) still counts toward
+            // letting a freeze go (`calm_run`: a blind sensor never holds a
+            // process stopped), but it says nothing about the *episode*: only
+            // readings that say the host is below Severe end it
+            // (`known_calm_run`), so a blind spell cannot clear what the
+            // episode has spent.
             self.calm_run = self.calm_run.saturating_add(1);
-            if self.calm_run >= SEVERE_BREAK_SAMPLES {
+            if tier.is_some() {
+                self.known_calm_run = self.known_calm_run.saturating_add(1);
+            }
+            if self.known_calm_run >= SEVERE_BREAK_SAMPLES {
                 if self.froze_this_episode || self.held_off {
                     self.episode = self.episode.wrapping_add(1);
                 }
@@ -580,6 +599,26 @@ impl Trigger {
     /// A Severe run is under way (any Severe sample since the last recovery).
     pub(crate) fn in_severe_run(&self) -> bool {
         self.severe_run > 0
+    }
+
+    /// The answer to [`Step::Begin`] in `advise`: nothing was stopped, so
+    /// nothing of the episode is spent (`pinned_spent`, `froze_this_episode`):
+    /// only Act may spend a build.
+    pub(crate) fn began_advised(&mut self, now: Instant, shown: bool) {
+        if shown {
+            self.phase = Phase::Frozen {
+                since: now,
+                samples: 0,
+            };
+        } else {
+            self.retry_wait = RETRY_SAMPLES;
+        }
+    }
+
+    /// Forgets what the episode has spent of the pinned-only allowance (the
+    /// mode changed: what advise showed, or act did, is not the other's).
+    pub(crate) fn clear_spent(&mut self) {
+        self.pinned_spent = false;
     }
 
     /// A person's pause began a freeze the trigger did not ask for: the normal
@@ -1548,7 +1587,7 @@ pub(crate) struct Replay {
 /// the drop and the teardown.
 pub(crate) fn replay_journal(dir: &Path, ns: &Path, actuator: &dyn Actuator) -> Replay {
     let mut out = Replay::default();
-    let journal = match read_journal(dir) {
+    let mut journal = match read_journal(dir) {
         Ok(Some(journal)) => journal,
         Ok(None) => return out,
         Err(why) => {
@@ -1571,6 +1610,13 @@ pub(crate) fn replay_journal(dir: &Path, ns: &Path, actuator: &dyn Actuator) -> 
         out.left_to = Some(journal.writer_pid);
         return out;
     }
+    // An entry the running relief took out of its own record (somebody else had
+    // stopped that process meanwhile) but whose removal from the file failed is
+    // not ours to continue, whatever the file still says.
+    let theirs = not_ours(dir);
+    journal
+        .entries
+        .retain(|e| !theirs.contains(&(e.pid, e.start_us)));
     // Parent-first in the file, so resume in reverse: a child never runs
     // while its parent is still stopped and would be blocked on it.
     for entry in journal.entries.iter().rev() {
@@ -1597,11 +1643,34 @@ pub(crate) fn replay_journal(dir: &Path, ns: &Path, actuator: &dyn Actuator) -> 
         }
     }
     sweep_inheritors(&journal.entries, ns, actuator, &mut out);
-    if let Err(why) = write_journal(dir, &[]) {
-        out.failures
-            .push(format!("the relief journal could not be removed: {why}"));
+    match write_journal(dir, &[]) {
+        Ok(()) => forget_not_ours(dir),
+        Err(why) => out
+            .failures
+            .push(format!("the relief journal could not be removed: {why}")),
     }
     out
+}
+
+/// Entries a relief dropped from its own record that its journal file may still
+/// list (the write that would have removed them failed), by relief directory.
+/// A replay never continues or restores one: the in-memory state, which saw the
+/// process stopped or backgrounded by somebody else, is the authority.
+static NOT_OURS: Mutex<BTreeMap<PathBuf, BTreeSet<(i32, u64)>>> = Mutex::new(BTreeMap::new());
+
+fn not_ours(dir: &Path) -> BTreeSet<(i32, u64)> {
+    lock(&NOT_OURS).get(dir).cloned().unwrap_or_default()
+}
+
+fn mark_not_ours(dir: &Path, keys: impl IntoIterator<Item = (i32, u64)>) {
+    lock(&NOT_OURS)
+        .entry(dir.to_path_buf())
+        .or_default()
+        .extend(keys);
+}
+
+fn forget_not_ours(dir: &Path) {
+    lock(&NOT_OURS).remove(dir);
 }
 
 /// The journal lists the processes the relief slowed *by name*. A child one of
@@ -1635,11 +1704,20 @@ fn sweep_inheritors(
     let stewards = ledger_stewards(&lock(&LEDGER), ns);
     // The mark a descendant must have started after, by pid: the stamp of the
     // nearest listed ancestor, in microseconds.
-    let mut under: HashMap<i32, u64> = slowed
-        .iter()
-        .map(|e| (e.pid, e.at_unix_ms.saturating_mul(1000)))
-        .collect();
-    let named: HashSet<i32> = under.keys().copied().collect();
+    // A journal entry names a process by pid *and start time*: after a crash or
+    // a reboot the pid may belong to an unrelated process, whose children are
+    // then nobody's to restore. Only a table row that is the very process the
+    // entry names seeds the walk.
+    let mut under: HashMap<i32, u64> = HashMap::new();
+    for e in &slowed {
+        if table
+            .iter()
+            .any(|&(pid, _, start_us)| pid == e.pid && start_us == e.start_us)
+        {
+            under.insert(e.pid, e.at_unix_ms.saturating_mul(1000));
+        }
+    }
+    let named: HashSet<i32> = slowed.iter().map(|e| e.pid).collect();
     for _ in 0..MAX_TREE_DEPTH {
         let before = under.len();
         for &(pid, ppid, start_us) in &table {
@@ -2196,7 +2274,10 @@ pub(crate) fn resume_up_to_within(
             });
         // Only an entry read as running before it was stopped is the relief's
         // to continue; one that is not is dropped from the file, not signalled.
-        let frozen = covered.iter().filter(|e| e.was_running);
+        let theirs = not_ours(dir);
+        let frozen = covered
+            .iter()
+            .filter(|e| e.was_running && !theirs.contains(&(e.pid, e.start_us)));
         for entry in frozen.rev() {
             let (ok, detail) = match actuator.signal(entry.pid, entry.start_us, Signal::Cont) {
                 Ok(_) => (true, None),
@@ -2210,8 +2291,15 @@ pub(crate) fn resume_up_to_within(
             });
         }
         // Cleared after the attempt, failures included; the slowed entries stay.
-        if let Err(why) = write_journal(dir, &rest) {
-            out.refused = Some(format!("the relief journal could not be trimmed: {why}"));
+        match write_journal(dir, &rest) {
+            Ok(()) => {
+                if rest.is_empty() {
+                    forget_not_ours(dir);
+                }
+            }
+            Err(why) => {
+                out.refused = Some(format!("the relief journal could not be trimmed: {why}"));
+            }
         }
     }
     out.held_off = hold_off_episode;
@@ -2334,6 +2422,17 @@ pub(crate) struct Relief {
     /// Every process a freeze of this Severe episode stopped, and their
     /// subtrees' roots: none is chosen again until the episode ends.
     spent: HashSet<(i32, u64)>,
+    /// The subtree footprint of each root `spent` holds, as it was frozen: a
+    /// spent root is chosen again only after growing past this by
+    /// [`REFREEZE_GROWTH_BYTES`].
+    spent_roots: HashMap<(i32, u64), u64>,
+    /// The mode at the last tick was Act: a change either way forgets what the
+    /// episode has spent (advise spends nothing, and act's is not advise's).
+    was_act: bool,
+    /// The processes the journal file listed after the last successful write.
+    on_disk: BTreeSet<(i32, u64)>,
+    /// The last journal write failed and is retried each tick.
+    journal_stale: bool,
     /// The trigger's [`Trigger::episode`] when `spent` was last cleared.
     episode_seen: u64,
     /// A person's resume request that found the action lock busy, kept (it
@@ -2392,6 +2491,10 @@ impl Relief {
             slow_since_pass: None,
             recovered: false,
             spent: HashSet::new(),
+            spent_roots: HashMap::new(),
+            was_act: initial == SupervisorMode::Act,
+            on_disk: BTreeSet::new(),
+            journal_stale: false,
             episode_seen: 0,
             pending_request: None,
             act_wait: ACT_WAIT,
@@ -2576,7 +2679,7 @@ impl Relief {
         } else {
             // A person who resumed without holding off decided the next
             // Severe minute may freeze again, the same builds included.
-            self.spent.clear();
+            self.forget_spent();
         }
         self.note(
             ActionKind::Resume,
@@ -2831,6 +2934,11 @@ impl Relief {
         // this relief's own record of what is frozen.
         self.reconcile_watchdog();
         self.reconcile_external();
+        if self.journal_stale {
+            // A trim that failed is tried again; until it takes, the entries it
+            // would have removed are marked not ours.
+            let _ = self.sync_journal();
+        }
         let mode = (self.mode)();
         self.status.mode = mode;
         if mode == SupervisorMode::Off || !input.enabled {
@@ -2843,11 +2951,18 @@ impl Relief {
         let sample = Sample::of(input);
         self.status.tier = sample.tier.map(|(tier, _)| tier);
         self.status.binding = sample.tier.and_then(|(_, binding)| binding);
+        if (mode == SupervisorMode::Act) != self.was_act {
+            // advise spends nothing and act's spending is not advise's: a
+            // change of mode either way starts the episode's accounts afresh.
+            self.was_act = mode == SupervisorMode::Act;
+            self.forget_spent();
+            self.trigger.clear_spent();
+        }
         let verdict = self.trigger.observe(now, &sample);
         if self.trigger.episode() != self.episode_seen {
             // The Severe episode is over: what it froze may be frozen again.
             self.episode_seen = self.trigger.episode();
-            self.spent.clear();
+            self.forget_spent();
             self.ended.clear();
         }
         if !self.trigger.in_severe_run() {
@@ -2902,12 +3017,16 @@ impl Relief {
         } else {
             self.slow_since_pass = None;
             self.status.would_slow = 0;
-            self.foreign.clear();
         }
         // What is in the background goes back as soon as the slowing is over
         // or the setting left `act`.
         if (!verdict.slow || !act) && !self.slowed.is_empty() {
             self.restore_slowed(table);
+        }
+        // The processes that put themselves in the background are forgotten
+        // only after the restore above has used them to stop its walk.
+        if !verdict.slow {
+            self.foreign.clear();
         }
 
         // Rung B. A build that held a lease slot was frozen because the board
@@ -2957,6 +3076,11 @@ impl Relief {
 
     // -- bookkeeping ------------------------------------------------------
 
+    fn forget_spent(&mut self) {
+        self.spent.clear();
+        self.spent_roots.clear();
+    }
+
     fn note(&mut self, kind: ActionKind, detail: String) {
         self.status.last_action = Some(LastAction {
             at_unix_ms: unix_ms(),
@@ -2985,8 +3109,27 @@ impl Relief {
         self.status.failures.drain(..excess);
     }
 
-    fn sync_journal(&self) -> Result<(), String> {
-        write_journal(&self.dir, &self.journal)
+    /// Writes the journal. A write that fails leaves the file listing whatever
+    /// this relief has since taken out of its own record: those entries are
+    /// marked not ours (a replay will not continue or restore them) and the
+    /// write is tried again on every tick until it takes.
+    fn sync_journal(&mut self) -> Result<(), String> {
+        let keys: BTreeSet<(i32, u64)> = self.journal.iter().map(|e| (e.pid, e.start_us)).collect();
+        let result = write_journal(&self.dir, &self.journal);
+        match &result {
+            Ok(()) => {
+                self.on_disk = keys;
+                if self.journal_stale {
+                    self.journal_stale = false;
+                    forget_not_ours(&self.dir);
+                }
+            }
+            Err(_) => {
+                self.journal_stale = true;
+                mark_not_ours(&self.dir, self.on_disk.difference(&keys).copied());
+            }
+        }
+        result
     }
 
     fn entry(&self, pid: i32, start_us: u64, session: &str, rung: JournalRung) -> JournalEntry {
@@ -3239,11 +3382,17 @@ impl Relief {
                 .collect();
             // Members come in table order, not tree order: sweep until none
             // joins. What the steward owns does not carry the walk on: its
-            // children inherited *its* priority, which is its to put back.
+            // children inherited *its* priority, which is its to put back. Nor
+            // does a process that put *itself* in the background (`foreign`):
+            // its children inherited a choice that was never ours.
             for _ in 0..MAX_TREE_DEPTH {
                 let before = under.len();
                 for m in &session.members {
-                    if under.contains_key(&m.pid) || stewards.contains(&(m.pid, m.start_us)) {
+                    let key = (m.pid, m.start_us);
+                    if under.contains_key(&m.pid)
+                        || stewards.contains(&key)
+                        || self.foreign.contains(&key)
+                    {
                         continue;
                     }
                     if let Some(&mark) = under.get(&m.ppid) {
@@ -3262,6 +3411,7 @@ impl Relief {
                 if under.get(&m.pid).is_some_and(|&mark| m.start_us > mark)
                     && slowed.get(&m.pid) != Some(&m.start_us)
                     && !stewards.contains(&key)
+                    && !self.foreign.contains(&key)
                     && self.actuator.is_background(m.pid, m.start_us) == Some(true)
                 {
                     found.push(key);
@@ -3641,30 +3791,82 @@ impl Relief {
         let busy: BTreeSet<(i32, u64)> = self.frozen.iter().map(|f| f.session).collect();
         let room = MAX_FROZEN_PER_HOST.saturating_sub(self.frozen.len());
         let mut notes = Vec::new();
-        let spent = self.spent.clone();
-        let want = Want {
-            busy: &busy,
-            room,
-            refusing: self.refusing,
-            spent: &spent,
-        };
-        let mut offered: Vec<(Selection, super::relief_status::OfferWhy)> = Vec::new();
-        let picks = match select_with(
-            table,
-            &*self.probe,
-            &*self.trusted,
-            &want,
-            &mut self.marks,
-            &mut notes,
-            &mut Scope::WithOffers(&mut offered),
-        ) {
-            Ok(picks) => picks,
-            Err(why) => {
-                self.fail(None, format!("nothing was frozen: {why}"));
-                self.trigger.began(now, false);
-                return;
+        let mut spent = self.spent.clone();
+        // A build this episode spent is chosen again only when a fresh rise is
+        // under way (not on pinned alone) *and* it has itself grown by
+        // [`REFREEZE_GROWTH_BYTES`] since it was frozen: otherwise it stays
+        // exempt and unrelated builds are the candidates.
+        if !self.trigger.begin_pinned_only {
+            for (root, before) in &self.spent_roots {
+                let grown = subtree_bytes(table, *root)
+                    .is_some_and(|now| now >= before.saturating_add(REFREEZE_GROWTH_BYTES));
+                if grown {
+                    spent.remove(root);
+                }
             }
-        };
+        }
+        let mut offered: Vec<(Selection, super::relief_status::OfferWhy)> = Vec::new();
+        let mut picks;
+        let mut attempts = 0;
+        loop {
+            offered.clear();
+            let want = Want {
+                busy: &busy,
+                room,
+                refusing: self.refusing,
+                spent: &spent,
+            };
+            picks = match select_with(
+                table,
+                &*self.probe,
+                &*self.trusted,
+                &want,
+                &mut self.marks,
+                &mut notes,
+                &mut Scope::WithOffers(&mut offered),
+            ) {
+                Ok(picks) => picks,
+                Err(why) => {
+                    self.fail(None, format!("nothing was frozen: {why}"));
+                    self.trigger.began(now, false);
+                    return;
+                }
+            };
+            // A candidate whose first process somebody else has stopped cannot
+            // be frozen, and choosing it again every retry would starve the
+            // next-heaviest subtree: leave it out and choose again.
+            let by_hand: Vec<&Selection> = picks
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        self.actuator.is_stopped(p.root.pid, p.root.start_us),
+                        Ok(true)
+                    )
+                })
+                .collect();
+            attempts += 1;
+            if by_hand.is_empty() || attempts >= MAX_RESELECT {
+                break;
+            }
+            // The whole subtree is left out, not just its root: a child of a
+            // process somebody stopped would hang against it.
+            let left_out: Vec<(i32, u64, String)> = by_hand
+                .iter()
+                .flat_map(|p| {
+                    p.members
+                        .iter()
+                        .map(|m| (m.pid, m.start_us, p.root.name.clone()))
+                })
+                .collect();
+            for (pid, start_us, name) in left_out {
+                spent.insert((pid, start_us));
+                if notes.len() < 16 && pid != 0 {
+                    notes.push(format!(
+                        "{name} was left out: somebody else has stopped its subtree"
+                    ));
+                }
+            }
+        }
         // What rung B would have picked in a session it may not touch is
         // published as an offer, newest pass replacing the last.
         offered.sort_by_key(|(p, _)| (std::cmp::Reverse(p.footprint), p.root.pid));
@@ -3705,8 +3907,8 @@ impl Relief {
                     holder: pick.holder,
                     left: BTreeSet::new(),
                 });
-                self.spent
-                    .extend(pick.members.iter().map(|m| (m.pid, m.start_us)));
+                // Nothing is spent: advise stopped nothing, so the same build
+                // is still Act's to freeze the moment the mode changes.
                 self.note(
                     ActionKind::Freeze,
                     format!(
@@ -3719,7 +3921,11 @@ impl Relief {
                 any = true;
             }
         }
-        self.trigger.began(now, any);
+        if act {
+            self.trigger.began(now, any);
+        } else {
+            self.trigger.began_advised(now, any);
+        }
     }
 
     /// Stops one subtree. Each member's state is read first: one that is
@@ -3900,6 +4106,8 @@ impl Relief {
         }
         self.spent
             .extend(pick.members.iter().map(|m| (m.pid, m.start_us)));
+        self.spent_roots
+            .insert((pick.root.pid, pick.root.start_us), pick.footprint);
         self.frozen.push(Frozen {
             info,
             session: (pick.session_pid, pick.session_start_us),
@@ -4173,6 +4381,34 @@ impl Relief {
             let since = self.frozen[at].since;
             let mut added = Vec::new();
             for m in &fresh {
+                // GitPulse is quitting: stop nothing more (the entries not
+                // stopped are trimmed below).
+                if STOPPING.load(Ordering::SeqCst) {
+                    break;
+                }
+                // The journal write above can take seconds on a host short of
+                // memory: read the state again immediately before the signal,
+                // as `freeze` does. One somebody else stopped meanwhile is not
+                // ours: it is left alone and its entry is trimmed.
+                match self.actuator.is_stopped(m.pid, m.start_us) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        self.frozen[at].left.insert((m.pid, m.start_us));
+                        continue;
+                    }
+                    Err(why) => {
+                        if !has_ended(&why) {
+                            self.fail(
+                                Some(m.pid),
+                                format!(
+                                    "{} (pid {}) was not stopped: its state could not be read: {why}",
+                                    m.name, m.pid
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+                }
                 match self.actuator.signal(m.pid, m.start_us, Signal::Stop) {
                     Ok(Delivery::Delivered) => {
                         added.push((m.pid, m.start_us));
@@ -4283,6 +4519,37 @@ fn process_is_gone(why: &str) -> bool {
 /// live process, and is recorded as a failure like any refused signal.
 fn has_ended(why: &str) -> bool {
     why.contains("no longer running")
+}
+
+/// The footprint of `root` and everything below it in the scan, `None` when the
+/// scan no longer has it.
+fn subtree_bytes(table: &ReliefTable, root: (i32, u64)) -> Option<u64> {
+    for session in &table.sessions {
+        let members = &session.members;
+        if !members.iter().any(|m| (m.pid, m.start_us) == root) {
+            continue;
+        }
+        let mut seen: HashSet<i32> = HashSet::from([root.0]);
+        let mut total = 0u64;
+        for _ in 0..MAX_TREE_DEPTH {
+            let before = seen.len();
+            for m in members {
+                if !seen.contains(&m.pid) && seen.contains(&m.ppid) && m.start_us >= root.1 {
+                    seen.insert(m.pid);
+                }
+            }
+            if seen.len() == before {
+                break;
+            }
+        }
+        for m in members {
+            if seen.contains(&m.pid) {
+                total = total.saturating_add(m.footprint.unwrap_or(0));
+            }
+        }
+        return Some(total);
+    }
+    None
 }
 
 /// One tree as the published file carries it.

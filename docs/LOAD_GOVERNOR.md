@@ -1165,6 +1165,31 @@ writer's) is never continued. The watchdog's copy takes a process only after
 its stop was delivered, so a tick that hangs *between* a delivered stop and
 that one append leaves the journal (and the shutdown replay) as the only record.
 
+**Residuals, stated plainly.** (1) A stop somebody layers *on top of ours* (a
+Ctrl-Z on a process we already stopped) cannot be told from ours: the state read
+sees "stopped" either way, so our resume continues it. (2) The state is read
+before the journal is written and again immediately before each stop (a late
+joiner is read again after its journal write, which can take seconds under
+pressure); that narrows the window in which a person's stop is mistaken for
+running, and cannot close it: a stop landing between the last read and the
+`SIGSTOP` is ours. (3) The watchdog's and the tick's reconcile can lag by one
+tick: a subtree the watchdog continued is still in the relief's record until the
+next tick drops it. (4) A journal write that fails after the relief took an
+entry out of its own record (somebody else stopped that process meanwhile)
+leaves the file listing it: the entry is marked *not ours*, no replay (election,
+drop, teardown) continues or restores it, and the write is retried every tick
+until it takes. (5) Only Act spends builds: `advise` records what it would
+freeze but never marks it spent, and a change of mode either way starts the
+episode's accounts afresh. (6) A candidate whose first process somebody else
+stopped is left out with its whole subtree and the next-heaviest is chosen (at
+most 8 re-selections per pass). (7) A build frozen earlier in an episode is
+chosen again only on a fresh rise (not pinned alone) *and* when it has itself
+grown by 1 GiB since it was frozen (`REFREEZE_GROWTH_BYTES`); otherwise it stays
+exempt for the episode. (8) An unreadable sample lets a freeze go as it always
+did (a blind sensor never holds a process stopped) but neither advances nor
+resets the count that ends an *episode*, so a blind spell cannot clear what the
+episode spent.
+
 **When the watchdog continued a freeze.** It records what it continued, and the
 next tick's first step drops those subtrees from the relief's own record, the
 journal and the snapshot (`last_action` says the watchdog continued it), and
@@ -1247,14 +1272,19 @@ that is gone leaves the ledger, the cap and the journal; the children that
 inherited the background from a slowed parent after the last pass are put back
 with it. A child counts as an inheritor only if it started after the pass that
 slowed its ancestor read the process table, it is not the steward's, and it is
-not under a process the steward owns; one that was already there and in the
-background was put there by something else, and stays. Residual: a descendant
-born after the slowing that put *itself* in the background is put back with
-the rest. A process the OS refused once is not asked again until the slowing
+not under a process the steward owns **or one that put itself in the background**
+(`foreign`: the walk stops there, and its children are never inheritors; the set
+is kept until after the restore has used it); one that was already there and in
+the background was put there by something else, and stays. Residual: a descendant
+born after the slowing that put *itself* in the background, and that this relief
+never saw as foreign (it was not in a slowing pass), is put back with the rest.
+A process the OS refused once is not asked again until the slowing
 ends. Inheritors are not journaled by name, but the journal's stamps are enough
 for a best-effort, bounded sweep (one read of the process table, at most 256
 restores) at shutdown and at a startup replay, so a crash does not leave them
-in the background either.
+in the background either. The sweep seeds only from the table row that is the
+very process a journal entry names (pid **and** start time): after a crash or a
+reboot a reused pid starts no walk, and its children are not restored.
 
 ### Not verified
 
