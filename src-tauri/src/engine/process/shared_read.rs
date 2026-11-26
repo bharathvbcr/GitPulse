@@ -34,11 +34,13 @@ pub(super) struct SharedReadKey {
 pub(super) struct SharedRead {
     result: Mutex<Option<Result<BoundedRun, CommandError>>>,
     done: Condvar,
-    /// Every request waiting on this flight, the leader's first. A request
-    /// that named no id is `None` and waits for good, so a flight with one is
-    /// never cancelled; otherwise the flight is cancelled when every flag is
-    /// set (see [`abandon_if_all_gone`]). Pushed only while the table is held.
-    waiters: Mutex<Vec<Option<read_cancel::ReadCancel>>>,
+    /// Every request that has waited on this flight, the leader's first. A
+    /// request that named no id waits for good while it is here, so a flight
+    /// with one is never cancelled; otherwise the flight is cancelled when
+    /// every entry is gone: its flag set, or the request having left by its own
+    /// deadline (see [`abandon_if_all_gone`], [`Waiter`]). Pushed only while
+    /// the table is held, and never removed from, so an index stays valid.
+    waiters: Mutex<Vec<Waiter>>,
     /// Set, with the flight leaving the table, by the decision to cancel it.
     /// A flight that is abandoned is never joined: a caller that arrives
     /// later, however it found the flight, starts a read of its own.
@@ -49,6 +51,50 @@ pub(super) struct SharedRead {
     /// admitted it, because everyone who asks was waiting before its child
     /// started, which is all the "joined while queued" rule protects.
     retry: Mutex<Option<Arc<SharedRead>>>,
+}
+
+/// One request's stake in a flight.
+enum Waiter {
+    /// Still waiting for the answer. `None` is a request with no id: it cannot
+    /// be cancelled, so it counts as present until it leaves.
+    Waiting(Option<read_cancel::ReadCancel>),
+    /// A joiner that stopped waiting on its own (its deadline, a hand-off to a
+    /// retry flight, an answer received, an unwind). Departure is recorded
+    /// here and never by cancelling the request's flag: that flag belongs to
+    /// the whole request and may be shared with other reads of it.
+    Left,
+}
+
+impl Waiter {
+    fn is_gone(&self) -> bool {
+        match self {
+            Self::Waiting(cancel) => cancel
+                .as_ref()
+                .is_some_and(read_cancel::ReadCancel::is_cancelled),
+            Self::Left => true,
+        }
+    }
+}
+
+/// Marks a joiner's entry `Left` on every way out of its wait. It takes only
+/// the waiters lock, never the table, so it cannot invert the order
+/// [`abandon_if_all_gone`] takes them in.
+struct JoinerDeparture<'a> {
+    flight: &'a SharedRead,
+    index: usize,
+}
+
+impl Drop for JoinerDeparture<'_> {
+    fn drop(&mut self) {
+        let mut waiters = self
+            .flight
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = waiters.get_mut(self.index) {
+            *slot = Waiter::Left;
+        }
+    }
 }
 
 impl SharedRead {
@@ -80,13 +126,7 @@ fn abandon_if_all_gone(key: &SharedReadKey, flight: &Arc<SharedRead>) -> bool {
     if flight.abandoned.load(Ordering::Acquire) {
         return true;
     }
-    let all_gone = |waiters: &[Option<read_cancel::ReadCancel>]| {
-        waiters.iter().all(|waiter| {
-            waiter
-                .as_ref()
-                .is_some_and(read_cancel::ReadCancel::is_cancelled)
-        })
-    };
+    let all_gone = |waiters: &[Waiter]| waiters.iter().all(Waiter::is_gone);
     // Without the table: nearly every poll of a flight someone still wants.
     if !all_gone(
         &flight
@@ -334,7 +374,7 @@ fn run_read_shared_once(
         class: current_admission(),
     };
     let table = shared_reads();
-    let (flight, leader) = {
+    let (flight, leader, index) = {
         let mut reads = table
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -370,14 +410,23 @@ fn run_read_shared_once(
         }
         // Counted as a waiter in the same step that found the flight, so the
         // decision to cancel it (also under the table) sees this request.
-        flight
-            .waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(cancel.cloned());
-        (flight, leader)
+        let index = {
+            let mut waiters = flight
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            waiters.push(Waiter::Waiting(cancel.cloned()));
+            waiters.len() - 1
+        };
+        (flight, leader, index)
     };
     if !leader {
+        // Whichever way this joiner stops waiting, it stops counting: a leader
+        // cancelled after that must be able to abandon its child.
+        let _departure = JoinerDeparture {
+            flight: &flight,
+            index,
+        };
         gate.note_coalesced(key.class);
         let mut result = flight
             .result

@@ -8,7 +8,7 @@
  * agent's view of the person's files, and Claude Code keeps the real
  * transcript. A resumed thread says so instead of pretending to remember.
  */
-import type { MaviPhase, MaviSummary, MaviTarget, ThreadState, TimelineItem } from "./types";
+import type { MaviPhase, MaviSummary, MaviTarget, ThreadState, ThreadWorkSummary, TimelineItem } from "./types";
 
 export const THREADS_STORAGE_KEY = "gitpulse.mavi.threads.v1";
 export const MAX_THREAD_RECORDS = 60;
@@ -32,6 +32,28 @@ export interface ThreadRecord {
    * the conversation belongs to the terminal until it is brought back.
    */
   movedToTerminalAt: number | null;
+  workSummary?: ThreadWorkSummary | null;
+}
+
+function parseWorkSummary(value: unknown): ThreadWorkSummary | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const s = value as Record<string, unknown>;
+  if (typeof s.text !== "string" || !s.text.trim()) return undefined;
+  if (typeof s.model !== "string" || typeof s.engine !== "string") return undefined;
+  const warnings = Array.isArray(s.warnings)
+    ? s.warnings
+        .filter((w): w is string => typeof w === "string" && w.trim().length > 0)
+        .slice(0, 4)
+        .map((w) => w.slice(0, 500))
+    : [];
+  return {
+    text: s.text.slice(0, 8000),
+    model: s.model.slice(0, 200),
+    engine: s.engine.slice(0, 40),
+    createdAt: typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0,
+    ...(typeof s.truncated === "boolean" ? { truncated: s.truncated } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
 }
 
 type StorageLike = Pick<Storage, "getItem" | "setItem">;
@@ -57,6 +79,7 @@ export function readThreadRecords(storage: StorageLike | null): ThreadRecord[] {
       if (!item || typeof item !== "object") continue;
       const r = item as Record<string, unknown>;
       if (typeof r.key !== "string" || !isTarget(r.target)) continue;
+      const workSummary = parseWorkSummary(r.workSummary);
       out.push({
         key: r.key,
         // Kept so a reloaded page reattaches to an agent that is still running;
@@ -72,6 +95,7 @@ export function readThreadRecords(storage: StorageLike | null): ThreadRecord[] {
         lastActivityAt: typeof r.lastActivityAt === "number" ? r.lastActivityAt : 0,
         seenAt: typeof r.seenAt === "number" ? r.seenAt : 0,
         movedToTerminalAt: typeof r.movedToTerminalAt === "number" ? r.movedToTerminalAt : null,
+        ...(workSummary ? { workSummary } : {}),
       });
       if (out.length >= MAX_THREAD_RECORDS) break;
     }

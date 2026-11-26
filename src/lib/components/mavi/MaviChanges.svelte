@@ -124,8 +124,9 @@
   <header class="mavi-changes-head flex items-center gap-2">
     <span class="text-xs font-medium text-textPrimary">Changes</span>
     {#if changes.length}
+      <span class="gp-chip" data-kind="count" data-tone="neutral">{changes.length}</span>
       {#if totals.added || totals.removed}
-        <span class="text-meta">{#if totals.added}<span class="text-ok">+{totals.added}</span>{/if} {#if totals.removed}<span class="text-danger">−{totals.removed}</span>{/if}</span>
+        <span class="text-meta tabular-nums">{#if totals.added}<span class="text-ok">+{totals.added}</span>{/if} {#if totals.removed}<span class="text-danger">−{totals.removed}</span>{/if}</span>
       {/if}
     {/if}
     <span class="ml-auto"></span>
@@ -139,23 +140,23 @@
   </header>
 
   {#if !wholeThread && turns.length > 1}
-    <div class="mavi-turns flex gap-1 overflow-x-auto" role="group" aria-label="Turn">
+    <div class="mavi-turns flex gap-1.5 overflow-x-auto" role="group" aria-label="Turn">
       {#each [...turns].reverse() as t (t)}
-        <button class="gp-chip" data-tone={t === shownTurn ? "accent" : "neutral"} onclick={() => (turn = t)}>Turn {t}</button>
+        <button class="gp-chip shrink-0" data-tone={t === shownTurn ? "accent" : "neutral"} onclick={() => (turn = t)}>Turn {t}</button>
       {/each}
     </div>
   {/if}
 
   <div class="flex-1 min-h-0 overflow-y-auto mavi-changes-body">
     {#if liveTurn && changes.length}
-      <p class="text-micro text-textMuted px-3 pt-2" aria-live="polite">Live: edits appear as the agent makes them; other changes are listed when the turn ends.</p>
+      <p class="text-micro text-textMuted px-3 pt-2.5 pb-1" aria-live="polite">Live: edits appear as the agent makes them; other changes are listed when the turn ends.</p>
     {/if}
     {#if turnFiles && !turnFiles.available}
-      <p class="gp-notice text-meta" data-tone="unknown">
+      <p class="gp-notice text-meta mx-3 mt-2" data-tone="unknown">
         {thread.turnFiles[shownTurn]?.reason ?? "Changes made outside the agent's edit tools were not tracked for this turn."}
       </p>
     {:else if turnFiles?.partial}
-      <p class="gp-notice text-meta" data-tone="warn">The worktree had too many changed paths to compare in full; this list may be incomplete.</p>
+      <p class="gp-notice text-meta mx-3 mt-2" data-tone="warn">The worktree had too many changed paths to compare in full; this list may be incomplete.</p>
     {/if}
 
     {#if changes.length === 0}
@@ -193,7 +194,7 @@
             {/if}
             {#if change.attributed}
               {#if change.added || change.removed}
-                <span class="text-meta shrink-0">{#if change.added}<span class="text-ok">+{change.added}</span>{/if} {#if change.removed}<span class="text-danger">−{change.removed}</span>{/if}</span>
+                <span class="text-meta tabular-nums shrink-0">{#if change.added}<span class="text-ok">+{change.added}</span>{/if} {#if change.removed}<span class="text-danger">−{change.removed}</span>{/if}</span>
               {/if}
             {:else}
               <span class="gp-chip shrink-0" data-tone="unknown" title="Changed during this turn, but no agent edit names it">Other · {describeCode(change.code)}</span>
@@ -203,8 +204,8 @@
             <div class="mavi-file-body">
               {#if change.attributed}
                 {#each change.edits as edit (edit.toolId)}
-                  <div class="text-micro text-textMuted mb-1 mt-2 flex items-center gap-1.5">
-                    <span>{edit.toolName}</span>
+                  <div class="text-micro text-textMuted mb-1.5 mt-2.5 flex items-center gap-1.5">
+                    <span class="font-medium text-textPrimary">{edit.toolName}</span>
                     {#if wholeThread}<span>· turn {edit.turn}</span>{/if}
                     <span>· {edit.state === "proposed" ? "proposed, waiting for you" : edit.state === "applying" ? "being applied" : edit.state === "not_applied" ? "not applied" : edit.state}</span>
                   </div>
@@ -216,7 +217,7 @@
                 {/each}
               {:else}
                 {@const patch = fetched[patchKey(change)]}
-                <p class="text-micro text-textMuted mt-2 mb-1">Changed during this turn outside the agent's edit tools: a command it ran, a formatter, or another program. Shown against HEAD.</p>
+                <p class="text-micro text-textMuted mt-2 mb-1.5">Changed during this turn outside the agent's edit tools: a command it ran, a formatter, or another program. Shown against HEAD.</p>
                 {#if patch === "loading" || patch === undefined}
                   <p class="text-meta text-textMuted">Reading the change…</p>
                 {:else if "error" in patch}
@@ -227,11 +228,11 @@
                   <p class="text-meta text-textMuted">{change.code?.trim() ? "No textual difference against HEAD." : "The file matches HEAD again."}</p>
                 {:else}
                   <MaviHunks hunks={patch.hunks} maxLines={400} />
-                  {#if patch.truncated}<p class="text-micro text-textMuted mt-1">The patch was cut at 256 KiB.</p>{/if}
+                  {#if patch.truncated}<p class="text-micro text-textMuted mt-1.5">The patch was cut at 256 KiB.</p>{/if}
                 {/if}
               {/if}
               {#if canOpen}
-                <button class="gp-btn mt-2" data-variant="ghost" onclick={() => openInExplorer(change)}>
+                <button class="gp-btn mt-2.5" data-variant="ghost" onclick={() => openInExplorer(change)}>
                   <ExternalLink size={11} aria-hidden="true" /> Open in Explorer
                 </button>
               {/if}
@@ -248,7 +249,8 @@
     background: rgb(var(--c-surface) / 0.5);
   }
   .mavi-changes-head {
-    padding: 8px 10px 8px 12px;
+    min-height: 44px;
+    padding: 6px 10px 6px 12px;
     border-bottom: 1px solid var(--gp-edge-soft);
   }
   .mavi-turns {
@@ -259,7 +261,8 @@
     padding-bottom: 12px;
   }
   .mavi-file-row {
-    padding: 5px 12px;
+    padding: 7px 12px;
+    transition: background-color var(--gp-dur-instant) var(--gp-ease-effect);
   }
   .mavi-file-row:hover {
     background: rgb(var(--c-surface-hover) / 0.65);
@@ -268,6 +271,6 @@
     background: rgb(var(--c-surface-hover) / 0.65);
   }
   .mavi-file-body {
-    padding: 0 12px 10px 33px;
+    padding: 4px 12px 12px 33px;
   }
 </style>

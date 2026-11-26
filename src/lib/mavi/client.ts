@@ -12,6 +12,8 @@ import type {
   MaviProbe,
   MaviReplay,
   MaviSummary,
+  MaviWorkSummary,
+  SummarizeRequest,
 } from "./types";
 
 export const MAVI_EVENT = "mavi-event";
@@ -57,6 +59,7 @@ export const maviClient = {
   sshProbe: (host: string, dir: string) => invoke<MaviProbe>("cmd_mavi_ssh_probe", { host, dir }),
   conversationCheck: (repoPath: string, conversationId: string) =>
     invoke<MaviConversationCheck>("cmd_mavi_conversation_check", { repoPath, conversationId }),
+  summarize: (request: SummarizeRequest) => invoke<MaviWorkSummary>("cmd_mavi_summarize", { request }),
 };
 
 export function onMaviEvents(handler: (id: string, entries: MaviEntry[]) => void): Promise<UnlistenFn> {

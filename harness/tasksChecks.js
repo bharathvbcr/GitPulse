@@ -88,6 +88,15 @@ let failList = false, corruptSave = false, loseSave = false, holdSave = false, r
 // failFill counts pages to fail, once each. A reload reads 200 at a time too,
 // but only past its first page, so a column that fits one page is never hit.
 let holdFill = false, heldFill = [], failFill = 0;
+// The host's admission refusal ("Task storage is busy", workbench.rs): the code
+// the board must treat as transient. `methods` names what is refused, `failing`
+// turns it on and off, and every call of a named method is logged with its time
+// so a check can read how often the board asks again. `listHold` parks the next
+// `left` task-list answers as they were read, to release them after a write.
+const busyFault = { methods: new Set(), failing: false, budget: 0, calls: [] };
+const listHold = { left: 0, parked: [] };
+// Every 200-row page read from a cursor: the fill's and Load more's.
+let cursorReads = 0;
 // Holds the catalog read a background refresh begins with, and any page read
 // from a cursor, to stage a Load more clicked as a refresh starts.
 let holdCatalog = false, heldCatalog = [], holdPages = false, heldPages = [];
@@ -215,6 +224,13 @@ mockIPC(async (cmd, args) => {
   if (cmd !== "cmd_workbench_request") { unknown.push(cmd); throw Error(`Unconfigured command: ${cmd}`); }
   const input = JSON.parse(args.input);
   ipcMethods.push(args.method);
+  if (busyFault.methods.has(args.method)) {
+    // `budget` refuses that many calls and then lets the rest through: one refusal, then a quiet store.
+    const refuse = busyFault.failing || busyFault.budget > 0;
+    if (!busyFault.failing && refuse) busyFault.budget--;
+    busyFault.calls.push({ method: args.method, at: Date.now(), archive: input.archived === true && input.limit === 1, refused: refuse });
+    if (refuse) throw {code: "busy", message: "Task storage is busy"};
+  }
   switch (args.method) {
     case "repositories.list": { const result = JSON.stringify(page(repos)); return holdCatalog ? new Promise(resolve => heldCatalog.push(() => resolve(result))) : result; }
     case "repositories.get": return JSON.stringify({ok:true, item: repos.find(repo => repo.id === input.id)});
@@ -398,8 +414,10 @@ mockIPC(async (cmd, args) => {
           return a.position - b.position || byId;
         });
       const result = JSON.stringify(page(matching, Number(input.cursor ?? 0), input.limit));
+      if (listHold.left > 0) { listHold.left--; return new Promise(resolve => listHold.parked.push(() => resolve(result))); }
       if (holdSearch && input.query === "older") return new Promise(resolve => heldSearch.push(() => resolve(result)));
       if (holdPages && input.cursor) return new Promise(resolve => heldPages.push(() => resolve(result)));
+      if (input.cursor && input.limit === 200) cursorReads++;
       if (input.cursor && input.limit === 200 && failFill > 0) { failFill--; throw {code: "store_error", message: "Fixture lost a page"}; }
       if (input.cursor && input.limit === 200 && holdFill) return new Promise(resolve => heldFill.push(() => resolve(result)));
       return result;
@@ -617,6 +635,271 @@ const moveThroughMenu = async (id, status) => {
 await wait(() => card("task-1"));
 if (params.has("check")) {
   try {
+    // ---- A change must not make the board blink ---------------------------
+    // The board keeps what it shows while it re-reads. Every check records the
+    // DOM with a MutationObserver (a poll cannot see a blink between two
+    // frames) and asserts its own setup, so it cannot pass on a board that
+    // never had the thing that might flicker.
+    {
+      let flickerStep = "start";
+      const nap = ms => new Promise(resolve => setTimeout(resolve, ms));
+      const churn = (target = root) => {
+        const records = [];
+        // Whether a target sat in a paging row is read as it is observed: the button is gone from the document by the time a check asks.
+        const note = list => { for (const record of list) { record.inPaging = record.type === "attributes" && Boolean(record.target.closest?.("[data-task-paging]")); records.push(record); } };
+        const observer = new MutationObserver(note);
+        observer.observe(target, { childList: true, attributes: true, characterData: true, subtree: true });
+        return { stop: () => { note(observer.takeRecords()); observer.disconnect(); return records; } };
+      };
+      const hits = (node, selector) => node.nodeType === 1 && (node.matches(selector) || Boolean(node.querySelector(selector)));
+      const removedOf = (records, selector) => records.filter(record => [...record.removedNodes].some(node => hits(node, selector))).length;
+      const addedOf = (records, selector) => records.filter(record => [...record.addedNodes].some(node => hits(node, selector))).length;
+      const addedText = (records, pattern) => records.filter(record => [...record.addedNodes].some(node => pattern.test(node.textContent ?? ""))).length;
+      const flips = (records, name) => records.filter(record => record.inPaging && record.attributeName === name).length;
+      // A removed node is out of the document, so what it is is read from its own class, not from where it sat.
+      const TOTAL = "span.text-meta.font-medium";
+      const HIDDEN = '[data-testid="task-hidden-columns"]';
+      const CHIPS = '[data-testid="card-verdict"], [data-testid="card-subtasks"], [data-testid="card-parent"]';
+      const NOTICES = '[role="alert"], [data-testid="board-read-notes"]';
+      const addPaged = () => { for (let i = 0; i < 230; i++) tasks.push(makeTask("task-" + (3000 + i), "Flicker ready " + String(i + 1).padStart(3, "0"), "repo-0", "ready")); };
+      const dropPaged = () => { tasks = tasks.filter(task => !task.title.startsWith("Flicker ready")); };
+      const navRow = id => root.querySelector('[data-repository-row="' + id + '"]');
+      const columnsTop = () => root.querySelector('[data-testid="task-columns"]')?.getBoundingClientRect().top ?? NaN;
+      const reads = () => ipcMethods.filter(method => method === "items.list").length;
+      const inColumn = (id, status) => Boolean(root.querySelector('[data-task-column="' + status + '"] [data-card-id="' + id + '"]'));
+      const copies = id => root.querySelectorAll('[data-card-id="' + id + '"]').length;
+      try {
+        flickerStep = "a: an external burst over unchanged data";
+        await wait(() => card("task-1") && root.querySelector(TOTAL));
+        await settle(1700);
+        const before = reads();
+        const burst = churn();
+        for (let i = 0; i < 4; i++) { await emit("workbench-changed", { sequence: null, source: "external" }); await nap(300); }
+        await settle(2200);
+        const quiet = burst.stop();
+        check("a burst of outside changes that changed nothing re-reads the board and touches no DOM (" + (reads() - before) + " reads, " + quiet.length + " mutations)", reads() > before && quiet.length === 0);
+
+        flickerStep = "b: one local move";
+        interfaceStore.toggleTaskColumn("backlog");
+        addPaged();
+        failFill = 1_000_000;
+        await settle(200);
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => root.querySelector(HIDDEN) && root.querySelector('[data-task-paging="ready"] button') && root.querySelector(TOTAL)).catch(() => {});
+        await settle(1700);
+        const missing = [["the hidden-column note", HIDDEN], ["a Load more button", '[data-task-paging="ready"] button'], ["the header total", TOTAL]].filter(([, selector]) => !root.querySelector(selector)).map(([name]) => name);
+        check("a board with a hidden column, a paged column and a total is on screen before the move (missing: " + (missing.join(", ") || "nothing") + ")", missing.length === 0);
+        const move = churn();
+        await moveThroughMenu("task-2", "In progress");
+        await settle(1500);
+        const moved = move.stop();
+        check("a card moved to another column is there (" + moved.length + " mutations)", inColumn("task-2", "in_progress") && !inColumn("task-2", "review"));
+        check("a local move never removes the header total (" + removedOf(moved, TOTAL) + " removals)", removedOf(moved, TOTAL) === 0);
+        check("a local move never removes and re-adds the hidden-column note (" + removedOf(moved, HIDDEN) + " removals)", removedOf(moved, HIDDEN) === 0);
+        check("a local move never disables and re-enables Load more or Load all (" + flips(moved, "disabled") + " flips)", flips(moved, "disabled") === 0);
+        check("a local move never flashes an empty state (" + addedText(moved, /No tasks (yet|match)/) + ")", addedText(moved, /No tasks (yet|match)/) === 0);
+        await moveThroughMenu("task-2", "Review"); await settle(800);
+        failFill = 0;
+        dropPaged();
+        interfaceStore.showAllTaskColumns();
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await settle(1500);
+
+        flickerStep = "c: busy refusals every other read";
+        verdicts.set("task-1", { ok: true, state: "passed", stale: false, record: null });
+        parentOf.set("task-10", "task-1");
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => card("task-1")?.querySelector('[data-testid="card-verdict"]') && card("task-1")?.querySelector('[data-testid="card-subtasks"]') && card("task-10")?.querySelector('[data-testid="card-parent"]'));
+        await settle(1700);
+        const chipsUp = root.querySelectorAll(CHIPS).length;
+        check("a verdict chip, a subtask chip and a parent chip are on screen before the refusals (" + chipsUp + ")", chipsUp >= 3);
+        const refusals = churn();
+        const tops = [columnsTop()], cue = [];
+        const sampler = setInterval(() => { tops.push(columnsTop()); cue.push(root.querySelector('[data-testid="task-board-paused"]')?.dataset.held); }, 80);
+        const rounds = [["verifications.board", "items.lineage"], null, ["items.list"], null, ["verifications.board", "items.lineage"], null];
+        for (const methods of rounds) {
+          busyFault.methods = new Set(methods ?? ["verifications.board", "items.lineage", "items.list"]);
+          busyFault.failing = methods !== null;
+          await emit("workbench-changed", { sequence: null, source: "external" });
+          await nap(1800);
+        }
+        busyFault.failing = false;
+        clearInterval(sampler);
+        await settle(800);
+        const refused = refusals.stop();
+        const refusedBy = method => busyFault.calls.filter(call => call.refused && call.method === method).length;
+        check("busy refusals were actually served for the verdicts, the lineage and the task list (" + ["verifications.board", "items.lineage", "items.list"].map(method => method + " " + refusedBy(method)).join(", ") + ")", ["verifications.board", "items.lineage", "items.list"].every(method => refusedBy(method) >= 1));
+        const cueAfter = root.querySelector('[data-testid="task-board-paused"]')?.dataset.held;
+        check("while the board holds what it read, a fixed slot in the header says so, and it clears once reads land (" + cue.filter(value => value === "true").length + " samples held, then " + cueAfter + ")", cue.includes("true") && cueAfter === "false");
+        check("a busy refusal never removes a verdict, subtask or parent chip (" + removedOf(refused, CHIPS) + " removals)", removedOf(refused, CHIPS) === 0);
+        check("a busy refusal never inserts a banner or a read-notes list (" + addedOf(refused, NOTICES) + " insertions)", addedOf(refused, NOTICES) === 0);
+        const spread = Math.max(...tops) - Math.min(...tops);
+        check("and the board does not move under the reader (spread " + spread.toFixed(1) + "px)", Number.isFinite(spread) && spread <= 1);
+        verdicts.delete("task-1"); parentOf.delete("task-10");
+        busyFault.methods = new Set(); busyFault.calls.length = 0;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await settle(2500);
+
+        flickerStep = "d: sustained busy refusals";
+        busyFault.methods = new Set(["items.list"]); busyFault.calls.length = 0; busyFault.failing = true;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await nap(10_500);
+        const attempts = busyFault.calls.filter(call => call.archive).map(call => call.at);
+        await wait(() => root.querySelector('[role="alert"]')).catch(() => {});
+        busyFault.failing = false;
+        const gaps = attempts.slice(1).map((at, i) => at - attempts[i]);
+        check("a board refused for 10 s asks again at least three times (" + attempts.length + " attempts)", attempts.length >= 3);
+        check("and spaces its asks further apart each time, in at most five attempts (gaps " + gaps.join(", ") + " ms)", attempts.length >= 3 && attempts.length <= 5 && gaps.at(-1) >= gaps[0] * 1.5);
+        check("and once the refusal outlasts what it will hold, it says the board could not be read", Boolean(root.querySelector('[role="alert"]')));
+        busyFault.methods = new Set();
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => !root.querySelector('[role="alert"]')).catch(() => {});
+        await settle(500);
+        check("the next answer that lands clears it", !root.querySelector('[role="alert"]'));
+
+        flickerStep = "e1: an old read answered after a move";
+        listHold.left = 6;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => listHold.parked.length >= 1);
+        await settle(100);
+        const heldReads = listHold.parked.length;
+        await moveThroughMenu("task-2", "Ready");
+        await settle(1200);
+        const landing = churn();
+        listHold.parked.splice(0).forEach(release => release());
+        await settle(1500);
+        const late = landing.stop();
+        check("a quiet read was held while the move was made (" + heldReads + " answers)", heldReads >= 1);
+        check("the moved card is in its new column once the old read answers, and was never drawn in the old one (" + copies("task-2") + " copies)", inColumn("task-2", "ready") && !inColumn("task-2", "review") && copies("task-2") === 1 && addedOf(late, '[data-task-column="review"] [data-card-id="task-2"]') === 0);
+        await moveThroughMenu("task-2", "Review"); await settle(800);
+
+        flickerStep = "e2: a Load more in flight when a card is moved";
+        addPaged();
+        failFill = 1_000_000;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => root.querySelector('[data-task-paging="ready"] button'));
+        await settle(1200);
+        const more = root.querySelector('[data-task-paging="ready"] button[aria-label="Load more Ready tasks"]');
+        check("Load more is on screen for a column the board could not finish", Boolean(more));
+        holdPages = true;
+        more?.click(); await settle(300);
+        await moveThroughMenu("task-2", "Ready");
+        await settle(800);
+        const pageLanding = churn();
+        heldPages.splice(0).forEach(release => release()); holdPages = false;
+        await settle(1500);
+        const pageLate = pageLanding.stop();
+        check("the moved card shows once, in its new column, after the older page lands (" + copies("task-2") + " copies)", inColumn("task-2", "ready") && !inColumn("task-2", "review") && copies("task-2") === 1 && addedOf(pageLate, '[data-task-column="review"] [data-card-id="task-2"]') === 0);
+        failFill = 0;
+        dropPaged();
+        await moveThroughMenu("task-2", "Review"); await settle(800);
+
+        flickerStep = "f: Load more pressed while the board re-reads after a write";
+        addPaged();
+        failFill = 1_000_000;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => root.querySelector('[data-task-paging="ready"] button[aria-label="Load more Ready tasks"]'));
+        await settle(1200);
+        listHold.left = 6;
+        const pressed = () => root.querySelector('[data-task-paging="ready"] button[aria-label="Load more Ready tasks"]');
+        await moveThroughMenu("task-2", "Ready");
+        await wait(() => listHold.parked.length >= 1);
+        const during = pressed();
+        const enabled = Boolean(during) && !during.disabled;
+        const readsBefore = cursorReads;
+        during?.click(); await settle(200);
+        check("Load more stays enabled while the board re-reads after a write, and is not run until it has", enabled && cursorReads === readsBefore);
+        check("and once pressed it is disabled, so a second click cannot replace the first (" + (pressed()?.disabled ? "disabled" : "enabled") + ")", pressed()?.disabled === true);
+        listHold.parked.splice(0).forEach(release => release());
+        await settle(2500);
+        check("and a click made then is not dropped: the page is read once the re-read is over (" + (cursorReads - readsBefore) + " page reads, a failing fill makes one)", cursorReads - readsBefore >= 2);
+        failFill = 0;
+        dropPaged();
+        await moveThroughMenu("task-2", "Review"); await settle(800);
+
+        flickerStep = "g: one refused card read, then a quiet store";
+        for (const which of ["verifications.board", "items.lineage"]) {
+          verdicts.set("task-1", { ok: true, state: "passed", stale: false, record: null });
+          parentOf.set("task-10", "task-1");
+          await emit("workbench-changed", { sequence: null, source: "external" });
+          await wait(() => card("task-1")?.querySelector('[data-testid="card-verdict"]')?.dataset.state === "passed" && card("task-1")?.querySelector('[data-testid="card-subtasks"]'));
+          await settle(1700);
+          // What the store now says differs from what is on screen, so a read that landed would show.
+          verdicts.set("task-1", { ok: true, state: "failed", stale: false, record: null });
+          parentOf.set("task-11", "task-1");
+          busyFault.methods = new Set([which]); busyFault.budget = 1; busyFault.calls.length = 0;
+          const readsBefore = which === "items.lineage" ? lineageReads.length : verdictReads.length;
+          await emit("workbench-changed", { sequence: null, source: "external" });
+          // No further events: the board must come back for it on its own, within a bound.
+          await nap(9_000);
+          const again = (which === "items.lineage" ? lineageReads.length : verdictReads.length) - readsBefore;
+          const chip = card("task-1")?.querySelector('[data-testid="card-verdict"]')?.dataset.state;
+          const subtasks = card("task-1")?.querySelector('[data-testid="card-subtasks"]')?.textContent ?? "";
+          const held = root.querySelector('[data-testid="task-board-paused"]')?.dataset.held;
+          const noted = Boolean(root.querySelector('[data-testid="board-verdicts-error"], [data-testid="board-lineage-error"]'));
+          check("a card read refused once (" + which + ") is asked for again without another change, and the chips follow it (" + again + " reads, verdict " + chip + ", subtasks " + subtasks.trim() + ", paused " + held + ")",
+            busyFault.calls.some(call => call.refused) && again >= 1 && held !== "true" && !noted && chip === "failed" && /\b0 ?\/ ?2|0 of 2|\b2\b/.test(subtasks));
+          busyFault.methods = new Set(); busyFault.budget = 0;
+          verdicts.delete("task-1"); parentOf.delete("task-10"); parentOf.delete("task-11");
+          await emit("workbench-changed", { sequence: null, source: "external" });
+          await settle(2200);
+        }
+
+        flickerStep = "h: Refresh pressed during a Load all and during a re-read";
+        addPaged();
+        failFill = 1_000_000;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => root.querySelector('[data-task-paging="ready"] button[aria-label="Load all Ready tasks"]'));
+        await settle(1200);
+        failFill = 0; holdPages = true;
+        const refresh = () => root.querySelector('header [aria-label="Refresh"]');
+        root.querySelector('[data-task-paging="ready"] button[aria-label="Load all Ready tasks"]').click(); await settle(300);
+        const refreshable = !refresh().disabled;
+        refresh().click(); await settle(300);
+        heldPages.splice(0).forEach(release => release()); holdPages = false;
+        await settle(3000);
+        const readyIds = [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.dataset.cardId);
+        const readyNow = tasks.filter(task => task.status === "ready").length;
+        check("Refresh can be pressed during a Load all, and the column ends whole, once each, with nothing left busy (" + readyIds.length + " of " + readyNow + ", Refresh " + (refresh().disabled ? "disabled" : "enabled") + ")",
+          refreshable && readyIds.length === readyNow && new Set(readyIds).size === readyIds.length && !refresh().disabled && root.querySelector('[data-testid="task-columns"]')?.getAttribute("aria-busy") !== "true");
+        dropPaged();
+        failFill = 0;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await settle(1500);
+        // During the re-read a write started: Refresh pressed then must not let the older answer win.
+        listHold.left = 6;
+        await moveThroughMenu("task-2", "Ready");
+        await wait(() => listHold.parked.length >= 1);
+        const refreshableThen = !refresh().disabled;
+        refresh().click(); await settle(800);
+        listHold.parked.splice(0).forEach(release => release()); listHold.left = 0;
+        await settle(2000);
+        check("Refresh pressed during a re-read after a write shows the moved card once, in its new column, and ends idle (" + copies("task-2") + " copies)",
+          refreshableThen && inColumn("task-2", "ready") && !inColumn("task-2", "review") && copies("task-2") === 1 && !refresh().disabled);
+        await moveThroughMenu("task-2", "Review"); await settle(800);
+
+        flickerStep = "e3: a scope change during the debounce";
+        listHold.left = 6;
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => listHold.parked.length >= 1);
+        navRow("repo-1").querySelector("button").click();
+        await nap(60);
+        const scoped = churn();
+        listHold.parked.splice(0).forEach(release => release());
+        await emit("workbench-changed", { sequence: null, source: "external" });
+        await wait(() => card("task-3") && !card("task-1"));
+        await settle(1200);
+        const afterScope = scoped.stop();
+        check("an answer read for the old scope never draws its cards on the new one (" + addedOf(afterScope, '[data-card-id="task-1"]') + " drawn)", !card("task-1") && addedOf(afterScope, '[data-card-id="task-1"]') === 0);
+        button("All", root.querySelector('nav[aria-label="Task scopes"]')).click(); await wait(() => card("task-1")); await settle(800);
+      } catch (error) { check("the flicker checks ran to the end (" + error.message + " at " + flickerStep + ")", false); }
+      finally {
+        busyFault.failing = false; busyFault.methods = new Set(); failFill = 0; holdPages = false; listHold.left = 0; dropPaged();
+        listHold.parked.splice(0).forEach(release => release()); heldPages.splice(0).forEach(release => release());
+        verdicts.delete("task-1"); parentOf.delete("task-10"); interfaceStore.showAllTaskColumns();
+      }
+    }
+
     // ---- The header lays its tools out in two deliberate rows -------------
     // Thirteen controls in one right-aligned strip were wider than the bar,
     // so they wrapped under a near-empty title row, at four different

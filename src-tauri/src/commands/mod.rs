@@ -50,7 +50,7 @@ use tauri::{AppHandle, State};
 
 mod analysis;
 mod app;
-mod assist;
+pub(crate) mod assist;
 mod audit;
 mod commit_graph;
 mod conflict;

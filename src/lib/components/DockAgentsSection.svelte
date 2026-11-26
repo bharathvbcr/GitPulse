@@ -72,11 +72,10 @@
     '[data-testid="dock-agents-attention-item"]:not(:disabled), [data-testid="dock-agent-row"]:not(:disabled)';
 
   let searchQuery = $state("");
-  // initialFilter and initialGroupMode only seed these two controls; after
-  // mount they are the user's to change, so each prop is read once on purpose.
-  // Justified: a seed read, not a missed reactive dependency.
+  // Justified: initialFilter intentionally seeds local filter state once on mount.
   // svelte-ignore state_referenced_locally
   let statusFilter = $state<DockAgentFilter>(initialFilter);
+  // Justified: initialGroupMode intentionally seeds local group-mode state once on mount.
   // svelte-ignore state_referenced_locally
   let groupMode = $state<"auto" | "repo" | "flat">(initialGroupMode);
   let collapsedGroupKeys = $state<Set<string>>(new Set());

@@ -30,9 +30,13 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-r
  * real 1.5 s settle a dozen times on purpose: 53 s on the development Mac, 57 s
  * and 61-69 s on the macOS CI runner with window focus on and off (probe runs
  * 44370388488: verdicts at 56.8, 56.7, 69.2 and 60.5 s), which a minute cannot
- * hold. `tasks` is 688 sequential checks, each behind real settled waits: 141 s
+ * hold. `tasks` was 688 sequential checks, each behind real settled waits: 141 s
  * on the development Mac and 168 s (focus on) and 194 s (focus off) on the CI
- * runner, with every section within the same ratio of its local time. `repo-tabs`
+ * runner, with every section within the same ratio of its local time. The 27
+ * checks that watch the board for flicker (`harness/tasksChecks.js`, "A change
+ * must not make the board blink") wait out refusals and the product's own
+ * 1.5 s spacing on purpose and add about 45-60 s: 200 s of the old 300 on a
+ * loaded development Mac, so `tasks` has 360. `repo-tabs`
  * runs 191 sequential checks plus a 12-phase rAF measurement loop (~45-62 s on
  * headless software WebKitGTK), and `terminal` reaches ~188-206 s under software
  * WebKitGTK. A page that is long by design gets
@@ -40,7 +44,7 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-r
  * still caught as fast.
  */
 export const DEFAULT_DEADLINE_SECONDS = 60;
-export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 300, health: 120, "tab-switch": 120, terminal: 240, coverage: 120, "repo-tabs": 120 }));
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 360, health: 120, "tab-switch": 120, terminal: 240, coverage: 120, "repo-tabs": 120 }));
 
 /**
  * @param {string} harness

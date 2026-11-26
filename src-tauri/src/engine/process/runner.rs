@@ -283,7 +283,7 @@ pub fn run_captured(
                 truncation_reason,
             }))
         }
-        Err(e) if is_timeout_error(program, e.message()) => Ok(RunOutcome::TimedOut(timeout)),
+        Err(e) if is_own_run_timeout(program, e.message()) => Ok(RunOutcome::TimedOut(timeout)),
         Err(e) => Err(e),
     }
 }
@@ -437,8 +437,28 @@ pub(crate) fn is_timed_out(err: &str) -> bool {
     err.contains(TIMEOUT_MARKER)
 }
 
-pub(super) fn is_timeout_error(program: &str, err: &str) -> bool {
-    err.starts_with(program) && is_timed_out(err)
+/// True when `err` is exactly the deadline text `run_bounded` writes for the
+/// child `run_captured` ran as `program`: `<program> timed out after <n>s`,
+/// where `<n>` is the seconds as a plain decimal and nothing follows.
+///
+/// The label is the program in whatever characters its path holds, so it is
+/// matched by prefix, not by shape. Everything else that carries the marker
+/// is refused by construction, because none of it ends in digits and `s`: a
+/// slot-wait refusal (`... waiting for a process slot`), a deferral, the
+/// up-front rejection of a zero deadline (`...0s: deadline must be positive
+/// ...`), a cancellation and a spawn failure. A child that never ran is not a
+/// run that timed out.
+pub(super) fn is_own_run_timeout(program: &str, err: &str) -> bool {
+    let Some(seconds) = err
+        .strip_prefix(program)
+        .and_then(|rest| rest.strip_prefix(TIMEOUT_MARKER))
+        .and_then(|rest| rest.strip_suffix('s'))
+    else {
+        return false;
+    };
+    seconds.bytes().any(|b| b.is_ascii_digit())
+        && seconds.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && seconds.bytes().filter(|&b| b == b'.').count() <= 1
 }
 
 /// What a runner failure message says happened, read once and in one place.

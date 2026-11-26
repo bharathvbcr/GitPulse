@@ -18,7 +18,8 @@
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { MAX_COLUMN_PAGES, fillColumns, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
-  import { createLiveLoader, createLiveReturn, liveOnScreen } from "../workbench/liveLoader";
+  import { createLiveLoader, createLiveReturn, liveOnScreen, LIVE_MIN_GAP_MS, LIVE_RETRY_MAX_MS } from "../workbench/liveLoader";
+  import { createBusyGrace } from "../workbench/busyGrace";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, organizeTasks, putTask, registerRepository, restoreDeletedTask, suggestTasks, WorkbenchError,
@@ -322,6 +323,36 @@
   let interactions = 0;
   /** The banner's error came from a background read, so the next one that succeeds may clear it. */
   let refreshError = false;
+  /**
+   * What stays on screen when the host refuses a read as busy (`busyGrace.ts`):
+   * one grace per kind of read, each holding its last good answer for a bounded
+   * time instead of blanking it and raising a banner above the board. `held`
+   * is when the answer still on screen was read, or null while it is current.
+   */
+  const boardGrace = createBusyGrace(), verdictGrace = createBusyGrace(), lineageGrace = createBusyGrace(), catalogGrace = createBusyGrace();
+  let held = $state<Record<"board" | "verdicts" | "lineage" | "catalog", number | null>>({ board: null, verdicts: null, lineage: null, catalog: null });
+  const heldSince = $derived(Math.min(...Object.values(held).filter((at): at is number => at !== null)));
+  const paused = $derived(Number.isFinite(heldSince));
+  function forgetHeld() {
+    for (const grace of [boardGrace, verdictGrace, lineageGrace, catalogGrace]) grace.forget();
+    held = { board: null, verdicts: null, lineage: null, catalog: null };
+  }
+  /**
+   * A paging control (Load more, Load all) that was pressed and is working. It
+   * is what disables them: a re-read after a write, which keeps the board as it
+   * is, must not (an enabled-looking button that ignored a click was the other
+   * way to get this wrong).
+   */
+  let paging = $state(false);
+  /** An explicit Refresh, from the click until its read lands. */
+  let refreshing = $state(false);
+  /**
+   * A paging click that came while the board was re-reading after a write or
+   * finishing a move: run once that is over, from wherever the column then
+   * stands, instead of being dropped. Only the latest is kept.
+   */
+  let deferredPaging = $state.raw<(() => void) | null>(null);
+  function deferPaging(run: () => void) { deferredPaging = run; }
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const openTabRefs = $derived($repoStore.openTabs.map((tab) => ({ path: tab.path, label: tab.label })));
   const catalogIds = $derived(repositories.map((repo) => repo.id));
@@ -576,7 +607,14 @@
    * the board gets to make silently. The banner names the columns and the
    * count, and offers the one action that undoes it.
    */
-  const hiddenWork = $derived(initialized && !loading ? hiddenColumnReport(hiddenColumns, columnTotals) : null);
+  /**
+   * There is no answer for what the board is asked yet: the first load, or a
+   * new scope or search still being read. `loading` also covers a re-read after
+   * a write, which has an answer on screen already and must not hide the total,
+   * the hidden-column note or the empty states for the moment it takes.
+   */
+  const blank = $derived(loading && loadedKey !== boardKey);
+  const hiddenWork = $derived(initialized && !blank ? hiddenColumnReport(hiddenColumns, columnTotals) : null);
   const quickAddRepositories = $derived(repositories.map((repo) => ({ id: repo.id, name: repo.name })));
   /**
    * Whether this scope can hold a new task, why not, and what one starts as.
@@ -802,9 +840,17 @@
    * overwritten by an answer read before it.
    */
   async function loadBoard(target: Scope = scope, current: SearchPlan = plan, quiet = false): Promise<boolean> {
+    return (await readBoard(target, current, quiet)) === "applied";
+  }
+  /**
+   * `loadBoard`, saying why when it did not apply: the reader started something
+   * meanwhile ("gave way", asked again as it was), or the read failed (retried
+   * with a growing delay by the live loader, `liveLoader.ts`).
+   */
+  async function readBoard(target: Scope, current: SearchPlan, quiet: boolean): Promise<"applied" | "gave way" | "failed"> {
     // Before the revision moves: a quiet read that bumped it under a running
     // "Load more" discarded that load's pages and left the board loading.
-    if (quiet && (loading || moving)) return false;
+    if (quiet && (loading || moving)) return "gave way";
     const generation = ++revision, key = JSON.stringify([target, current.key]), touched = interactions;
     if (!quiet) { loading = true; error = ""; refreshError = false; }
     const stale = () => generation !== revision || disposed || key !== boardKey || (quiet && (loading || moving || touched !== interactions));
@@ -822,7 +868,7 @@
           reloadCandidates((query, cursor) => listTasks(current.scope, null, query, cursor, CANDIDATE_PAGE, BOARD), current.word, kept),
           archived,
         ]);
-        if (stale()) return false;
+        if (stale()) return "gave way";
         const pages = bucketByStatus(set.cards);
         candidates = set; columns = keepUnchanged(pages); loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
         // A hidden repository's tasks are not this board's work in progress.
@@ -830,7 +876,7 @@
         keepSelected(pages);
         settled(quiet);
         void fillBoard(generation, key, target, current);
-        return true;
+        return "applied";
       }
       // Columns are re-read as far as they were paged in (`boardPaging.ts`),
       // so a refresh after any write keeps "Load more" where the reader left
@@ -847,7 +893,7 @@
         })),
         archived,
       ]);
-      if (stale()) return false;
+      if (stale()) return "gave way";
       const read = Object.fromEntries(pages);
       columns = keepUnchanged(read); candidates = null; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
       inProgressCount = columns.in_progress?.total ?? 0;
@@ -855,17 +901,27 @@
       settled(quiet);
       void loadCardReads(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
       void fillBoard(generation, key, target, current);
-      return true;
+      return "applied";
     } catch (cause) {
-      // A background read that failed says so, and the next one that
-      // succeeds clears what it said; neither touches the reader's own error.
-      if (generation === revision && !disposed && !(quiet && error && !refreshError)) { error = failure("load", "tasks", cause); refreshError = quiet; }
-      return false;
+      if (generation === revision && !disposed) {
+        // A background read the host refused as busy leaves the board as it is
+        // for a bounded grace (`busyGrace.ts`); the reader's own read, and any
+        // other failure, is said at once.
+        const holding = quiet ? boardGrace.failed(cause) : (boardGrace.forget(), false);
+        held.board = boardGrace.held();
+        // A background read that failed says so, and the next one that
+        // succeeds clears what it said; neither touches the reader's own error.
+        if (!holding && !(quiet && error && !refreshError)) { error = failure("load", "tasks", cause); refreshError = quiet; }
+      }
+      return "failed";
     }
     finally { if (!quiet && generation === revision && !disposed) loading = false; }
   }
   /** A read landed: a failure only an earlier background read reported is over. */
-  function settled(quiet: boolean) { if (quiet && refreshError) { error = ""; refreshError = false; } }
+  function settled(quiet: boolean) {
+    boardGrace.succeeded(); held.board = null;
+    if (quiet && refreshError) { error = ""; refreshError = false; }
+  }
   /**
    * The rest of the board, read on its own after each read that landed: every
    * column (or a search's candidates) to its end, `CANDIDATE_PAGE` tasks a
@@ -923,7 +979,12 @@
         keys: STATUSES,
         current: (status) => columns[status],
         read: (status, cursor) => listTasks(target, status, "", cursor, CANDIDATE_PAGE, BOARD),
-        apply: (status, page) => { if (!live()) return false; columns = { ...columns, [status]: page }; grew = true; return true; },
+        apply: (status, page) => {
+          if (!live()) return false;
+          // A page that read back what the column already shows draws nothing.
+          if (samePage(columns[status], page)) return true;
+          columns = { ...columns, [status]: page }; grew = true; return true;
+        },
         live,
         budget: MAX_CANDIDATES,
       });
@@ -957,9 +1018,14 @@
   async function loadVerdicts(ids: string[], generation: number) {
     try {
       const read = await getBoardVerdicts(ids);
-      if (generation === revision && !disposed) { if (!sameVerdicts(verdicts, read)) verdicts = read; verdictError = ""; }
+      if (generation === revision && !disposed) { if (!sameVerdicts(verdicts, read)) verdicts = read; verdictError = ""; verdictGrace.succeeded(); held.verdicts = null; }
     } catch (cause) {
-      if (generation === revision && !disposed) { verdicts = new Map(); verdictError = explainError(cause); }
+      if (generation !== revision || disposed) return;
+      // A busy refusal keeps the chips on screen for a bounded grace (`busyGrace.ts`); anything else clears them and says so.
+      const holding = verdictGrace.failed(cause);
+      held.verdicts = verdictGrace.held();
+      if (holding) background.schedule();
+      else { verdicts = new Map(); verdictError = explainError(cause); }
     }
   }
   /**
@@ -970,16 +1036,26 @@
   async function loadLineage(ids: string[], generation: number) {
     try {
       const read = await getBoardLineage(ids);
-      if (generation === revision && !disposed) { if (!sameLineage(lineage, read)) lineage = read; lineageError = ""; }
+      if (generation === revision && !disposed) { if (!sameLineage(lineage, read)) lineage = read; lineageError = ""; lineageGrace.succeeded(); held.lineage = null; }
     } catch (cause) {
-      if (generation === revision && !disposed) { lineage = new Map(); lineageError = explainError(cause); }
+      if (generation !== revision || disposed) return;
+      const holding = lineageGrace.failed(cause);
+      held.lineage = lineageGrace.held();
+      if (holding) background.schedule();
+      else { lineage = new Map(); lineageError = explainError(cause); }
     }
   }
   /** Everything a card shows that the card list does not carry: its verdict and its place in a task tree. */
   function loadCardReads(ids: string[], generation: number) {
-    void loadVerdicts(ids, generation);
-    void loadLineage(ids, generation);
+    cardRun = Promise.all([loadVerdicts(ids, generation), loadLineage(ids, generation)]).then(() => undefined);
   }
+  /**
+   * The latest card reads. The background read awaits them, as it does the fill,
+   * so a refusal they held through (`busyGrace.ts`) makes that read "failed" and
+   * the live loader asks again with backoff; a read held from anywhere else
+   * (after a write, Load more, the fill) asks the loader for that read.
+   */
+  let cardRun: Promise<void> = Promise.resolve();
   /**
    * A task write finished; tell the archive dock to reload.
    *
@@ -1017,6 +1093,11 @@
     try { await catalog(); } catch (cause) { catalogError = failure("refresh", "repositories and workspaces", cause); }
     if (initialized && active && !disposed) { await loadBoard(); await loadUnread(); }
   }
+  /** The Refresh button: disabled until its read lands, which is what tells a caller it finished. */
+  async function explicitRefresh() {
+    refreshing = true;
+    try { await (initialized ? refresh() : initialize()); } finally { refreshing = false; }
+  }
   /**
    * Keeping the board current after a change made elsewhere — an agent over
    * MCP, a background sweep, another window — or the window coming back.
@@ -1026,6 +1107,9 @@
    */
   const background = createLiveLoader({
     canRun: () => initialized && active && !disposed && liveOnScreen(),
+    // A read that fails is asked again 1.5 s later, then 3, 6, up to LIVE_RETRY_MAX_MS: a store refusing reads as busy was
+    // asked the whole fan-out again every 1.5 s, which kept it busy.
+    retry: { baseMs: LIVE_MIN_GAP_MS, maxMs: LIVE_RETRY_MAX_MS },
     read: async () => {
       // The agents on the cards follow the same spaced cadence, on screen
       // focused or not; on every change they cost a read of runs and one per
@@ -1033,12 +1117,24 @@
       void boardAgents.refresh();
       if (loading || moving) { background.schedule(); return; }
       membershipToken++;
-      try { await catalog(); } catch (cause) { if (!disposed) catalogError = failure("refresh", "repositories and workspaces", cause); }
-      if (!(await loadBoard(scope, plan, true)) && !disposed) background.schedule();
+      let failed = false;
+      try { await catalog(); catalogGrace.succeeded(); held.catalog = null; } catch (cause) {
+        failed = true;
+        // A busy refusal keeps the catalog as it is for a bounded grace; anything else is said.
+        const holding = catalogGrace.failed(cause);
+        held.catalog = catalogGrace.held();
+        if (!disposed && !holding) catalogError = failure("refresh", "repositories and workspaces", cause);
+      }
+      const outcome = await readBoard(scope, plan, true);
+      // The reader started something meanwhile: ask again as it stands. A failure is the loader's to retry, with backoff.
+      if (outcome === "gave way" && !disposed) background.schedule();
       // The fill that read started runs inside this read, so a change that
       // lands meanwhile is read once after it rather than restarting it.
       await fillRun;
+      await cardRun;
       await loadUnread();
+      // Chips held through a refusal are stale: the loader asks again, backing off, until they land or the grace ends.
+      return failed || outcome === "failed" || held.verdicts !== null || held.lineage !== null ? "failed" : undefined;
     },
     onError: (cause) => { if (!disposed) liveNotice = `${failure("keep", "live updates running", cause)} Use Refresh.`; },
   });
@@ -1141,6 +1237,8 @@
     // changes the ranking or a filter re-reads nothing.
     boardKey;
     const target = untrack(() => scope), current = untrack(() => plan);
+    // Another scope or search: what was held belongs to the old one, and so does a paging click waiting its turn.
+    if (untrack(() => loadedKey) !== boardKey) { forgetHeld(); deferredPaging = null; }
     loading = true;
     const timer = setTimeout(() => { void loadBoard(target, current); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
@@ -1599,10 +1697,12 @@
    */
   async function loadMoreCandidates(all = false) {
     const set = candidates, current = plan;
-    if (!set || loading || moving || loadedKey !== boardKey || !canLoadMore(set)) return;
+    if (!set || loadedKey !== boardKey) return;
+    if (loading || moving) { deferPaging(() => void loadMoreCandidates(all)); return; }
+    if (!canLoadMore(set)) return;
     const generation = revision, key = boardKey;
     const stale = () => generation !== revision || disposed || key !== boardKey;
-    interactions++; loading = true; loadingAll = all ? "search" : null; stopLoadingAll = false; error = ""; refreshError = false;
+    interactions++; loading = true; paging = true; loadingAll = all ? "search" : null; stopLoadingAll = false; error = ""; refreshError = false;
     const read: CandidateRead = (query, cursor) => listTasks(current.scope, null, query, cursor, CANDIDATE_PAGE, BOARD);
     const show = (next: CandidateSet) => {
       if (stale()) return false;
@@ -1614,7 +1714,7 @@
       if (all) await readAllCandidates(set, current.word, read, show);
       else show(await nextCandidates(set, current.word, read));
     } catch (cause) { if (generation === revision && !disposed) error = failure("load", "more tasks", cause); }
-    finally { loadingAll = null; if (generation === revision && !disposed) loading = false; }
+    finally { loadingAll = null; paging = false; if (generation === revision && !disposed) loading = false; }
   }
   /** Whether a column has cards beyond the loaded ones, so the end of what is loaded is not its end. */
   function tailUnknown(status: TaskStatus): boolean {
@@ -1643,9 +1743,11 @@
     finally { if (generation === revision && !disposed) loading = false; }
   }
   async function pageColumn(status: TaskStatus, cursor: string) {
-    if (searching || loading || moving || loadedKey !== boardKey) return;
+    if (searching || loadedKey !== boardKey) return;
+    // Pressed while the board re-reads after a write: done once that is over, from where the column then ends.
+    if (loading || moving) { deferPaging(() => { const next = columns[status]?.next_cursor; if (next) void pageColumn(status, next); }); return; }
     const generation = revision, key = boardKey;
-    interactions++; loading = true; error = ""; refreshError = false;
+    interactions++; loading = true; paging = true; error = ""; refreshError = false;
     try {
       // The fill's page size: past the board's cap this is how the rest of a column is reached.
       const result = await listTasks(scope, status, "", cursor, CANDIDATE_PAGE, BOARD);
@@ -1654,7 +1756,7 @@
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
       loadCardReads(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = failure("load", "more tasks", cause); }
-    finally { if (generation === revision && !disposed) loading = false; }
+    finally { paging = false; if (generation === revision && !disposed) loading = false; }
   }
   /** Cards loaded across every column: what Load all budgets against `MAX_CANDIDATES`, since each one is drawn. */
   const columnCards = $derived(Object.values(columns).reduce((sum, page) => sum + (page?.items.length ?? 0), 0));
@@ -1666,12 +1768,14 @@
    */
   async function loadColumnAll(status: TaskStatus) {
     const page = columns[status];
-    if (searching || loading || moving || loadedKey !== boardKey || !page?.next_cursor) return;
+    if (searching || loadedKey !== boardKey) return;
+    if (loading || moving) { deferPaging(() => void loadColumnAll(status)); return; }
+    if (!page?.next_cursor) return;
     const generation = revision, key = boardKey, target = scope;
     const stale = () => generation !== revision || disposed || key !== boardKey;
     const budget = MAX_CANDIDATES - (columnCards - page.items.length);
     if (budget <= page.items.length) return;
-    interactions++; loading = true; loadingAll = status; stopLoadingAll = false; error = ""; refreshError = false;
+    interactions++; loading = true; paging = true; loadingAll = status; stopLoadingAll = false; error = ""; refreshError = false;
     try {
       await readOn((cursor) => listTasks(target, status, "", cursor, CANDIDATE_PAGE, BOARD), page, MAX_COLUMN_PAGES, {
         maxRows: budget,
@@ -1683,8 +1787,14 @@
       });
       if (!stale()) loadCardReads(Object.values(columns).flatMap((one) => one?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = failure("load", "all tasks", cause); }
-    finally { loadingAll = null; if (generation === revision && !disposed) loading = false; }
+    finally { loadingAll = null; paging = false; if (generation === revision && !disposed) loading = false; }
   }
+  // A paging click that came during a re-read (`deferPaging`) runs once the board is idle.
+  $effect(() => {
+    if (!deferredPaging || loading || moving || !initialized) return;
+    const run = deferredPaging;
+    untrack(() => { deferredPaging = null; run(); });
+  });
   /**
    * Where a drag at this point would drop.
    *
@@ -2679,14 +2789,14 @@
   {#if pageOf?.next_cursor}
     <div class="paging" data-task-paging={status}>
       <span class="paging-count">{named ? `${STATUS_LABELS[status]}: ` : ""}{pageOf.items.length} of {pageOf.total}</span>
-      {#if filling && !loading}<span class="paging-note" data-testid="task-column-filling">Loading the rest…</span>{:else}
+      {#if filling && !paging}<span class="paging-note" data-testid="task-column-filling">Loading the rest…</span>{:else}
       {#if boardSort === "priority" && !searching && pageOf.next_cursor}
         {@const note = priorityOrderNote(pageOf.items.length, pageOf.total)}
         {#if note}<p class="paging-note" data-testid="task-priority-partial">{note} Load all orders the rest.</p>{/if}
       {/if}
-      <button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => { if (pageOf.next_cursor) void pageColumn(status, pageOf.next_cursor); }} disabled={loading}>Load more</button>
+      <button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => { if (pageOf.next_cursor) void pageColumn(status, pageOf.next_cursor); }} disabled={blank || paging || deferredPaging !== null}>Load more</button>
         {#if loadingAll === status}<button type="button" class="gp-btn" aria-label={`Stop loading ${STATUS_LABELS[status]} tasks`} onclick={() => { stopLoadingAll = true; }}>Stop</button>
-        {:else}<button type="button" class="gp-btn" aria-label={`Load all ${STATUS_LABELS[status]} tasks`} title={columnCards >= MAX_CANDIDATES ? `The board already holds ${MAX_CANDIDATES.toLocaleString("en-US")} cards, the most it reads on its own; Load more continues this column, or search to reach the rest` : `Read the rest of ${STATUS_LABELS[status]}, ${CANDIDATE_PAGE} tasks at a time`} onclick={() => void loadColumnAll(status)} disabled={loading || columnCards >= MAX_CANDIDATES}>Load all</button>{/if}
+        {:else}<button type="button" class="gp-btn" aria-label={`Load all ${STATUS_LABELS[status]} tasks`} title={columnCards >= MAX_CANDIDATES ? `The board already holds ${MAX_CANDIDATES.toLocaleString("en-US")} cards, the most it reads on its own; Load more continues this column, or search to reach the rest` : `Read the rest of ${STATUS_LABELS[status]}, ${CANDIDATE_PAGE} tasks at a time`} onclick={() => void loadColumnAll(status)} disabled={blank || paging || deferredPaging !== null || columnCards >= MAX_CANDIDATES}>Load all</button>{/if}
       {/if}
     </div>
   {/if}
@@ -2885,7 +2995,9 @@
         {/if}
       {/snippet}
       {#snippet meta()}
-        {#if !loading && initialized}<span class="text-meta font-medium text-textMuted">{total}</span>{/if}
+        {#if !blank && initialized}<span class="text-meta font-medium text-textMuted">{total}</span>{/if}
+        <!-- Always drawn, so showing it moves nothing: the board is keeping what it last read because the store is busy. -->
+        <span class="paused" role="status" data-testid="task-board-paused" data-held={paused ? "true" : "false"} title={paused ? `Storage is busy, so the board is showing what it read at ${new Date(heldSince).toLocaleTimeString()}. It keeps trying.` : undefined}><CircleAlert size={12} aria-hidden="true" />{#if paused}<span class="sr-only">Updating paused: storage is busy</span>{/if}</span>
         {#if inProgressCount > 0}<span class="gp-chip" data-kind="label" data-tone="accent">{inProgressCount} in progress</span>{/if}
         <!-- A repository's board has no navigator, so this is its one way to
              the boards for every task and for its workspaces. -->
@@ -2897,7 +3009,7 @@
              The toolbar row: how the board is drawn on the left, Manvi's
              tools on the right. Each group wraps as a unit, never button by
              button. -->
-        <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repository:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
+        <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={blank && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repository:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
         <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repository:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
         <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}><CircleQuestionMark size={13} /></button>
         <span class="tool-sep" aria-hidden="true"></span>
@@ -2914,7 +3026,7 @@
             {#if archivedCount > 0}<span class="tally">{archivedCount}</span>{/if}
           </button>
         {/if}
-        <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
+        <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; void explicitRefresh(); }} disabled={refreshing || blank || (!initialized && loading)}><RefreshCw size={13} /></button>
         <span class="tool-sep" aria-hidden="true"></span>
         <button type="button" class="gp-btn" data-variant="primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task"><Plus size={12} />New task</button>
         <!-- A disabled New task always says why, and a caveat says what the
@@ -3049,11 +3161,11 @@
           {#if filling && candidates && !candidatesComplete(candidates)}<span class="paging-note" data-testid="task-search-filling">Loading the rest…</span>{/if}
         {/if}
         {#if moreCandidates}
-          <button type="button" class="gp-btn quick" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+          <button type="button" class="gp-btn quick" data-size="sm" disabled={blank || paging || deferredPaging !== null} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
           {#if loadingAll === "search"}
             <button type="button" class="gp-btn quick" data-size="sm" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
           {:else}
-            <button type="button" class="gp-btn quick" data-size="sm" disabled={loading} title={`Read every remaining page, ${CANDIDATE_PAGE} tasks at a time, up to ${MAX_CANDIDATES.toLocaleString("en-US")}`} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>
+            <button type="button" class="gp-btn quick" data-size="sm" disabled={blank || paging || deferredPaging !== null} title={`Read every remaining page, ${CANDIDATE_PAGE} tasks at a time, up to ${MAX_CANDIDATES.toLocaleString("en-US")}`} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>
           {/if}
         {/if}
         {#if searching && parsedQuery.words}
@@ -3105,9 +3217,9 @@
         <EyeOff size={11} />
         {hiddenRepositoryReport.line}
         {#if moreCandidates && !filtering}
-          <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+          <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" disabled={blank || paging || deferredPaging !== null} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
           {#if loadingAll === "search"}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
-          {:else}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>{/if}
+          {:else}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" disabled={blank || paging || deferredPaging !== null} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>{/if}
         {/if}
         <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => interfaceStore.showAllTaskRepositories()}>Show hidden repositories</button>
       </p>
@@ -3235,18 +3347,18 @@
       <div class="pad"><Skeleton variant="card" count={4} /></div>
     {:else if initialized && error && loadedKey !== boardKey}
       <EmptyState icon={Inbox} title="Tasks unavailable" hint="Try again to load this scope." action={{label:"Try again",onClick:()=>void loadBoard(),variant:"secondary"}} />
-    {:else if initialized && !loading && listCards.length === 0 && !filtering && (hiddenRepositoryReport?.tasks ?? 0) > 0}
+    {:else if initialized && !blank && listCards.length === 0 && !filtering && (hiddenRepositoryReport?.tasks ?? 0) > 0}
       <!-- Not "No tasks yet": there are tasks, the reader hid where they live. -->
       <EmptyState icon={EyeOff} title="Every loaded task is in a hidden repository" hint={hiddenRepositoryReport?.line ?? ""} action={moreCandidates ? { label: "Load more tasks", onClick: () => void loadMoreCandidates(), variant: "secondary" } : { label: "Show hidden repositories", onClick: () => interfaceStore.showAllTaskRepositories(), variant: "secondary" }} />
-    {:else if initialized && !loading && total === 0 && !filtering}
+    {:else if initialized && !blank && total === 0 && !filtering}
       <!-- Gated on the same decision as the header button. Offering New task
            here where the header refuses it opened a sheet that could never be
            saved, because nothing had linked a repository. -->
       <EmptyState icon={Inbox} title="No tasks yet" hint={creation.blocked ?? creation.caveat ?? "Create a task in this scope. Cards stay on this board until you delete them."} action={creation.allowed ? { label: "New task", onClick: () => void createTask(), variant: "primary" } : undefined} />
-    {:else if initialized && !loading && listCards.length === 0 && filtering}
+    {:else if initialized && !blank && listCards.length === 0 && filtering}
       <EmptyState icon={Search} title="No tasks match" hint={candidates && !candidatesComplete(candidates) ? `Only ${candidates.broad.loaded} of ${candidates.broad.total} tasks on this board were searched. Load more tasks to search the rest, or clear the search.` : "Nothing on this board matches every word and filter. Clear the search or remove a filter to see the rest."} action={moreCandidates ? { label: "Load more tasks", onClick: () => void loadMoreCandidates(), variant: "secondary" } : { label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
-      <div class="list" role="group" data-testid="task-columns" data-task-list aria-busy={loading || moving} aria-label="Task list">
+      <div class="list" role="group" data-testid="task-columns" data-task-list aria-busy={blank || moving} aria-label="Task list">
         {#if laneList}
           {#each laneList as group (group.key)}
             <div class="list-lane" role="group" aria-label={laneAria(group)} data-task-lane={group.key}>
@@ -3263,7 +3375,7 @@
       <!-- Lanes are rows across the status columns. The column heads, with
            their counts and limits, are drawn once above every lane: a limit
            is about the whole column, not one lane's share of it. -->
-      <div class="columns laned" aria-busy={loading || moving} data-testid="task-columns">
+      <div class="columns laned" aria-busy={blank || moving} data-testid="task-columns">
         <div class="lane-head" style={laneGrid}>
           {#each shown as status (status)}
             <div class="column-head" class:over-limit={wipOf(status) === "over"} data-task-column-head={status} data-wip={wipOf(status) ?? undefined}>{@render columnTitle(status)}</div>
@@ -3306,7 +3418,7 @@
            the window drifted off the cards; and the drop, Home/End, nudge and
            move-across code finds cards in the DOM, so an unmounted card lost
            the focus a keyboard move hands back to it. -->
-      <div class="columns" aria-busy={loading || moving} data-testid="task-columns">
+      <div class="columns" aria-busy={blank || moving} data-testid="task-columns">
         {#each shown as status (status)}
           {@const drawn = visibleIn(status)}
           <section
@@ -3629,6 +3741,8 @@
   .labels{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
   .paging{display:flex;align-items:center;flex-wrap:wrap;gap:5px;padding:6px}
   .paging-count{font-size:var(--text-micro);color:rgb(var(--c-text-muted));font-variant-numeric:tabular-nums;margin-right:auto}
+  .paused{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;flex-shrink:0;color:rgb(var(--c-warn));visibility:hidden}
+  .paused[data-held="true"]{visibility:visible}
   .paging-note{flex-basis:100%;margin:0;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
   .column-empty{margin:10px 8px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .list{padding:12px;overflow:auto;flex:1}

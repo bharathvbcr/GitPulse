@@ -3,7 +3,7 @@ import { get } from "svelte/store";
 import { createBoardAgents, type BoardAgentsDeps } from "./boardAgents";
 import { monitorAttempt, taskAgentSummaries, type MonitorContext } from "./taskSessions";
 import { TASK_RUN_POLL_MS } from "./runPoll";
-import type { TaskRun } from "./client";
+import { WorkbenchError, type TaskRun } from "./client";
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 
@@ -147,6 +147,44 @@ describe("createBoardAgents", () => {
     expect(state.runs).toEqual([]);
     expect(state.error).toContain("store unavailable");
     expect(host.timers).toHaveLength(0);
+  });
+
+  it("keeps the marks through a busy refusal, and clears them once the refusals are repeated and the reading is old", async () => {
+    let now = NOW;
+    const host = harness({ clock: () => now });
+    const busy = () => new WorkbenchError("busy", "Task storage is busy");
+    host.watch.start();
+    await host.answer([run({ id: "a" })]);
+    await host.tick();
+    await host.fail(busy());
+    // One refusal: the marks stay, nothing is said.
+    expect(get(host.watch).runs.map((item) => item.id)).toEqual(["a"]);
+    expect(get(host.watch).error).toBeNull();
+    expect(host.timers).toHaveLength(1);
+    // Refusals keep coming, but the reading is still recent: still held.
+    await host.tick();
+    await host.fail(busy());
+    expect(get(host.watch).runs).toHaveLength(1);
+    expect(get(host.watch).error).toBeNull();
+    // Old enough, and refused again: said, and cleared, as for any other failure.
+    now += 6_000;
+    await host.tick();
+    await host.fail(busy());
+    expect(get(host.watch).runs).toEqual([]);
+    expect(get(host.watch).error).toContain("busy");
+  });
+
+  it("does not keep the marks through a refusal that is not busy, or before any reading", async () => {
+    const host = harness();
+    host.watch.start();
+    await host.fail(new WorkbenchError("busy", "Task storage is busy"));
+    expect(get(host.watch).error).toContain("busy");
+    void host.watch.refresh();
+    await host.answer([run({ id: "a" })]);
+    await host.tick();
+    await host.fail(new WorkbenchError("store_error", "Task storage offline"));
+    expect(get(host.watch).runs).toEqual([]);
+    expect(get(host.watch).error).toContain("offline");
   });
 
   it("reads requests only for managed attempts with a session, and omits a count it could not read", async () => {
