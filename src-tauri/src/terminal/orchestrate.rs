@@ -1329,6 +1329,8 @@ impl OrchestrationRegistry {
 
     /// Keystrokes written to `session_id`'s PTY. Anything but cursor
     /// navigation answers or dismisses a standing dialog.
+    // Called by the hosted-session client, which is Unix-only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn note_input(&self, session_id: &str, bytes: &[u8]) {
         if crate::terminal::input_answers_prompt(bytes) {
             self.clear_prompt(session_id, true);
@@ -5250,7 +5252,9 @@ pub(crate) mod tests {
     /// A pid no process can have: past the kernel's pid ceiling on every
     /// supported system, so `kill(pid, 0)` answers ESRCH.
     const DEAD_PID_OWNER: &str = "ext-2000000000";
+    #[cfg(unix)]
     const THREAD_A: &str = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+    #[cfg(unix)]
     const THREAD_B: &str = "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 
     /// A child with no PTY, owned by `owner`, for tests about ownership alone.

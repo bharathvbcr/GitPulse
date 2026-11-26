@@ -278,10 +278,10 @@ describe("a wave end to end against a fake sidecar", () => {
     expect(w.verifies.filter((v) => v === "a")).toHaveLength(2);
   });
 
-  it("launches no batch while the main checkout is dirty or has an operation in progress, and says why", async () => {
+  it("launches no batch while the main checkout has an operation in progress or is unreadable, and says why", async () => {
     for (const [main, why] of [
-      [{ dirty: 3, operation: null }, /3 uncommitted files/],
       [{ dirty: 0, operation: "squash merge" }, /squash merge is in progress/],
+      [{ dirty: 3, operation: "rebase" }, /rebase is in progress/],
       [{ dirty: null, operation: null }, /couldn't be counted/],
     ] as [MainState, RegExp][]) {
       const w = world({ main: () => main });
@@ -298,14 +298,28 @@ describe("a wave end to end against a fake sidecar", () => {
     expect(unreadable.launched).toEqual([]);
   });
 
-  it("refuses each merge while the main checkout is dirty or mid-operation, merging nothing", async () => {
+  it("allows launching and merging while main has uncommitted files, delegating disjointness to Rust", async () => {
+    const w = world({
+      scopes: { a: ["a"], b: ["b"] },
+      main: () => ({ dirty: 3, operation: null }),
+      mergeFailure: (id) => (id === "b" ? { code: "held", reason: "checkout_dirty", message: "main has overlapping uncommitted files", path: "/repo" } as unknown as MergeTeardownError : null),
+    });
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("done");
+    expect(w.launched).toEqual(["a", "b"]);
+    expect(w.merged).toEqual(["a"]);
+    expect(phases(done)).toEqual({ a: "merged", b: "held" });
+    expect(done.members[1]!.detail).toMatch(/overlapping uncommitted files/);
+  });
+
+  it("refuses each merge while the main checkout has a parked operation, merging nothing", async () => {
     let reads = 0;
-    // Clean for the launch of the batch, then dirty for the merges.
-    const w = world({ scopes: { a: ["a"], b: ["b"] }, main: () => ((reads += 1) === 1 ? { dirty: 0, operation: null } : { dirty: 2, operation: null }) });
+    // Free for the launch of the batch, then parked operation for the merges.
+    const w = world({ scopes: { a: ["a"], b: ["b"] }, main: () => ((reads += 1) === 1 ? { dirty: 0, operation: null } : { dirty: 2, operation: "merge" }) });
     const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
     expect(w.merged).toEqual([]);
     expect(phases(done)).toEqual({ a: "held", b: "held" });
-    expect(done.members[0]!.detail).toMatch(/Not merged: the main worktree has 2 uncommitted files/);
+    expect(done.members[0]!.detail).toMatch(/Not merged: a merge is in progress in the main worktree/);
     expect(w.mainReads()).toBeGreaterThan(1);
   });
 

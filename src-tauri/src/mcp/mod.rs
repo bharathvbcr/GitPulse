@@ -3873,17 +3873,10 @@ fn workbench_message(error: crate::workbench::WorkbenchError) -> String {
 /// first pass that ends just inside the window, the delay, and a second pass of
 /// up to 12 s: [`WORST_CASE_DEFERRED_READ`] (5 s + 2 x 12 s = 29 s as a ceiling
 /// that counts both passes at their maximum), under the 60 s
-/// `DEFAULT_CALL_BUDGET` (pinned by a test in `gitpulse-mcp`).
-/// Time, sleeping and randomness are injected so a test is exact and instant.
-pub(crate) struct DeferralRetry<'a> {
-    pub sleep: &'a dyn Fn(std::time::Duration),
-    /// A value in `0..bound`.
-    pub jitter: &'a dyn Fn(u64) -> u64,
-    pub now: &'a dyn Fn() -> std::time::Instant,
-    /// The request's own deadline. A retry that could not finish before it is
-    /// not started.
-    pub deadline: std::time::Instant,
-}
+/// `DEFAULT_CALL_BUDGET` (pinned by a test in `gitpulse-mcp`). The retry itself
+/// is owned by [`crate::engine::process::deferral_retry`], which the policy
+/// gate's binding lookup shares.
+pub(crate) use crate::engine::process::deferral_retry::{retry_once_on_deferral, DeferralRetry};
 
 /// Longest a read may run, counted from the start of the request, and still be
 /// retried: a call that already spent this long has no budget for a second
@@ -3898,39 +3891,6 @@ pub const WORST_CASE_DEFERRED_READ: std::time::Duration = std::time::Duration::f
         + 2 * (insights::SNAPSHOT_DEADLINE.as_secs()
             + crate::engine::process::SPAWN_QUEUE_BUDGET.as_secs()),
 );
-
-/// A value in `0..bound` that differs between processes and between calls.
-/// Not a CSPRNG and not meant to be: it only spreads retries apart.
-fn process_jitter(bound: u64) -> u64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CALLS: AtomicU64 = AtomicU64::new(0);
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(CALLS.fetch_add(1, Ordering::Relaxed));
-    hasher.finish() % bound.max(1)
-}
-
-/// Runs `read`; when its answer was a deferral, waits and runs it once more
-/// and returns the second answer, whatever it was. Otherwise, or when the
-/// deadline leaves no room, the first answer.
-pub(crate) fn retry_once_on_deferral<T>(
-    mut read: impl FnMut() -> T,
-    deferred: impl Fn(&T) -> bool,
-    retry: &DeferralRetry<'_>,
-) -> T {
-    let first = read();
-    if !deferred(&first) {
-        return first;
-    }
-    let base = insights::deferral_retry_after_ms();
-    let delay = std::time::Duration::from_millis(base + (retry.jitter)(base));
-    if (retry.now)() + delay >= retry.deadline {
-        return first;
-    }
-    (retry.sleep)(delay);
-    read()
-}
 
 /// [`retry_once_on_deferral`] for an insights payload: marks every deferred
 /// facet (see [`insights::mark_deferrals`]) on whichever answer is returned,
@@ -3952,12 +3912,10 @@ pub(crate) fn read_insights(read: impl Fn() -> Value, retry: &DeferralRetry<'_>)
 /// Calls `body` with the production retry: real clock, real sleep, a window
 /// counted from now.
 fn with_production_retry<T>(body: impl FnOnce(&DeferralRetry<'_>) -> T) -> T {
-    body(&DeferralRetry {
-        sleep: &std::thread::sleep,
-        jitter: &process_jitter,
-        now: &std::time::Instant::now,
-        deadline: std::time::Instant::now() + DEFERRAL_RETRY_WINDOW,
-    })
+    crate::engine::process::deferral_retry::with_production_retry_window(
+        DEFERRAL_RETRY_WINDOW,
+        body,
+    )
 }
 
 /// The repository address a read resolves, retried once if the spawn gate
@@ -13368,13 +13326,7 @@ mod tests {
             json!({ "repo_path": repo, "force": true }),
         );
         assert!(!err, "{out}");
-        let find = |path: &str| {
-            out["outcomes"]
-                .as_array()
-                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
-                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
-                .clone()
-        };
+        let find = |path: &str| outcome_for(&out, path);
         let kept_outcome = find(&kept);
         assert_eq!(kept_outcome["status"], "skipped", "{out}");
         assert!(

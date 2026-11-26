@@ -3952,7 +3952,7 @@ if (params.has("check")) {
         check("a failed CI notice says what failed, on which branch and how", /Coding agent branch failed CI/.test(rows[0].textContent) && /CI · gitpulse\/fix-1234abcd · failure/.test(rows[0].textContent) && rows[0].dataset.noticeKind === "run_ci_failed");
         check("a local CI result is marked as local", /ci\.local · gitpulse\/fix-1234abcd · success \(local\)/.test(rows[1].textContent));
         check("a CI notice opens its task", Boolean(button("Open", rows[0])) && Boolean(button("Open", rows[1])));
-        check("a kind this version cannot read is a row that says so, not an error", /A notice this version of GitPulse cannot read/.test(rows[2].textContent) && /run_quarantined/.test(rows[2].textContent) && !inbox().querySelector('[role="alert"]'));
+        check("a kind this version cannot read is a row that says so, not an error", /A notice this version of Waylode cannot read/.test(rows[2].textContent) && /run_quarantined/.test(rows[2].textContent) && !inbox().querySelector('[role="alert"]'));
         check("and offers nothing to open, since what it targets is unknown", !button("Open", rows[2]));
         attentionRows = [];
         toggle.click(); await settle();

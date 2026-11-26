@@ -223,7 +223,7 @@ export async function checkStatusPopover() {
 
   try {
     await settle();
-    check("header uses the current GitPulse logo mark instead of legacy Activity", !!document.querySelector('.mark svg[aria-label="GitPulse"]') && !document.querySelector(".lucide-activity"));
+    check("header uses the current Waylode logo mark instead of legacy Activity", !!document.querySelector('.mark svg[aria-label="Waylode"]') && !document.querySelector(".lucide-activity"));
     check("first glance has three equal metric cards", metrics().length === 3 && new Set(metrics().map(m => m.offsetWidth)).size === 1);
     check("numbers use the display step for metric numerals (24px)", getComputedStyle(element(".metric strong")).fontSize === "24px");
     check("the preview renders an actual backdrop blur", getComputedStyle(element(".panel")).getPropertyValue("backdrop-filter").includes("blur(34px)"));
@@ -362,7 +362,7 @@ export async function checkStatusPopover() {
     await click('[aria-label="Choose repository"]'); await click('.repositories button[title="/Projects/GitPulse"]');
     await click('[aria-label="Settings"]'); check("footer settings keeps its route", action("settings"));
     await click(".open-app"); check("footer restores GitPulse", action("show"));
-    await click('[aria-label="Quit GitPulse"]'); check("footer retains guarded quit dispatch", action("quit"));
+    await click('[aria-label="Quit Waylode"]'); check("footer retains guarded quit dispatch", action("quit"));
 
     await select(1, "agents waiting");
     const reqSection = document.querySelector('[data-testid="status-agent-requests"]');

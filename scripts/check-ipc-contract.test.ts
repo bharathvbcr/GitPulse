@@ -370,8 +370,8 @@ describe("annotated but unregistered commands", () => {
     // cmd_host_relief_request_pause (a person's request to end a paused tree,
     // and to pause one of an agent GitPulse did not launch). 370 with
     // cmd_mavi_close_thread_children (forgetting a Mavi thread closes its
-    // terminal children).
-    expect(found.size).toBe(370);
+    // terminal children). 371 with cmd_mavi_summarize.
+    expect(found.size).toBe(371);
     for (const legacy of ["hosts", "kill", "transcript"]) {
       expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
     }
@@ -386,6 +386,7 @@ describe("annotated but unregistered commands", () => {
       expect(found.has(idleCmd)).toBe(true);
     }
     expect(found.has("cmd_mavi_start")).toBe(true);
+    expect(found.has("cmd_mavi_summarize")).toBe(true);
     expect(found.has("cmd_terminal_set_title")).toBe(true);
     for (const steward of ["status", "save", "set_repo", "run_now"]) {
       expect(found.has(`cmd_manvi_steward_${steward}`)).toBe(true);

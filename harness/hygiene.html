@@ -159,10 +159,10 @@
     component=mount(GlobalCleaner,{target:root});await settle();take("cmd_cleaner_state").resolve(globalState);await settle();
     check("global cleaner loads without an open repository",root.textContent.includes("Global build cleaner"));
     check("scheduling defaults off",!root.querySelector('[aria-label="Enable scheduled cleanup"]').checked);
-    check("closed-app scheduling defaults off", !root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').checked);
-    check("unsupported background registration cannot be enabled", root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').disabled);
+    check("closed-app scheduling defaults off", !root.querySelector('[aria-label="Run cleanup when Waylode is closed"]').checked);
+    check("unsupported background registration cannot be enabled", root.querySelector('[aria-label="Run cleanup when Waylode is closed"]').disabled);
     check("global inspections require saved roots",button("Inspect saved roots").disabled);
-    check("global scheduling explains its app lifetime",root.textContent.includes("while GitPulse is open"));
+    check("global scheduling explains its app lifetime",root.textContent.includes("while Waylode is open"));
     button("Add repository root").click();await settle();
     check("folder picker adds a root",root.querySelector('[aria-label="Repository roots"]').value==="/fixture/code");
     const exclusions=root.querySelector('[aria-label="Excluded directories"]');exclusions.value="/fixture/code/important";exclusions.dispatchEvent(new Event("input",{bubbles:true}));
@@ -196,7 +196,7 @@
     check("an unfinished size walk is not shown as a size",leaked.includes("size not fully measured"));
     const longLived=root.querySelector('[data-testid="long-lived"]');
     const longText=longLived?.textContent??"";
-    check("long-lived data is listed as not cleaned by GitPulse, with sizes, a floor stated and an unreadable path not shown as zero",longText.includes("not cleaned by GitPulse")&&longText.includes("30.0 GB")&&longText.includes("at least 14")&&longText.includes("could not be read: Permission denied")&&!longText.includes("0 B"));
+    check("long-lived data is listed as not cleaned by Waylode, with sizes, a floor stated and an unreadable path not shown as zero",longText.includes("not cleaned by Waylode")&&longText.includes("30.0 GB")&&longText.includes("at least 14")&&longText.includes("could not be read: Permission denied")&&!longText.includes("0 B"));
     check("the long-lived section has no remove control",longLived!==null&&longLived.querySelectorAll("button,input[type=checkbox]").length===0);
     button("Inspect saved roots").click();await settle();take("cmd_cleaner_scan").resolve({...scan,candidates:[]});await settle();
     check("a partial inventory with nothing eligible blocks global cleanup",button("Clean eligible output now").disabled&&root.textContent.includes("nothing eligible was found"));
@@ -219,7 +219,7 @@
     check("stale draft can reload the saved revision",button("Save cleanup policy").disabled&&root.textContent.includes("Unsaved edits were discarded"));
     button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,background_error:"launchd unavailable",config:{...globalState.config,enabled:false,run_when_closed:false,revision:3}});await settle();
     check("background registration failures disable the schedule visibly",root.textContent.includes("the schedule is off")&&root.textContent.includes("launchd unavailable"));
-    root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').click();root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();
+    root.querySelector('[aria-label="Run cleanup when Waylode is closed"]').click();root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();
     button("Save cleanup policy").click();await settle();const closedSave=take("cmd_cleaner_save");
     check("closed-app scheduling requires explicit saved consent",closedSave.args.config.run_when_closed===true&&closedSave.args.config.enabled===true);
     closedSave.resolve({...structuredClone(globalState),background_supported:true,config:{...closedSave.args.config,revision:4}});await settle();

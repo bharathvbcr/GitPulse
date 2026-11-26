@@ -9930,24 +9930,6 @@ mod tests {
             assert_eq!(answer.base.map(|(n, _)| n).as_deref(), Some("release"));
 
             let (answer, once) = recomputes(&|| {
-                // checkout.defaultRemote only counts when it names a
-                // configured remote, so `upstream` has to be one.
-                git_in(
-                    &repo,
-                    &[
-                        "remote",
-                        "add",
-                        "upstream",
-                        "https://example.com/upstream.git",
-                    ],
-                );
-                git_in(&repo, &["config", "checkout.defaultRemote", "upstream"]);
-            });
-            assert_eq!(once, 1, "config edited");
-            assert_eq!(answer.remote, "upstream");
-
-            let (answer, once) = recomputes(&|| {
-                git_in(&repo, &["config", "--unset", "checkout.defaultRemote"]);
                 git_in(
                     &repo,
                     &["remote", "add", "second", "https://example.com/second.git"],
@@ -9955,6 +9937,18 @@ mod tests {
             });
             assert_eq!(once, 1, "remote added");
             assert_eq!(answer.remote, "origin", "two remotes fall back to origin");
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "checkout.defaultRemote", "second"]);
+            });
+            assert_eq!(once, 1, "config edited");
+            assert_eq!(answer.remote, "second");
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "--unset", "checkout.defaultRemote"]);
+            });
+            assert_eq!(once, 1, "config unset");
+            assert_eq!(answer.remote, "origin");
 
             let (answer, once) = recomputes(&|| {
                 git_in(&repo, &["config", "branch.lane.remote", "second"]);

@@ -28,6 +28,7 @@
 pub mod history;
 pub mod session;
 pub mod ssh;
+pub mod summary;
 pub(crate) mod wire;
 pub(crate) mod worktree;
 
@@ -41,6 +42,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tauri::State;
 
 /// The most threads alive at once.
 const MAX_LIVE: usize = 12;
@@ -675,6 +677,18 @@ pub async fn cmd_mavi_ssh_hosts() -> Result<Vec<String>, IpcError> {
 #[tauri::command(async)]
 pub async fn cmd_mavi_ssh_probe(host: String, dir: String) -> Result<ssh::MaviProbe, IpcError> {
     off_thread(move || Ok(ssh::probe(&host, &dir))).await
+}
+
+/// Summarizes a Mavi thread's session work with a small model.
+#[tauri::command(async)]
+pub async fn cmd_mavi_summarize(
+    state: State<'_, MaviState>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+    request: summary::SummarizeRequest,
+) -> Result<summary::MaviWorkSummary, IpcError> {
+    let state = state.inner().clone();
+    let workbench = workbench.inner().clone();
+    off_thread(move || summary::summarize(&state, &workbench, request)).await
 }
 
 #[cfg(test)]

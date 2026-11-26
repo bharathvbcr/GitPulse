@@ -165,15 +165,15 @@ fn a_held_index_lock_refuses_before_anything_moves() {
     assert!(lane.path().exists() && branch_exists(repo, "feature-x"));
 }
 
-/// A dirty main checkout is not detached and not moved: the integration is
-/// refused with a typed reason and nothing changes, so a live session in it
-/// keeps its branch.
+/// An overlapping dirty main checkout is not detached and not moved: the
+/// integration is refused with a typed reason and nothing changes, so a live
+/// session in it keeps its branch and its uncommitted edit.
 #[test]
 fn a_dirty_main_checkout_refuses_and_stays_attached() {
     for squash in [false, true] {
         let (dir, lane) = lane_fixture();
         let repo = dir.path();
-        std::fs::write(repo.join("scratch.txt"), "in progress\n").unwrap();
+        std::fs::write(repo.join("README.md"), "in progress\n").unwrap();
         let before = git(repo, &["rev-parse", "refs/heads/main"]);
         let porcelain = git(repo, &["status", "--porcelain"]);
         let refused = merge(repo, lane.path(), "main", squash, &mut allow_all).unwrap_err();
@@ -254,7 +254,7 @@ fn a_clean_sibling_checkout_of_the_target_follows_the_ref() {
 #[test]
 fn a_dirty_sibling_checkout_of_the_target_refuses_and_is_untouched() {
     let (dir, _sibling_dir, sibling, _lane_dir, lane) = sibling_fixture();
-    std::fs::write(sibling.join("wip.txt"), "someone's work\n").unwrap();
+    std::fs::write(sibling.join("y.txt"), "someone's work\n").unwrap();
     let before = git(dir.path(), &["rev-parse", "refs/heads/integ"]);
     let refused = merge(dir.path(), &lane, "integ", false, &mut allow_all).unwrap_err();
     let MergeTeardownError::Held {
@@ -269,8 +269,31 @@ fn a_dirty_sibling_checkout_of_the_target_refuses_and_is_untouched() {
     assert!(path.unwrap().ends_with("integ"), "{message}");
     assert_eq!(git(dir.path(), &["rev-parse", "refs/heads/integ"]), before);
     assert_eq!(symbolic_head(&sibling), "refs/heads/integ");
-    assert_eq!(git(&sibling, &["status", "--porcelain"]), "?? wip.txt");
+    assert_eq!(git(&sibling, &["status", "--porcelain"]), "?? y.txt");
     assert!(lane.exists() && branch_exists(dir.path(), "feature-y"));
+}
+
+#[test]
+fn prepare_with_message_records_custom_commit_message() {
+    let (dir, _lane) = lane_fixture();
+    let repo = dir.path();
+    let target_sha = git(repo, &["rev-parse", "refs/heads/main"]);
+    let branch_sha = git(repo, &["rev-parse", "refs/heads/feature-x"]);
+    let candidate = crate::engine::merge_tree::prepare_with_message(
+        repo,
+        "feature-x",
+        "main",
+        &target_sha,
+        &branch_sha,
+        true,
+        Some("Custom squash landing message"),
+        &mut allow_all,
+    )
+    .unwrap();
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%s", &candidate]),
+        "Custom squash landing message"
+    );
 }
 
 /// A sibling whose directory is gone cannot be shown clean, so it refuses.

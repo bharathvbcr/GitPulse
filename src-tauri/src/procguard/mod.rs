@@ -1364,6 +1364,10 @@ fn try_lock_for(pid: &Mutex<Option<u32>>, budget: Duration) -> Option<MutexGuard
     }
 }
 
+/// Whether this platform delivers termination signals that
+/// [`install_signal_handlers`] can arm.
+pub const SIGNALS_SUPPORTED: bool = cfg!(unix);
+
 /// What [`install_signal_handlers`] actually armed.
 ///
 /// Modelled on `limits::raise_open_file_limit`: the caller logs
@@ -1379,6 +1383,26 @@ impl SignalGuard {
     /// True when at least one termination signal now runs the sweep.
     pub fn is_armed(&self) -> bool {
         !self.installed.is_empty()
+    }
+
+    /// The level [`Self::describe`] is logged at.
+    ///
+    /// A warning means this start lost a guarantee another start could have
+    /// had. Where no termination signal exists to handle (Windows) nothing is
+    /// lost by this start in particular: the gap is stated at information
+    /// level instead, in every log that records setup. As a warning it went to
+    /// the stderr of every one-shot `gitpulse-mcp call`, beside the answer.
+    pub fn log_level(&self) -> log::Level {
+        if self.is_armed() || !SIGNALS_SUPPORTED {
+            log::Level::Info
+        } else {
+            log::Level::Warn
+        }
+    }
+
+    /// Logs what was armed under the `setup` target, at [`Self::log_level`].
+    pub fn log_setup(&self) {
+        log::log!(target: "setup", self.log_level(), "{}", self.describe());
     }
 
     pub fn describe(&self) -> String {
@@ -2508,6 +2532,11 @@ mod tests {
             "the reason was dropped: {}",
             unarmed.describe()
         );
+        assert_eq!(armed.log_level(), log::Level::Info);
+        // Where a handler could have been armed, failing to is a warning.
+        if SIGNALS_SUPPORTED {
+            assert_eq!(unarmed.log_level(), log::Level::Warn);
+        }
     }
 
     /// The descriptors one child was handed, as it sees them.
@@ -2929,6 +2958,8 @@ mod tests {
         assert!(guard
             .describe()
             .contains("no termination signal is handled"));
+        // Every start is the same here, so it is not a warning about this one.
+        assert_eq!(guard.log_level(), log::Level::Info);
     }
 }
 

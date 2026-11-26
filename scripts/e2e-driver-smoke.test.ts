@@ -12,6 +12,7 @@ import {
   detectDisplayBackend,
   main,
   parseArgs,
+  ptyProbeForShell,
   remainingBudgetMs,
   webviewOptionsFor,
   windowsLoggingDriver,
@@ -154,6 +155,38 @@ describe("e2e-driver-smoke", () => {
     ]);
   });
 
+  it("waits for the app's page before probing: WebView2 hands the session over on its blank first document", async () => {
+    // As msedgedriver answered in run 45844814075: blank, a look lost to the
+    // navigation, the app's page still loading, then loaded.
+    const answers: Array<{ status: number; value: unknown }> = [
+      { status: 200, value: { href: "about:blank", ready: "complete" } },
+      { status: 500, value: { error: "javascript error", message: "Execution context was destroyed." } },
+      { status: 200, value: { href: "http://tauri.localhost/", ready: "loading" } },
+      { status: 200, value: { href: "http://tauri.localhost/", ready: "complete" } },
+    ];
+    let looks = 0;
+    const fakeFetch: typeof fetch = async () => {
+      const answer = answers[Math.min(looks++, answers.length - 1)];
+      return new Response(JSON.stringify({ value: answer.value }), { status: answer.status });
+    };
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    client.sessionId = "sess-w";
+    const pauses: number[] = [];
+    const state = await client.waitForAppDocument(20_000, async (ms) => { pauses.push(ms); });
+    expect(state).toEqual({ href: "http://tauri.localhost/", ready: "complete" });
+    expect(looks).toBe(4);
+    expect(pauses).toHaveLength(3);
+  });
+
+  it("names the last answer when the app's page never loads, instead of probing a blank document", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ value: { href: "about:blank", ready: "complete" } }), { status: 200 });
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    client.sessionId = "sess-w";
+    await expect(client.waitForAppDocument(30, async () => { await new Promise((r) => setTimeout(r, 10)); }))
+      .rejects.toThrow(/did not load in the webview within 30 ms \(last: .*about:blank/);
+  });
+
   it("enforces the overall --timeout budget on WebDriver requests", async () => {
     expect(remainingBudgetMs(10_000, 5_000, 2_000)).toBe(5_000);
     expect(remainingBudgetMs(10_000, 5_000, 8_500)).toBe(1_500);
@@ -177,6 +210,24 @@ describe("e2e-driver-smoke", () => {
     const winPs = buildPtyProbeCommand(prefix, suffix, "win32", { COMSPEC: "powershell.exe" });
     expect(winPs.join("")).not.toContain(marker);
     expect(winPs[0].endsWith("\r") && !winPs[0].endsWith("\r\n")).toBe(true);
+  });
+
+  it("reads Windows' ComSpec in any case, the way the app's default shell does", () => {
+    // Windows spells it `ComSpec`; a copied environment object is not
+    // case-insensitive, and the probe fell back to PowerShell syntax for the
+    // cmd.exe the app started (E2E run on 17e968915).
+    const viaComSpec = buildPtyProbeCommand("P_", "s", "win32", { ComSpec: "C:\\Windows\\system32\\cmd.exe" });
+    expect(viaComSpec).toEqual(ptyProbeForShell("P_", "s", "win32", "cmd.exe"));
+    expect(buildPtyProbeCommand("P_", "s", "win32", {})).toEqual(ptyProbeForShell("P_", "s", "win32", "powershell.exe"));
+  });
+
+  it("types for the shell the app reports it started", () => {
+    const cmd = ptyProbeForShell("P_", "s", "win32", "C:\\Windows\\system32\\cmd.exe");
+    expect(cmd.join("")).toContain("%_gp_m%");
+    for (const shell of ["powershell.exe", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"]) {
+      expect(ptyProbeForShell("P_", "s", "win32", shell)[0]).toContain("Write-Output");
+    }
+    expect(ptyProbeForShell("P_", "s", "linux", "/bin/zsh")[0]).toContain("printf");
   });
 
   it("matches every CLI invocation in .github/workflows/e2e-desktop.yml", () => {

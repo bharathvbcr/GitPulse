@@ -627,6 +627,44 @@ where
     }))
 }
 
+/// What `collision-guard` does when another live session holds a fresh
+/// (< 5 min) claim on the same file in a shared worktree (>= 2 live sessions).
+/// Stored as its own top-level key, `shared_checkout_guard`, so an older build
+/// keeps it in `unknown`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCheckoutGuardMode {
+    /// Keep today's advisory notice.
+    Off,
+    /// Escalate to `PermissionDecision::Ask` (waived by `bypassPermissions`).
+    #[default]
+    Ask,
+    /// Refuse concurrent same-file stomping with `PermissionDecision::Deny`
+    /// even in `bypassPermissions` mode (fails open to `Ask`/notice on
+    /// `owner_unknown` or a degraded/unreadable claim store).
+    Enforce,
+}
+
+fn lenient_shared_checkout_guard<'de, D>(
+    deserializer: D,
+) -> Result<SharedCheckoutGuardMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable shared_checkout_guard, keeping ask: {error}"
+        );
+        SharedCheckoutGuardMode::default()
+    }))
+}
+
+fn is_default_shared_checkout_guard(mode: &SharedCheckoutGuardMode) -> bool {
+    *mode == SharedCheckoutGuardMode::default()
+}
+
 /// Reads `host_load_profile`; a value this build does not know (a newer tier,
 /// or not a string) is `auto` and costs no other setting.
 fn lenient_profile<'de, D>(deserializer: D) -> Result<crate::sysload::ProfileChoice, D::Error>
@@ -1773,6 +1811,15 @@ pub struct ToolConfig {
         skip_serializing_if = "is_default_idle_memory_mode"
     )]
     pub idle_memory_mode: IdleMemoryMode,
+    /// What `collision-guard` does when another live session holds a fresh
+    /// (< 5 min) claim on the same path in a shared worktree (`off`, `ask`,
+    /// `enforce`; default `ask`).
+    #[serde(
+        default,
+        deserialize_with = "lenient_shared_checkout_guard",
+        skip_serializing_if = "is_default_shared_checkout_guard"
+    )]
+    pub shared_checkout_guard: SharedCheckoutGuardMode,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -1805,6 +1852,7 @@ impl Default for ToolConfig {
             host_load_supervisor_terminate: false,
             manvi_steward: ManviStewardSettings::default(),
             idle_memory_mode: IdleMemoryMode::default(),
+            shared_checkout_guard: SharedCheckoutGuardMode::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -2750,6 +2798,29 @@ pub fn host_load_hook_mode() -> HostLoadHookMode {
     load()
         .map(|cfg| cfg.host_load_hook_mode)
         .unwrap_or_default()
+}
+
+/// What `collision-guard` does when another live session holds a fresh
+/// (< 5 min) claim on the same path in a shared worktree (`ask` by default).
+pub fn shared_checkout_guard() -> SharedCheckoutGuardMode {
+    load()
+        .map(|cfg| cfg.shared_checkout_guard)
+        .unwrap_or_default()
+}
+
+/// [`shared_checkout_guard`] read from `tools.json` in `dir`.
+pub fn shared_checkout_guard_in(dir: &Path) -> SharedCheckoutGuardMode {
+    read_disk(&dir.join("tools.json"))
+        .map(|cfg| cfg.shared_checkout_guard)
+        .unwrap_or_default()
+}
+
+/// Persists `shared_checkout_guard` (`off`, `ask`, or `enforce`) to `tools.json`.
+pub fn set_shared_checkout_guard(mode: SharedCheckoutGuardMode) -> Result<(), String> {
+    update(|cfg| {
+        cfg.shared_checkout_guard = mode;
+        Ok(())
+    })
 }
 
 /// How builds are leased, or the defaults (on, 4 slots).
@@ -5133,6 +5204,45 @@ mod model_setting_tests {
             assert!(!target.exists());
             drop(held);
         }
+    }
+
+    #[test]
+    fn shared_checkout_guard_defaults_to_ask_roundtrips_and_degrades_leniently() {
+        with_temp_config(|path| {
+            assert_eq!(shared_checkout_guard(), SharedCheckoutGuardMode::Ask);
+
+            set_shared_checkout_guard(SharedCheckoutGuardMode::Enforce).unwrap();
+            invalidate_cache();
+            assert_eq!(shared_checkout_guard(), SharedCheckoutGuardMode::Enforce);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["shared_checkout_guard"], "enforce");
+
+            set_shared_checkout_guard(SharedCheckoutGuardMode::Off).unwrap();
+            invalidate_cache();
+            assert_eq!(shared_checkout_guard(), SharedCheckoutGuardMode::Off);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["shared_checkout_guard"], "off");
+
+            // Default (`ask`) is omitted on serialization.
+            set_shared_checkout_guard(SharedCheckoutGuardMode::Ask).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored.get("shared_checkout_guard").is_none());
+
+            // Unreadable value degrades to `Ask` without losing sibling keys.
+            write_raw(
+                path,
+                r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"shared_checkout_guard":"strict"}"#,
+            );
+            assert_eq!(shared_checkout_guard(), SharedCheckoutGuardMode::Ask);
+            assert_eq!(load().unwrap().devmap.binary.as_deref(), Some("/tmp/fake"));
+
+            // Corrupt JSON falls back to `Ask`.
+            write_raw(path, "{ broken");
+            assert_eq!(shared_checkout_guard(), SharedCheckoutGuardMode::Ask);
+        });
     }
 }
 

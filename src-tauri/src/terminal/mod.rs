@@ -492,8 +492,17 @@ pub fn new_shared_telemetry() -> SharedSessionTelemetry {
     ))
 }
 
+/// A session's PTY master. `None` once its console was closed because the
+/// shell had exited (Windows: see `close_console_when_the_shell_exits`); a
+/// resize or a size read then answers that the terminal has closed. On Unix it
+/// is always `Some`.
+type SharedMaster = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+
+/// What a resize or size read of a closed terminal answers.
+const MASTER_CLOSED: &str = "the terminal has closed";
+
 struct SessionEntry {
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    master: SharedMaster,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     dead: Arc<AtomicBool>,
@@ -1823,10 +1832,10 @@ fn build_pty_command(
         LEGACY_TERMINAL_SESSION_ENV,
         crate::alerts::bridge::SOCKET_ENV,
         crate::alerts::bridge::LEGACY_SOCKET_ENV,
-        crate::hooks::lease_wrapper::BIN_ENV,
-        crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
-        crate::hooks::lease_wrapper::HELD_ENV,
-        crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
+        crate::hooks::lease_env::BIN_ENV,
+        crate::hooks::lease_env::LEGACY_BIN_ENV,
+        crate::hooks::lease_env::HELD_ENV,
+        crate::hooks::lease_env::LEGACY_HELD_ENV,
         crate::sysload::RUN_ID_ENV,
         crate::sysload::LEGACY_RUN_ID_ENV,
         crate::hooks::AGENT_KIND_ENV,
@@ -1846,7 +1855,15 @@ fn build_pty_command(
     for (key, value) in env.into_iter().flatten() {
         cmd.env(key, value);
     }
-    cmd.cwd(cwd);
+    // The shell is a child like git: it gets the ordinary spelling of its
+    // directory, not the `\\?\C:\...` one the repository's identity is kept in.
+    // `cmd.exe` refuses a `\\?\` working directory ("UNC paths are not
+    // supported") and starts in C:\Windows instead (E2E run on 17e968915:
+    // the prompt read `C:\Windows>`). Identity off Windows.
+    match cwd.to_str() {
+        Some(text) => cmd.cwd(crate::engine::process::plain_path_text(text)),
+        None => cmd.cwd(cwd),
+    }
     PtyCommand { cmd, resolved }
 }
 
@@ -2769,7 +2786,8 @@ pub(in crate::terminal) fn engine_session_context(
         let group = master
             .lock()
             .map_err(|e| format!("Terminal size lock error: {e}"))?
-            .process_group_leader();
+            .as_ref()
+            .and_then(|open| open.process_group_leader());
         // Same ownership rule as the kill path: a group counts only when it
         // belongs to this child's own session.
         // SAFETY: getsid takes a numeric id and reads nothing else.
@@ -3151,7 +3169,7 @@ struct Takeover {
     output: Arc<OutputSlot>,
     ring: Arc<Mutex<ring::Ring>>,
     events: Arc<dyn SessionEvents>,
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    master: SharedMaster,
     spawned: TerminalSpawned,
 }
 
@@ -3372,11 +3390,17 @@ pub(in crate::terminal) fn engine_attach_tracked_session(
 
 /// Has the program redraw at the size it already has: what a view that
 /// skipped output needs to show the screen as it is.
-fn repaint_current(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) {
-    let size = master
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_size();
+fn repaint_current(master: &SharedMaster) {
+    let size = {
+        let held = master
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A closed terminal has no screen left to redraw.
+        let Some(open) = held.as_ref() else {
+            return;
+        };
+        open.get_size()
+    };
     match size {
         Ok(size) => repaint(master, size.rows, size.cols),
         Err(error) => {
@@ -3385,12 +3409,15 @@ fn repaint_current(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) {
     }
 }
 
-fn repaint(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, rows: u16, cols: u16) {
+fn repaint(master: &SharedMaster, rows: u16, cols: u16) {
     let target = bounded_pty_size(rows, cols);
     let nudge = bounded_pty_size(rows, if target.cols > 1 { target.cols - 1 } else { 2 });
-    let master = master
+    let held = master
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(master) = held.as_ref() else {
+        return;
+    };
     for size in [nudge, target] {
         if let Err(error) = master.resize(size) {
             log::warn!(target: "terminal", "could not resize a reattached terminal: {error}");
@@ -4052,7 +4079,9 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     let wakeups = Arc::new(AtomicU64::new(0));
     let output_slot = Arc::new(OutputSlot::new(output));
     let hidden = Arc::new(AtomicBool::new(false));
-    let master = Arc::new(Mutex::new(pair.master));
+    let master: SharedMaster = Arc::new(Mutex::new(Some(pair.master)));
+    #[cfg(windows)]
+    close_console_when_the_shell_exits(&session_id, &child, &master);
     let closing = Arc::new(AtomicUsize::new(0));
     let ring = Arc::new(Mutex::new(ring::Ring::for_session(
         &engine.ring_taps,
@@ -4946,7 +4975,12 @@ pub(in crate::terminal) fn engine_resize_session(
     // one thread, and a master lock that never came free must make this resize
     // fail, not take every later resize of the session down with it.
     let size = bounded_pty_size(rows, cols);
-    let resized = lock_within(&master, MASTER_LOCK_BUDGET)?.resize(size);
+    let resized = {
+        let held = lock_within(&master, MASTER_LOCK_BUDGET)?;
+        held.as_ref()
+            .ok_or_else(|| MASTER_CLOSED.to_string())?
+            .resize(size)
+    };
     resized.map_err(|e| format!("Failed to resize terminal: {e}"))?;
     entry_rows.store(size.rows, Ordering::Release);
     entry_cols.store(size.cols, Ordering::Release);
@@ -4957,9 +4991,9 @@ pub(in crate::terminal) fn engine_resize_session(
 /// Takes `lock` within `budget`, recovering a poisoned one (a PTY master holds
 /// no state a panic could leave half-written).
 fn lock_within<T: ?Sized>(
-    lock: &Mutex<Box<T>>,
+    lock: &Mutex<T>,
     budget: Duration,
-) -> Result<std::sync::MutexGuard<'_, Box<T>>, String> {
+) -> Result<std::sync::MutexGuard<'_, T>, String> {
     let deadline = Instant::now() + budget;
     loop {
         match lock.try_lock() {
@@ -5046,9 +5080,13 @@ pub(in crate::terminal) fn engine_pty_size(
         .get(session_id)
         .map(|session| session.master.clone())
         .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
-    let size = lock_within(&master, MASTER_LOCK_BUDGET)?
-        .get_size()
-        .map_err(|e| format!("Failed to read the terminal size: {e}"))?;
+    let size = {
+        let held = lock_within(&master, MASTER_LOCK_BUDGET)?;
+        held.as_ref()
+            .ok_or_else(|| MASTER_CLOSED.to_string())?
+            .get_size()
+    }
+    .map_err(|e| format!("Failed to read the terminal size: {e}"))?;
     Ok((size.rows, size.cols))
 }
 
@@ -5466,9 +5504,87 @@ impl Drop for ClosingGuard {
     }
 }
 
+/// How often a Windows session's console watcher looks for its shell's exit.
+#[cfg(windows)]
+const CONSOLE_EXIT_POLL: Duration = Duration::from_millis(50);
+
+/// Closes a Windows session's pseudoconsole once its shell has exited, so the
+/// session can end.
+///
+/// ConPTY ends its output pipe only when the pseudoconsole closes, and
+/// portable-pty closes it when the last master is dropped (`PsuedoCon`'s
+/// `Drop`; the slave is dropped right after spawn). The session held that
+/// master until its reader ended, and the reader ended only at the pipe's end:
+/// a shell that exited, or that Close terminated, left its session open for
+/// good, and every Close answered "retry Close" (E2E run 45847340460: `terminal
+/// close requested`, then no `terminal session ended`). Taking the master out
+/// once the shell has exited closes the console; the pipe then drains to its
+/// end and the reader finishes the session through the ordinary path.
+#[cfg(windows)]
+fn close_console_when_the_shell_exits(
+    session_id: &str,
+    child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    master: &SharedMaster,
+) {
+    let child = Arc::clone(child);
+    let master = Arc::downgrade(master);
+    let session = session_id.to_owned();
+    let spawned = crate::supervisor::spawn_one_of_many(
+        format!("terminal-console-{session_id}"),
+        "terminal console close",
+        move || loop {
+            // Gone with its session: nothing left to close.
+            let Some(held) = master.upgrade() else {
+                return;
+            };
+            let exited = child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_wait();
+            match exited {
+                Ok(None) => {
+                    drop(held);
+                    thread::sleep(CONSOLE_EXIT_POLL);
+                }
+                Ok(Some(status)) => {
+                    // Each step of the close is on record with its time, so a
+                    // session that still does not end says which step stalled:
+                    // this line without the next is a close that never
+                    // returned; both without "terminal session ended" is a
+                    // console that closed and left its output pipe open.
+                    log::info!(target: "terminal", "terminal shell exited ({status:?}); closing its console: session={session}");
+                    let console = held
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let closing = Instant::now();
+                    // Outside the lock: closing waits for the reader to drain
+                    // what the console still holds.
+                    let had_console = console.is_some();
+                    drop(console);
+                    log::info!(
+                        target: "terminal",
+                        "terminal console closed in {} ms (it was {}): session={session}",
+                        closing.elapsed().as_millis(),
+                        if had_console { "open" } else { "already closed" },
+                    );
+                    return;
+                }
+                Err(error) => {
+                    log::warn!(target: "terminal", "could not tell whether a terminal's shell exited; its console stays open: {error}");
+                    return;
+                }
+            }
+        },
+    );
+    if let Err(error) = spawned {
+        log::warn!(target: "terminal", "a terminal's console will not close when its shell exits: {error}");
+    }
+}
+
 fn terminate_pty_child(
     child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    master: &SharedMaster,
     closing: &Arc<AtomicUsize>,
 ) -> Result<(), String> {
     terminate_pty_child_within(child, master, closing, HANGUP_GRACE)
@@ -5476,7 +5592,7 @@ fn terminate_pty_child(
 
 fn terminate_pty_child_within(
     child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    master: &SharedMaster,
     closing: &Arc<AtomicUsize>,
     grace: Duration,
 ) -> Result<(), String> {
@@ -7483,6 +7599,8 @@ mod tests {
         let size = master
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .expect("the session is open")
             .get_size()
             .unwrap();
         assert_eq!((size.rows, size.cols), (40, 120));
@@ -7811,7 +7929,7 @@ mod tests {
         id: &str,
     ) -> (
         Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-        Arc<Mutex<Box<dyn MasterPty + Send>>>,
+        SharedMaster,
         Arc<AtomicUsize>,
     ) {
         state
@@ -7826,7 +7944,7 @@ mod tests {
     #[cfg(unix)]
     fn close_for_test(
         child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-        master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+        master: &SharedMaster,
         closing: &Arc<AtomicUsize>,
         grace: Duration,
     ) -> Result<(), String> {
@@ -8123,6 +8241,93 @@ mod tests {
         }
         assert!(wait_until(Duration::from_secs(1), || !alive(pid)));
         assert!(list_sessions(&state).unwrap().is_empty());
+    }
+
+    /// A shell starts in the plain spelling of its directory. Handed the
+    /// `\\?\C:\...` spelling a repository is admitted under, `cmd.exe` refuses
+    /// it ("UNC paths are not supported") and starts in C:\Windows (E2E run
+    /// on 17e968915: the prompt read `C:\Windows>`).
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_shell_starts_in_the_plain_spelling_of_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            verbatim.to_string_lossy().starts_with(r"\\?\"),
+            "the premise: canonical paths are verbatim here: {verbatim:?}"
+        );
+        let PtyCommand { cmd, .. } = build_pty_command(
+            "cmd.exe",
+            true,
+            None,
+            None,
+            &verbatim,
+            &PtyEnv::from_process(),
+        );
+        let cwd = cmd
+            .get_cwd()
+            .expect("the shell is given a working directory")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!cwd.starts_with(r"\\?\"), "{cwd}");
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            verbatim,
+            "the plain spelling names the same directory"
+        );
+    }
+
+    /// Spawns `cmd.exe /c <line>` in a trusted scratch repo.
+    #[cfg(windows)]
+    fn spawn_cmd(state: &TerminalSessions, dir: &std::path::Path, line: &str) -> TerminalSpawned {
+        init_test_repo(dir);
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let spawned = spawn_session_inner(
+            app.handle(),
+            state,
+            dir.to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("cmd.exe".into()),
+            Some(vec!["/c".into(), line.into()]),
+            None,
+            discard(),
+            None,
+        )
+        .unwrap();
+        drop(app);
+        spawned
+    }
+
+    #[cfg(windows)]
+    fn session_gone_within(state: &TerminalSessions, within: Duration) -> bool {
+        crate::test_support::wait_until(within, || list_sessions(state).unwrap().is_empty())
+    }
+
+    /// ConPTY ends its output only when its console closes, which used to wait
+    /// for the session to end: Close terminated the shell, then answered
+    /// "retry Close" forever (E2E run 45847340460).
+    #[cfg(windows)]
+    #[test]
+    fn a_closed_windows_terminal_finishes_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_cmd(&state, dir.path(), "ping -n 60 127.0.0.1 >NUL");
+        assert_eq!(list_sessions(&state).unwrap().len(), 1);
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).expect("close finishes");
+        assert!(session_gone_within(&state, Duration::from_secs(2)));
+    }
+
+    /// The same cycle without a Close: a shell that exits on its own ends its
+    /// session rather than staying listed as running.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_shell_that_exits_ends_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        spawn_cmd(&state, dir.path(), "exit 0");
+        assert!(session_gone_within(&state, Duration::from_secs(10)));
     }
 
     /// The jobs a close would kill are visible to the unmount check: a prompt
@@ -11450,10 +11655,10 @@ mod tests {
             LEGACY_TERMINAL_SESSION_ENV,
             crate::alerts::bridge::SOCKET_ENV,
             crate::alerts::bridge::LEGACY_SOCKET_ENV,
-            crate::hooks::lease_wrapper::BIN_ENV,
-            crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
-            crate::hooks::lease_wrapper::HELD_ENV,
-            crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
+            crate::hooks::lease_env::BIN_ENV,
+            crate::hooks::lease_env::LEGACY_BIN_ENV,
+            crate::hooks::lease_env::HELD_ENV,
+            crate::hooks::lease_env::LEGACY_HELD_ENV,
             crate::sysload::RUN_ID_ENV,
             crate::sysload::LEGACY_RUN_ID_ENV,
             crate::hooks::AGENT_KIND_ENV,
@@ -11476,10 +11681,10 @@ mod tests {
             LEGACY_TERMINAL_SESSION_ENV,
             crate::alerts::bridge::SOCKET_ENV,
             crate::alerts::bridge::LEGACY_SOCKET_ENV,
-            crate::hooks::lease_wrapper::BIN_ENV,
-            crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
-            crate::hooks::lease_wrapper::HELD_ENV,
-            crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
+            crate::hooks::lease_env::BIN_ENV,
+            crate::hooks::lease_env::LEGACY_BIN_ENV,
+            crate::hooks::lease_env::HELD_ENV,
+            crate::hooks::lease_env::LEGACY_HELD_ENV,
             crate::sysload::RUN_ID_ENV,
             crate::sysload::LEGACY_RUN_ID_ENV,
             crate::hooks::AGENT_KIND_ENV,

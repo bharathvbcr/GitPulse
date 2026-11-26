@@ -1,49 +1,262 @@
 <!doctype html>
-<html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Mavi verification</title></head>
+<html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Mavi verification</title>
+<script>
+  try {
+    const isLight = new URLSearchParams(location.search).get("theme") === "light";
+    localStorage.setItem("gitpulse_theme_preference", isLight ? "light" : "dark");
+    if (isLight) {
+      document.documentElement.classList.remove("dark");
+      document.documentElement.classList.add("light");
+    }
+  } catch {}
+</script></head>
 <body style="margin:0;height:100vh"><div id="app" style="height:100vh;display:flex"></div><pre id="result" style="position:fixed;bottom:4px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:6px;max-width:420px;white-space:pre-wrap;display:none"></pre>
 <script type="module">
   import { mockIPC } from "@tauri-apps/api/mocks";
+  import { emit } from "@tauri-apps/api/event";
   import "../src/app.css";
   import { mount } from "svelte";
   import MaviView from "../src/lib/components/mavi/MaviView.svelte";
-  import { mainLines, doneLines, summary, MAIN_SESSION, DONE_SESSION, SNAPSHOT_PATCH } from "./maviFixture.ts";
+  import { mainLines, doneLines, summary, MAIN_SESSION, DONE_SESSION, SNAPSHOT_PATCH, ROOT } from "./maviFixture.ts";
   import historyText from "../src/lib/mavi/__fixtures__/history-allow-edit.jsonl?raw";
 
   // Disposable fixture: the host is simulated. What is real is the view, the
   // store, the reducer, the rows, the changes model and every component.
   const params = new URLSearchParams(location.search);
-  if (params.get("theme") === "light") document.documentElement.classList.remove("dark");
-  const calls = { answers: [], sends: [], diffs: [], errors: [] };
+  const isLight = params.get("theme") === "light";
+  localStorage.setItem("gitpulse_theme_preference", isLight ? "light" : "dark");
+  if (isLight) {
+    document.documentElement.classList.remove("dark");
+    document.documentElement.classList.add("light");
+  }
+  const calls = { answers: [], sends: [], diffs: [], stops: [], summarizes: [], errors: [] };
   const show = () => { const el = document.getElementById("result"); el.textContent = JSON.stringify(calls); };
   addEventListener("error", e => { calls.errors.push(e.message); show(); });
   addEventListener("unhandledrejection", e => { calls.errors.push(String(e.reason)); show(); });
   window.__mavi = calls;
 
   const escape = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const md = text => text.split(/\n\n+/).map(block => block.startsWith("- ")
-    ? `<ul>${block.split("\n").map(l => `<li>${escape(l.slice(2)).replace(/`([^`]+)`/g, "<code>$1</code>")}</li>`).join("")}</ul>`
-    : `<p>${escape(block).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>")}</p>`).join("");
+  const inlineMd = s => escape(s).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>");
+  const md = text => text.split(/\n\n+/).map(block => {
+    const out = [];
+    let items = [];
+    const flushList = () => {
+      if (items.length) {
+        out.push(`<ul>${items.map(item => `<li>${inlineMd(item)}</li>`).join("")}</ul>`);
+        items = [];
+      }
+    };
+    const para = [];
+    const flushPara = () => {
+      if (para.length) {
+        out.push(`<p>${inlineMd(para.join(" "))}</p>`);
+        para.length = 0;
+      }
+    };
+    for (const rawLine of block.split("\n")) {
+      const line = rawLine.trimEnd();
+      if (line.startsWith("### ")) {
+        flushList(); flushPara();
+        out.push(`<h3>${inlineMd(line.slice(4))}</h3>`);
+      } else if (line.startsWith("## ")) {
+        flushList(); flushPara();
+        out.push(`<h2>${inlineMd(line.slice(3))}</h2>`);
+      } else if (line.startsWith("- ")) {
+        flushPara();
+        items.push(line.slice(2));
+      } else if (line) {
+        flushList();
+        para.push(line);
+      }
+    }
+    flushList();
+    flushPara();
+    return out.join("");
+  }).join("");
 
   const entries = lines => lines.map((line, i) => ({ seq: i + 1, line }));
   const scenario = params.get("scenario") ?? "approval";
+  const isLong = params.get("long") === "1" || scenario === "long";
+  const noRepo = params.get("norepo") === "1";
+
+  function longMainLines() {
+    const base = mainLines().map(s => JSON.parse(s));
+    const splitAt = base.findIndex(l => l.type === "mavi_user" && l.turn === 2);
+    const head = splitAt >= 0 ? base.slice(0, splitAt) : base;
+    const tail = splitAt >= 0 ? base.slice(splitAt).map(l => (l.type === "mavi_user" ? { ...l, turn: 7 } : l)) : [];
+    const turns = [
+      {
+        turn: 2,
+        user: "Check whether `refund.ts` or `webhook.ts` also call the gateway without backoff.",
+        tools: [
+          { name: "Grep", input: { pattern: "gateway\\.", path: `${ROOT}/src` }, result: "src/refund.ts:28:  return gateway.refund(req);\nsrc/webhook.ts:64:  await gateway.ack(event.id);" },
+          { name: "Read", input: { file_path: `${ROOT}/src/refund.ts` }, result: "24\texport async function refund(req: RefundRequest) {\n28\t  return gateway.refund(req);\n29\t}" },
+        ],
+        answer: "Both `src/refund.ts` and `src/webhook.ts` call the gateway directly.\n\n- `refund.ts` exposes an idempotency key so retries on timeout are safe\n- `webhook.ts` acknowledges delivery and already tolerates duplicate acks on the server",
+        detail: "checked refund.ts and webhook.ts",
+      },
+      {
+        turn: 3,
+        user: "Wire `retryWithBackoff` into `refund.ts` too, keeping the same timeout predicate.",
+        tools: [
+          { name: "Edit", input: { file_path: `${ROOT}/src/refund.ts` }, result: "The file has been updated." },
+          { name: "Bash", input: { command: "npm test -- refund", description: "Run the refund tests" }, result: "PASS src/refund.test.ts\n  ✓ refunds idempotently (9 ms)\n  ✓ propagates 404 (4 ms)\n\nTests: 2 passed" },
+        ],
+        answer: "Updated `src/refund.ts` to wrap `gateway.refund(req)` in `retryWithBackoff` with `isTimeout`.\n\n- Non-timeout errors (such as 400/404 responses) still reject immediately on the first attempt\n- Existing refund tests pass without snapshot changes",
+        detail: "wired retry into refund.ts",
+      },
+      {
+        turn: 4,
+        user: "Does `isTimeout` handle `UND_ERR_CONNECT_TIMEOUT` and `AbortError` from undici/fetch?",
+        tools: [
+          { name: "Read", input: { file_path: `${ROOT}/src/util/retry.ts` }, result: "42\texport function isTimeout(err: unknown): boolean {\n43\t  return err instanceof GatewayTimeoutError;\n44\t}" },
+        ],
+        answer: "Currently `isTimeout` only checks `err instanceof GatewayTimeoutError`. Transport-level timeouts (`UND_ERR_CONNECT_TIMEOUT`, `UND_ERR_HEADERS_TIMEOUT`, and `AbortError` with name `TimeoutError`) fall straight through without retrying.\n\n- Checking `err.code` and `err.name === 'TimeoutError'` will cover undici and `AbortSignal.timeout()` cleanly",
+        detail: "inspected isTimeout predicate",
+      },
+      {
+        turn: 5,
+        user: "Expand `isTimeout` to recognize those transport codes and verify jitter bounds in `retryWithBackoff`.",
+        tools: [
+          { name: "Edit", input: { file_path: `${ROOT}/src/util/retry.ts` }, result: "The file has been updated." },
+          { name: "Bash", input: { command: "npm test -- retry", description: "Run retry helper tests" }, result: "PASS src/util/retry.test.ts\n  ✓ exponential backoff with full jitter (14 ms)\n  ✓ matches undici connect timeout (3 ms)\n\nTests: 5 passed" },
+        ],
+        answer: "Extended `isTimeout` in `src/util/retry.ts` to match `UND_ERR_CONNECT_TIMEOUT`, `UND_ERR_HEADERS_TIMEOUT`, `ETIMEDOUT`, and `TimeoutError`.\n\n- Verified full jitter stays within `[0, baseMs * 2^attempt]`\n- All 5 retry helper tests pass",
+        detail: "expanded isTimeout coverage",
+      },
+      {
+        turn: 6,
+        user: "Summarize what's left before we open a pull request.",
+        tools: [
+          { name: "Bash", input: { command: "git status -s", description: "Check modified files" }, result: " M src/charge.ts\n M src/refund.ts\n M src/util/retry.ts\n M src/__snapshots__/charge.test.ts.snap" },
+        ],
+        answer: "Three production files and one snapshot are updated:\n\n- `src/charge.ts` and `src/refund.ts` both retry timeouts up to **4 attempts**\n- `src/util/retry.ts` recognizes transport timeout codes in addition to `GatewayTimeoutError`\n- Next step: add the unit tests in `src/charge.test.ts` covering timeout retries vs. fast-fail declines",
+        detail: "summarized remaining test work",
+      },
+    ];
+    let longUuid = 0;
+    const lid = () => `10000000-0000-4000-8000-${String(++longUuid).padStart(12, "0")}`;
+    const extra = [];
+    for (const item of turns) {
+      extra.push({ type: "mavi_user", text: item.user, turn: item.turn, at: Date.now() - (300_000 - item.turn * 30_000) });
+      item.tools.forEach((tool, idx) => {
+        const msgId = `lm-${item.turn}-${idx}`;
+        const toolId = `lt-${item.turn}-${idx}`;
+        extra.push({ type: "assistant", message: { id: msgId, role: "assistant", content: [{ type: "tool_use", id: toolId, name: tool.name, input: tool.input }] }, uuid: lid() });
+        extra.push({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: tool.result }] }, uuid: lid() });
+      });
+      extra.push({ type: "assistant", message: { id: `la-${item.turn}`, role: "assistant", content: [{ type: "text", text: item.answer }] }, uuid: lid() });
+      extra.push({ type: "system", subtype: "post_turn_summary", status_category: "review_ready", status_detail: item.detail, needs_action: "" });
+      extra.push({ type: "result", subtype: "success", duration_ms: 42_000, total_cost_usd: 0.41 + item.turn * 0.22, usage: {} });
+    }
+    return [...head, ...extra, ...tail].map(l => JSON.stringify(l));
+  }
 
   localStorage.setItem("gitpulse.mavi.threads.v1", JSON.stringify(scenario === "empty" ? [] : [
-    { key: "k-main", sessionId: MAIN_SESSION, title: "Back off retries when the gateway times out", target: { kind: "local", root: "/Users/me/code/payments" }, mode: "ask", model: null, conversationId: scenario === "moved" ? "7c0e6c1a-4d1f-4c55-9b0e-2f8f5a1d3b21" : null, createdAt: 1, lastActivityAt: Date.now() - 20_000, seenAt: 0, movedToTerminalAt: scenario === "moved" ? Date.now() - 5_000 : null },
-    { key: "k-done", sessionId: DONE_SESSION, title: "Why is the nightly build slow?", target: { kind: "local", root: "/Users/me/code/payments" }, mode: "inspect", model: null, conversationId: null, createdAt: 1, lastActivityAt: Date.now() - 3_500_000, seenAt: 0 },
+    { key: "k-main", sessionId: MAIN_SESSION, title: "Back off retries when the gateway times out", target: { kind: "local", root: ROOT }, mode: "ask", model: null, conversationId: scenario === "moved" ? "7c0e6c1a-4d1f-4c55-9b0e-2f8f5a1d3b21" : null, createdAt: 1, lastActivityAt: Date.now() - 20_000, seenAt: 0, movedToTerminalAt: scenario === "moved" ? Date.now() - 5_000 : null },
+    { key: "k-done", sessionId: DONE_SESSION, title: "Why is the nightly build slow?", target: { kind: "local", root: ROOT }, mode: "inspect", model: null, conversationId: null, createdAt: 1, lastActivityAt: Date.now() - 3_500_000, seenAt: 0 },
     { key: "k-ssh", sessionId: null, title: "Profile the ingest worker", target: { kind: "ssh", host: "gpu-box", dir: "~/ingest" }, mode: "edit", model: null, conversationId: "1f0e6c1a-4d1f-4c55-9b0e-2f8f5a1d3b99", createdAt: 1, lastActivityAt: Date.now() - 86_400_000, seenAt: Date.now() },
   ]));
+  if (noRepo) {
+    localStorage.removeItem("gitpulse_workspace_v1");
+    localStorage.removeItem("gitpulse_workspace_v1.bak");
+    localStorage.removeItem("gitpulse_last_repo");
+  }
+
+  const sessionStates = new Map([
+    [MAIN_SESSION, { phase: scenario === "moved" ? "ended" : "approval", extra: scenario === "moved" ? { exit_ok: true } : {} }],
+    [DONE_SESSION, { phase: "idle", extra: { touched: [], cost_usd: 0.08 } }],
+  ]);
+  const sessionSummary = (id) => {
+    const state = sessionStates.get(id) ?? { phase: "idle", extra: {} };
+    return summary(id, state.phase, {
+      ...(id === MAIN_SESSION && isLong ? { turns: 7, cost_usd: 1.84 } : {}),
+      ...state.extra,
+    });
+  };
+  let savedAgentDefaults = { permission: {} };
+  const agentDefaultsView = () => ({
+    defaults: savedAgentDefaults,
+    modes: ["inspect", "ask", "edit", "auto_review", "preapproved", "bypass"],
+    launchers: ["claude", "codex", "grok", "agy"],
+    model_fields: {
+      agy: ["model", "effort"],
+      claude: ["model", "effort", "fallback", "advisor"],
+      codex: ["model"],
+      grok: ["model"],
+    },
+    effort_levels: ["low", "medium", "high", "xhigh", "max"],
+    model_listing: { claude: "known", agy: "listed" },
+  });
 
   mockIPC(async (cmd, args) => {
     switch (cmd) {
+      case "cmd_resolve_repo":
+        return { path: args.repoPath, name: "payments", is_bare: false, common_dir: `${args.repoPath}/.git` };
+      case "cmd_list_branches":
+        return [{ name: "main", is_current: true, is_remote: false, remote_name: null, tip_commit_id: "abc123456789", is_default: true, is_gone: false, last_commit_timestamp: 1700000000, last_author: "Alex", last_summary: "Work" }];
+      case "cmd_get_status":
+        return [];
+      case "cmd_list_tags":
+        return { tags: [], truncated: false };
+      case "cmd_repo_operation":
+        return null;
+      case "cmd_stash_list":
+        return { entries: [], truncated: false };
+      case "cmd_branch_stats":
+        return { updates: [], capped: false, compute_failures: 0, compared_to: "main" };
+      case "cmd_get_commit_graph":
+        return { nodes: [], edges: [], total_commits: 0, truncated: false };
+      case "cmd_workspace_sync":
+        return { repos: [] };
+      case "cmd_devcouncil_init":
+        return { repo: args.repoPath, state_dir: `${args.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
+      case "cmd_devmap_maybe_refresh":
+        return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
       case "cmd_mavi_list":
-        return scenario === "empty" ? [] : [summary(MAIN_SESSION, scenario === "moved" ? "ended" : "approval", scenario === "moved" ? { exit_ok: true } : {}), summary(DONE_SESSION, "idle", { touched: [], cost_usd: 0.08 })];
-      case "cmd_mavi_events":
+        return scenario === "empty" ? [] : [sessionSummary(MAIN_SESSION), sessionSummary(DONE_SESSION)];
+      case "cmd_mavi_events": {
         if (args.id === MAIN_SESSION && scenario === "history") {
           const history = historyText.split("\n").filter(Boolean);
           return { entries: entries(history), next_seq: 999, summary: summary(MAIN_SESSION, "ready", { touched: [] }) };
         }
-        if (args.id === MAIN_SESSION) return { entries: entries(scenario === "moved" ? [...mainLines(), JSON.stringify({ type: "mavi_exit", exit: "stopped by signal 15", ok: true, stderr: [] })] : mainLines()), next_seq: 999, summary: summary(MAIN_SESSION, scenario === "moved" ? "ended" : "approval", scenario === "moved" ? { exit_ok: true } : {}) };
-        return { entries: entries(doneLines()), next_seq: 99, summary: summary(DONE_SESSION, "idle", { touched: [] }) };
+        const rawMain = isLong ? longMainLines() : mainLines();
+        if (args.id === MAIN_SESSION) return { entries: entries(scenario === "moved" ? [...rawMain, JSON.stringify({ type: "mavi_exit", exit: "stopped by signal 15", ok: true, stderr: [] })] : rawMain), next_seq: 999, summary: sessionSummary(MAIN_SESSION) };
+        return { entries: entries(doneLines()), next_seq: 99, summary: sessionSummary(DONE_SESSION) };
+      }
+      case "cmd_mavi_stop": {
+        const id = args?.id;
+        calls.stops.push(id);
+        show();
+        if (id) {
+          const prev = sessionStates.get(id) ?? { phase: "idle", extra: {} };
+          sessionStates.set(id, {
+            phase: "ended",
+            extra: { ...prev.extra, pending: 0, exit: "stopped by signal 15", exit_ok: true },
+          });
+          await emit("mavi-status", sessionSummary(id));
+        }
+        return null;
+      }
+      case "cmd_mavi_summarize": {
+        const request = args?.request ?? {};
+        calls.summarizes.push(request);
+        show();
+        await new Promise(resolve => setTimeout(resolve, 150));
+        return {
+          text: "Routed gateway charges and refunds through `retryWithBackoff` and expanded timeout matching.\n\n### What changed\n- `src/charge.ts` retries timeout errors up to 4 attempts.\n- `src/refund.ts` wraps `gateway.refund` in `retryWithBackoff` with `isTimeout`.\n- `src/util/retry.ts` recognizes `UND_ERR_CONNECT_TIMEOUT`, `UND_ERR_HEADERS_TIMEOUT`, `ETIMEDOUT`, and `TimeoutError`.\n\n### Open items\n- Add unit tests in `src/charge.test.ts` covering timeout retries vs. fast-fail declines.",
+          model: request.model || "haiku",
+          engine: request.engine || "claude",
+          elapsedMs: 148,
+          truncated: false,
+          warnings: [],
+        };
+      }
+      case "cmd_agent_defaults":
+        return agentDefaultsView();
+      case "cmd_agent_defaults_save":
+        if (args?.defaults && typeof args.defaults === "object") savedAgentDefaults = args.defaults;
+        return agentDefaultsView();
       case "cmd_mavi_ssh_hosts":
         return ["devbox", "gpu-box", "build-01"];
       case "cmd_mavi_ssh_probe":
@@ -59,10 +272,73 @@
         return 1;
       case "cmd_markdown_render":
         return { html: md(args.text), headings: [], frontmatter: [], omittedBytes: 0 };
+      case "cmd_list_repo_files":
+        return [
+          "src/charge.ts",
+          "src/charge.test.ts",
+          "src/refund.ts",
+          "src/refund.test.ts",
+          "src/util/retry.ts",
+          "src/util/retry.test.ts",
+          "src/gateway.ts",
+          "src/validate.ts",
+          "src/webhook.ts",
+          "src/__snapshots__/charge.test.ts.snap",
+          "src/lib/components/mavi/MaviView.svelte",
+          "src/lib/components/mavi/MaviNewThread.svelte",
+          "src/lib/components/mavi/MaviTimeline.svelte",
+          "README.md",
+          "package.json",
+          "docs/MAVI.md",
+        ];
+      case "cmd_agent_models": {
+        const launcher = args?.launcher === "agy" ? "agy" : "claude";
+        if (launcher === "agy") {
+          return {
+            launcher: "agy",
+            models: [
+              { id: "gemini-4-pro", label: "Gemini 4 Pro", source: "cli" },
+              { id: "gemini-4-flash", label: "Gemini 4 Flash", source: "cli" },
+              { id: "claude-opus-5-5", label: "Claude Opus 5.5", source: "cli" },
+              { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", source: "cli" },
+            ],
+            listing: "listed",
+            command: "agy models",
+            fetched_at: Date.now(),
+            cached: false,
+            skipped: 0,
+            truncated: false,
+            error: null,
+          };
+        }
+        return {
+          launcher: "claude",
+          models: [
+            { id: "fable", label: "Fable", source: "alias" },
+            { id: "opus", label: "Opus", source: "alias" },
+            { id: "sonnet", label: "Sonnet", source: "alias" },
+            { id: "haiku", label: "Haiku", source: "alias" },
+            { id: "claude-opus-5-5", label: "Claude Opus 5.5", source: "settings" },
+            { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", source: "settings" },
+          ],
+          listing: "known",
+          command: "claude",
+          fetched_at: Date.now(),
+          cached: false,
+          skipped: 0,
+          truncated: false,
+          error: null,
+        };
+      }
       default:
         return null;
     }
   }, { shouldMockEvents: true });
+
+  if (!noRepo) {
+    const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+    await repoStore.openRepo(ROOT);
+  }
 
   mount(MaviView, { target: document.getElementById("app") });
   if (scenario !== "empty" && scenario !== "new") {

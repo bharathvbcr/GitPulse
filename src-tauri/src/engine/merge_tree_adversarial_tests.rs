@@ -589,3 +589,564 @@ fn an_unreadable_hooks_dir_fails_closed() {
     assert_eq!(git(dir.path(), &["rev-parse", "refs/heads/main"]), before);
     let _ = PathBuf::new();
 }
+
+/// M2 Test 1: Disjoint staged, unstaged, and untracked edits in the target
+/// checkout survive `land()` intact while incoming changes materialize.
+#[test]
+fn disjoint_dirty_staged_unstaged_and_untracked_survive_land() {
+    for squash in [false, true] {
+        let (dir, lane) = fixture();
+        let repo = dir.path();
+        std::fs::write(repo.join("tracked_staged.txt"), "base\n").unwrap();
+        git(repo, &["add", "tracked_staged.txt"]);
+        git(repo, &["commit", "-q", "-m", "add tracked_staged"]);
+
+        // Disjoint staged add, staged modification, unstaged modification, and untracked file.
+        std::fs::write(repo.join("staged_new.txt"), "user staged new\n").unwrap();
+        git(repo, &["add", "staged_new.txt"]);
+        std::fs::write(repo.join("tracked_staged.txt"), "user staged mod\n").unwrap();
+        git(repo, &["add", "tracked_staged.txt"]);
+        std::fs::write(repo.join("other.txt"), "user unstaged mod\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "user untracked\n").unwrap();
+
+        let done = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            lane.path().to_str().unwrap(),
+            Some("main"),
+            squash,
+            None,
+            &mut |_| Ok(()),
+        )
+        .unwrap_or_else(|e| panic!("squash={squash}: {e}"));
+
+        assert!(
+            done.merged && done.checkout_advanced,
+            "squash={squash}: {done:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "hello\nlane line\n",
+            "squash={squash}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("new.txt")).unwrap(),
+            "lane new\n",
+            "squash={squash}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("staged_new.txt")).unwrap(),
+            "user staged new\n",
+            "squash={squash}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked_staged.txt")).unwrap(),
+            "user staged mod\n",
+            "squash={squash}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("other.txt")).unwrap(),
+            "user unstaged mod\n",
+            "squash={squash}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("untracked.txt")).unwrap(),
+            "user untracked\n",
+            "squash={squash}"
+        );
+        let status = git_text(repo, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.contains("A  staged_new.txt"),
+            "squash={squash}: {status}"
+        );
+        assert!(
+            status.contains("M  tracked_staged.txt"),
+            "squash={squash}: {status}"
+        );
+        assert!(status.contains(" M other.txt"), "squash={squash}: {status}");
+        assert!(
+            status.contains("?? untracked.txt"),
+            "squash={squash}: {status}"
+        );
+        assert_eq!(
+            git(repo, &["symbolic-ref", "-q", "HEAD"]),
+            "refs/heads/main"
+        );
+        assert_eq!(git(repo, &["rev-parse", "HEAD"]), done.after_oid.unwrap());
+    }
+}
+
+/// M2 Test 2: APFS / case-insensitive collision (staged `foo.txt` vs incoming
+/// `Foo.txt`) and non-ASCII paths on case-insensitive filesystems refuse with
+/// `HeldReason::CheckoutDirty` and zero bytes overwritten.
+#[cfg(unix)]
+#[test]
+fn apfs_case_collision_with_staged_file_refuses_without_overwriting() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path(), None);
+    let repo = dir.path();
+    git(repo, &["config", "core.ignorecase", "true"]);
+    let lane = tempfile::tempdir().unwrap();
+    add_worktree_extended(
+        repo.to_str().unwrap(),
+        lane.path().to_str().unwrap(),
+        Some("feature-x"),
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    crate::test_support::trust_repo(lane.path());
+    std::fs::write(lane.path().join("Foo.txt"), "incoming Foo\n").unwrap();
+    git(lane.path(), &["add", "Foo.txt"]);
+    git(lane.path(), &["commit", "-q", "-m", "add Foo.txt"]);
+
+    std::fs::write(repo.join("foo.txt"), "precious staged foo\n").unwrap();
+    git(repo, &["add", "foo.txt"]);
+    let before = git(repo, &["rev-parse", "refs/heads/main"]);
+
+    let refused = merge_and_teardown_worktree(
+        repo.to_str().unwrap(),
+        lane.path().to_str().unwrap(),
+        Some("main"),
+        false,
+        None,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    let MergeTeardownError::Held {
+        reason: HeldReason::CheckoutDirty,
+        ..
+    } = refused
+    else {
+        panic!("expected CheckoutDirty, got {refused:?}");
+    };
+    assert_eq!(
+        std::fs::read(repo.join("foo.txt")).unwrap(),
+        b"precious staged foo\n"
+    );
+    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), before);
+    assert!(lane.path().exists());
+
+    // Non-ASCII dirty path on case-insensitive filesystem also fails closed.
+    let (dir2, lane2) = fixture();
+    let repo2 = dir2.path();
+    git(repo2, &["config", "core.ignorecase", "true"]);
+    std::fs::write(repo2.join("caf\u{00e9}.txt"), "user non-ascii\n").unwrap();
+    let before2 = git(repo2, &["rev-parse", "refs/heads/main"]);
+    let refused2 = merge_and_teardown_worktree(
+        repo2.to_str().unwrap(),
+        lane2.path().to_str().unwrap(),
+        Some("main"),
+        false,
+        None,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            refused2,
+            MergeTeardownError::Held {
+                reason: HeldReason::CheckoutDirty,
+                ..
+            }
+        ),
+        "{refused2:?}"
+    );
+    assert_eq!(git(repo2, &["rev-parse", "refs/heads/main"]), before2);
+}
+
+/// M2 Test 3: Gitignored local `ign.log` collides with incoming `ign.log` ->
+/// refuses with `HeldReason::CheckoutDirty`, zero bytes overwritten.
+#[cfg(unix)]
+#[test]
+fn gitignored_file_collision_refuses_without_overwriting() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path(), Some("ign.log\n"));
+    let repo = dir.path();
+    let lane = tempfile::tempdir().unwrap();
+    add_worktree_extended(
+        repo.to_str().unwrap(),
+        lane.path().to_str().unwrap(),
+        Some("feature-x"),
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    crate::test_support::trust_repo(lane.path());
+    std::fs::write(lane.path().join("ign.log"), "incoming ignored\n").unwrap();
+    git(lane.path(), &["add", "-f", "ign.log"]);
+    git(lane.path(), &["commit", "-q", "-m", "force add ign.log"]);
+
+    std::fs::write(repo.join("ign.log"), "precious local log\n").unwrap();
+    assert_eq!(git(repo, &["status", "--porcelain"]), "");
+    let before = git(repo, &["rev-parse", "refs/heads/main"]);
+
+    let refused = merge_and_teardown_worktree(
+        repo.to_str().unwrap(),
+        lane.path().to_str().unwrap(),
+        Some("main"),
+        false,
+        None,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    let MergeTeardownError::Held {
+        reason: HeldReason::CheckoutDirty,
+        ..
+    } = refused
+    else {
+        panic!("expected CheckoutDirty, got {refused:?}");
+    };
+    assert_eq!(
+        std::fs::read(repo.join("ign.log")).unwrap(),
+        b"precious local log\n"
+    );
+    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), before);
+    assert!(lane.path().exists());
+}
+
+/// M2 Test 4: Incoming `160000` gitlink/submodule entry refuses disjoint-dirty
+/// advancement with `HeldReason::CheckoutDirty`.
+#[cfg(unix)]
+#[test]
+fn submodule_gitlink_advance_on_dirty_holder_refuses() {
+    let sub_dir = tempfile::tempdir().unwrap();
+    init_repo(sub_dir.path(), None);
+    let c1 = git(sub_dir.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(sub_dir.path().join("README.md"), "sub v2\n").unwrap();
+    git(sub_dir.path(), &["commit", "-q", "-am", "sub v2"]);
+    let c2 = git(sub_dir.path(), &["rev-parse", "HEAD"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path(), None);
+    let repo = dir.path();
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{c1},sub"),
+        ],
+    );
+    git(repo, &["commit", "-q", "-m", "add gitlink"]);
+
+    let lane = tempfile::tempdir().unwrap();
+    add_worktree_extended(
+        repo.to_str().unwrap(),
+        lane.path().to_str().unwrap(),
+        Some("feature-x"),
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    crate::test_support::trust_repo(lane.path());
+    git(
+        lane.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{c2},sub"),
+        ],
+    );
+    git(lane.path(), &["commit", "-q", "-m", "advance gitlink"]);
+
+    std::fs::write(repo.join("unrelated.txt"), "user wip\n").unwrap();
+    let before = git(repo, &["rev-parse", "refs/heads/main"]);
+
+    let refused = merge_and_teardown_worktree(
+        repo.to_str().unwrap(),
+        lane.path().to_str().unwrap(),
+        Some("main"),
+        false,
+        None,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    let MergeTeardownError::Held {
+        reason: HeldReason::CheckoutDirty,
+        ..
+    } = refused
+    else {
+        panic!("expected CheckoutDirty, got {refused:?}");
+    };
+    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), before);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("unrelated.txt")).unwrap(),
+        "user wip\n"
+    );
+    assert!(lane.path().exists());
+}
+
+/// M2 Test 5: Truncated dirty scan (`> MAX_CHANGED_PATHS = 2048`) refuses
+/// disjoint-dirty advancement with `HeldReason::CheckoutDirty`.
+#[cfg(unix)]
+#[test]
+fn truncated_dirty_scan_refuses_disjoint_advance() {
+    let (dir, lane) = fixture();
+    let repo = dir.path();
+    git(repo, &["config", "status.showUntrackedFiles", "all"]);
+    let bulk = repo.join("bulk");
+    std::fs::create_dir_all(&bulk).unwrap();
+    for i in 0..2060 {
+        std::fs::write(bulk.join(format!("f_{i:04}.txt")), "").unwrap();
+    }
+    let before = git(repo, &["rev-parse", "refs/heads/main"]);
+
+    let refused = merge_and_teardown_worktree(
+        repo.to_str().unwrap(),
+        lane.path().to_str().unwrap(),
+        Some("main"),
+        false,
+        None,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    let MergeTeardownError::Held {
+        reason: HeldReason::CheckoutDirty,
+        ..
+    } = refused
+    else {
+        panic!("expected CheckoutDirty, got {refused:?}");
+    };
+    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), before);
+    assert!(lane.path().exists());
+}
+
+/// M2 Test 6: Rollback with pre-existing staged edits preserves staged edits,
+/// restores incoming files, and passes `pre_cached_digest` verification
+/// without emitting a false "restore was incomplete".
+#[test]
+fn rollback_with_preexisting_staged_edits_preserves_edits_and_passes_digest_check() {
+    // Part A: single holder read-tree fails with pre-existing staged + unstaged edits.
+    {
+        let (dir, lane) = fixture();
+        let repo = dir.path();
+        std::fs::write(repo.join("staged.txt"), "precious staged\n").unwrap();
+        git(repo, &["add", "staged.txt"]);
+        std::fs::write(repo.join("other.txt"), "staged mod\n").unwrap();
+        git(repo, &["add", "other.txt"]);
+        std::fs::write(repo.join("unstaged.txt"), "precious unstaged\n").unwrap();
+        let before = git(repo, &["rev-parse", "refs/heads/main"]);
+
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            lane.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut |argv: &[&str]| {
+                if argv.first() == Some(&"read-tree") {
+                    return Err(CommandError::plain("injected read-tree failure"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        let msg = refused.message().to_string();
+        assert!(
+            !msg.contains("restore was incomplete") && !msg.contains("does not match"),
+            "unexpected false incomplete-restore message: {msg}"
+        );
+        assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), before);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("staged.txt")).unwrap(),
+            "precious staged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("other.txt")).unwrap(),
+            "staged mod\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("unstaged.txt")).unwrap(),
+            "precious unstaged\n"
+        );
+        let cached = git(repo, &["diff", "--cached", "--name-status"]);
+        assert!(cached.contains("M\tother.txt"), "{cached}");
+        assert!(cached.contains("A\tstaged.txt"), "{cached}");
+        assert!(lane.path().exists());
+    }
+
+    // Part B: two holders; first holder has pre-existing staged edit, advances
+    // cleanly, second holder fails `read-tree`, first holder rolls back cleanly.
+    {
+        let (dir, lane) = fixture();
+        let repo = dir.path();
+        let second_dir = tempfile::tempdir().unwrap();
+        let second = second_dir.path().join("second");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-f",
+                second.to_str().unwrap(),
+                "main",
+            ],
+        );
+        crate::test_support::trust_repo(&second);
+
+        std::fs::write(repo.join("staged.txt"), "keep staged\n").unwrap();
+        git(repo, &["add", "staged.txt"]);
+        let before = git(repo, &["rev-parse", "refs/heads/main"]);
+        let first_before = snapshot(repo);
+        let second_before = snapshot(&second);
+
+        let mut reads = 0;
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            lane.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut |argv: &[&str]| {
+                if argv.first() == Some(&"read-tree") {
+                    reads += 1;
+                    if reads == 2 {
+                        return Err(CommandError::plain("injected second holder failure"));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        let msg = refused.message().to_string();
+        assert!(
+            !msg.contains("restore was incomplete"),
+            "unexpected incomplete restore: {msg}"
+        );
+        assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), before);
+        assert_eq!(snapshot(repo), first_before);
+        assert_eq!(snapshot(&second), second_before);
+        assert!(lane.path().exists());
+    }
+}
+
+/// Trap E + directory prefix ancestry: parked operation on a non-anchor linked
+/// holder and directory-prefix collision (`sub` vs `sub/nested.txt`) both refuse
+/// with `HeldReason::CheckoutDirty`.
+#[cfg(unix)]
+#[test]
+fn parked_op_on_linked_holder_and_prefix_ancestry_both_refuse() {
+    // Parked MERGE_HEAD on linked holder of `integ`.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path(), None);
+        let repo = dir.path();
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let sibling = sibling_dir.path().join("integ");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "integ",
+                sibling.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&sibling);
+        let lane_dir = tempfile::tempdir().unwrap();
+        let lane = lane_dir.path().join("lane");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-y",
+                lane.to_str().unwrap(),
+                "integ",
+            ],
+        );
+        crate::test_support::trust_repo(&lane);
+        std::fs::write(lane.join("y.txt"), "y\n").unwrap();
+        git(&lane, &["add", "y.txt"]);
+        git(&lane, &["commit", "-q", "-m", "y"]);
+
+        let head_oid = git(&sibling, &["rev-parse", "HEAD"]);
+        let sibling_git_dir = crate::engine::git_cli::resolve_git_dir(&sibling).unwrap();
+        std::fs::write(sibling_git_dir.join("MERGE_HEAD"), format!("{head_oid}\n")).unwrap();
+        let before = git(repo, &["rev-parse", "refs/heads/integ"]);
+
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            lane.to_str().unwrap(),
+            Some("integ"),
+            false,
+            None,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                MergeTeardownError::Held {
+                    reason: HeldReason::CheckoutDirty,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(git(repo, &["rev-parse", "refs/heads/integ"]), before);
+    }
+
+    // Directory prefix ancestry: untracked `sub` vs incoming `sub/nested.txt`.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path(), None);
+        let repo = dir.path();
+        let lane = tempfile::tempdir().unwrap();
+        add_worktree_extended(
+            repo.to_str().unwrap(),
+            lane.path().to_str().unwrap(),
+            Some("feature-x"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        crate::test_support::trust_repo(lane.path());
+        std::fs::create_dir_all(lane.path().join("sub")).unwrap();
+        std::fs::write(lane.path().join("sub/nested.txt"), "nested\n").unwrap();
+        git(lane.path(), &["add", "sub/nested.txt"]);
+        git(lane.path(), &["commit", "-q", "-m", "add sub/nested.txt"]);
+
+        std::fs::write(repo.join("sub"), "user file at sub\n").unwrap();
+        let before = git(repo, &["rev-parse", "refs/heads/main"]);
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            lane.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                MergeTeardownError::Held {
+                    reason: HeldReason::CheckoutDirty,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("sub")).unwrap(),
+            "user file at sub\n"
+        );
+        assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), before);
+    }
+}

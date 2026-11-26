@@ -5,6 +5,19 @@ use std::sync::{Arc, Mutex};
 const STEP: Duration = Duration::from_secs(2);
 const MIB: u64 = 1 << 20;
 
+/// The process that started this test: a live process the test did not
+/// start, which is what "another running Waylode" stands in for.
+fn parent_id() -> u32 {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::parent_id()
+    }
+    #[cfg(windows)]
+    {
+        crate::workbench::process_birth::parent_pid().expect("the test's parent is running")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fakes. Nothing here signals a process this test did not start.
 // ---------------------------------------------------------------------------
@@ -1657,7 +1670,7 @@ fn a_refused_process_is_not_asked_again_every_pass() {
 #[test]
 fn a_journal_another_running_gitpulse_wrote_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let parent = std::os::unix::process::parent_id();
+    let parent = parent_id();
     let live_start = crate::sysload::process_start_us(parent).expect("the parent is running");
     let entries = vec![JournalEntry {
         pid: 301,
@@ -1784,7 +1797,7 @@ fn resume_all_reports_each_pid_and_records_a_refused_one_as_failed() {
 #[test]
 fn resume_all_leaves_another_running_gitpulses_processes_alone_and_without_a_relief_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let parent = std::os::unix::process::parent_id();
+    let parent = parent_id();
     let journal = Journal {
         version: 1,
         writer_pid: parent,
@@ -2727,7 +2740,7 @@ fn shutdown_does_not_wait_for_a_hung_tick_and_continues_from_memory() {
 #[test]
 fn recovery_leaves_a_live_writers_journal_entirely_alone_however_old_it_is() {
     let dir = tempfile::tempdir().unwrap();
-    let parent = std::os::unix::process::parent_id();
+    let parent = parent_id();
     let live_start = crate::sysload::process_start_us(parent).expect("the parent is running");
     let now = unix_ms();
     let grace = u64::try_from((FREEZE_CAP + WATCHDOG_GRACE).as_millis()).unwrap();
@@ -3358,6 +3371,32 @@ mod real_signals {
         let child = Sleeper::spawn();
         let (pid, start) = (child.pid(), child.start_us());
         assert_eq!(OsActuator.is_background(pid, start), Some(false));
+        // Linux slows a process only when it could put it back: lowering nice
+        // again needs the target's RLIMIT_NICE to cover nice 0 (20), or root.
+        // A host without that (the CI runner's limit is 0) refuses, says why,
+        // and leaves the process at normal priority, which is the answer to
+        // check there.
+        #[cfg(target_os = "linux")]
+        {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: reads this process's limit (the child inherits it) into a local.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut limit) }, 0);
+            // SAFETY: `geteuid` has no preconditions.
+            let privileged = unsafe { libc::geteuid() } == 0;
+            if !privileged && limit.rlim_cur < 20 {
+                let refused = OsActuator.set_background(pid, start, true).unwrap_err();
+                assert!(refused.contains("RLIMIT_NICE"), "{refused}");
+                assert_eq!(
+                    OsActuator.is_background(pid, start),
+                    Some(false),
+                    "a refused slowing leaves the process at normal priority"
+                );
+                return;
+            }
+        }
         assert_eq!(OsActuator.set_background(pid, start, true), Ok(true));
         assert_eq!(OsActuator.is_background(pid, start), Some(true));
         assert_eq!(
@@ -3466,15 +3505,22 @@ mod real_signals {
     /// The identification of an agent's tool shell reads `/bin/zsh`'s own
     /// arguments, and `/bin/zsh` is an Apple platform binary: macOS hides the
     /// *environment* of those, and this test is what shows it does not hide
-    /// the arguments.
+    /// the arguments. Elsewhere the shell is whatever the host has (the
+    /// Ubuntu runner has no zsh); the identification reads only the argument
+    /// mark, never the shell's name.
     #[test]
     fn a_shell_started_with_a_tool_snapshot_is_identified_through_real_argv() {
+        let shell = if cfg!(target_os = "macos") {
+            "/bin/zsh"
+        } else {
+            "/bin/sh"
+        };
         let spawn = |script: &str| {
             Sleeper(
-                std::process::Command::new("/bin/zsh")
+                std::process::Command::new(shell)
                     .args(["-c", script])
                     .spawn_locked()
-                    .expect("zsh"),
+                    .unwrap_or_else(|error| panic!("{shell}: {error}")),
             )
         };
         let tool = spawn("sleep 60; echo # source /x/.claude/shell-snapshots/snapshot-zsh-1-a.sh");

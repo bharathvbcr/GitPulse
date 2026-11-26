@@ -5036,8 +5036,11 @@ while IFS= read -r line; do handle "$line" & done
         // the second does, whatever the host's speed: one scale for all three.
         let scale = crate::test_support::coverage_relaxed(Duration::from_secs(1));
         let late_secs = scale.as_secs_f64().ceil() as u64;
+        let short = scale.mul_f64(0.3);
+        let long = scale.mul_f64(2.5) + Duration::from_secs(late_secs);
+        let wedge_secs = (long + short).as_secs() + 30;
         std::fs::write(dir.path().join("slow-late"), late_secs.to_string()).unwrap();
-        std::fs::write(dir.path().join("slow-wedge"), "30").unwrap();
+        std::fs::write(dir.path().join("slow-wedge"), wedge_secs.to_string()).unwrap();
         let (_binary, connection) = managed_fixture(&serial, &dir);
         connection
             .call(
@@ -5053,8 +5056,6 @@ while IFS= read -r line; do handle "$line" & done
                 window,
             )
         };
-        let short = scale.mul_f64(0.3);
-        let long = scale.mul_f64(2.5) + Duration::from_secs(late_secs);
         // Timeout one; its answer arrives later, while the next call is
         // waiting, and is read and dropped there.
         assert!(matches!(call("late", short), Err(HarnessError::Timeout(_))));

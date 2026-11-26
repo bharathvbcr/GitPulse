@@ -1285,6 +1285,7 @@ fn record_verification_for(
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
+        tree_oid: None,
     };
 
     match crate::engine::provenance::write_verification_note(&repo_str, &head, &note) {

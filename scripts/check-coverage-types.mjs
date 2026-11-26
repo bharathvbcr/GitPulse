@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 141 contracts over
- * 372 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 142 contracts over
+ * 373 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -151,6 +151,7 @@ export const CONTRACTS = Object.freeze([
   // Asked before a terminal tab is ended to move its conversation into Mavi:
   // "elsewhere" must never read as "found", or the tab ends for nothing.
   { label: "mavi-history", rustPath: rust("mavi", "history.rs"), tsPath: ts("mavi", "types.ts"), structs: ["MaviConversationCheck"] },
+  { label: "mavi-summary", rustPath: rust("mavi", "summary.rs"), tsPath: ts("mavi", "types.ts"), structs: ["MaviWorkSummary"] },
   { label: "ledger", rustPath: rust("ledger", "mod.rs"), tsPath: ts("ledger", "types.ts"), structs: ["LedgerEvent", "LedgerStatus", "LedgerAppended"], flattenFrom: rust("ledger", "freshness.rs") },
   // Flattened into `LedgerStatus`, and the `ledger_freshness` of a change context.
   { label: "ledger-freshness", rustPath: rust("ledger", "freshness.rs"), tsPath: ts("ledger", "types.ts"), structs: ["Freshness", "CatchUpSummary"] },

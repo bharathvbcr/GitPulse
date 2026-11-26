@@ -1395,6 +1395,23 @@ pub(crate) fn git_captured_quarantined(
     run_bounded(command, &label, timeout, None)
 }
 
+/// Spawns a quarantined git child process for lockstep stdin/stdout streaming
+/// under one held spawn-gate permit.
+pub(crate) fn git_spawn_quarantined_streaming(
+    repo: &Path,
+    args: &[&str],
+    object_dir: &Path,
+    alternates: &std::ffi::OsStr,
+    timeout: Duration,
+) -> Result<super::process::StreamingChild, CommandError> {
+    crate::repository_trust::require(repo)?;
+    let label = format!("git {}", subcommand(args));
+    let mut command = git_command(Some(repo), args);
+    command.env("GIT_OBJECT_DIRECTORY", object_dir);
+    command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates);
+    super::process::spawn_streaming(&mut command, &label, timeout)
+}
+
 /// Runs `git` in `repo` with an explicit deadline instead of
 /// [`DEFAULT_TIMEOUT`].
 ///

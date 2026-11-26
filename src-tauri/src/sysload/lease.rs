@@ -737,17 +737,17 @@ pub fn launch_env(
         (true, Some(bin)) => vec![
             ("PATH", Some(path_with_bin_first(&bin, existing_path))),
             (
-                crate::hooks::lease_wrapper::BIN_ENV,
+                crate::hooks::lease_env::BIN_ENV,
                 Some(bin.clone().into_os_string()),
             ),
             (
-                crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
+                crate::hooks::lease_env::LEGACY_BIN_ENV,
                 Some(bin.into_os_string()),
             ),
         ],
         _ => vec![
-            (crate::hooks::lease_wrapper::BIN_ENV, None),
-            (crate::hooks::lease_wrapper::LEGACY_BIN_ENV, None),
+            (crate::hooks::lease_env::BIN_ENV, None),
+            (crate::hooks::lease_env::LEGACY_BIN_ENV, None),
         ],
     }
 }

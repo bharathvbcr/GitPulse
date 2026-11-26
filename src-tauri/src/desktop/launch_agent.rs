@@ -7,7 +7,9 @@
 //! Windows uses `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Waylode`,
 //! and Linux uses `~/.config/autostart/Waylode.desktop`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "windows"))]
+use std::path::PathBuf;
 
 /// The most a plist or desktop entry is read for: the entries are a few hundred bytes.
 const MAX_PLIST: u64 = 16 * 1024;
@@ -77,6 +79,8 @@ pub fn classify(document: Option<&str>, current: &Path) -> Registration {
     }
 }
 
+// Read by the macOS and XDG migrations; Windows migrates through the registry.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn read_bounded_regular_file(path: &Path) -> Result<Option<String>, String> {
     use std::io::Read;
     let meta = match std::fs::symlink_metadata(path) {
@@ -133,6 +137,7 @@ pub enum AutostartMigration {
     IgnoredForeign,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn looks_like_legacy_plist(doc: &str) -> bool {
     doc.contains("<string>GitPulse</string>") || doc.to_ascii_lowercase().contains("gitpulse")
 }

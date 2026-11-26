@@ -201,11 +201,7 @@ pub fn run() {
     // teardown through `RunEvent::Exit`, below), and a signal's default action ends this process and leaves whatever git
     // commands the UI had in flight running against the user's repository.
     let signals = procguard::install_signal_handlers();
-    if signals.is_armed() {
-        log::info!(target: "setup", "{}", signals.describe());
-    } else {
-        log::warn!(target: "setup", "{}", signals.describe());
-    }
+    signals.log_setup();
     let builder = tauri::Builder::default();
     // Registered before every other plugin, as this one requires: it decides
     // whether this process is the app or a message to the app, and nothing
@@ -517,6 +513,7 @@ pub fn run() {
             mavi::cmd_mavi_ssh_hosts,
             mavi::cmd_mavi_ssh_probe,
             mavi::cmd_mavi_conversation_check,
+            mavi::cmd_mavi_summarize,
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
             workbench::cmd_workbench_relink_repository,

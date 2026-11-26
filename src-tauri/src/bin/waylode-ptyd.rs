@@ -95,11 +95,7 @@ fn main() {
     // A signal stops every session with the hangup grace and records each
     // exit (the shutdown hook `serve` registers), then exits.
     let signals = waylode_lib::procguard::install_signal_handlers();
-    if signals.is_armed() {
-        log::info!(target: "setup", "{}", signals.describe());
-    } else {
-        log::warn!(target: "setup", "{}", signals.describe());
-    }
+    signals.log_setup();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = match parse(&argv) {
         Parsed::Help => {

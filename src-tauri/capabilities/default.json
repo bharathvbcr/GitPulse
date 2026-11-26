@@ -252,6 +252,7 @@
     "allow-cmd-mavi-ssh-probe",
     "allow-cmd-mavi-start",
     "allow-cmd-mavi-stop",
+    "allow-cmd-mavi-summarize",
     "allow-cmd-markdown-render",
     "allow-cmd-mcp-info",
     "allow-cmd-merge-branch",

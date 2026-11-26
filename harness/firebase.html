@@ -581,8 +581,8 @@
           && copied.includes("exit 1") && copied.includes("firebase-debug.log"));
       check("the copy is timestamped", () => /Generated: \d{4}-\d{2}-\d{2}T/.test(copied)
         && copied.includes("started 2026-11-14T09:00:00.000Z"));
-      check("the copy names the repository and the GitPulse version",
-        () => copied.includes(`Repository: ${REPO}`) && /GitPulse: \S+/.test(copied));
+      check("the copy names the repository and the Waylode version",
+        () => copied.includes(`Repository: ${REPO}`) && /Waylode: \S+/.test(copied));
       check("the copy says it was copied", () => flat().includes("Copied"));
       const details = [...root().querySelectorAll("details")].find(d => d.querySelector("summary")?.textContent.trim() === "Diagnostics");
       const shownText = details?.querySelector("pre")?.textContent ?? "";

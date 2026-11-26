@@ -257,6 +257,7 @@ pub enum Feature {
     /// keyed per feature, so coverage analyses calibrate on their report shape
     /// instead of inheriting dependency-plan estimates.
     CoverageReport,
+    SessionSummary,
 }
 
 impl Feature {
@@ -267,15 +268,17 @@ impl Feature {
             Feature::BranchName => "branch-name",
             Feature::HealthFix => "health-fix",
             Feature::CoverageReport => "coverage-report",
+            Feature::SessionSummary => "session-summary",
         }
     }
 
     fn max_output_tokens(self) -> i64 {
         match self {
             Feature::HealthFix | Feature::CoverageReport => MAX_ADVISORY_OUTPUT_TOKENS,
-            Feature::CommitMessage | Feature::ExplainCommit | Feature::BranchName => {
-                MAX_OUTPUT_TOKENS
-            }
+            Feature::CommitMessage
+            | Feature::ExplainCommit
+            | Feature::BranchName
+            | Feature::SessionSummary => MAX_OUTPUT_TOKENS,
         }
     }
 }
@@ -1834,6 +1837,36 @@ fn run_advisory_with_empty_retry(
         "The model returned an empty {answer_name} twice; Waylode stopped after one bounded retry."
     )
     .into())
+}
+
+/// Summarizes a finished coding-agent session from its redacted, bounded digest.
+pub fn summarize_session(
+    repo_path: &str,
+    digest: &str,
+    route: impl Into<Route>,
+) -> Result<AiGeneration, CommandError> {
+    if digest.trim().is_empty() {
+        return Err("There is no session activity to summarize yet.".into());
+    }
+    let mut generation = run(Feature::SessionSummary, repo_path, route.into(), |budget| {
+        let budgeted = prompt::budget_text(digest, budget);
+        Ok(Turn {
+            system: prompt::session_summary_system(),
+            user: prompt::session_summary_user(&budgeted.text),
+            diff: budgeted,
+        })
+    })?;
+    generation.text = prompt::strip_think_tags(&generation.text)
+        .trim()
+        .to_string();
+    if generation.text.is_empty() {
+        return Err(empty_reply_reason(
+            &generation,
+            "The model returned an empty session summary.",
+        )
+        .into());
+    }
+    Ok(generation)
 }
 
 fn append_visible_answer_retry(system: &mut String, retry: bool) {

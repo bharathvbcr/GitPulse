@@ -283,6 +283,39 @@ export class WebDriverClient {
     return this.request("POST", `/session/${this.sessionId}/execute/sync`, { script, args }, timeoutMs);
   }
 
+  /**
+   * Waits until the webview has left its initial blank document for the app's
+   * own page, and returns `{ href, ready }` for it.
+   *
+   * WebView2 hands the session over while it is still on that initial document
+   * (origin `://`). A script started there is destroyed when the app's page
+   * replaces it, and msedgedriver answers it at once with "script timeout"
+   * (run 45844814075: the probe began at .494, `Page.frameNavigated` to
+   * `http://tauri.localhost/` came at .751, the error at .757). WebKitGTK hands
+   * it over on the app's page already, so this returns on the first look there.
+   *
+   * @param {number} [timeoutMs]
+   * @param {(ms: number) => Promise<void>} [pause]
+   */
+  async waitForAppDocument(timeoutMs = 20_000, pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+    const deadline = Date.now() + timeoutMs;
+    let last = "nothing answered";
+    while (Date.now() < deadline) {
+      try {
+        const state = await this.executeScript("return { href: location.href, ready: document.readyState };", [], 5_000);
+        last = JSON.stringify(state);
+        if (state && typeof state.href === "string" && /^(https?|tauri):/i.test(state.href) && state.ready !== "loading") {
+          return state;
+        }
+      } catch (error) {
+        // A navigation in flight can fail the look itself; the next one sees where it landed.
+        last = error instanceof Error ? error.message : String(error);
+      }
+      await pause(150);
+    }
+    throw new Error(`the app's page did not load in the webview within ${timeoutMs} ms (last: ${last})`);
+  }
+
   /** @param {string} script @param {unknown[]} [args] @param {number} [timeoutMs] */
   async executeAsyncScript(script, args = [], timeoutMs = 35_000) {
     if (!this.sessionId) throw new Error("No active WebDriver session");
@@ -428,8 +461,29 @@ function commandAvailable(program) {
  */
 export function buildPtyProbeCommand(prefix, suffix, platform = process.platform, env = process.env) {
   if (platform === "win32") {
-    const comspec = (env.COMSPEC || "powershell.exe").toLowerCase();
-    if (comspec.includes("powershell") || comspec.includes("pwsh")) {
+    // The app's own default (`default_shell`): COMSPEC, else PowerShell. Windows
+    // spells it `ComSpec`, and a copied environment object is not
+    // case-insensitive the way `process.env` is, so look it up by any case.
+    const key = Object.keys(env).find((name) => name.toUpperCase() === "COMSPEC");
+    return ptyProbeForShell(prefix, suffix, platform, (key && env[key]) || "powershell.exe");
+  }
+  return ptyProbeForShell(prefix, suffix, platform, "");
+}
+
+/**
+ * [`buildPtyProbeCommand`] for the shell the app reports it started
+ * (`cmd_terminal_spawn`'s `shell`): PowerShell and cmd.exe read different
+ * syntax, and typing the wrong one only prints an error.
+ * @param {string} prefix
+ * @param {string} suffix
+ * @param {NodeJS.Platform} platform
+ * @param {string} shell
+ * @returns {string[]}
+ */
+export function ptyProbeForShell(prefix, suffix, platform, shell) {
+  if (platform === "win32") {
+    const name = shell.toLowerCase();
+    if (name.includes("powershell") || name.includes("pwsh")) {
       return [`Write-Output ("${prefix}" + "${suffix}")\r`];
     }
     return [`set "_gp_m=${suffix}"\r`, `echo ${prefix}%_gp_m%\r`];
@@ -730,11 +784,15 @@ async function runSmoke(opts) {
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
-  /** @type {{ platform: string, display: string, startedAt: string, scenarios: Array<{ name: string, ok: boolean, ms: number, detail?: string }>, screenshots: Array<{ name: string, path: string, bytes: number }> }} */
+  /** @type {{ platform: string, display: string, startedAt: string, ok: boolean, exitCode: number | null, scenarios: Array<{ name: string, ok: boolean, ms: number, detail?: string }>, screenshots: Array<{ name: string, path: string, bytes: number }> }} */
   const summary = {
     platform: process.platform,
     display,
     startedAt: new Date().toISOString(),
+    // The verdict, written last: a run that never finished has `ok: false`,
+    // so a wrapper that loses the exit code (gsudo) can still tell.
+    ok: false,
+    exitCode: null,
     scenarios: [],
     screenshots: [],
   };
@@ -788,6 +846,7 @@ async function runSmoke(opts) {
 
     await step("cold-start", async () => {
       await client.createSession(opts.binary, [repoAlpha], webviewOptionsFor(profileRoot));
+      await client.waitForAppDocument();
       const boot = await client.executeAsyncScript(`
         const done = arguments[arguments.length - 1];
         const deadline = Date.now() + 20000;
@@ -902,11 +961,20 @@ async function runSmoke(opts) {
       const suffix = randomUUID().slice(0, 8);
       const marker = `${prefix}${suffix}`;
       const probeLines = buildPtyProbeCommand(prefix, suffix, process.platform, env);
+      // On Windows the page types for the shell the app reports it started.
+      const probeByShell =
+        process.platform === "win32"
+          ? {
+              powershell: ptyProbeForShell(prefix, suffix, "win32", "powershell.exe"),
+              cmd: ptyProbeForShell(prefix, suffix, "win32", "cmd.exe"),
+            }
+          : null;
       const result = await client.executeAsyncScript(
         `
         const repoPath = arguments[0];
         const marker = arguments[1];
-        const probeLines = arguments[2];
+        const defaultProbeLines = arguments[2];
+        const probeByShell = arguments[3];
         const done = arguments[arguments.length - 1];
         (async () => {
           let sessionId = null;
@@ -916,20 +984,36 @@ async function runSmoke(opts) {
             const cbId = window.__TAURI_INTERNALS__.transformCallback((raw) => {
               const msg = raw && typeof raw === "object" && "message" in raw ? raw.message : raw;
               let text = "";
+              // Flow control counts bytes, not decoded characters.
+              let bytes = 0;
               if (msg instanceof ArrayBuffer) {
+                bytes = msg.byteLength;
                 text = decoder.decode(new Uint8Array(msg));
               } else if (ArrayBuffer.isView(msg)) {
+                bytes = msg.byteLength;
                 text = decoder.decode(new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength));
               } else if (Array.isArray(msg)) {
+                bytes = msg.length;
                 text = decoder.decode(Uint8Array.from(msg));
               } else if (typeof msg === "string") {
+                bytes = new TextEncoder().encode(msg).length;
                 text = msg;
               } else if (msg && typeof msg === "object" && typeof msg.data_b64 === "string") {
                 try { text = atob(msg.data_b64); } catch { text = msg.data_b64; }
+                bytes = text.length;
               }
               if (text) collected += text;
-              if (sessionId && text.length > 0) {
-                window.__TAURI_INTERNALS__.invoke("cmd_terminal_ack", { sessionId, bytes: text.length }).catch(() => {});
+              if (sessionId && bytes > 0) {
+                window.__TAURI_INTERNALS__.invoke("cmd_terminal_ack", { sessionId, bytes }).catch(() => {});
+              }
+              // This page stands in for the terminal (xterm.js in the app), so it
+              // answers what a terminal answers. Windows' ConPTY is created with
+              // PSEUDOCONSOLE_INHERIT_CURSOR: it asks for the cursor position
+              // (ESC [ 6 n) and reads no input until the reply arrives.
+              if (sessionId && text.includes("\\x1b[6n")) {
+                window.__TAURI_INTERNALS__
+                  .invoke("cmd_terminal_write", { sessionId, data: "\\x1b[1;1R", binary: false })
+                  .catch(() => {});
               }
             });
             const spawned = await window.__TAURI_INTERNALS__.invoke("cmd_terminal_spawn", {
@@ -939,6 +1023,10 @@ async function runSmoke(opts) {
               onOutput: "__CHANNEL__:" + cbId,
             });
             sessionId = spawned.id;
+            const shellName = String(spawned.shell || "");
+            const probeLines = probeByShell
+              ? (/powershell|pwsh/i.test(shellName) ? probeByShell.powershell : probeByShell.cmd)
+              : defaultProbeLines;
             // Wait briefly for initial shell prompt/banner (cold cmd.exe/PowerShell
             // on Windows can take >400ms before reading ConPTY input).
             const readyDeadline = Date.now() + 3000;
@@ -960,9 +1048,24 @@ async function runSmoke(opts) {
               await new Promise((r) => setTimeout(r, 150));
             }
             const matched = collected.includes(marker);
-            await window.__TAURI_INTERNALS__.invoke("cmd_terminal_kill", { sessionId });
+            // Both outcomes are reported: a Close that fails must not hide
+            // whether the round trip itself worked, nor the other way round.
+            let closeError = null;
+            try {
+              await window.__TAURI_INTERNALS__.invoke("cmd_terminal_kill", { sessionId });
+            } catch (err) {
+              closeError = String(err);
+            }
             if (!matched) {
-              done({ ok: false, error: "PTY output did not contain marker " + marker + "; got " + collected.slice(-300) });
+              done({
+                ok: false,
+                error: "PTY output did not contain marker " + marker + "; got " + JSON.stringify(collected.slice(-300)) +
+                  (closeError ? "; Close then failed too: " + closeError : ""),
+              });
+              return;
+            }
+            if (closeError) {
+              done({ ok: false, error: "the round trip worked, but Close failed: " + closeError });
               return;
             }
             done({ ok: true, sessionId, bytes: collected.length });
@@ -974,7 +1077,7 @@ async function runSmoke(opts) {
           }
         })();
         `,
-        [repoAlpha, marker, probeLines],
+        [repoAlpha, marker, probeLines, probeByShell],
       );
       if (!result?.ok) throw new Error(result?.error ?? "Terminal PTY round-trip failed");
       await snap("03-terminal-pty");
@@ -1144,6 +1247,8 @@ async function runSmoke(opts) {
     }
     driverProc.stdout?.destroy();
     driverProc.stderr?.destroy();
+    summary.exitCode = exitCode;
+    summary.ok = exitCode === 0 && summary.scenarios.length > 0 && summary.scenarios.every((s) => s.ok);
     writeFileSync(path.join(opts.artifactsDir, "summary.json"), JSON.stringify(summary, null, 2));
     if (!opts.keepTemp) {
       try {

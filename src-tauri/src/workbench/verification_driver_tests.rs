@@ -208,10 +208,10 @@ fn a_pass_recorded_for_an_older_head_does_not_promote_the_card() {
     let mut driver = Driver::default();
     driver.sweep(&store, &fake);
     let old = head_of(&repo);
-    crate::test_support::git_in(
-        repo.path(),
-        &["commit", "-q", "--allow-empty", "-m", "more"],
-    );
+    // Change tree contents (empty commits preserve tree_oid and remain valid).
+    std::fs::write(repo.path().join("more_work.txt"), "more\n").unwrap();
+    crate::test_support::git_in(repo.path(), &["add", "more_work.txt"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "more"]);
     store_record(&store, &id, &record(&id, "passed", "settled", &repo, &old));
     driver.sweep(&store, &fake);
     assert_eq!(status_of(&store, &id), "review");
@@ -1927,7 +1927,14 @@ impl Backend for Manvi<'_> {
 }
 
 fn commit(path: &std::path::Path, message: &str) {
-    crate::test_support::git_in(path, &["commit", "-q", "--allow-empty", "-m", message]);
+    let slug: String = message
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let file = format!("{slug}.txt");
+    std::fs::write(path.join(&file), format!("{message}\n")).unwrap();
+    crate::test_support::git_in(path, &["add", &file]);
+    crate::test_support::git_in(path, &["commit", "-q", "-m", message]);
 }
 
 #[test]
@@ -2231,6 +2238,9 @@ fn attack_a_pass_for_a_reset_away_default_branch_commit_never_promotes() {
     // The default branch is force-moved past the judged commit and the
     // checkout moves on to another line: the judged object still exists.
     crate::test_support::git_in(repo.path(), &["checkout", "-q", "--orphan", "fresh"]);
+    // `git checkout --orphan` keeps the prior index staged; clear it so
+    // `fresh` genuinely has an unrelated tree.
+    crate::test_support::git_in(repo.path(), &["rm", "-q", "-rf", "."]);
     commit(repo.path(), "unrelated root");
     crate::test_support::git_in(repo.path(), &["branch", "-q", "-M", "main"]);
     let report = driver.sweep(&store, &manvi);

@@ -44,6 +44,12 @@ use std::time::{Duration, Instant};
 
 pub const VERIFICATION_NOTES_REF: &str = "refs/notes/gitpulse/verification";
 pub const SESSION_NOTES_REF: &str = "refs/notes/gitpulse/sessions";
+/// Namespace prefix for monotonically advancing verified green branch pointers.
+pub const GREEN_REF_PREFIX: &str = "refs/gitpulse/green/";
+/// Maximum byte length of a full Git ref name (matching `git-ai` `MaxReferenceNameLength`).
+const MAX_REF_NAME_BYTES: usize = 1024;
+/// DWIM decoy prefixes rejected when validating a green branch name.
+const DWIM_DECOY_PREFIXES: &[&str] = &["refs/", "heads/refs/", "tags/refs/", "remotes/refs/"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerificationNote {
@@ -52,6 +58,8 @@ pub struct VerificationNote {
     pub checked_by: String,
     pub task_id: Option<String>,
     pub details: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -328,6 +336,148 @@ pub fn read_session_note(
     read_note(&repo, SESSION_NOTES_REF, commit_sha)
 }
 
+fn is_full_lowercase_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64)
+        && oid
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn validate_green_branch(branch: &str) -> Result<String, CommandError> {
+    if branch == "HEAD" {
+        return Err("Invalid branch name for green ref: 'HEAD' is not allowed".into());
+    }
+    if DWIM_DECOY_PREFIXES
+        .iter()
+        .any(|prefix| branch.starts_with(prefix))
+    {
+        return Err(format!(
+            "Invalid branch name for green ref {branch:?}: DWIM ref prefix is not allowed"
+        )
+        .into());
+    }
+    crate::engine::git_writer::validate_ref_name(branch)?;
+    let green_ref = format!("{GREEN_REF_PREFIX}{branch}");
+    crate::engine::git_writer::validate_ref_name(&green_ref)?;
+    if green_ref.len() > MAX_REF_NAME_BYTES {
+        return Err(
+            format!("Green ref name exceeds {MAX_REF_NAME_BYTES} bytes: {green_ref:?}").into(),
+        );
+    }
+    Ok(green_ref)
+}
+
+/// Reads the exact full ref without DWIM fallback (`for-each-ref` + literal
+/// refname equality). Returns `None` if absent.
+fn read_exact_ref(repo: &Path, full_ref: &str) -> Result<Option<String>, CommandError> {
+    let run = git_captured(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)\t%(objectname)\t%(symref)",
+            "--",
+            full_ref,
+        ],
+    )?
+    .require_complete("git for-each-ref")?;
+    if !run.success {
+        return Err(format!(
+            "git for-each-ref failed for {full_ref}: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )
+        .into());
+    }
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let Some(refname) = parts.next() else {
+            continue;
+        };
+        if refname != full_ref {
+            continue;
+        }
+        let oid = parts.next().unwrap_or_default().trim();
+        let symref = parts.next().unwrap_or_default().trim();
+        if !symref.is_empty() {
+            return Err(format!("Refusing symbolic green ref {full_ref} -> {symref}").into());
+        }
+        if !is_full_lowercase_oid(oid) {
+            return Err(format!("Green ref {full_ref} holds invalid object id {oid:?}").into());
+        }
+        return Ok(Some(oid.to_string()));
+    }
+    Ok(None)
+}
+
+/// Monotonically advances `refs/gitpulse/green/<branch>` to `verified_oid` via
+/// atomic CAS (`git update-ref`).
+///
+/// Returns `Ok(true)` if the ref was created or advanced, `Ok(false)` if it
+/// already points at `verified_oid` (no-op), and `Err` if `branch` or
+/// `verified_oid` is invalid, if moving would rewind or diverge from the
+/// current green pointer, or if a concurrent updater won the CAS race.
+pub fn advance_green_ref(
+    repo: &Path,
+    branch: &str,
+    verified_oid: &str,
+) -> Result<bool, CommandError> {
+    let green_ref = validate_green_branch(branch)?;
+    if !is_full_lowercase_oid(verified_oid) {
+        return Err(format!("Invalid commit id for green ref: {verified_oid:?}").into());
+    }
+    let commit_spec = format!("{verified_oid}^{{commit}}");
+    let resolved = git_complete_text(
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", &commit_spec],
+        "git rev-parse",
+    )?;
+    if resolved.trim() != verified_oid {
+        return Err(format!(
+            "Verified commit {verified_oid:?} did not resolve to itself (got {:?})",
+            resolved.trim()
+        )
+        .into());
+    }
+
+    let current = read_exact_ref(repo, &green_ref)?;
+    if current.as_deref() == Some(verified_oid) {
+        return Ok(false);
+    }
+
+    let expected_old: String = match current {
+        Some(cur_oid) => {
+            if !crate::harness::review::contains(repo, verified_oid, &cur_oid)? {
+                return Err(format!(
+                    "Refusing to rewind {green_ref}: current {cur_oid} is not an ancestor of {verified_oid}"
+                )
+                .into());
+            }
+            cur_oid
+        }
+        None => crate::engine::git_writer::absent_oid_for_len(verified_oid.len()).to_string(),
+    };
+
+    let run = git_captured(
+        repo,
+        &[
+            "update-ref",
+            "--no-deref",
+            &green_ref,
+            verified_oid,
+            &expected_old,
+        ],
+    )?
+    .require_complete("git update-ref")?;
+    if !run.success {
+        return Err(format!(
+            "git update-ref CAS failed for {green_ref}: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )
+        .into());
+    }
+    Ok(true)
+}
+
 impl ProvenanceFreshness {
     /// The answer for a commit nothing could be established about: no
     /// distance, no confidence, not fresh, and *not* "the notes were read".
@@ -502,6 +652,7 @@ mod tests {
             checked_by: "manvi".into(),
             task_id: Some("task-1".into()),
             details: Some("All tests green".into()),
+            tree_oid: None,
         };
 
         write_verification_note(path, &sha, &note).expect("write note");
@@ -614,6 +765,7 @@ mod freshness_honesty_tests {
                 checked_by: "test".into(),
                 task_id: None,
                 details: None,
+                tree_oid: None,
             },
         )
         .expect("note");
@@ -651,6 +803,7 @@ mod freshness_honesty_tests {
             checked_by: "ci.local".into(),
             task_id: Some("TASK-1".into()),
             details: Some("6 steps".into()),
+            tree_oid: None,
         };
         write_verification_note(repo, &sha, &note).expect("write");
         assert_eq!(read_verification_note(repo, &sha).unwrap(), Some(note));
@@ -2695,6 +2848,7 @@ mod batch_tests {
                     checked_by: "ci.local".into(),
                     task_id: Some("TASK-1".into()),
                     details: None,
+                    tree_oid: None,
                 },
             )
             .expect("write note");
@@ -3807,3 +3961,170 @@ mod batch_tests {
 #[cfg(test)]
 #[path = "provenance_relation_tests.rs"]
 mod relation_tests;
+
+#[cfg(test)]
+mod green_ref_tests {
+    use super::*;
+    use crate::procguard::LockedSpawn;
+    use std::process::Command;
+
+    fn repo_with_branch_commits() -> (tempfile::TempDir, String, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output_locked()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@test.com"]);
+        crate::test_support::trust_repo(dir.path());
+
+        std::fs::write(dir.path().join("f.txt"), "1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "c1"]);
+        let c1 = git(&["rev-parse", "HEAD"]);
+
+        std::fs::write(dir.path().join("f.txt"), "2\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "c2"]);
+        let c2 = git(&["rev-parse", "HEAD"]);
+
+        git(&["checkout", "-b", "side", &c1]);
+        std::fs::write(dir.path().join("side.txt"), "side\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "side"]);
+        let side = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "main"]);
+
+        (dir, c1, c2, side)
+    }
+
+    #[test]
+    fn advance_green_ref_creates_advances_monotonically_and_refuses_rewind() {
+        let (dir, c1, c2, side) = repo_with_branch_commits();
+        let repo = dir.path();
+
+        // Initial CAS create.
+        assert!(advance_green_ref(repo, "main", &c1).expect("create green ref"));
+        assert_eq!(
+            read_exact_ref(repo, "refs/gitpulse/green/main").unwrap(),
+            Some(c1.clone())
+        );
+
+        // Idempotent no-op when already at verified_oid.
+        assert!(!advance_green_ref(repo, "main", &c1).expect("no-op at same oid"));
+
+        // Monotonic forward advance succeeds.
+        assert!(advance_green_ref(repo, "main", &c2).expect("advance forward"));
+        assert_eq!(
+            read_exact_ref(repo, "refs/gitpulse/green/main").unwrap(),
+            Some(c2.clone())
+        );
+
+        // Backward rewind is refused and ref stays at c2.
+        let rewind = advance_green_ref(repo, "main", &c1);
+        assert!(rewind.is_err(), "expected rewind refusal, got {rewind:?}");
+        assert_eq!(
+            read_exact_ref(repo, "refs/gitpulse/green/main").unwrap(),
+            Some(c2.clone())
+        );
+
+        // Diverged non-descendant commit is also refused.
+        let diverged = advance_green_ref(repo, "main", &side);
+        assert!(
+            diverged.is_err(),
+            "expected diverged refusal, got {diverged:?}"
+        );
+        assert_eq!(
+            read_exact_ref(repo, "refs/gitpulse/green/main").unwrap(),
+            Some(c2)
+        );
+    }
+
+    #[test]
+    fn advance_green_ref_rejects_decoys_and_ignores_dwim_shadow() {
+        let (dir, c1, c2, _) = repo_with_branch_commits();
+        let repo = dir.path();
+
+        // Invalid branch names / DWIM decoys are rejected.
+        for bad in [
+            "",
+            "HEAD",
+            "-flag",
+            "refs/heads/main",
+            "refs/refs/heads/main",
+            "heads/refs/main",
+            "tags/refs/main",
+            "remotes/refs/main",
+            "feat..bar",
+            "feat.lock",
+        ] {
+            let res = advance_green_ref(repo, bad, &c1);
+            assert!(res.is_err(), "bad branch {bad:?} should be rejected");
+        }
+
+        // Non-commit OID (tree OID) and bogus OID are rejected.
+        let tree_oid = git_complete_text(repo, &["rev-parse", "HEAD^{tree}"], "rev-parse")
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(advance_green_ref(repo, "main", &tree_oid).is_err());
+        assert!(advance_green_ref(repo, "main", &"ab".repeat(20)).is_err());
+
+        // Plant a DWIM decoy at refs/heads/refs/gitpulse/green/main pointing to c2.
+        let decoy = git_captured(
+            repo,
+            &["update-ref", "refs/heads/refs/gitpulse/green/main", &c2],
+        )
+        .unwrap();
+        assert!(decoy.success);
+
+        // Exact non-DWIM lookup ignores the decoy and creates refs/gitpulse/green/main at c1.
+        assert!(advance_green_ref(repo, "main", &c1).expect("ignore DWIM decoy"));
+        assert_eq!(
+            read_exact_ref(repo, "refs/gitpulse/green/main").unwrap(),
+            Some(c1)
+        );
+    }
+
+    #[test]
+    fn verification_note_tree_oid_roundtrips_and_omits_when_none() {
+        let (dir, c1, _, _) = repo_with_branch_commits();
+        let path = dir.path().to_str().unwrap();
+        let tree_oid = git_complete_text(
+            dir.path(),
+            &["rev-parse", &format!("{c1}^{{tree}}")],
+            "rev-parse",
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let without_tree = VerificationNote {
+            verdict: "passed".into(),
+            verified_at: 1_788_000_000,
+            checked_by: "ci.local".into(),
+            task_id: None,
+            details: None,
+            tree_oid: None,
+        };
+        let encoded = serde_json::to_string(&without_tree).unwrap();
+        assert!(!encoded.contains("tree_oid"), "{encoded}");
+
+        let with_tree = VerificationNote {
+            tree_oid: Some(tree_oid),
+            ..without_tree
+        };
+        write_verification_note(path, &c1, &with_tree).expect("write");
+        assert_eq!(read_verification_note(path, &c1).unwrap(), Some(with_tree));
+    }
+}
