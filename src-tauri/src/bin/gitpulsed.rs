@@ -422,11 +422,7 @@ fn main() {
     // have anyone watching when it does.
     log::info!(target: "setup", "{}", gitpulse_lib::limits::raise_open_file_limit().describe());
     let signals = gitpulse_lib::procguard::install_signal_handlers();
-    if signals.is_armed() {
-        log::info!(target: "setup", "{}", signals.describe());
-    } else {
-        log::warn!(target: "setup", "{}", signals.describe());
-    }
+    signals.log_setup();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match parse(&argv) {
         Parsed::Help => {
