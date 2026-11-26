@@ -1026,7 +1026,27 @@ fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
         *losses.lock().unwrap() > 0,
         "the stalled view was never shed"
     );
-    // Keep repaying, coalesced, until the shell is asked to show it is alive.
+    // Repay, coalesced, until the burst is over: everything delivered is
+    // repaid and nothing more has come for a while. Only then is the shell
+    // asked to show it is alive. A chunk read while the view is still shed
+    // and owes more than half the window is dropped by design (the program is
+    // asked to repaint, which a plain `printf` does not do), so asking any
+    // earlier let `RESUMED-OK` fall into that window on a loaded runner and
+    // the wait below ran out (Linux CI, fc9ec7b81).
+    let mut quiet_since = Instant::now();
+    let settled = wait_for(Duration::from_secs(30), || {
+        let batch: Vec<(String, usize)> = owed.lock().unwrap().drain().collect();
+        if !batch.is_empty() {
+            quiet_since = Instant::now();
+        }
+        for (session, bytes) in batch {
+            if let Err(error) = acknowledge_output(&state, &session, bytes) {
+                refused.lock().unwrap().push(error);
+            }
+        }
+        quiet_since.elapsed() >= Duration::from_millis(300)
+    });
+    assert!(settled, "the burst never went quiet while the view repaid");
     write_to_session(&state, &id, "go\n").unwrap();
     let resumed = wait_for(Duration::from_secs(30), || {
         let batch: Vec<(String, usize)> = owed.lock().unwrap().drain().collect();
