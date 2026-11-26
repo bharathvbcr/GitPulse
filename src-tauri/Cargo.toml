@@ -86,7 +86,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 # Shared audited protocol, canonical JSON/SHA-256 hashing, DeviceCertificate +
 # SignedRevocationList verification, and P-256 hardware approval verification.
-gitpulse-protocol = { path = "../crates/gitpulse-protocol" }
+gitpulse-protocol = { path = "crates/gitpulse-protocol" }
 rayon = "1.12"
 # The async runtime `pools::install_async_runtime` builds and hands to tauri.
 # Pinned to the version already resolved in Cargo.lock (the framework's own

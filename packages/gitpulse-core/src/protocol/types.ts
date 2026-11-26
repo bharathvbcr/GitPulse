@@ -1,5 +1,5 @@
 /**
- * Canonical wire types mirroring `crates/gitpulse-protocol/src/wire.rs` (`GPTF` v1).
+ * Canonical wire types mirroring `src-tauri/crates/gitpulse-protocol/src/wire.rs` (`GPTF` v1).
  *
  * Pure TypeScript — zero Svelte, DOM, or Tauri imports.
  */

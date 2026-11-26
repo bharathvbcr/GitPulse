@@ -419,3 +419,4 @@ blob-report/
 *.pdb
 
 /crates/gitpulse-worktree/target/
+/src-tauri/crates/gitpulse-protocol/target/

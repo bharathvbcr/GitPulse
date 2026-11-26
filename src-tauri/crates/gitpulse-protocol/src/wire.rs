@@ -1,7 +1,7 @@
 //! Canonical wire types for GitPulse's unified control plane (`GPTF` v1).
 //!
 //! All field names and enum tags are frozen across:
-//! - `crates/gitpulse-protocol` (Rust desktop, daemon, iOS/Android UniFFI)
+//! - `src-tauri/crates/gitpulse-protocol` (Rust desktop, daemon, iOS/Android UniFFI)
 //! - `gitpulse-relay` (Go outer frame & wake push routing)
 //! - `packages/gitpulse-core` & `apps/mobile` (TypeScript)
 //!

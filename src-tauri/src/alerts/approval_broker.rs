@@ -17,7 +17,7 @@
 //!    payload omits `tool_use_id`. Concurrent plugin + `--settings` hooks are
 //!    deduplicated by `(session_id, input_sha256)` where `input_sha256` is the
 //!    SHA-256 of canonical sorted-key JSON `{"cwd":...,"tool_input":...,"tool_name":...}`
-//!    (matching `crates/gitpulse-protocol`).
+//!    (matching `src-tauri/crates/gitpulse-protocol`).
 //! 3. **Zero same-UID resolution (P0-3 / #15):** `getpeereid`/`SO_PEERCRED`
 //!    only proves same UID, so a rogue agent's `Bash` tool can connect to the
 //!    Unix socket. Therefore the socket exposes **ONLY** `register_or_attach`,
@@ -88,7 +88,7 @@ const MAX_CLOCK_SKEW_SECS: i64 = 300;
 const MAX_DECISION_TTL_SECS: i64 = 3600;
 
 /// Domain prefix for P-256 approval decision signatures (re-exported from
-/// `crates/gitpulse-protocol`).
+/// `src-tauri/crates/gitpulse-protocol`).
 pub const APPROVAL_SIGNING_DOMAIN: &[u8] = proto_canonical::APPROVAL_SIGNING_DOMAIN;
 
 /// Default read/write timeout for short read-only broker socket queries
@@ -104,7 +104,7 @@ pub fn default_socket_path() -> Option<PathBuf> {
     Some(crate::tool_config::default_config_dir()?.join(SOCKET_NAME))
 }
 
-/* ── Canonical input hashing (delegated to crates/gitpulse-protocol) ─────── */
+/* ── Canonical input hashing (delegated to src-tauri/crates/gitpulse-protocol) ─────── */
 
 /// Canonical JSON string for a tool approval request:
 /// `{"cwd":...,"tool_input":...,"tool_name":...}` with sorted object keys and
@@ -146,7 +146,7 @@ pub fn is_remote_approvable_tool(tool_name: &str) -> bool {
     ) || tool_name.starts_with("mcp__")
 }
 
-/* ── Trust anchor & errors (delegated to crates/gitpulse-protocol) ───────── */
+/* ── Trust anchor & errors (delegated to src-tauri/crates/gitpulse-protocol) ───────── */
 
 /// Errors returned by [`ApprovalBroker`] operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -675,7 +675,7 @@ pub struct ApprovalTicketSummary {
 }
 
 /// Terminal disposition of a ticket resolution attempt (aligned with
-/// `crates/gitpulse-protocol` `ApprovalResolvedEvent.outcome`).
+/// `src-tauri/crates/gitpulse-protocol` `ApprovalResolvedEvent.outcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolveStatus {
@@ -1850,7 +1850,7 @@ mod tests {
     };
     use gitpulse_protocol::wire::DeviceKind;
 
-    /// Deterministic P-256 test keypair from `crates/gitpulse-protocol/tests/vectors/approval_canonical_v1.json`.
+    /// Deterministic P-256 test keypair from `src-tauri/crates/gitpulse-protocol/tests/vectors/approval_canonical_v1.json`.
     const TEST_P256_SECRET: [u8; 32] = [0x66; 32];
     const TEST_P256_PUB_SEC1_B64: &str = "Awu7xei8hL0z0dPOA/+smnR/TBmT/dsuyTpBFqhvAip3";
     const ROGUE_P256_SECRET: [u8; 32] = [0x77; 32];

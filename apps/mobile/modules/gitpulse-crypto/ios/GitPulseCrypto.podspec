@@ -6,7 +6,7 @@ Pod::Spec.new do |s|
   s.name           = 'GitPulseCrypto'
   s.version        = package['version']
   s.summary        = 'GitPulse native hardware P-256 + Rust UniFFI crypto and approval confirmation sheet'
-  s.description    = 'Secure Enclave P-256 approval signing, Keychain Ed25519/X25519 identity isolation, native full-bytes approval sheet, and crates/gitpulse-protocol XCFramework bridge.'
+  s.description    = 'Secure Enclave P-256 approval signing, Keychain Ed25519/X25519 identity isolation, native full-bytes approval sheet, and src-tauri/crates/gitpulse-protocol XCFramework bridge.'
   s.license        = 'MIT OR Apache-2.0'
   s.author         = 'GitPulse'
   s.homepage       = 'https://github.com/bharathvbcr/GitPulse'

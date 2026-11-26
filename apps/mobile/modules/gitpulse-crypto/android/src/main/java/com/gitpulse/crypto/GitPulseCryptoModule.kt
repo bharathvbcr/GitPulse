@@ -25,7 +25,7 @@ import java.util.UUID
 
 /**
  * GitPulse Native Crypto & Hardware Signing Expo Module for Android (Opus M1–M4).
- * Aligned 100% with `crates/gitpulse-protocol` (board #18).
+ * Aligned 100% with `src-tauri/crates/gitpulse-protocol` (board #18).
  */
 class GitPulseCryptoModule : Module() {
     companion object {

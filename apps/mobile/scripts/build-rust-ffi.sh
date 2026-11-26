@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build Rust FFI native libraries (`crates/gitpulse-protocol`) for GitPulse Mobile:
+# Build Rust FFI native libraries (`src-tauri/crates/gitpulse-protocol`) for GitPulse Mobile:
 #   - host:    macOS/Linux host `staticlib` + `cdylib` verification build
 #   - ios:     `GitPulseProtocol.xcframework` -> modules/gitpulse-crypto/ios/Frameworks/
 #   - android: `libgitpulse_protocol.so` (arm64-v8a, armeabi-v7a, x86_64) via `cargo ndk`
@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOBILE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${MOBILE_ROOT}/../.." && pwd)"
-CRATE_DIR="${REPO_ROOT}/crates/gitpulse-protocol"
+CRATE_DIR="${REPO_ROOT}/src-tauri/crates/gitpulse-protocol"
 CRATE_MANIFEST="${CRATE_DIR}/Cargo.toml"
 TARGET_DIR="${CRATE_DIR}/target"
 
@@ -166,7 +166,7 @@ module GitPulseProtocolFFI {
 EOF
     cat > "${IOS_HEADERS_STAGE}/gitpulse_protocol.h" <<'EOF'
 #pragma once
-/* Placeholder header for crates/gitpulse-protocol staticlib XCFramework packaging.
+/* Placeholder header for src-tauri/crates/gitpulse-protocol staticlib XCFramework packaging.
  * Install uniffi-bindgen to emit full UniFFI Swift/C headers automatically. */
 EOF
   fi

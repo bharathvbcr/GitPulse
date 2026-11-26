@@ -1432,7 +1432,7 @@ fn steering_ingress_gate_requires_p256_signature_and_mandatory_revocations_befor
 fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
     // 1. revocation_list_v1.json
     let rev_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../crates/gitpulse-protocol/tests/vectors/revocation_list_v1.json"
+        "../../crates/gitpulse-protocol/tests/vectors/revocation_list_v1.json"
     ))
     .unwrap();
     let id_pub: [u8; 32] = hex_decode(rev_vec["identity_pub_hex"].as_str().unwrap()).unwrap();
@@ -1447,7 +1447,7 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
 
     // 2. relay_request_signing_v1.json
     let req_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../crates/gitpulse-protocol/tests/vectors/relay_request_signing_v1.json"
+        "../../crates/gitpulse-protocol/tests/vectors/relay_request_signing_v1.json"
     ))
     .unwrap();
     let dev_seed: [u8; 32] = hex_decode(req_vec["ed25519_seed_hex"].as_str().unwrap()).unwrap();
@@ -1467,7 +1467,7 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
 
     // 3. steering_confirm_v1.json -> verified through SteeringIngressGate!
     let steer_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../crates/gitpulse-protocol/tests/vectors/steering_confirm_v1.json"
+        "../../crates/gitpulse-protocol/tests/vectors/steering_confirm_v1.json"
     ))
     .unwrap();
     let signed: SignedSteeringConfirm =
@@ -1515,7 +1515,7 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
 
     // 4. approval_canonical_v1.json -> verified via gitpulse_protocol::crypto::verify_approval_decision!
     let appr_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../crates/gitpulse-protocol/tests/vectors/approval_canonical_v1.json"
+        "../../crates/gitpulse-protocol/tests/vectors/approval_canonical_v1.json"
     ))
     .unwrap();
     let decision = SignedApprovalDecision {

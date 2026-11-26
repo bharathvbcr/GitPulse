@@ -1,6 +1,6 @@
 # GitPulse Mobile (`apps/mobile`)
 
-Single cross-platform **iOS + Android** mobile companion for the GitPulse Unified Control Plane, built on **Expo SDK 55 (React Native 0.83 New Architecture: Fabric + TurboModules)** + `@gitpulse/core` + shared Rust **`crates/gitpulse-protocol`** (UniFFI `XCFramework` / Android `.so`).
+Single cross-platform **iOS + Android** mobile companion for the GitPulse Unified Control Plane, built on **Expo SDK 55 (React Native 0.83 New Architecture: Fabric + TurboModules)** + `@gitpulse/core` + shared Rust **`src-tauri/crates/gitpulse-protocol`** (UniFFI `XCFramework` / Android `.so`).
 
 ## Security Architecture (Opus M1–M5 & P0-4 / P0-7)
 
@@ -9,7 +9,7 @@ Single cross-platform **iOS + Android** mobile companion for the GitPulse Unifie
   - **Approval Key:** Non-exportable hardware **P-256** key in iOS Secure Enclave (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly` + `.biometryCurrentSet`) and Android StrongBox (`setUserAuthenticationRequired(true)` + `setInvalidatedByBiometricEnrollment(true)`), used exclusively for `approval_decide` and `steering_confirm_req` signatures.
   - **Identity Keys:** Ed25519 / X25519 keys stored in iOS App Group Keychain (`group.com.gitpulse.mobile`, `AfterFirstUnlockThisDeviceOnly`) / Android Keystore AES-256-GCM wrapped storage. Raw private key bytes never cross the JS bridge and are zeroized immediately after native/Rust calls.
 - **M3 — Native Approval Sheet + Code-Signed OTA:** `app.config.ts` enforces mandatory offline-key code signing on `expo-updates` (`codeSigningCertificate` + `codeSigningMetadata`). The approval confirmation sheet (`GitPulseApprovalSheet`) runs in native UIKit / Android View, calling Rust `render_canonical_tool_input` and `hash_canonical`, failing closed on hash mismatch or non-canonical numbers.
-- **M4 — Minimal FFI Surface:** Native bridges expose only the small, frozen `crates/gitpulse-protocol/src/uniffi_api.rs` surface.
+- **M4 — Minimal FFI Surface:** Native bridges expose only the small, frozen `src-tauri/crates/gitpulse-protocol/src/uniffi_api.rs` surface.
 - **M5 — Android FCM Hygiene:** `GitPulseMessagingService` always posts a visible notification within an 8s guard (inside Android's 10s FCM budget), falls back to a generic banner on decrypt failure/timeout, and removes `USE_FULL_SCREEN_INTENT` via `blockedPermissions` (`tools:node="remove"`).
 - **P0-4 — Minimal Decision Surface:** Strictly `allow_once | deny | deny_and_interrupt`; `updatedInput` and `updatedPermissions` are rejected at both TypeScript and Rust boundaries.
 - **P0-7 — Opt-In PTY Input Gate:** `app/pty/[sessionKey].tsx` is strictly read-only by default; `pty_input` requires an unexpired Desktop-granted time-boxed `PtyConsentGrant` plus local biometric step-up, auto-relocking on expiry or drawer close. **Accepted residual risk (Opus #23):** individual `pty.input` keystrokes within an active Desktop-granted consent window are authenticated by the Noise IK tunnel and audited under `audit_id`, rather than signed per keystroke.
@@ -45,7 +45,7 @@ npx expo run:android
 
 ## Rust FFI Toolchain Prerequisites
 
-`crates/gitpulse-protocol` defines `crate-type = ["rlib", "staticlib", "cdylib"]`. To cross-compile the mobile native libraries with `./scripts/build-rust-ffi.sh`:
+`src-tauri/crates/gitpulse-protocol` defines `crate-type = ["rlib", "staticlib", "cdylib"]`. To cross-compile the mobile native libraries with `./scripts/build-rust-ffi.sh`:
 
 ```bash
 # iOS XCFramework (macOS + Xcode)
@@ -69,10 +69,10 @@ Verified on macOS (`arm64-apple-darwin`) with:
   - `tsc --noEmit`: 0 errors (zero React/RN/Expo ambient shims).
   - `vitest run --config vitest.config.ts`: all unit, security-invariant, and `with-nse` plugin execution tests passing.
   - `expo prebuild --platform ios --no-install` & `--platform android --no-install`: verified end-to-end with an ephemeral public test cert (`plutil -lint` OK on generated NSE `Info.plist` and `.entitlements`; `AndroidManifest.xml` emits non-exported FCM service/receiver and `USE_FULL_SCREEN_INTENT` `tools:node="remove"`).
-- **Rust (`crates/gitpulse-protocol`):** `cargo 1.100.0` (`aarch64-apple-darwin` host).
+- **Rust (`src-tauri/crates/gitpulse-protocol`):** `cargo 1.100.0` (`aarch64-apple-darwin` host).
   - `./scripts/build-rust-ffi.sh --platform host --release`: builds `libgitpulse_protocol.a` (`staticlib`) and `libgitpulse_protocol.dylib` (`cdylib`).
-  - `cargo clippy --manifest-path crates/gitpulse-protocol/Cargo.toml --all-targets --locked -- -D warnings`: 0 warnings.
-  - `cargo test --manifest-path crates/gitpulse-protocol/Cargo.toml --locked`: 11/11 KAT tests passing.
+  - `cargo clippy --manifest-path src-tauri/crates/gitpulse-protocol/Cargo.toml --all-targets --locked -- -D warnings`: 0 warnings.
+  - `cargo test --manifest-path src-tauri/crates/gitpulse-protocol/Cargo.toml --locked`: 11/11 KAT tests passing.
   - Note: mobile cross-targets (`aarch64-apple-ios*`, `*-linux-android`), `cargo-ndk`, and `uniffi-bindgen` are not pre-installed on this host, so iOS `.xcframework` and Android `.so` cross-compilation was not executed here.
 - **iOS Swift:** `Xcode 27.2`, `swiftc 6.4.2`, `iPhoneSimulator27.2.sdk`.
   - `swiftc -parse` passed on all 5 Swift files.

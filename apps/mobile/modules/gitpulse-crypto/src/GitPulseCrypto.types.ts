@@ -1,6 +1,6 @@
 /**
  * Minimal stable TypeScript types for the native `GitPulseCrypto` Expo Module (Opus M1–M4).
- * Aligned 100% with `crates/gitpulse-protocol/src/uniffi_api.rs` & `wire.rs` (board #18).
+ * Aligned 100% with `src-tauri/crates/gitpulse-protocol/src/uniffi_api.rs` & `wire.rs` (board #18).
  *
  * Security Invariants:
  * - Opus M2: Raw private key bytes (Ed25519, X25519, or P-256) NEVER cross the JS bridge.
@@ -66,7 +66,7 @@ export interface NativeApprovalSheetRequest {
 }
 
 /**
- * Matches `crates/gitpulse-protocol/src/wire.rs` `SignedApprovalDecision` (`#[serde(deny_unknown_fields)]`).
+ * Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `SignedApprovalDecision` (`#[serde(deny_unknown_fields)]`).
  */
 export interface SignedApprovalDecision {
   readonly host_id: string;

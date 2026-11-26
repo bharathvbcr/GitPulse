@@ -2,7 +2,7 @@ import Foundation
 import Security
 import UserNotifications
 
-// Linked from crates/gitpulse-protocol XCFramework.
+// Linked from src-tauri/crates/gitpulse-protocol XCFramework.
 // NEVER link React Native or Hermes into the Notification Service Extension (24 MB memory budget).
 #if canImport(GitPulseProtocol)
 import GitPulseProtocol

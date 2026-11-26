@@ -107,7 +107,7 @@ export function isPtyInputUnlocked(params: {
 
 /**
  * Mobile Control-Plane State Machine & WebSocket Client.
- * Aligned 100% with `crates/gitpulse-protocol/src/wire.rs` (board #18).
+ * Aligned 100% with `src-tauri/crates/gitpulse-protocol/src/wire.rs` (board #18).
  *
  * Implements:
  * - Cursor tracking (`after_epoch`, `after_seq`) + bounded jittered reconnect (`250ms..15s`)

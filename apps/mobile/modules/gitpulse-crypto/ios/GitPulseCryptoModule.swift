@@ -6,7 +6,7 @@ import Security
 import UIKit
 
 /// GitPulse Native Crypto & Hardware Signing Expo Module for iOS (Opus M1–M4).
-/// Aligned 100% with `crates/gitpulse-protocol` (board #18).
+/// Aligned 100% with `src-tauri/crates/gitpulse-protocol` (board #18).
 ///
 /// Two-Key Hardware Model (Opus M2):
 /// 1. Approval Key: Non-exportable hardware P-256 key in Secure Enclave

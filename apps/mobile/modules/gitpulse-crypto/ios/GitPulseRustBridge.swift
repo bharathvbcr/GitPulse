@@ -4,7 +4,7 @@ import Foundation
 import GitPulseProtocol
 #endif
 
-/// Thin Swift wrapper over the `crates/gitpulse-protocol` UniFFI XCFramework (Opus M4).
+/// Thin Swift wrapper over the `src-tauri/crates/gitpulse-protocol` UniFFI XCFramework (Opus M4).
 /// Matches the frozen `uniffi_api.rs` contract (board #18) 1:1.
 final class GitPulseRustBridge {
     static let shared = GitPulseRustBridge()

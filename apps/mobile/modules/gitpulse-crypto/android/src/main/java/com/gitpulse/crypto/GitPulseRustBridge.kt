@@ -14,7 +14,7 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /**
- * Thin Kotlin bridge to `libgitpulse_protocol.so` (crates/gitpulse-protocol UniFFI / JNI, Opus M4).
+ * Thin Kotlin bridge to `libgitpulse_protocol.so` (src-tauri/crates/gitpulse-protocol UniFFI / JNI, Opus M4).
  * Matches frozen `uniffi_api.rs` contract (board #18) 1:1.
  *
  * Security invariants (Opus M2 & #15):
