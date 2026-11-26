@@ -12987,15 +12987,16 @@ mod tests {
             .and_then(|o| o.iter().find(|o| names_path(o, &wt)))
             .unwrap_or_else(|| panic!("no outcome for the busy worktree: {out}"));
         assert_eq!(outcome["status"], "skipped", "{out}");
-        // Windows has no process scan, so it cannot say which process is in the
-        // worktree; it refuses on the session check instead of a named process.
-        let why = if cfg!(windows) {
-            "could not rule out a live agent session"
-        } else {
-            "process"
-        };
+        // Windows has a process scan now, so the refusal is the process check's
+        // there too: either it names the process in the worktree ("live
+        // process(es) use it") or, where some process of the user's cannot be
+        // read (a 32-bit one), says it could not check ("could not check for
+        // live processes").
+        // Both say "process". Unverified on Windows: not run by its author.
         assert!(
-            outcome["reason"].as_str().is_some_and(|r| r.contains(why)),
+            outcome["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("process")),
             "{out}"
         );
         assert_eq!(out["reaped_pids"], json!([]));
@@ -13230,17 +13231,21 @@ mod tests {
         let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
         assert!(!err, "{out}");
         let find = |path: &str| outcome_for(&out, path);
-        if cfg!(windows) {
-            // No process scan, so no worktree can be shown free of a live agent
-            // session, and prune removes none: there is no branch delete to
-            // fail and nothing to keep going past.
+        // On Windows the process scan runs, but a host where some process of
+        // the user's cannot be read (a 32-bit one, whose parameter block the
+        // reader refuses) cannot show any worktree free of a live process, and
+        // prune then removes none:
+        // there is no branch delete to fail and nothing to keep going past. A
+        // host that reads every process takes the path below. Unverified on
+        // Windows: not run by its author.
+        if cfg!(windows) && find(&other)["status"] == "skipped" {
             for path in [&stuck, &other] {
                 let outcome = find(path);
                 assert_eq!(outcome["status"], "skipped", "{out}");
                 assert!(
                     outcome["reason"]
                         .as_str()
-                        .is_some_and(|r| r.contains("could not rule out a live agent session")),
+                        .is_some_and(|r| r.contains("could not check for live processes")),
                     "{out}"
                 );
                 assert!(std::path::Path::new(path).is_dir(), "{out}");

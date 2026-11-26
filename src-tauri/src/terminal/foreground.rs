@@ -92,12 +92,20 @@ fn read_name(_pid: i32) -> Option<String> {
 /// be the agent's, which runs as this user. `Err` when the process table
 /// itself could not be read; that is never "nobody is there". The table walk
 /// is the host-load scan's (`sysload::procscan`), the one owner of it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    all(windows, target_pointer_width = "64")
+))]
 pub(crate) fn working_in(dir: &std::path::Path) -> Result<Vec<i32>, String> {
     crate::sysload::procscan::working_in(dir)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    all(windows, target_pointer_width = "64")
+)))]
 pub(crate) fn working_in(_dir: &std::path::Path) -> Result<Vec<i32>, String> {
     Err("listing the processes working in a directory is not supported on this platform".into())
 }
