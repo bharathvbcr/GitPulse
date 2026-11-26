@@ -51,8 +51,9 @@ describe("e2e-driver-smoke", () => {
 
     const win = buildIsolatedEnv("C:\\temp\\e2e-p", { PATH: "C:\\Windows", WEBVIEW2_USER_DATA_FOLDER: "C:\\runner\\wv2" }, "win32");
     expect(win.USERPROFILE).toBe(path.join("C:\\temp\\e2e-p", "home"));
-    expect(win.APPDATA).toBe(path.join("C:\\temp\\e2e-p", "config"));
-    expect(win.LOCALAPPDATA).toBe(path.join("C:\\temp\\e2e-p", "data"));
+    // AppData sits where the known-folder lookup finds it under USERPROFILE.
+    expect(win.APPDATA).toBe(path.join("C:\\temp\\e2e-p", "home", "AppData", "Roaming"));
+    expect(win.LOCALAPPDATA).toBe(path.join("C:\\temp\\e2e-p", "home", "AppData", "Local"));
     // The profile is the driver's to place (webviewOptions.userDataFolder);
     // the env override, set here or inherited, made session creation hang.
     expect("WEBVIEW2_USER_DATA_FOLDER" in win).toBe(false);

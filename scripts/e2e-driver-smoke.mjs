@@ -119,8 +119,14 @@ export function buildIsolatedEnv(profileRoot, baseEnv, platform = process.platfo
   };
   if (platform === "win32") {
     env.USERPROFILE = home;
-    env.APPDATA = config;
-    env.LOCALAPPDATA = data;
+    // The app resolves its data directory through the known-folder API,
+    // which derives AppData from the profile, not from these variables.
+    // Point both at the folders that lookup would find under the isolated
+    // USERPROFILE (runSmoke creates them), so either route lands on the same
+    // existing directory: a missing one left tauri logging "failed to
+    // resolve the app local data directory: unknown path".
+    env.APPDATA = path.join(home, "AppData", "Roaming");
+    env.LOCALAPPDATA = path.join(home, "AppData", "Local");
     // The WebView2 profile goes to Edge WebDriver as
     // webviewOptions.userDataFolder (webviewOptionsFor), never through
     // WEBVIEW2_USER_DATA_FOLDER: that variable overrides the folder the
@@ -589,6 +595,9 @@ async function runSmoke(opts) {
   }
   writeFileSync(path.join(profileRoot, "gitconfig"), "[init]\n\tdefaultBranch = main\n");
   const env = buildIsolatedEnv(profileRoot, process.env);
+  for (const dir of [env.APPDATA, env.LOCALAPPDATA]) {
+    if (process.platform === "win32" && dir) mkdirSync(dir, { recursive: true });
+  }
 
   initFixtureRepo(repoAlpha, "hello.txt", "line 1\nline 2\n", env);
   initFixtureRepo(repoBeta, "beta.txt", "beta repo\n", env);
