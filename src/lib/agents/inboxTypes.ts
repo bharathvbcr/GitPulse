@@ -15,6 +15,10 @@ export interface AgentLaneClaim {
   claimed_files: string[];
   claimed_symbols: string[];
   updated_at_ms: number;
+  expires_at_ms?: number;
+  owner_pid?: number;
+  owner_proc_start_ns?: number;
+  session_id?: string;
 }
 
 export interface AgentBusMessage {
