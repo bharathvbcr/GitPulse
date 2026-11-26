@@ -5,7 +5,7 @@ import {
   type DevicePublicKeys,
   type SignedApprovalDecision,
   type SignedSteeringConfirm,
-} from "@gitpulse/crypto";
+} from "@waylode/crypto";
 
 export {
   assertValidSignedApprovalDecision,
@@ -18,7 +18,7 @@ export {
 
 export type HarnessKind = "claude" | "antigravity" | "codex" | "manvi";
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `ApprovalChannel` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `ApprovalChannel` (board #18). */
 export type ApprovalChannel =
   | "presence_gated_hook"
   | "codex_app_server"
@@ -28,7 +28,7 @@ export type ApprovalChannel =
   | "pty_human"
   | "observe_only";
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `CapabilitySet` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `CapabilitySet` (board #18). */
 export interface CapabilitySet {
   readonly harness: HarnessKind;
   readonly approval_channel: ApprovalChannel;
@@ -66,7 +66,7 @@ export interface ProbeGap {
   readonly reason: string;
 }
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `SubagentSummary` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `SubagentSummary` (board #18). */
 export interface SubagentSummary {
   readonly agent_id: string;
   readonly parent_session_id: string;
@@ -95,7 +95,7 @@ export interface DiffHunkFile {
   readonly unified_diff: string;
 }
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `SessionSnapshot` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `SessionSnapshot` (board #18). */
 export interface SessionSnapshot {
   readonly session_key: string;
   readonly host_id?: string;
@@ -120,7 +120,7 @@ export interface SessionSnapshot {
   readonly diff_files?: readonly DiffHunkFile[];
 }
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `ApprovalTicket` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `ApprovalTicket` (board #18). */
 export interface ApprovalTicket {
   readonly ticket_id: string;
   readonly host_id: string;
@@ -140,7 +140,7 @@ export interface ApprovalTicket {
   readonly expires_at: number;
 }
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `ApprovalResolvedEvent` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `ApprovalResolvedEvent` (board #18). */
 export interface ApprovalResolvedEvent {
   readonly ticket_id: string;
   readonly host_id: string;
@@ -163,7 +163,7 @@ export type SteeringDeliveryMode =
   | "wake_resume"
   | "unsupported";
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `SteeringPreviewReq/Resp` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `SteeringPreviewReq/Resp` (board #18). */
 export interface SteeringPreviewReq {
   readonly request_id: string;
   readonly session_key: string;
@@ -180,7 +180,7 @@ export interface SteeringPreviewResp {
   readonly warning?: string;
 }
 
-/** Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `SteeringConfirmReq/Resp` (board #18). */
+/** Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `SteeringConfirmReq/Resp` (board #18). */
 /**
  * Matches `SteeringConfirmReq` (board #18 + Opus #23 P1 steering authenticity).
  * Carries a hardware P-256 `SignedSteeringConfirm` signed from the native steering sheet
@@ -281,7 +281,7 @@ export interface WakePushFrame {
 }
 
 /**
- * Matches `src-tauri/crates/gitpulse-protocol/src/wire.rs` `ControlPlaneEvent` (`tag = "type"`, snake_case, board #18).
+ * Matches `src-tauri/crates/waylode-protocol/src/wire.rs` `ControlPlaneEvent` (`tag = "type"`, snake_case, board #18).
  */
 export type ControlPlaneEvent =
   | {

@@ -3,7 +3,7 @@ import {
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   WS_CLOSE_REVOKED,
-} from "@gitpulse/core/client";
+} from "@waylode/core/client";
 import {
   assertValidSignedApprovalDecision,
   assertValidSignedSteeringConfirm,
@@ -72,7 +72,7 @@ export interface ControlPlaneClientOptions {
 
 /**
  * Bounded exponential jittered reconnect delay (`250ms..15s`, Opus Relay spec),
- * delegated to `@gitpulse/core/client`.
+ * delegated to `@waylode/core/client`.
  */
 export function computeReconnectDelayMs(
   attempt: number,
@@ -107,7 +107,7 @@ export function isPtyInputUnlocked(params: {
 
 /**
  * Mobile Control-Plane State Machine & WebSocket Client.
- * Aligned 100% with `src-tauri/crates/gitpulse-protocol/src/wire.rs` (board #18).
+ * Aligned 100% with `src-tauri/crates/waylode-protocol/src/wire.rs` (board #18).
  *
  * Implements:
  * - Cursor tracking (`after_epoch`, `after_seq`) + bounded jittered reconnect (`250ms..15s`)

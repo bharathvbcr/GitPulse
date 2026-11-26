@@ -854,7 +854,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
       };
     };
     const handlers = manifest.hooks.PermissionRequest.flatMap((g) => g.hooks);
-    const notifyEntry = handlers.find((h) => h.command === "gitpulse-hook notify permission_request");
+    const notifyEntry = handlers.find((h) => h.command === "waylode-hook notify permission_request");
     expect(notifyEntry, "existing async notify permission_request must remain untouched").toBeDefined();
     expect(notifyEntry!.async).toBe(true);
     expect(notifyEntry!.timeout).toBe(5);

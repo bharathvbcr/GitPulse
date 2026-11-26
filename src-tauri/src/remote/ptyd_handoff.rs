@@ -1,14 +1,14 @@
-//! `gitpulse-ptyd` single-client takeover handoff (Opus R5).
+//! `waylode-ptyd` single-client takeover handoff (Opus R5).
 //!
-//! `gitpulse-ptyd` enforces strictly **one** connected app at a time
+//! `waylode-ptyd` enforces strictly **one** connected app at a time
 //! (`LinkState::current` in `terminal/host/server.rs`). Its `HANDOFF_GRACE`
 //! (`250ms`) is a *post-FIN drain*, not a dual-client takeover window: if
 //! Desktop sends `Request::Hello` before the daemon's connection has closed and
-//! drained, `ptyd` refuses with `"Another GitPulse window is connected to this
+//! drained, `ptyd` refuses with `"Another Waylode window is connected to this
 //! terminal host."`.
 //!
 //! Therefore the takeover sequence is:
-//! 1. Desktop sends `TakeoverPtyd` to `gitpulsed --relay`.
+//! 1. Desktop sends `TakeoverPtyd` to `wayloded --relay`.
 //! 2. Daemon detaches (`DetachAll`, best-effort) and immediately shuts down &
 //!    closes its `ptyd` Unix socket, returning [`TakeoverAck`].
 //! 3. Desktop waits out the post-FIN drain (`HANDOFF_GRACE = 250ms` default)
@@ -60,8 +60,8 @@ impl Default for HandoffRetryPolicy {
     }
 }
 
-/// Control-plane message sent by Desktop to ask `gitpulsed --relay` to release
-/// its `gitpulse-ptyd` socket.
+/// Control-plane message sent by Desktop to ask `wayloded --relay` to release
+/// its `waylode-ptyd` socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakeoverPtydRequest {
     pub desktop_pid: u32,
@@ -75,7 +75,7 @@ pub struct TakeoverAck {
     pub detach_warning: Option<String>,
 }
 
-/// Daemon-side holder of the single `gitpulse-ptyd` link when Desktop is closed.
+/// Daemon-side holder of the single `waylode-ptyd` link when Desktop is closed.
 #[derive(Default)]
 pub struct PtydHandoffCoordinator {
     state: Arc<Mutex<DaemonPtydState>>,
@@ -135,10 +135,10 @@ impl PtydHandoffCoordinator {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.desktop_active {
-                return Err("desktop currently owns gitpulse-ptyd; daemon will not compete".into());
+                return Err("desktop currently owns waylode-ptyd; daemon will not compete".into());
             }
             if guard.link.is_some() {
-                return Err("daemon already holds a gitpulse-ptyd link".into());
+                return Err("daemon already holds a waylode-ptyd link".into());
             }
         }
 
@@ -150,7 +150,7 @@ impl PtydHandoffCoordinator {
         if guard.desktop_active {
             // Desktop arrived while we were handshaking — release immediately!
             let _ = stream.shutdown(Shutdown::Both);
-            return Err("desktop took over gitpulse-ptyd while daemon was attaching".into());
+            return Err("desktop took over waylode-ptyd while daemon was attaching".into());
         }
         guard.link = Some(stream);
         guard.next_id = 2;
@@ -200,7 +200,7 @@ impl PtydHandoffCoordinator {
     }
 }
 
-/// Successful result of Desktop taking over `gitpulse-ptyd` from the daemon.
+/// Successful result of Desktop taking over `waylode-ptyd` from the daemon.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct TakeoverConnectResult {
@@ -218,7 +218,7 @@ pub struct TakeoverConnectResult {
 /// 2. Waits `policy.post_fin_drain` (default `HANDOFF_GRACE = 250ms`) for
 ///    `ptyd` to finish its post-FIN drain.
 /// 3. Runs bounded retry `Request::Hello` against `socket_path`, retrying any
-///    `"Another GitPulse window is connected"` / drain-window refusal until
+///    `"Another Waylode window is connected"` (older hosts: `GitPulse`) / drain-window refusal until
 ///    accepted or limits expire.
 #[cfg(unix)]
 pub fn desktop_takeover_and_connect(
@@ -269,7 +269,8 @@ pub fn desktop_takeover_and_connect(
 /// rather than a permanent protocol mismatch or missing socket.
 pub fn is_drain_race_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
-    lower.contains("another gitpulse window is connected")
+    lower.contains("another waylode window is connected")
+        || lower.contains("another gitpulse window is connected")
         || lower.contains("already connected")
         || lower.contains("unexpected eof")
         || lower.contains("connection reset")

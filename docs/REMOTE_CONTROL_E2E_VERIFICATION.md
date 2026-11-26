@@ -1,7 +1,7 @@
 # Remote Control E2E & Empirical Host Verification
 
 This document records:
-1. The live end-to-end integration test (`src-tauri/tests/remote_relay_e2e.rs`) exercising the real Go `gitpulse-relay` binary against Rust `gitpulsed`, `gitpulse-protocol`, `HostNoiseManager`, `RevocationCache`, `ApprovalBroker`, and `SteeringIngressGate` over real loopback TCP/HTTP/WebSockets.
+1. The live end-to-end integration test (`src-tauri/tests/remote_relay_e2e.rs`) exercising the real Go `gitpulse-relay` binary against Rust `wayloded`, `waylode-protocol`, `HostNoiseManager`, `RevocationCache`, `ApprovalBroker`, and `SteeringIngressGate` over real loopback TCP/HTTP/WebSockets.
 2. Read-only, non-destructive empirical host probes conducted on this macOS workstation for `codex`, `claude` CLI + Claude Desktop (`claude-desktop`), and `agy` CLI + Antigravity Desktop (`Antigravity.app`).
 
 ---
@@ -20,7 +20,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --test remote_relay_e2e -- --noc
 
 ### End-to-End Flow Exercised
 1. **Free-tier gating (host + relay)**:
-   - Runs the compiled `gitpulsed --relay --once --config-dir <free-dir>` binary against `tier: "free"` (`remote_control_enabled: true`) and asserts exit code **`4`** (`EXIT_CODE_FREE_OR_DISABLED`) before creating `gitpulsed-relay.lock`.
+   - Runs the compiled `wayloded --relay --once --config-dir <free-dir>` binary against `tier: "free"` (`remote_control_enabled: true`) and asserts exit code **`4`** (`EXIT_CODE_FREE_OR_DISABLED`) before creating `wayloded-relay.lock`.
    - Signs in via `POST /v1/auth/github` (against an in-process loopback mock GitHub `/user` server), verifies `tier == "free"`, `paywall_mode == "enforced"`, and absence of `remote_control`.
    - Registers desktop (`kind: "desktop"`) and mobile (`kind: "mobile"`) devices via `POST /v1/devices` and asserts that `GET /v1/tunnel/ws?role=host` is rejected pre-upgrade with HTTP **`403`** and error code **`feature_required`**.
 2. **Tier upgrade, enrollment, and revocation list**:
@@ -29,7 +29,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --test remote_relay_e2e -- --noc
    - Completes `PUT /v1/identity`, `PUT /v1/devices/me/enc-key` (both devices), `POST /v1/enrolments`, `POST /v1/enrolments/{mobile_id}/approve`, and `GET /v1/enrolments/self`.
    - Publishes `SignedRevocationList` v1 via `PUT /v1/identity/revocations`, fetches it back live via `GET /v1/identity/revocations`, and installs it into host `RevocationCache` and `TrustedApprovalKeyStore`.
 3. **Signed WebSocket tunnels + role/kind enforcement**:
-   - Opens live host (`role=host`) and mobile (`role=client`) tunnels to `/v1/tunnel/ws` authenticated with Ed25519 request-signing headers from `gitpulse_protocol::crypto::sign_relay_request`.
+   - Opens live host (`role=host`) and mobile (`role=client`) tunnels to `/v1/tunnel/ws` authenticated with Ed25519 request-signing headers from `waylode_protocol::crypto::sign_relay_request`.
    - Asserts a mobile device attempting `role=host` is rejected pre-upgrade with HTTP **`403`** (`role_device_kind_mismatch`).
 4. **Live Noise `IK` handshake over relay**:
    - Exchanges empty-payload Noise `IK` (`Noise_IK_25519_ChaChaPoly_SHA256`) handshake `msg1` and `msg2` wrapped in `GPTF` v1 `OuterFrame`s over the live relay WebSockets (`NoiseHandshake::new_initiator` <-> `HostNoiseManager::accept_mobile`), pinning peer static X25519 keys against verified `DeviceCertificate` v2 records and the live `RevocationCache`.
@@ -72,7 +72,7 @@ All probes below were executed read-only on this macOS arm64 workstation (Go `1.
   - Historical `~/.codex/` directory exists with `config.toml` (`project_doc_max_bytes = 65536`), `AGENTS.md -> /Users/bharath/.claude/CLAUDE.md`, `skills/`, and SQLite state files (`state_5.sqlite`, `logs_2.sqlite`, `goals_1.sqlite`, `memories_1.sqlite`, `queue_1.sqlite`).
 - **What is verified**:
   - No runnable `codex` binary is currently present on this host.
-  - GitPulse's `src-tauri/src/remote/codex_app_server.rs` protocol adapter (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, policy-override refusal) is verified only against Rust unit tests with mock stdio streams.
+  - Waylode's `src-tauri/src/remote/codex_app_server.rs` protocol adapter (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, policy-override refusal) is verified only against Rust unit tests with mock stdio streams.
 - **What remains unverified empirically**:
   - Live `codex --version`, `codex app-server --help`, `codex app-server generate-json-schema`, and whether Codex TUI supports a native `PermissionRequest` hook schema cannot be empirically verified until a live `codex` binary is reinstalled.
 
@@ -112,4 +112,4 @@ All probes below were executed read-only on this macOS arm64 workstation (Go `1.
   - **No `PermissionRequest` hook symbol** was found in `agy 1.5.15`.
 - **Architectural conclusion**:
   - Even with `Antigravity.app 2.34.0` (above `2.32.1`) and `agy 1.5.15`, `agy` still does **not** expose a `PermissionRequest` hook or a per-invocation `--plugin-dir` flag (only `--settings` and persistent `agy plugin install/enable`).
-  - This empirically confirms GitPulse's conservative capability modeling for Antigravity: `ApprovalChannel::NativeOnly` (`ungated: true`, `supports_remote_approval: false`), persistent plugin management via `agy plugin`, and honest `"Queued (next turn)"` steering semantics for idle sessions.
+  - This empirically confirms Waylode's conservative capability modeling for Antigravity: `ApprovalChannel::NativeOnly` (`ungated: true`, `supports_remote_approval: false`), persistent plugin management via `agy plugin`, and honest `"Queued (next turn)"` steering semantics for idle sessions.

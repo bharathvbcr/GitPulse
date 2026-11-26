@@ -2,12 +2,12 @@
 //! (Opus R3, board #15, and board #31).
 //!
 //! All certificate, revocation-list, and signature verification delegates
-//! strictly to the single audited `gitpulse-protocol` crate (zero local
+//! strictly to the single audited `waylode-protocol` crate (zero local
 //! crypto reimplementation).
 //!
 //! # Security Invariant (Opus Board #15 & #31)
 //!
-//! Agents run as the same UID as GitPulse, so an agent-writable `0600` file
+//! Agents run as the same UID as Waylode, so an agent-writable `0600` file
 //! MUST NEVER be trusted as the root of trust for the Account `IdentityKey` or
 //! paired mobile P-256 approval keys.
 //! - Production (`run_relay_mode`) uses [`PlatformTrustAnchor`] backed by the
@@ -16,24 +16,24 @@
 //!   preceded by a non-blocking `<1ms` lock check) or Linux Secret Service.
 //! - If no real platform trust anchor is provisioned or the Keychain is locked,
 //!   [`PlatformTrustAnchor`] fails closed (`TrustAnchorError::Unavailable` /
-//!   `KeychainLocked`) and `gitpulsed --relay` refuses with exit code `4`.
+//!   `KeychainLocked`) and `wayloded --relay` refuses with exit code `4`.
 //! - [`InMemoryTrustAnchor`] is strictly `#[cfg(test)]`-only.
 
 use crate::remote::config::{probe_keychain_status, KeychainStatus};
-pub use gitpulse_protocol::crypto::{
+use std::collections::HashSet;
+use std::time::Duration;
+pub use waylode_protocol::crypto::{
     issue_device_certificate, issue_revocation_list, verify_device_certificate,
     verify_revocation_list, RevocationPolicy,
 };
-pub use gitpulse_protocol::wire::{DeviceCertificate, DeviceKind, SignedRevocationList};
-use gitpulse_protocol::ProtocolError;
-use std::collections::HashSet;
-use std::time::Duration;
+pub use waylode_protocol::wire::{DeviceCertificate, DeviceKind, SignedRevocationList};
+use waylode_protocol::ProtocolError;
 use zeroize::Zeroizing;
 
 /// Default staleness ceiling for the host's cached revocation list (15 minutes).
 pub const DEFAULT_REVOCATION_STALE_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// Keychain service identifier for GitPulse remote-control trust anchors.
+/// Keychain service identifier for Waylode remote-control trust anchors.
 pub const TRUST_ANCHOR_SERVICE: &str = "com.gitpulse.desktop.remote-trust";
 /// Keychain account name storing the 32-byte pinned Account IdentityKey Ed25519 pubkey.
 pub const IDENTITY_PUB_ACCOUNT: &str = "account-identity-ed25519-pub";
@@ -434,7 +434,7 @@ impl TrustAnchorProvider for InMemoryTrustAnchor {
 }
 
 /// Host-side cache for the Account IdentityKey-signed [`SignedRevocationList`]
-/// (Opus R3). Delegates all cryptographic verification to `gitpulse-protocol`.
+/// (Opus R3). Delegates all cryptographic verification to `waylode-protocol`.
 #[derive(Debug, Clone)]
 pub struct RevocationCache {
     identity_pub_ed25519: [u8; 32],
@@ -477,7 +477,7 @@ impl RevocationCache {
     }
 
     /// Ingests a freshly fetched [`SignedRevocationList`] via
-    /// `gitpulse_protocol::crypto::verify_revocation_list`, enforcing strict
+    /// `waylode_protocol::crypto::verify_revocation_list`, enforcing strict
     /// Ed25519 verification, monotonic version progression, and expiry bounds.
     pub fn update(
         &mut self,
@@ -521,7 +521,7 @@ impl RevocationCache {
         self.revoked_ids.contains(device_id)
     }
 
-    /// Produces a mandatory [`RevocationPolicy::Enforced`] for `gitpulse-protocol`
+    /// Produces a mandatory [`RevocationPolicy::Enforced`] for `waylode-protocol`
     /// verifiers. Fails closed with [`ProtocolError::Expired`] whenever the
     /// cache is missing or stale past TTL.
     pub fn enforced_policy(&self, now_secs: i64) -> Result<RevocationPolicy<'_>, ProtocolError> {
@@ -539,7 +539,7 @@ impl RevocationCache {
         })
     }
 
-    /// Verifies a `DeviceCertificate` v2 through `gitpulse_protocol::crypto::verify_device_certificate`
+    /// Verifies a `DeviceCertificate` v2 through `waylode_protocol::crypto::verify_device_certificate`
     /// using our mandatory non-stale [`RevocationPolicy::Enforced`].
     pub fn verify_device_certificate(
         &self,

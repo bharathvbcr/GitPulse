@@ -1,5 +1,5 @@
 //! Live end-to-end integration test exercising the real Go `gitpulse-relay`
-//! binary alongside Rust `gitpulsed`, `gitpulse-protocol`, `HostNoiseManager`,
+//! binary alongside Rust `wayloded`, `waylode-protocol`, `HostNoiseManager`,
 //! `RevocationCache`, `ApprovalBroker`, and `SteeringIngressGate` over real
 //! loopback TCP/HTTP/WebSocket connections.
 //!
@@ -11,30 +11,6 @@ mod common;
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-use gitpulse_lib::alerts::approval_broker::{
-    ApprovalBroker, BrokerError, HookBrokerReply, MockPresenceProvider, RegisterApprovalRequest,
-    ResolveStatus, TrustedApprovalKeyStore, UserPresence,
-};
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::remote::config::{
-    RemoteControlConfig, Tier, EXIT_CODE_FREE_OR_DISABLED, RELAY_LOCK_FILE, REMOTE_CONFIG_FILE,
-};
-use gitpulse_lib::remote::revocations::{
-    issue_device_certificate, issue_revocation_list, DeviceCertificate, DeviceKind,
-    RevocationCache, SignedRevocationList,
-};
-use gitpulse_lib::remote::tunnel::{
-    sign_relay_request, ApprovalChannel, ApprovalDecisionKind, ApprovalTicket, CapabilitySet,
-    ControlPlaneEvent, FrameClass, HostNoiseManager, NoiseHandshake, OuterFrame, SessionSnapshot,
-    SteeringIngressGate, SteeringIngressVerdict, GPTF_VERSION, WS_CLOSE_REVOKED_OR_DOWNGRADED,
-};
-use gitpulse_protocol::canonical::steering_text_sha256_hex;
-use gitpulse_protocol::crypto::{
-    ed25519_public_from_secret, sign_approval_decision_software, sign_steering_confirm_software,
-    x25519_public_from_secret,
-};
-use gitpulse_protocol::wire::SteeringConfirmReq;
-use gitpulse_protocol::ProtocolError;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -48,6 +24,30 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
+use waylode_lib::alerts::approval_broker::{
+    ApprovalBroker, BrokerError, HookBrokerReply, MockPresenceProvider, RegisterApprovalRequest,
+    ResolveStatus, TrustedApprovalKeyStore, UserPresence,
+};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::remote::config::{
+    RemoteControlConfig, Tier, EXIT_CODE_FREE_OR_DISABLED, RELAY_LOCK_FILE, REMOTE_CONFIG_FILE,
+};
+use waylode_lib::remote::revocations::{
+    issue_device_certificate, issue_revocation_list, DeviceCertificate, DeviceKind,
+    RevocationCache, SignedRevocationList,
+};
+use waylode_lib::remote::tunnel::{
+    sign_relay_request, ApprovalChannel, ApprovalDecisionKind, ApprovalTicket, CapabilitySet,
+    ControlPlaneEvent, FrameClass, HostNoiseManager, NoiseHandshake, OuterFrame, SessionSnapshot,
+    SteeringIngressGate, SteeringIngressVerdict, GPTF_VERSION, WS_CLOSE_REVOKED_OR_DOWNGRADED,
+};
+use waylode_protocol::canonical::steering_text_sha256_hex;
+use waylode_protocol::crypto::{
+    ed25519_public_from_secret, sign_approval_decision_software, sign_steering_confirm_software,
+    x25519_public_from_secret,
+};
+use waylode_protocol::wire::SteeringConfirmReq;
+use waylode_protocol::ProtocolError;
 
 const DEFAULT_RELAY_DIR: &str = "/Users/bharath/Code/devtools/gitpulse-relay.remote-control";
 
@@ -550,7 +550,7 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
     let clock = MonotonicClock::new();
 
     // -----------------------------------------------------------------------
-    // (a) Free tier enforcement: `gitpulsed --relay` exits 4 AND live relay
+    // (a) Free tier enforcement: `wayloded --relay` exits 4 AND live relay
     //     rejects `/v1/tunnel/ws` with 403 `feature_required`.
     // -----------------------------------------------------------------------
     let free_cfg = RemoteControlConfig {
@@ -563,26 +563,23 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
         serde_json::to_vec_pretty(&free_cfg).expect("serialize free remote-control.json"),
     )
     .expect("write free remote-control.json");
-    let gitpulsed_out = Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
+    let wayloded_out = Command::new(env!("CARGO_BIN_EXE_wayloded"))
         .args(["--relay", "--once", "--config-dir"])
         .arg(&free_cfg_dir)
         // The binary logs to GITPULSE_LOG_DIR; never the user's real log.
         .env("GITPULSE_LOG_DIR", free_cfg_dir.join("logs"))
         .output_locked()
-        .expect("run real gitpulsed --relay binary");
+        .expect("run real wayloded --relay binary");
     assert_eq!(
-        gitpulsed_out.status.code(),
+        wayloded_out.status.code(),
         Some(EXIT_CODE_FREE_OR_DISABLED),
-        "expected gitpulsed --relay on free tier to exit 4, got {:?}\nstderr: {}",
-        gitpulsed_out.status.code(),
-        String::from_utf8_lossy(&gitpulsed_out.stderr)
+        "expected wayloded --relay on free tier to exit 4, got {:?}\nstderr: {}",
+        wayloded_out.status.code(),
+        String::from_utf8_lossy(&wayloded_out.stderr)
     );
     assert!(
-        !free_cfg_dir
-            .join("gitpulsed")
-            .join(RELAY_LOCK_FILE)
-            .exists(),
-        "free-tier refusal must exit 4 before acquiring gitpulsed-relay.lock"
+        !free_cfg_dir.join("wayloded").join(RELAY_LOCK_FILE).exists(),
+        "free-tier refusal must exit 4 before acquiring wayloded-relay.lock"
     );
 
     let auth_body = serde_json::to_vec(&json!({ "github_token": github_token })).unwrap();
@@ -916,7 +913,7 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
 
     // -----------------------------------------------------------------------
     // (c) Open live WS tunnels for host (`role=host`) and mobile (`role=client`)
-    //     using Ed25519 request-signing headers from `gitpulse_protocol`.
+    //     using Ed25519 request-signing headers from `waylode_protocol`.
     // -----------------------------------------------------------------------
     let mut host_ws = connect_signed_ws(
         &relay.addr,
@@ -1232,7 +1229,7 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
 
     // Decrypt on mobile side and validate inner payloads.
     let decrypt_mobile =
-        |session: &mut gitpulse_protocol::crypto::TunnelSession, raw: &str| -> ControlPlaneEvent {
+        |session: &mut waylode_protocol::crypto::TunnelSession, raw: &str| -> ControlPlaneEvent {
             let outer: OuterFrame = serde_json::from_str(raw).expect("parse OuterFrame");
             let wire_ct = base64::engine::general_purpose::STANDARD
                 .decode(&outer.ciphertext_b64)
@@ -1298,7 +1295,7 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
     )
     .expect("sign P-256 steering confirm");
 
-    let send_encrypted_from_mobile = |session: &mut gitpulse_protocol::crypto::TunnelSession,
+    let send_encrypted_from_mobile = |session: &mut waylode_protocol::crypto::TunnelSession,
                                       class: FrameClass,
                                       ttl_sec: u32,
                                       evt: &ControlPlaneEvent|

@@ -1989,25 +1989,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitpulse-protocol"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "chacha20poly1305 0.11.0",
- "ed25519-dalek",
- "getrandom 0.4.3",
- "hkdf",
- "p256",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "snow",
- "thiserror 2.0.20",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "gix"
 version = "0.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6940,7 +6921,6 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.4.3",
- "gitpulse-protocol",
  "gix",
  "gtk",
  "http",
@@ -6975,7 +6955,27 @@ dependencies = [
  "tree-sitter-javascript",
  "url",
  "vt100",
+ "waylode-protocol",
  "wry",
+ "zeroize",
+]
+
+[[package]]
+name = "waylode-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "chacha20poly1305 0.11.0",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hkdf",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "snow",
+ "thiserror 2.0.20",
+ "x25519-dalek",
  "zeroize",
 ]
 

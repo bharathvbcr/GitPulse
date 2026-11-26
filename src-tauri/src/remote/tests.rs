@@ -1,6 +1,6 @@
 //! Comprehensive unit & integration tests for `crate::remote::*`,
 //! delegating all protocol crypto, Noise IK, sliding replay window, cert,
-//! revocation, approval, and steering verification to `gitpulse-protocol`.
+//! revocation, approval, and steering verification to `waylode-protocol`.
 
 use super::codex_app_server::{
     refuse_remote_policy_change, reject_remote_policy_overrides, CodexAppServerClient,
@@ -42,13 +42,6 @@ use crate::procguard::LockedSpawn;
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
-use gitpulse_protocol::canonical::{hex_decode, steering_text_sha256_hex};
-use gitpulse_protocol::crypto::{
-    ed25519_public_from_secret, sign_approval_decision_software, sign_steering_confirm_software,
-    verify_relay_request, x25519_public_from_secret, RevocationPolicy,
-};
-use gitpulse_protocol::wire::MAX_CERT_TTL_SECS;
-use gitpulse_protocol::ProtocolError;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,6 +50,13 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
+use waylode_protocol::canonical::{hex_decode, steering_text_sha256_hex};
+use waylode_protocol::crypto::{
+    ed25519_public_from_secret, sign_approval_decision_software, sign_steering_confirm_software,
+    verify_relay_request, x25519_public_from_secret, RevocationPolicy,
+};
+use waylode_protocol::wire::MAX_CERT_TTL_SECS;
+use waylode_protocol::ProtocolError;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -184,7 +184,7 @@ fn run_relay_mode_refuses_with_exit_4_and_trust_anchor_unavailable_without_platf
         "must fail closed with exit 4 when OS trust anchor is absent"
     );
     assert!(
-        !dir.path().join("gitpulsed/gitpulsed-relay.lock").exists(),
+        !dir.path().join("wayloded/wayloded-relay.lock").exists(),
         "must not acquire lock when trust anchor is unavailable"
     );
 
@@ -389,7 +389,7 @@ fn revocation_cache_fails_closed_when_missing_stale_or_rolled_back() {
 
     assert!(cache.should_bypass_remote_holds(now + 601));
 
-    // > 30 day DeviceCertificate ceiling is rejected by `gitpulse-protocol`.
+    // > 30 day DeviceCertificate ceiling is rejected by `waylode-protocol`.
     let mob_ed_pub = ed25519_public_from_secret(&[0x21u8; 32]);
     let mob_x_pub = x25519_public_from_secret(&[0x22u8; 32]);
     assert_eq!(
@@ -427,7 +427,7 @@ fn handshake_mobile_and_host(
     mob_x_secret: &[u8; 32],
     mob_cert: &DeviceCertificate,
     rev_cache: &RevocationCache,
-) -> gitpulse_protocol::crypto::TunnelSession {
+) -> waylode_protocol::crypto::TunnelSession {
     let host_x_pub = x25519_public_from_secret(host_x_secret);
     let stream_id = host_mgr.stream_id();
     let mut init_hs = NoiseHandshake::new_initiator_pinned(
@@ -446,7 +446,7 @@ fn handshake_mobile_and_host(
 }
 
 fn mobile_seal_outer(
-    mob_session: &mut gitpulse_protocol::crypto::TunnelSession,
+    mob_session: &mut waylode_protocol::crypto::TunnelSession,
     stream_id: &str,
     class: FrameClass,
     event: &ControlPlaneEvent,
@@ -510,7 +510,7 @@ fn noise_ik_roundtrip_sliding_window_replay_rejection_and_backoff_bounds() {
     // Genuine seq=2 arrives first -> ok; out-of-order seq=1 inside 1024-frame window -> ok once!
     assert_eq!(host_mgr.open_from_mobile(&f2, &rev_cache).unwrap(), ev2);
     assert_eq!(host_mgr.open_from_mobile(&f1, &rev_cache).unwrap(), ev1);
-    // Replay of seq=1 is rejected by `gitpulse-protocol`'s sliding window!
+    // Replay of seq=1 is rejected by `waylode-protocol`'s sliding window!
     assert!(matches!(
         host_mgr.open_from_mobile(&f1, &rev_cache),
         Err(ProtocolError::ReplayDetected { .. })
@@ -606,13 +606,13 @@ async fn tunnel_emits_inbox_snapshot_on_connect_and_releases_state_on_4003() {
         .await
         .unwrap();
 
-        // Verify Ed25519 WS upgrade headers via `gitpulse_protocol::crypto::verify_relay_request`!
+        // Verify Ed25519 WS upgrade headers via `waylode_protocol::crypto::verify_relay_request`!
         let (uri, dev, ts, sig_b64) = captured.lock().unwrap().clone();
         assert_eq!(dev, "host-mac-1");
         assert_eq!(uri, "/v1/tunnel/ws?role=host&after_epoch=7&after_seq=0");
         let ts_ms: i64 = ts.parse().unwrap();
         verify_relay_request(&host_ed_pub, "GET", &uri, ts_ms, &[], &sig_b64)
-            .expect("WS upgrade signature must verify via gitpulse-protocol");
+            .expect("WS upgrade signature must verify via waylode-protocol");
 
         let (mut sink, mut src) = ws.split();
 
@@ -851,7 +851,7 @@ fn ptyd_takeover_retries_through_post_fin_drain_race_and_succeeds() {
                                         id,
                                         ok: None,
                                         error: Some(
-                                            "Another GitPulse window is connected to this terminal host."
+                                            "Another Waylode window is connected to this terminal host."
                                                 .into(),
                                         ),
                                     },
@@ -1432,13 +1432,13 @@ fn steering_ingress_gate_requires_p256_signature_and_mandatory_revocations_befor
 }
 
 /// Consumes the actual cross-language KAT vector files committed in
-/// `crates/gitpulse-protocol/tests/vectors/*.json` directly through our
-/// `RevocationCache`, `SteeringIngressGate`, and `gitpulse-protocol` wrappers!
+/// `crates/waylode-protocol/tests/vectors/*.json` directly through our
+/// `RevocationCache`, `SteeringIngressGate`, and `waylode-protocol` wrappers!
 #[test]
-fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
+fn host_remote_wrappers_pass_all_waylode_protocol_kat_vector_files() {
     // 1. revocation_list_v1.json
     let rev_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../crates/gitpulse-protocol/tests/vectors/revocation_list_v1.json"
+        "../../crates/waylode-protocol/tests/vectors/revocation_list_v1.json"
     ))
     .unwrap();
     let id_pub: [u8; 32] = hex_decode(rev_vec["identity_pub_hex"].as_str().unwrap()).unwrap();
@@ -1453,7 +1453,7 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
 
     // 2. relay_request_signing_v1.json
     let req_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../crates/gitpulse-protocol/tests/vectors/relay_request_signing_v1.json"
+        "../../crates/waylode-protocol/tests/vectors/relay_request_signing_v1.json"
     ))
     .unwrap();
     let dev_seed: [u8; 32] = hex_decode(req_vec["ed25519_seed_hex"].as_str().unwrap()).unwrap();
@@ -1473,7 +1473,7 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
 
     // 3. steering_confirm_v1.json -> verified through SteeringIngressGate!
     let steer_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../crates/gitpulse-protocol/tests/vectors/steering_confirm_v1.json"
+        "../../crates/waylode-protocol/tests/vectors/steering_confirm_v1.json"
     ))
     .unwrap();
     let signed: SignedSteeringConfirm =
@@ -1519,9 +1519,9 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
         }
     );
 
-    // 4. approval_canonical_v1.json -> verified via gitpulse_protocol::crypto::verify_approval_decision!
+    // 4. approval_canonical_v1.json -> verified via waylode_protocol::crypto::verify_approval_decision!
     let appr_vec: serde_json::Value = serde_json::from_str(include_str!(
-        "../../crates/gitpulse-protocol/tests/vectors/approval_canonical_v1.json"
+        "../../crates/waylode-protocol/tests/vectors/approval_canonical_v1.json"
     ))
     .unwrap();
     let decision = SignedApprovalDecision {
@@ -1537,7 +1537,7 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
     };
     let rev_policy = cache.enforced_policy(valid_at).unwrap();
     assert!(matches!(rev_policy, RevocationPolicy::Enforced { .. }));
-    let verified_kind = gitpulse_protocol::crypto::verify_approval_decision(
+    let verified_kind = waylode_protocol::crypto::verify_approval_decision(
         &decision,
         &mob_cert,
         &id_pub,
@@ -1547,6 +1547,18 @@ fn host_remote_wrappers_pass_all_gitpulse_protocol_kat_vector_files() {
         rev_policy,
         valid_at,
     )
-    .expect("KAT approval vector must verify through gitpulse-protocol");
+    .expect("KAT approval vector must verify through waylode-protocol");
     assert_eq!(verified_kind, ApprovalDecisionKind::AllowOnce);
+}
+
+#[test]
+fn drain_race_matches_both_the_current_and_the_pre_rename_ptyd_refusal() {
+    use super::ptyd_handoff::is_drain_race_error;
+    assert!(is_drain_race_error(
+        "Another Waylode window is connected to this terminal host."
+    ));
+    assert!(is_drain_race_error(
+        "Another GitPulse window is connected to this terminal host."
+    ));
+    assert!(!is_drain_race_error("protocol version mismatch"));
 }

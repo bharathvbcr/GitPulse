@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import type { NativeApprovalSheetOutcome } from "@gitpulse/crypto";
+import type { NativeApprovalSheetOutcome } from "@waylode/crypto";
 import { useControlPlane } from "@/state/ControlPlaneContext";
 import { colors, radii, spacing } from "@/theme/tokens";
 
@@ -10,7 +10,7 @@ import { colors, radii, spacing } from "@/theme/tokens";
  *
  * Security invariants:
  * - Displays tool summary, repo/worktree context, and `input_sha256` prefix.
- * - Launches the native/Rust `GitPulseApprovalSheet` which renders the FULL canonical bytes
+ * - Launches the native/Rust `WaylodeApprovalSheet` which renders the FULL canonical bytes
  *   directly in native UIKit/Android View, recomputes `input_sha256` in Rust, prompts biometrics,
  *   and signs strictly `allow_once | deny | deny_and_interrupt` with Secure Enclave / StrongBox P-256.
  * - NEVER allows `updatedInput` or `updatedPermissions`.

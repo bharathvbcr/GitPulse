@@ -8,9 +8,9 @@ import type { ExpoConfig } from "expo/config";
  * NEVER register an Approve action on lock screen or notification categories.
  * Tapping the notification opens the app to the native full-bytes approval sheet.
  */
-export const APPROVAL_NOTIFICATION_CATEGORY_ID = "GITPULSE_APPROVAL";
-export const ACTION_DENY_ID = "GITPULSE_ACTION_DENY";
-export const ACTION_DENY_AND_INTERRUPT_ID = "GITPULSE_ACTION_DENY_AND_INTERRUPT";
+export const APPROVAL_NOTIFICATION_CATEGORY_ID = "WAYLODE_APPROVAL";
+export const ACTION_DENY_ID = "WAYLODE_ACTION_DENY";
+export const ACTION_DENY_AND_INTERRUPT_ID = "WAYLODE_ACTION_DENY_AND_INTERRUPT";
 export const MAX_PREVIEW_CT_BYTES = 2048;
 
 export interface NotificationActionSpec {
@@ -106,14 +106,14 @@ export function describePushExtensionsPlan(
 ): ConfigPluginManifestResult {
   assertNoLockScreenApproveActions(NOTIFICATION_CATEGORIES);
   return {
-    iosExtensionName: "GitPulseNotificationService",
+    iosExtensionName: "WaylodeNotificationService",
     iosBundleIdentifier:
       options.nseBundleIdentifier ?? "com.gitpulse.mobile.NotificationService",
     iosAppGroup: options.appGroup ?? "group.com.gitpulse.mobile",
     iosUsesHermes: false,
     iosMemoryBudgetMb: 24,
-    androidMessagingServiceClass: "com.gitpulse.mobile.push.GitPulseMessagingService",
-    androidActionReceiverClass: "com.gitpulse.mobile.push.GitPulseNotificationActionReceiver",
+    androidMessagingServiceClass: "com.gitpulse.mobile.push.WaylodeMessagingService",
+    androidActionReceiverClass: "com.gitpulse.mobile.push.WaylodeNotificationActionReceiver",
     androidBudgetSeconds: 10,
     androidAlwaysPostsVisibleNotification: true,
     notificationCategories: NOTIFICATION_CATEGORIES,
@@ -122,11 +122,11 @@ export function describePushExtensionsPlan(
 
 /**
  * Expo Config Plugin wiring:
- * 1. iOS Notification Service Extension (Swift -> Rust GitPulseProtocol.xcframework, NEVER Hermes).
- * 2. Android FirebaseMessagingService (Kotlin -> libgitpulse_protocol.so, 10s budget, always visible).
+ * 1. iOS Notification Service Extension (Swift -> Rust WaylodeProtocol.xcframework, NEVER Hermes).
+ * 2. Android FirebaseMessagingService (Kotlin -> libwaylode_protocol.so, 10s budget, always visible).
  * 3. Lock-screen Deny / Deny & Stop ONLY categories (Opus M1).
  */
-export function withGitPulsePushExtensions<T extends ExpoConfig>(
+export function withWaylodePushExtensions<T extends ExpoConfig>(
   config: T,
   options: WithNsePluginOptions = {},
 ): T {
@@ -166,7 +166,7 @@ export function withGitPulsePushExtensions<T extends ExpoConfig>(
     };
 
     if (configPlugins.withDangerousMod) {
-      // Copy Swift NSE sources + entitlements + Info.plist into ios/GitPulseNotificationService/
+      // Copy Swift NSE sources + entitlements + Info.plist into ios/WaylodeNotificationService/
       nextConfig = configPlugins.withDangerousMod(nextConfig, [
         "ios",
         async (modConfig) => {
@@ -179,7 +179,7 @@ export function withGitPulsePushExtensions<T extends ExpoConfig>(
           for (const filename of [
             "NotificationService.swift",
             "Info.plist",
-            "GitPulseNotificationService.entitlements",
+            "WaylodeNotificationService.entitlements",
           ]) {
             const src = path.join(templateDir, filename);
             if (fs.existsSync(src)) {
@@ -208,8 +208,8 @@ export function withGitPulsePushExtensions<T extends ExpoConfig>(
           );
           fs.mkdirSync(targetDir, { recursive: true });
           for (const filename of [
-            "GitPulseMessagingService.kt",
-            "GitPulseNotificationActionReceiver.kt",
+            "WaylodeMessagingService.kt",
+            "WaylodeNotificationActionReceiver.kt",
           ]) {
             const src = path.join(templateDir, filename);
             if (fs.existsSync(src)) {
@@ -229,12 +229,12 @@ export function withGitPulsePushExtensions<T extends ExpoConfig>(
           const hasService = services.some(
             (s) =>
               (s.$ as Record<string, string> | undefined)?.["android:name"] ===
-              ".push.GitPulseMessagingService",
+              ".push.WaylodeMessagingService",
           );
           if (!hasService) {
             services.push({
               $: {
-                "android:name": ".push.GitPulseMessagingService",
+                "android:name": ".push.WaylodeMessagingService",
                 "android:exported": "false",
               },
               "intent-filter": [
@@ -250,12 +250,12 @@ export function withGitPulsePushExtensions<T extends ExpoConfig>(
           const hasReceiver = receivers.some(
             (r) =>
               (r.$ as Record<string, string> | undefined)?.["android:name"] ===
-              ".push.GitPulseNotificationActionReceiver",
+              ".push.WaylodeNotificationActionReceiver",
           );
           if (!hasReceiver) {
             receivers.push({
               $: {
-                "android:name": ".push.GitPulseNotificationActionReceiver",
+                "android:name": ".push.WaylodeNotificationActionReceiver",
                 "android:exported": "false",
               },
             });
@@ -272,4 +272,4 @@ export function withGitPulsePushExtensions<T extends ExpoConfig>(
   return nextConfig as T;
 }
 
-export default withGitPulsePushExtensions;
+export default withWaylodePushExtensions;

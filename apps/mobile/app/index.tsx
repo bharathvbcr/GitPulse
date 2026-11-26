@@ -163,7 +163,7 @@ export default function UnifiedInboxScreen() {
           <View style={styles.emptyCard}>
             <Text style={styles.emptyTitle}>No sessions match "{filter}"</Text>
             <Text style={styles.emptySub}>
-              Pair a desktop running `gitpulsed --relay` (Geek / Squad / Enterprise) to view
+              Pair a desktop running `wayloded --relay` (Geek / Squad / Enterprise) to view
               live Claude, Antigravity, Codex, and Manvi sessions.
             </Text>
           </View>

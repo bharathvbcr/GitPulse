@@ -11,8 +11,8 @@ ios/
 android/
 
 # Local native Rust FFI build artifacts
-modules/gitpulse-crypto/ios/Frameworks/
-modules/gitpulse-crypto/android/src/main/jniLibs/
+modules/waylode-crypto/ios/Frameworks/
+modules/waylode-crypto/android/src/main/jniLibs/
 
 # Logs, caches & OS files
 *.log

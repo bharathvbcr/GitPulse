@@ -17,7 +17,7 @@ export default function RootLayout() {
             contentStyle: { backgroundColor: colors.bg },
           }}
         >
-          <Stack.Screen name="index" options={{ title: "GitPulse Control Plane" }} />
+          <Stack.Screen name="index" options={{ title: "Waylode Control Plane" }} />
           <Stack.Screen
             name="approvals/[ticketId]"
             options={{ title: "Approval Request", presentation: "modal" }}

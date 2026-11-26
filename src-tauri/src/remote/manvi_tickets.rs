@@ -1,7 +1,7 @@
 //! Manvi policy approval ticket transport (Opus §4 & R9).
 //!
-//! **Manvi remains the policy authority.** GitPulse transports Manvi policy
-//! approval requests to mobile and turns `gitpulse-protocol`-verified mobile
+//! **Manvi remains the policy authority.** Waylode transports Manvi policy
+//! approval requests to mobile and turns `waylode-protocol`-verified mobile
 //! decisions into **single-use, hash-bound, TTL'd grants**:
 //! - **Never cached from mobile:** any decision requesting a reusable/cached
 //!   grant is refused loudly (`once: true` always).
@@ -9,25 +9,25 @@
 //!   `action_sha256(repo_root, task_id, rule, target)` and fails closed if
 //!   redeemed against any different target or rule.
 //! - **Hard denies are non-overridable:** rule severities are loaded from
-//!   GitPulse's shared `contracts/verdict.schema.json` (same contract as
+//!   Waylode's shared `contracts/verdict.schema.json` (same contract as
 //!   `src-tauri/src/grants/mod.rs`). Any `"hard"` rule OR unknown rule is
 //!   strictly refused.
 //! - **Enterprise `remote_approval` policy honored:** `Deny` blocks all remote
 //!   Manvi approvals; `StepUp` requires fresh hardware P-256 step-up auth;
 //!   `Allow` still requires a valid hardware P-256 signature verified through
-//!   `gitpulse_protocol::crypto::verify_approval_decision` (Opus R2 & #31).
+//!   `waylode_protocol::crypto::verify_approval_decision` (Opus R2 & #31).
 //! - **Audit export:** every ticket, decision, grant, redemption, and refusal
 //!   is recorded for Enterprise `audit_export`.
 
 use crate::remote::config::RemoteApprovalPolicy;
 use crate::remote::pty_gate::sha256_hex;
 use crate::remote::revocations::RevocationCache;
-use gitpulse_protocol::canonical::hex_encode;
-use gitpulse_protocol::crypto::verify_approval_decision;
-use gitpulse_protocol::wire::{ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use waylode_protocol::canonical::hex_encode;
+use waylode_protocol::crypto::verify_approval_decision;
+use waylode_protocol::wire::{ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision};
 
 /// Maximum TTL for a remotely issued Manvi single-use grant (5 minutes).
 pub const MAX_MANVI_GRANT_TTL_SECS: i64 = 5 * 60;
@@ -91,7 +91,7 @@ pub struct ManviPolicyTicket {
     pub expires_at: i64,
 }
 
-/// Mobile decision for a Manvi policy ticket wrapping `gitpulse-protocol`'s
+/// Mobile decision for a Manvi policy ticket wrapping `waylode-protocol`'s
 /// hardware P-256 [`SignedApprovalDecision`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManviMobileDecision {
@@ -189,7 +189,7 @@ impl std::fmt::Display for ManviTicketError {
                 write!(f, "Manvi decision nonce already used")
             }
             ManviTicketError::ProtocolVerificationFailed(m) => {
-                write!(f, "gitpulse-protocol verification failed: {m}")
+                write!(f, "waylode-protocol verification failed: {m}")
             }
             ManviTicketError::GrantNotFound(id) => write!(f, "Manvi grant '{id}' not found"),
             ManviTicketError::GrantAlreadyConsumed(id) => {
@@ -337,7 +337,7 @@ impl ManviTicketBridge {
         Ok(ticket)
     }
 
-    /// Resolves an open Manvi ticket via `gitpulse_protocol::crypto::verify_approval_decision`,
+    /// Resolves an open Manvi ticket via `waylode_protocol::crypto::verify_approval_decision`,
     /// minting a single-use, hash-bound, TTL'd grant on `AllowOnce`.
     pub fn apply_mobile_decision(
         &self,
@@ -397,7 +397,7 @@ impl ManviTicketBridge {
         };
 
         // Delegate 100% of cert + mandatory RevocationPolicy::Enforced + P-256
-        // DER signature verification to `gitpulse-protocol`!
+        // DER signature verification to `waylode-protocol`!
         let rev_policy = revocations
             .enforced_policy(now_secs)
             .map_err(|e| ManviTicketError::ProtocolVerificationFailed(e.to_string()))?;

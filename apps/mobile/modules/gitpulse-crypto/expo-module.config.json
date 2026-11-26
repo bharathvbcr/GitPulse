@@ -1,9 +1,0 @@
-{
-  "platforms": ["ios", "android"],
-  "ios": {
-    "modules": ["GitPulseCryptoModule"]
-  },
-  "android": {
-    "modules": ["com.gitpulse.crypto.GitPulseCryptoModule"]
-  }
-}

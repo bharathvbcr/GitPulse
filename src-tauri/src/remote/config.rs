@@ -1,11 +1,11 @@
 //! Configuration, tier gating, Enterprise BYOC policy bundles, single-owner
-//! relay lock (`gitpulsed-relay.lock`), Data Protection Keychain probe, and
-//! dynamic trusted-workspace discovery for `gitpulsed --relay`.
+//! relay lock (`wayloded-relay.lock`), Data Protection Keychain probe, and
+//! dynamic trusted-workspace discovery for `wayloded --relay`.
 //!
 //! # Hard Free/Local Invariant
 //!
 //! On the `free` tier, or whenever `remote_control_enabled` is `false`,
-//! `gitpulsed --relay` MUST refuse and exit with [`EXIT_CODE_FREE_OR_DISABLED`]
+//! `wayloded --relay` MUST refuse and exit with [`EXIT_CODE_FREE_OR_DISABLED`]
 //! (`4`) **before** opening any Unix socket or network connection.
 
 use crate::daemon_lock::{self, Acquire, Owner};
@@ -17,22 +17,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Exit code emitted by `gitpulsed --relay` when tier is `free` or remote
+/// Exit code emitted by `wayloded --relay` when tier is `free` or remote
 /// control opt-in is disabled. Guaranteed before opening any socket/network.
 pub const EXIT_CODE_FREE_OR_DISABLED: i32 = 4;
 
-/// Dedicated single-owner lock for `gitpulsed --relay`, distinct from
-/// `gitpulsed.lock` so attribution catch-up and relay hosting never collide.
-pub const RELAY_LOCK_FILE: &str = "gitpulsed-relay.lock";
+/// Dedicated single-owner lock for `wayloded --relay`, distinct from
+/// `wayloded.lock` so attribution catch-up and relay hosting never collide.
+pub const RELAY_LOCK_FILE: &str = "wayloded-relay.lock";
 
 /// Default cloud relay WebSocket URL for `pro` and `team` tiers.
 pub const DEFAULT_CLOUD_RELAY_URL: &str = "wss://relay.gitpulse.dev";
 
 /// Default macOS Data Protection Keychain Access Group shared between
-/// GitPulse Desktop and `gitpulsed --relay` in notarized builds.
+/// Waylode Desktop and `wayloded --relay` in notarized builds.
 pub const DEFAULT_KEYCHAIN_ACCESS_GROUP: &str = "com.gitpulse.desktop.shared";
 
-/// Persisted config file name inside the GitPulse config directory.
+/// Persisted config file name inside the Waylode config directory.
 pub const REMOTE_CONFIG_FILE: &str = "remote-control.json";
 
 /// Persisted state file observed by hooks/Desktop so active holds release to
@@ -202,7 +202,7 @@ impl OrgPolicyBundle {
     }
 }
 
-/// Persisted remote-control configuration loaded by `gitpulsed --relay`.
+/// Persisted remote-control configuration loaded by `wayloded --relay`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteControlConfig {
     #[serde(default)]
@@ -219,7 +219,7 @@ pub struct RemoteControlConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_policy_bundle: Option<OrgPolicyBundle>,
     /// Optional workspace roots whose `.devmap/workspace.json` files are read
-    /// dynamically by `gitpulsed --relay`.
+    /// dynamically by `wayloded --relay`.
     #[serde(default)]
     pub workspace_roots: Vec<PathBuf>,
     /// Loopback `ws://` override strictly for local/unit tests; never enabled
@@ -249,7 +249,7 @@ impl Default for RemoteControlConfig {
 
 impl RemoteControlConfig {
     /// Loads `remote-control.json` from `config_dir`. When absent, returns the
-    /// safe Free/disabled default so `gitpulsed --relay` refuses with exit 4.
+    /// safe Free/disabled default so `wayloded --relay` refuses with exit 4.
     pub fn load_from_dir(config_dir: &Path) -> Result<Self, String> {
         let path = config_dir.join(REMOTE_CONFIG_FILE);
         match std::fs::read_to_string(&path) {
@@ -274,7 +274,7 @@ pub struct EffectiveRelayConfig {
     pub workspace_roots: Vec<PathBuf>,
 }
 
-/// Why `gitpulsed --relay` refused to start.
+/// Why `wayloded --relay` refused to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayGateError {
     /// Hard Free/Local invariant: exit code `4`, zero sockets/network opened.
@@ -306,7 +306,7 @@ impl std::fmt::Display for RelayGateError {
 
 impl std::error::Error for RelayGateError {}
 
-/// Validates whether `gitpulsed --relay` is permitted to start.
+/// Validates whether `wayloded --relay` is permitted to start.
 ///
 /// Must be called **before** acquiring locks, binding sockets, or opening any
 /// network connection. Returns `Err(RelayGateError::FreeOrDisabled(_))`
@@ -424,12 +424,12 @@ fn validate_relay_url(raw: &str, allow_insecure_loopback: bool) -> Result<(), Re
     }
 }
 
-/// Acquires the dedicated `gitpulsed-relay.lock` single-owner lock.
+/// Acquires the dedicated `wayloded-relay.lock` single-owner lock.
 pub fn acquire_relay_lock(dir: &Path, version: &str) -> Acquire {
     daemon_lock::acquire_named(dir, RELAY_LOCK_FILE, version)
 }
 
-/// Probes whether another `gitpulsed --relay` holds `gitpulsed-relay.lock`.
+/// Probes whether another `wayloded --relay` holds `wayloded-relay.lock`.
 pub fn relay_running(dir: &Path) -> Result<Option<Owner>, String> {
     daemon_lock::running_named(dir, RELAY_LOCK_FILE)
 }
@@ -451,7 +451,7 @@ pub struct WorkspaceDiscovery {
 }
 
 /// Reads registered workspaces dynamically via `workspace_registry::list` and
-/// filters them through `repository_trust::require` so `gitpulsed --relay`
+/// filters them through `repository_trust::require` so `wayloded --relay`
 /// never touches untrusted repositories and needs no `<REPO>...` CLI arguments.
 pub fn discover_trusted_repositories(workspace_roots: &[PathBuf]) -> WorkspaceDiscovery {
     let mut discovery = WorkspaceDiscovery::default();
@@ -489,7 +489,7 @@ pub fn discover_trusted_repositories(workspace_roots: &[PathBuf]) -> WorkspaceDi
 
 /// Status of the host Keychain / Data Protection Access Group.
 ///
-/// Reported explicitly so `gitpulsed --relay` never hangs waiting on a locked
+/// Reported explicitly so `wayloded --relay` never hangs waiting on a locked
 /// macOS login Keychain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]

@@ -1,6 +1,6 @@
 /**
  * Pure TypeScript flat-span diff helpers for virtualized FlashList `<Text>` rendering.
- * Consumes `@gitpulse/core/diff` (`computeWordDiff` and segment types) directly so mobile
+ * Consumes `@waylode/core/diff` (`computeWordDiff` and segment types) directly so mobile
  * and desktop share one intra-line diff engine while rendering 120fps native diffs without WebViews.
  */
 
@@ -9,7 +9,7 @@ import {
   type DiffChunkKind,
   type DiffSegment,
   type IntraLineDiff,
-} from "@gitpulse/core/diff";
+} from "@waylode/core/diff";
 
 export { computeWordDiff, type DiffChunkKind, type DiffSegment, type IntraLineDiff };
 

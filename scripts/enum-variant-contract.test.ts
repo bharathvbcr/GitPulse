@@ -85,19 +85,19 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   [
     "CodexApprovalPolicy",
-    "the host-configured policy `gitpulsed` hands to `codex app-server` over JSON-RPC stdio; no IPC command carries it",
+    "the host-configured policy `wayloded` hands to `codex app-server` over JSON-RPC stdio; no IPC command carries it",
   ],
   [
     "CodexSandboxMode",
-    "the host-configured sandbox `gitpulsed` hands to `codex app-server` over JSON-RPC stdio; no IPC command carries it",
+    "the host-configured sandbox `wayloded` hands to `codex app-server` over JSON-RPC stdio; no IPC command carries it",
   ],
   [
     "RemoteApprovalPolicy",
-    "read from `remote-control.json` by `gitpulsed` and the approval path; no IPC command carries it and the frontend never branches on it",
+    "read from `remote-control.json` by `wayloded` and the approval path; no IPC command carries it and the frontend never branches on it",
   ],
   [
     "KeychainStatus",
-    "internally tagged enum, not a unit enum; reported by the remote-control config code so `gitpulsed --relay` never hangs on a locked Keychain; no IPC command carries it and the frontend never reads it",
+    "internally tagged enum, not a unit enum; reported by the remote-control config code so `wayloded --relay` never hangs on a locked Keychain; no IPC command carries it and the frontend never reads it",
   ],
   [
     "PtyGateDenial",
@@ -105,11 +105,11 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   [
     "RelayWireMessage",
-    "untagged enum, not a unit enum; the relay tunnel's wire message, whose parts are mirrored for the mobile app in packages/gitpulse-core/src/protocol/types.ts, not for the desktop frontend",
+    "untagged enum, not a unit enum; the relay tunnel's wire message, whose parts are mirrored for the mobile app in packages/waylode-core/src/protocol/types.ts, not for the desktop frontend",
   ],
   [
     "RemoteApprovalState",
-    "the remote-approval state persisted to the remote-approval.state file that gitpulse-hook and the approval broker read (remote/tunnel.rs); no IPC command carries it and no frontend reads it",
+    "the remote-approval state persisted to the remote-approval.state file that waylode-hook and the approval broker read (remote/tunnel.rs); no IPC command carries it and no frontend reads it",
   ],
   [
     "LandedAtSource",

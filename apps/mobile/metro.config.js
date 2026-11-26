@@ -7,8 +7,8 @@ const monorepoRoot = path.resolve(projectRoot, "../..");
 
 const config = getDefaultConfig(projectRoot);
 
-// Watch shared @gitpulse/core workspace package
-config.watchFolders = [path.resolve(monorepoRoot, "packages/gitpulse-core")];
+// Watch shared @waylode/core workspace package
+config.watchFolders = [path.resolve(monorepoRoot, "packages/waylode-core")];
 
 config.resolver.nodeModulesPaths = [
   path.resolve(projectRoot, "node_modules"),

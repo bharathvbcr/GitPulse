@@ -3,9 +3,9 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@gitpulse/mobile",
+      "name": "@waylode/mobile",
       "dependencies": {
-        "@gitpulse/core": "file:../../packages/gitpulse-core",
+        "@waylode/core": "file:../../packages/waylode-core",
         "@shopify/flash-list": "^2.0.2",
         "expo": "~55.0.0",
         "expo-camera": "~55.0.0",
@@ -330,7 +330,7 @@
 
     "@expo/xcpretty": ["@expo/xcpretty@4.4.7", "", { "dependencies": { "@babel/code-frame": "^7.20.0", "chalk": "^4.1.0", "js-yaml": "^4.1.0" }, "bin": { "excpretty": "build/cli.js" } }, "sha512-EbxYllZ7/ozONVZd425cm4XnolfW+AmSFT5aP7Jdno6oc3WrYQcHz2CO20z/2rwWwYgztmV2PXvYH+BQ8YFjqg=="],
 
-    "@gitpulse/core": ["@gitpulse/core@file:../../packages/gitpulse-core", { "devDependencies": { "typescript": "^5.8.3", "vitest": "^3.2.4" } }],
+    "@waylode/core": ["@waylode/core@file:../../packages/waylode-core", { "devDependencies": { "typescript": "^5.8.3", "vitest": "^3.2.4" } }],
 
     "@isaacs/ttlcache": ["@isaacs/ttlcache@1.4.1", "", {}, "sha512-RQgQ4uQ+pLbqXfOmieB91ejmLwvSgv9nLx6sT6sD83s7umBypgg+OIBOBbEUiJXrfpnp9j0mRhYYdzp9uqq3lA=="],
 

@@ -1,19 +1,19 @@
 //! `pty.input` RCE gate and read-only lossy PTY streaming buffer (Opus P0-7 / R7).
 //!
 //! All P-256 step-up signature, certificate, and mandatory revocation checks
-//! delegate strictly to `gitpulse-protocol` (zero local crypto duplication).
+//! delegate strictly to `waylode-protocol` (zero local crypto duplication).
 //!
 //! # Security Model (Opus P0-7)
 //!
 //! Writing bytes to a live PTY is remote code execution. Therefore:
 //! 1. **Read-only PTY streaming is the default** (`LossyPtyStreamBuffer`, `<= 16 KiB`
-//!    chunk cap, lossy drop-oldest so a slow mobile link never stalls `gitpulse-ptyd`).
+//!    chunk cap, lossy drop-oldest so a slow mobile link never stalls `waylode-ptyd`).
 //! 2. **`pty.input` is gated behind a separate entitlement and is OFF by default.**
 //! 3. Even when entitled, every `pty.input` authorization MUST present:
 //!    - an active, in-memory, Desktop-granted, time-boxed [`PtyInputConsentToken`]
 //!      bound to `(session_id, mobile_device_id)` (never read from an agent-writable file);
 //!    - a fresh mobile hardware **P-256** [`SignedApprovalDecision`] verified via
-//!      `gitpulse_protocol::crypto::verify_approval_decision` against the
+//!      `waylode_protocol::crypto::verify_approval_decision` against the
 //!      Keychain-pinned Account `IdentityKey` and mandatory non-stale [`RevocationCache`];
 //!    - an unspent nonce and valid payload digest (`<= 16 KiB`).
 //! 4. Every attempt (both allowed and denied) is appended to [`PtyAuditEntry`]
@@ -30,17 +30,17 @@
 use crate::remote::config::RemoteApprovalPolicy;
 use crate::remote::revocations::RevocationCache;
 use base64::Engine as _;
-use gitpulse_protocol::canonical::hex_encode;
-use gitpulse_protocol::crypto::verify_approval_decision;
-use gitpulse_protocol::wire::{
-    ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision, MAX_PTY_FRAME_BYTES,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use waylode_protocol::canonical::hex_encode;
+use waylode_protocol::crypto::verify_approval_decision;
+use waylode_protocol::wire::{
+    ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision, MAX_PTY_FRAME_BYTES,
+};
 
-/// Re-exported `<= 16 KiB` PTY chunk ceiling from `gitpulse-protocol`.
+/// Re-exported `<= 16 KiB` PTY chunk ceiling from `waylode-protocol`.
 pub const MAX_PTY_CHUNK_BYTES: usize = MAX_PTY_FRAME_BYTES;
 
 /// Maximum time-box for a Desktop-granted `pty.input` consent token (15 min).
@@ -49,7 +49,7 @@ pub const MAX_PTY_CONSENT_TTL_SECS: i64 = 15 * 60;
 /// Lossy drop-oldest buffer for read-only mobile PTY streaming (`<= 16 KiB` per chunk).
 ///
 /// Guarantees a slow or disconnected mobile client can never apply backpressure
-/// to `gitpulse-ptyd`.
+/// to `waylode-ptyd`.
 #[derive(Debug)]
 pub struct LossyPtyStreamBuffer {
     max_chunks: usize,
@@ -126,7 +126,7 @@ pub struct SignedPtyInputRequest {
     pub consent_token_id: String,
     /// Base64-encoded raw bytes to write (`<= 16 KiB` decoded).
     pub payload_b64: String,
-    /// Hardware P-256 step-up authorization verified via `gitpulse-protocol`.
+    /// Hardware P-256 step-up authorization verified via `waylode-protocol`.
     pub step_up: SignedApprovalDecision,
 }
 
@@ -179,7 +179,7 @@ impl std::fmt::Display for PtyGateDenial {
                 write!(f, "pty.input step-up nonce already used")
             }
             PtyGateDenial::ProtocolVerificationFailed(reason) => {
-                write!(f, "gitpulse-protocol verification failed: {reason}")
+                write!(f, "waylode-protocol verification failed: {reason}")
             }
         }
     }
@@ -280,7 +280,7 @@ impl PtyInputGate {
     }
 
     /// Validates a mobile `pty.input` request against all Opus P0-7 gates via
-    /// `gitpulse-protocol`, records an audit entry regardless of outcome, and
+    /// `waylode-protocol`, records an audit entry regardless of outcome, and
     /// returns the verified raw payload bytes only if every check passes.
     pub fn authorize_input(
         &self,
@@ -361,7 +361,7 @@ impl PtyInputGate {
         let payload_sha256 = sha256_hex(&payload);
 
         // 3. Delegate cert + mandatory RevocationPolicy::Enforced + P-256 DER
-        //    signature verification strictly to `gitpulse-protocol`!
+        //    signature verification strictly to `waylode-protocol`!
         let policy = revocations
             .enforced_policy(now_secs)
             .map_err(|e| PtyGateDenial::ProtocolVerificationFailed(e.to_string()))?;

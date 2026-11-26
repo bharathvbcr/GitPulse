@@ -1,14 +1,14 @@
-//! `gitpulse-hook permission-bridge`: presence-gated universal Claude Code
+//! `waylode-hook permission-bridge`: presence-gated universal Claude Code
 //! `PermissionRequest` approval bridge (Opus P0-1, P0-2, P0-3, P0-4, P1).
 //!
 //! Registered as a **separate** synchronous `PermissionRequest` hook entry in
-//! `plugins/gitpulse/hooks/hooks.json` alongside the untouched `async: true`
-//! `gitpulse-hook notify permission_request` entry.
+//! `plugins/waylode/hooks/hooks.json` alongside the untouched `async: true`
+//! `waylode-hook notify permission_request` entry.
 //!
 //! ## Narrow carve-out from `hooks/mod.rs`'s "never emit `allow`" invariant
 //!
 //! `PreToolUse` safety hooks (`collision-guard`, `command-gate`) NEVER emit
-//! `allow`. This subcommand is the **sole** path in `gitpulse-hook` permitted
+//! `allow`. This subcommand is the **sole** path in `waylode-hook` permitted
 //! to emit a `PermissionRequest` `{"behavior":"allow"}` verdict, and ONLY when:
 //!
 //! 1. The local control-plane [`crate::alerts::approval_broker::ApprovalBroker`]
@@ -47,11 +47,13 @@ pub const PERMISSION_BRIDGE_WAIT: Duration = Duration::from_secs(1740);
 /// Optional environment variable shortening [`PERMISSION_BRIDGE_WAIT`] in
 /// milliseconds for tests. Values larger than [`PERMISSION_BRIDGE_WAIT`] are
 /// ignored so nothing can make the hook outlive its host timeout.
-pub const WAIT_ENV: &str = "GITPULSE_HOOK_PERMISSION_WAIT_MS";
+pub const WAIT_ENV: &str = "WAYLODE_HOOK_PERMISSION_WAIT_MS";
+/// Legacy environment variable for [`WAIT_ENV`].
+pub const LEGACY_WAIT_ENV: &str = "GITPULSE_HOOK_PERMISSION_WAIT_MS";
 
 /// Default message returned to Claude when a human denies a tool call without
 /// specifying custom text.
-const DEFAULT_DENY_MESSAGE: &str = "Denied by the user in GitPulse.";
+const DEFAULT_DENY_MESSAGE: &str = "Denied by the user in Waylode.";
 
 /// Strictly minimal Claude `PermissionRequest` decision object (Opus P0-4).
 /// `updatedInput` and `updatedPermissions` are deliberately absent.
@@ -166,7 +168,7 @@ pub fn run(input: &HookInput) -> Option<String> {
     if !is_trusted_repo_cwd(&input.cwd) {
         return None;
     }
-    let wait = wait_limit(std::env::var(WAIT_ENV).ok().as_deref());
+    let wait = wait_limit(crate::env_compat::var_compat(WAIT_ENV, LEGACY_WAIT_ENV).as_deref());
     let socket_path = default_socket_path()?;
     run_against_socket_with_trust_check(input, &socket_path, wait, is_trusted_repo_cwd)
 }

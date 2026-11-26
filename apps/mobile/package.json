@@ -1,8 +1,8 @@
 {
-  "name": "@gitpulse/mobile",
+  "name": "@waylode/mobile",
   "version": "0.1.0",
   "private": true,
-  "description": "GitPulse Unified Control Plane mobile companion (iOS + Android, Expo New Architecture + Rust UniFFI)",
+  "description": "Waylode Unified Control Plane mobile companion (iOS + Android, Expo New Architecture + Rust UniFFI)",
   "main": "expo-router/entry",
   "scripts": {
     "start": "expo start --dev-client",
@@ -15,7 +15,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@gitpulse/core": "file:../../packages/gitpulse-core",
+    "@waylode/core": "file:../../packages/waylode-core",
     "@shopify/flash-list": "^2.0.2",
     "expo": "~55.0.0",
     "expo-camera": "~55.0.0",

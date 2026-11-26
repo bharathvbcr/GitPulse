@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useLocalSearchParams } from "expo-router";
 import { WebView } from "react-native-webview";
-import { GitPulseCrypto } from "@gitpulse/crypto";
+import { WaylodeCrypto } from "@waylode/crypto";
 import { isPtyInputUnlocked } from "@/client/ControlPlaneClient";
 import { PtyAccessoryBar } from "@/components/PtyAccessoryBar";
 import { useControlPlane } from "@/state/ControlPlaneContext";
@@ -26,7 +26,7 @@ const QUARANTINED_PTY_HTML = `<!doctype html>
     <pre id="term"></pre>
     <script>
       const term = document.getElementById('term');
-      window.__gitpulseAppendChunk = function(text) {
+      window.__waylodeAppendChunk = function(text) {
         term.textContent += text;
         window.scrollTo(0, document.body.scrollHeight);
       };
@@ -55,7 +55,7 @@ function encodeUtf8ToBase64(input: string): string {
  * - Strictly READ-ONLY by default.
  * - Unlocking `pty_input` requires BOTH:
  *   1. An active, unexpired Desktop-granted time-boxed `PtyConsentGrant` for this session + device.
- *   2. Local hardware biometric step-up (`GitPulseCrypto.authenticateBiometricStepUp`).
+ *   2. Local hardware biometric step-up (`WaylodeCrypto.authenticateBiometricStepUp`).
  * - Auto-relocks immediately when grant expires or drawer unmounts.
  * - Accepted residual risk (Opus #23): Individual `pty.input` keystrokes sent within an
  *   active Desktop-granted time-boxed consent window + biometric step-up are authenticated
@@ -97,14 +97,14 @@ export default function PtyDrawerScreen() {
       if (key !== decodedKey) return;
       const safeJson = JSON.stringify(chunkB64);
       webViewRef.current?.injectJavaScript?.(
-        `window.__gitpulseAppendChunk && window.__gitpulseAppendChunk(atob(${safeJson})); true;`,
+        `window.__waylodeAppendChunk && window.__waylodeAppendChunk(atob(${safeJson})); true;`,
       );
     });
   }, [client, decodedKey]);
 
   const handleBiometricUnlock = async () => {
     setStepUpError(null);
-    const result = await GitPulseCrypto.authenticateBiometricStepUp(
+    const result = await WaylodeCrypto.authenticateBiometricStepUp(
       `Unlock time-boxed PTY input for ${decodedKey}`,
     );
     if (result.ok && result.attested_at_ms) {
@@ -130,7 +130,7 @@ export default function PtyDrawerScreen() {
         </Text>
         <Text style={styles.bannerBody}>
           {!grant || remainingSec <= 0
-            ? "Desktop has not granted active time-boxed `pty.input` consent for this session. Grant consent from GitPulse Desktop first."
+            ? "Desktop has not granted active time-boxed `pty.input` consent for this session. Grant consent from Waylode Desktop first."
             : inputUnlocked
               ? `Audit ID: ${grant.audit_id}. Input auto-relocks on expiry or drawer close.`
               : `Desktop consent granted (${remainingSec}s remaining). Complete biometric step-up to unlock input.`}

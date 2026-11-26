@@ -419,5 +419,5 @@ blob-report/
 *.pdb
 
 /crates/gitpulse-worktree/target/
-/src-tauri/crates/gitpulse-protocol/target/
+/src-tauri/crates/waylode-protocol/target/
 /crates/waylode-worktree/target/

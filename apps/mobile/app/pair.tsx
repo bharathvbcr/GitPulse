@@ -56,7 +56,7 @@ export default function PairAndDevicesScreen() {
           </>
         ) : (
           <Text style={styles.hint}>
-            Initializing hardware P-256 + Ed25519/X25519 keys via GitPulseCrypto native module…
+            Initializing hardware P-256 + Ed25519/X25519 keys via WaylodeCrypto native module…
           </Text>
         )}
       </View>

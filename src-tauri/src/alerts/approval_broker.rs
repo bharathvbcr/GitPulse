@@ -17,7 +17,7 @@
 //!    payload omits `tool_use_id`. Concurrent plugin + `--settings` hooks are
 //!    deduplicated by `(session_id, input_sha256)` where `input_sha256` is the
 //!    SHA-256 of canonical sorted-key JSON `{"cwd":...,"tool_input":...,"tool_name":...}`
-//!    (matching `src-tauri/crates/gitpulse-protocol`).
+//!    (matching `src-tauri/crates/waylode-protocol`).
 //! 3. **Zero same-UID resolution (P0-3 / #15):** `getpeereid`/`SO_PEERCRED`
 //!    only proves same UID, so a rogue agent's `Bash` tool can connect to the
 //!    Unix socket. Therefore the socket exposes **ONLY** `register_or_attach`,
@@ -26,22 +26,13 @@
 //!    issuance; any such request is rejected as `forbidden_socket_op`.
 //!    Tickets resolve strictly via in-process Desktop calls or a verified
 //!    P-256 hardware signature delegated to the single audited crypto core
-//!    (`gitpulse-protocol::crypto::verify_approval_decision`) against a
+//!    (`waylode-protocol::crypto::verify_approval_decision`) against a
 //!    Keychain-backed Account `IdentityKey` + `DeviceCertificate` + mandatory
 //!    `RevocationPolicy` held in broker memory (never an agent-writable `0600`
 //!    file).
 //! 4. **Minimal decision surface (P0-4):** Strictly `allow_once`, `deny`, or
 //!    `deny_and_interrupt` — never `updatedInput` or `updatedPermissions`.
 
-use gitpulse_protocol::canonical as proto_canonical;
-use gitpulse_protocol::crypto::{
-    verify_approval_decision, verify_device_certificate, verify_revocation_list, RevocationPolicy,
-};
-pub use gitpulse_protocol::wire::{
-    ApprovalDecisionKind as ApprovalDecision, DeviceCertificate, SignedApprovalDecision,
-    SignedRevocationList,
-};
-use gitpulse_protocol::ProtocolError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -49,14 +40,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use waylode_protocol::canonical as proto_canonical;
+use waylode_protocol::crypto::{
+    verify_approval_decision, verify_device_certificate, verify_revocation_list, RevocationPolicy,
+};
+pub use waylode_protocol::wire::{
+    ApprovalDecisionKind as ApprovalDecision, DeviceCertificate, SignedApprovalDecision,
+    SignedRevocationList,
+};
+use waylode_protocol::ProtocolError;
 
 use crate::agent_mailbox::{process_human_issuance_ledger, HumanIssuanceLedger};
 
-/// Socket file name inside GitPulse's config directory (`0600` in `0700`).
+/// Socket file name inside Waylode's config directory (`0600` in `0700`).
 pub const SOCKET_NAME: &str = "approval-broker.sock";
 
 /// Environment override for tests and custom daemon profiles.
-pub const SOCKET_ENV: &str = "GITPULSE_APPROVAL_BROKER_SOCKET";
+pub const SOCKET_ENV: &str = "WAYLODE_APPROVAL_BROKER_SOCKET";
+/// Legacy environment variable for [`SOCKET_ENV`].
+pub const LEGACY_SOCKET_ENV: &str = "GITPULSE_APPROVAL_BROKER_SOCKET";
 
 /// Default maximum time a broker holds a remote approval ticket when the user
 /// is away (matches `hooks::permission_bridge::PERMISSION_BRIDGE_WAIT`, leaving
@@ -88,7 +90,7 @@ const MAX_CLOCK_SKEW_SECS: i64 = 300;
 const MAX_DECISION_TTL_SECS: i64 = 3600;
 
 /// Domain prefix for P-256 approval decision signatures (re-exported from
-/// `src-tauri/crates/gitpulse-protocol`).
+/// `src-tauri/crates/waylode-protocol`).
 pub const APPROVAL_SIGNING_DOMAIN: &[u8] = proto_canonical::APPROVAL_SIGNING_DOMAIN;
 
 /// Default read/write timeout for short read-only broker socket queries
@@ -96,19 +98,19 @@ pub const APPROVAL_SIGNING_DOMAIN: &[u8] = proto_canonical::APPROVAL_SIGNING_DOM
 #[cfg(unix)]
 const SHORT_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
 
-/// Default socket path in GitPulse's configuration directory.
+/// Default socket path in Waylode's configuration directory.
 pub fn default_socket_path() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) {
+    if let Some(explicit) = crate::env_compat::var_os_compat(SOCKET_ENV, LEGACY_SOCKET_ENV) {
         return Some(PathBuf::from(explicit));
     }
     Some(crate::tool_config::default_config_dir()?.join(SOCKET_NAME))
 }
 
-/* ── Canonical input hashing (delegated to src-tauri/crates/gitpulse-protocol) ─────── */
+/* ── Canonical input hashing (delegated to src-tauri/crates/waylode-protocol) ─────── */
 
 /// Canonical JSON string for a tool approval request:
 /// `{"cwd":...,"tool_input":...,"tool_name":...}` with sorted object keys and
-/// zero insignificant whitespace, delegated to `gitpulse-protocol`.
+/// zero insignificant whitespace, delegated to `waylode-protocol`.
 ///
 /// Fails closed with [`ProtocolError::NonCanonicalNumber`] on lossy numbers
 /// (`-0.0`, integer-valued floats like `1.0`, non-finite floats, etc.).
@@ -122,7 +124,7 @@ pub fn canonical_tool_input_bytes(
 }
 
 /// Lowercase 64-char hex SHA-256 of [`canonical_tool_input_bytes`], delegated
-/// to `gitpulse-protocol`.
+/// to `waylode-protocol`.
 pub fn input_sha256_hex(
     tool_name: &str,
     tool_input: &Value,
@@ -146,7 +148,7 @@ pub fn is_remote_approvable_tool(tool_name: &str) -> bool {
     ) || tool_name.starts_with("mcp__")
 }
 
-/* ── Trust anchor & errors (delegated to src-tauri/crates/gitpulse-protocol) ───────── */
+/* ── Trust anchor & errors (delegated to src-tauri/crates/waylode-protocol) ───────── */
 
 /// Errors returned by [`ApprovalBroker`] operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,7 +220,7 @@ fn map_protocol_error(err: ProtocolError, device_id: &str) -> BrokerError {
 }
 
 /// In-memory trust anchor for verifying hardware-signed mobile approvals via
-/// `gitpulse_protocol::crypto::verify_approval_decision`.
+/// `waylode_protocol::crypto::verify_approval_decision`.
 ///
 /// Populated ONLY in-process from OS Keychain / Secret Service pairing state
 /// (Account `IdentityKey` Ed25519 public key, enrolled `DeviceCertificate`s,
@@ -342,7 +344,7 @@ impl TrustedApprovalKeyStore {
     }
 
     /// Verifies a [`SignedApprovalDecision`] end-to-end through
-    /// `gitpulse_protocol::crypto::verify_approval_decision` with mandatory
+    /// `waylode_protocol::crypto::verify_approval_decision` with mandatory
     /// `RevocationPolicy::Enforced` (fails closed when the revocation list is
     /// missing, expired, or rolled back).
     pub fn verify_decision(
@@ -402,7 +404,7 @@ impl TrustedApprovalKeyStore {
 
 /* ── Repository trust check (Opus #39 P1 / A1-8) ─────────────────────────── */
 
-/// Checks whether `cwd` belongs to a GitPulse-trusted Git repository
+/// Checks whether `cwd` belongs to a Waylode-trusted Git repository
 /// (`find_git_root` + `repository_trust::require`).
 ///
 /// Fails closed (`false`) when `cwd` is empty, outside any Git repository, or
@@ -463,16 +465,11 @@ impl RepoTrustChecker for MockRepoTrustChecker {
 #[cfg(test)]
 pub(crate) fn configure_test_trust_anchor(keys: &TrustedApprovalKeyStore) {
     let seed = [0x11u8; 32];
-    keys.set_identity_pub_ed25519(gitpulse_protocol::crypto::ed25519_public_from_secret(&seed));
+    keys.set_identity_pub_ed25519(waylode_protocol::crypto::ed25519_public_from_secret(&seed));
     let now = wall_now_secs();
-    let list = gitpulse_protocol::crypto::issue_revocation_list(
-        &seed,
-        1,
-        now - 60,
-        now + 3600,
-        Vec::new(),
-    )
-    .expect("issue empty test revocation list");
+    let list =
+        waylode_protocol::crypto::issue_revocation_list(&seed, 1, now - 60, now + 3600, Vec::new())
+            .expect("issue empty test revocation list");
     keys.install_revocation_list(list, now)
         .expect("install empty test revocation list");
 }
@@ -675,7 +672,7 @@ pub struct ApprovalTicketSummary {
 }
 
 /// Terminal disposition of a ticket resolution attempt (aligned with
-/// `src-tauri/crates/gitpulse-protocol` `ApprovalResolvedEvent.outcome`).
+/// `src-tauri/crates/waylode-protocol` `ApprovalResolvedEvent.outcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolveStatus {
@@ -694,7 +691,7 @@ pub struct ResolveOutcome {
     pub reason: Option<String>,
 }
 
-/// Result returned to `gitpulse-hook permission-bridge` for one `PermissionRequest`.
+/// Result returned to `waylode-hook permission-bridge` for one `PermissionRequest`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum HookBrokerReply {
@@ -709,7 +706,7 @@ pub enum HookBrokerReply {
     },
 }
 
-/// Payload sent by `gitpulse-hook permission-bridge` to register/attach to a ticket.
+/// Payload sent by `waylode-hook permission-bridge` to register/attach to a ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterApprovalRequest {
     pub session_id: String,
@@ -975,7 +972,7 @@ impl ApprovalBroker {
         }
     }
 
-    /// Read-only verification for `gitpulse-hook` `HumanConfirmed` checks.
+    /// Read-only verification for `waylode-hook` `HumanConfirmed` checks.
     pub fn verify_human_issuance(
         &self,
         session_id: &str,
@@ -1030,7 +1027,7 @@ impl ApprovalBroker {
     }
 
     /// Resolves an open ticket using a cryptographically verified P-256
-    /// hardware-signed mobile decision delegated to `gitpulse-protocol`
+    /// hardware-signed mobile decision delegated to `waylode-protocol`
     /// (`DeviceCertificate` + mandatory `RevocationPolicy` + P-256 ECDSA-SHA256)
     /// (Opus P0-3, P0-5, R2, #15, #31).
     pub fn resolve_signed(
@@ -1791,7 +1788,7 @@ pub fn query_human_issuance_via_default_socket(
     query_human_issuance_via_socket(&path, session_id, request_id, text_sha256)
 }
 
-/// Sends a `register_or_attach` request from `gitpulse-hook permission-bridge`
+/// Sends a `register_or_attach` request from `waylode-hook permission-bridge`
 /// and waits up to `wait_budget` for the broker's [`HookBrokerReply`].
 ///
 /// Notice the client intentionally does **NOT** half-close its write side after
@@ -1865,13 +1862,13 @@ pub fn list_pending_tickets_via_socket(
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use gitpulse_protocol::crypto::{
+    use waylode_protocol::crypto::{
         ed25519_public_from_secret, issue_device_certificate, issue_revocation_list,
         sign_approval_decision_software, x25519_public_from_secret,
     };
-    use gitpulse_protocol::wire::DeviceKind;
+    use waylode_protocol::wire::DeviceKind;
 
-    /// Deterministic P-256 test keypair from `src-tauri/crates/gitpulse-protocol/tests/vectors/approval_canonical_v1.json`.
+    /// Deterministic P-256 test keypair from `src-tauri/crates/waylode-protocol/tests/vectors/approval_canonical_v1.json`.
     const TEST_P256_SECRET: [u8; 32] = [0x66; 32];
     const TEST_P256_PUB_SEC1_B64: &str = "Awu7xei8hL0z0dPOA/+smnR/TBmT/dsuyTpBFqhvAip3";
     const ROGUE_P256_SECRET: [u8; 32] = [0x77; 32];

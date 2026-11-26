@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build Rust FFI native libraries (`src-tauri/crates/gitpulse-protocol`) for GitPulse Mobile:
+# Build Rust FFI native libraries (`src-tauri/crates/waylode-protocol`) for Waylode Mobile:
 #   - host:    macOS/Linux host `staticlib` + `cdylib` verification build
-#   - ios:     `GitPulseProtocol.xcframework` -> modules/gitpulse-crypto/ios/Frameworks/
-#   - android: `libgitpulse_protocol.so` (arm64-v8a, armeabi-v7a, x86_64) via `cargo ndk`
-#              -> modules/gitpulse-crypto/android/src/main/jniLibs/
+#   - ios:     `WaylodeProtocol.xcframework` -> modules/waylode-crypto/ios/Frameworks/
+#   - android: `libwaylode_protocol.so` (arm64-v8a, armeabi-v7a, x86_64) via `cargo ndk`
+#              -> modules/waylode-crypto/android/src/main/jniLibs/
 #
 # Usage:
 #   ./scripts/build-rust-ffi.sh [--platform host|ios|android|all] [--debug|--release] [--check]
@@ -13,14 +13,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOBILE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${MOBILE_ROOT}/../.." && pwd)"
-CRATE_DIR="${REPO_ROOT}/src-tauri/crates/gitpulse-protocol"
+CRATE_DIR="${REPO_ROOT}/src-tauri/crates/waylode-protocol"
 CRATE_MANIFEST="${CRATE_DIR}/Cargo.toml"
 TARGET_DIR="${CRATE_DIR}/target"
 
-IOS_FRAMEWORKS_DIR="${MOBILE_ROOT}/modules/gitpulse-crypto/ios/Frameworks"
-IOS_XCFRAMEWORK_OUT="${IOS_FRAMEWORKS_DIR}/GitPulseProtocol.xcframework"
+IOS_FRAMEWORKS_DIR="${MOBILE_ROOT}/modules/waylode-crypto/ios/Frameworks"
+IOS_XCFRAMEWORK_OUT="${IOS_FRAMEWORKS_DIR}/WaylodeProtocol.xcframework"
 IOS_HEADERS_STAGE="${TARGET_DIR}/xcframework-headers"
-ANDROID_JNILIBS_OUT="${MOBILE_ROOT}/modules/gitpulse-crypto/android/src/main/jniLibs"
+ANDROID_JNILIBS_OUT="${MOBILE_ROOT}/modules/waylode-crypto/android/src/main/jniLibs"
 
 PLATFORM="all"
 PROFILE="release"
@@ -102,7 +102,7 @@ ensure_rust_targets() {
 }
 
 print_toolchain_inventory() {
-  echo "=== GitPulse Rust FFI Toolchain Inventory ==="
+  echo "=== Waylode Rust FFI Toolchain Inventory ==="
   echo "Repo root:        ${REPO_ROOT}"
   echo "Crate manifest:   ${CRATE_MANIFEST}"
   echo "Cargo:            $(cargo --version 2>/dev/null || echo 'missing')"
@@ -123,16 +123,16 @@ print_toolchain_inventory() {
 }
 
 build_host() {
-  echo "=== Building gitpulse-protocol host staticlib + cdylib (${PROFILE}) ==="
+  echo "=== Building waylode-protocol host staticlib + cdylib (${PROFILE}) ==="
   cargo build --manifest-path "${CRATE_MANIFEST}" --lib --locked ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
 
   local out_dir="${TARGET_DIR}/${PROFILE}"
-  local static_lib="${out_dir}/libgitpulse_protocol.a"
+  local static_lib="${out_dir}/libwaylode_protocol.a"
   local dyn_lib=""
-  if [[ -f "${out_dir}/libgitpulse_protocol.dylib" ]]; then
-    dyn_lib="${out_dir}/libgitpulse_protocol.dylib"
-  elif [[ -f "${out_dir}/libgitpulse_protocol.so" ]]; then
-    dyn_lib="${out_dir}/libgitpulse_protocol.so"
+  if [[ -f "${out_dir}/libwaylode_protocol.dylib" ]]; then
+    dyn_lib="${out_dir}/libwaylode_protocol.dylib"
+  elif [[ -f "${out_dir}/libwaylode_protocol.so" ]]; then
+    dyn_lib="${out_dir}/libwaylode_protocol.so"
   fi
 
   if [[ ! -f "${static_lib}" || -z "${dyn_lib}" ]]; then
@@ -159,23 +159,23 @@ prepare_ios_headers() {
     # Minimal modulemap so xcodebuild -create-xcframework produces a linkable C/Swift module
     # even before uniffi-bindgen codegen is added to the toolchain.
     cat > "${IOS_HEADERS_STAGE}/module.modulemap" <<'EOF'
-module GitPulseProtocolFFI {
-    header "gitpulse_protocol.h"
+module WaylodeProtocolFFI {
+    header "waylode_protocol.h"
     export *
 }
 EOF
-    cat > "${IOS_HEADERS_STAGE}/gitpulse_protocol.h" <<'EOF'
+    cat > "${IOS_HEADERS_STAGE}/waylode_protocol.h" <<'EOF'
 #pragma once
-/* Placeholder header for src-tauri/crates/gitpulse-protocol staticlib XCFramework packaging.
+/* Placeholder header for src-tauri/crates/waylode-protocol staticlib XCFramework packaging.
  * Install uniffi-bindgen to emit full UniFFI Swift/C headers automatically. */
 EOF
   fi
 }
 
 build_ios() {
-  echo "=== Building iOS GitPulseProtocol.xcframework (${PROFILE}) ==="
+  echo "=== Building iOS WaylodeProtocol.xcframework (${PROFILE}) ==="
   if ! command -v xcodebuild >/dev/null 2>&1; then
-    echo "xcodebuild is required to build GitPulseProtocol.xcframework (macOS + Xcode)." >&2
+    echo "xcodebuild is required to build WaylodeProtocol.xcframework (macOS + Xcode)." >&2
     exit 1
   fi
 
@@ -186,21 +186,21 @@ build_ios() {
   # iOS device slice (arm64)
   cargo build --manifest-path "${CRATE_MANIFEST}" --lib --locked \
     --target aarch64-apple-ios ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
-  local ios_device_lib="${TARGET_DIR}/aarch64-apple-ios/${PROFILE}/libgitpulse_protocol.a"
+  local ios_device_lib="${TARGET_DIR}/aarch64-apple-ios/${PROFILE}/libwaylode_protocol.a"
 
   # iOS simulator slice (arm64, plus x86_64 universal lipo if installed)
   cargo build --manifest-path "${CRATE_MANIFEST}" --lib --locked \
     --target aarch64-apple-ios-sim ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
-  local ios_sim_arm64="${TARGET_DIR}/aarch64-apple-ios-sim/${PROFILE}/libgitpulse_protocol.a"
+  local ios_sim_arm64="${TARGET_DIR}/aarch64-apple-ios-sim/${PROFILE}/libwaylode_protocol.a"
   local ios_sim_lib="${ios_sim_arm64}"
 
   if has_rust_target x86_64-apple-ios; then
     cargo build --manifest-path "${CRATE_MANIFEST}" --lib --locked \
       --target x86_64-apple-ios ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
-    local ios_sim_x64="${TARGET_DIR}/x86_64-apple-ios/${PROFILE}/libgitpulse_protocol.a"
+    local ios_sim_x64="${TARGET_DIR}/x86_64-apple-ios/${PROFILE}/libwaylode_protocol.a"
     local ios_sim_fat_dir="${TARGET_DIR}/ios-sim-universal/${PROFILE}"
     mkdir -p "${ios_sim_fat_dir}"
-    ios_sim_lib="${ios_sim_fat_dir}/libgitpulse_protocol.a"
+    ios_sim_lib="${ios_sim_fat_dir}/libwaylode_protocol.a"
     lipo -create "${ios_sim_arm64}" "${ios_sim_x64}" -output "${ios_sim_lib}"
   fi
 
@@ -218,7 +218,7 @@ build_ios() {
 }
 
 build_android() {
-  echo "=== Building Android libgitpulse_protocol.so via cargo-ndk (${PROFILE}) ==="
+  echo "=== Building Android libwaylode_protocol.so via cargo-ndk (${PROFILE}) ==="
   if ! command -v cargo-ndk >/dev/null 2>&1; then
     echo "cargo-ndk is required for Android .so builds. Install with: cargo install cargo-ndk" >&2
     exit 1
@@ -249,7 +249,7 @@ build_android() {
     build --lib --locked ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
 
   echo "Built Android jniLibs in: ${ANDROID_JNILIBS_OUT}"
-  find "${ANDROID_JNILIBS_OUT}" -name 'libgitpulse_protocol.so' -exec ls -lh {} +
+  find "${ANDROID_JNILIBS_OUT}" -name 'libwaylode_protocol.so' -exec ls -lh {} +
 }
 
 if [[ "${CHECK_ONLY}" -eq 1 ]]; then

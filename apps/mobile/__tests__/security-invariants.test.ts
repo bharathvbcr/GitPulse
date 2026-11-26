@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildMobileAppConfig,
-  GITPULSE_IOS_APP_GROUP,
+  WAYLODE_IOS_APP_GROUP,
   validateMobileAppConfig,
 } from "../app.config";
 import {
@@ -14,18 +14,18 @@ import {
   assertNoLockScreenApproveActions,
   describePushExtensionsPlan,
   NOTIFICATION_CATEGORIES,
-  withGitPulsePushExtensions,
+  withWaylodePushExtensions,
 } from "../plugins/with-nse";
 import {
-  __setGitPulseCryptoBindingForTests,
+  __setWaylodeCryptoBindingForTests,
   assertNoRawKeyMaterial,
   assertValidSignedApprovalDecision,
   assertValidSignedSteeringConfirm,
-  GitPulseCrypto,
-  type NativeGitPulseCryptoBinding,
+  WaylodeCrypto,
+  type NativeWaylodeCryptoBinding,
   type SignedApprovalDecision,
   type SignedSteeringConfirm,
-} from "../modules/gitpulse-crypto/src/index";
+} from "../modules/waylode-crypto/src/index";
 import {
   ControlPlaneClient,
   isPtyInputUnlocked,
@@ -52,8 +52,8 @@ function makeValidDecision(
 }
 
 function makeMockBinding(
-  overrides: Partial<NativeGitPulseCryptoBinding> = {},
-): NativeGitPulseCryptoBinding {
+  overrides: Partial<NativeWaylodeCryptoBinding> = {},
+): NativeWaylodeCryptoBinding {
   return {
     async ensureDeviceKeys() {
       return {
@@ -83,7 +83,7 @@ function makeMockBinding(
         ticket_id: "tkt-123",
         title: "Approval Required",
         subtitle: "Bash",
-        body: "Open GitPulse to inspect",
+        body: "Open Waylode to inspect",
       };
     },
     async tunnelInitiatorNew() {
@@ -146,7 +146,7 @@ function makeMockBinding(
 }
 
 afterEach(() => {
-  __setGitPulseCryptoBindingForTests(null);
+  __setWaylodeCryptoBindingForTests(null);
 });
 
 describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
@@ -175,8 +175,8 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
     expect(() =>
       assertNoLockScreenApproveActions([
         {
-          identifier: "GITPULSE_APPROVAL",
-          actions: [{ identifier: "GITPULSE_ACTION_APPROVE", buttonTitle: "Approve" }],
+          identifier: "WAYLODE_APPROVAL",
+          actions: [{ identifier: "WAYLODE_ACTION_APPROVE", buttonTitle: "Approve" }],
         },
       ]),
     ).toThrow(/Opus M1/i);
@@ -184,7 +184,7 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
     expect(() =>
       assertNoLockScreenApproveActions([
         {
-          identifier: "GITPULSE_APPROVAL",
+          identifier: "WAYLODE_APPROVAL",
           actions: [{ identifier: "ALLOW_ONCE", buttonTitle: "Allow Once" }],
         },
       ]),
@@ -198,18 +198,18 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
     );
     expect(swiftSrc).toContain("UNNotificationServiceExtension");
     expect(swiftSrc).toContain("maxPreviewCiphertextBytes = 2048");
-    expect(swiftSrc).toContain("GITPULSE_APPROVAL");
+    expect(swiftSrc).toContain("WAYLODE_APPROVAL");
     expect(swiftSrc).not.toMatch(/import\s+React|import\s+Hermes|RCTBridge/i);
-    expect(swiftSrc).not.toMatch(/GITPULSE_ACTION_APPROVE|UNNotificationAction\(identifier:.*allow/i);
+    expect(swiftSrc).not.toMatch(/WAYLODE_ACTION_APPROVE|UNNotificationAction\(identifier:.*allow/i);
   });
 
-  it("Android GitPulseMessagingService.kt always posts visible notification, omits full-screen intent, and exposes Deny-only actions", () => {
+  it("Android WaylodeMessagingService.kt always posts visible notification, omits full-screen intent, and exposes Deny-only actions", () => {
     const ktService = fs.readFileSync(
-      path.join(MOBILE_ROOT, "plugins/templates/android/GitPulseMessagingService.kt"),
+      path.join(MOBILE_ROOT, "plugins/templates/android/WaylodeMessagingService.kt"),
       "utf8",
     );
     const ktReceiver = fs.readFileSync(
-      path.join(MOBILE_ROOT, "plugins/templates/android/GitPulseNotificationActionReceiver.kt"),
+      path.join(MOBILE_ROOT, "plugins/templates/android/WaylodeNotificationActionReceiver.kt"),
       "utf8",
     );
 
@@ -224,7 +224,7 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
     expect(ktReceiver).not.toMatch(/allow_once/i);
   });
 
-  it("withGitPulsePushExtensions executes iOS NSE + Android FCM mods and enforces AndroidManifest hygiene", async () => {
+  it("withWaylodePushExtensions executes iOS NSE + Android FCM mods and enforces AndroidManifest hygiene", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gitpulse-nse-test-"));
     const iosRoot = path.join(tmpRoot, "ios");
     const androidRoot = path.join(tmpRoot, "android");
@@ -233,8 +233,8 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
 
     try {
       const base = buildMobileAppConfig({});
-      const modded = withGitPulsePushExtensions(base, {
-        appGroup: GITPULSE_IOS_APP_GROUP,
+      const modded = withWaylodePushExtensions(base, {
+        appGroup: WAYLODE_IOS_APP_GROUP,
         nseBundleIdentifier: "com.gitpulse.mobile.NotificationService",
         androidPackage: "com.gitpulse.mobile",
       }) as unknown as {
@@ -264,24 +264,24 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
       await modded.mods!.ios!.dangerous!({
         modRequest: { projectRoot: tmpRoot, platformProjectRoot: iosRoot },
       });
-      const nseDir = path.join(iosRoot, "GitPulseNotificationService");
+      const nseDir = path.join(iosRoot, "WaylodeNotificationService");
       const renderedSwift = fs.readFileSync(path.join(nseDir, "NotificationService.swift"), "utf8");
       const renderedPlist = fs.readFileSync(path.join(nseDir, "Info.plist"), "utf8");
       const renderedEntitlements = fs.readFileSync(
-        path.join(nseDir, "GitPulseNotificationService.entitlements"),
+        path.join(nseDir, "WaylodeNotificationService.entitlements"),
         "utf8",
       );
-      expect(renderedSwift).toContain(`appGroup = "${GITPULSE_IOS_APP_GROUP}"`);
+      expect(renderedSwift).toContain(`appGroup = "${WAYLODE_IOS_APP_GROUP}"`);
       expect(renderedSwift).not.toContain("__APP_GROUP__");
       expect(renderedPlist).toContain("com.gitpulse.mobile.NotificationService");
-      expect(renderedEntitlements).toContain(GITPULSE_IOS_APP_GROUP);
+      expect(renderedEntitlements).toContain(WAYLODE_IOS_APP_GROUP);
 
       await modded.mods!.android!.dangerous!({
         modRequest: { projectRoot: tmpRoot, platformProjectRoot: androidRoot },
       });
       const pushDir = path.join(androidRoot, "app/src/main/java/com/gitpulse/mobile/push");
-      expect(fs.existsSync(path.join(pushDir, "GitPulseMessagingService.kt"))).toBe(true);
-      expect(fs.existsSync(path.join(pushDir, "GitPulseNotificationActionReceiver.kt"))).toBe(true);
+      expect(fs.existsSync(path.join(pushDir, "WaylodeMessagingService.kt"))).toBe(true);
+      expect(fs.existsSync(path.join(pushDir, "WaylodeNotificationActionReceiver.kt"))).toBe(true);
 
       const manifestRes = await modded.mods!.android!.manifest!({
         modResults: { manifest: { application: [{}] } },
@@ -290,10 +290,10 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
       const services = appNode.service as Array<{ $: Record<string, string> }>;
       const receivers = appNode.receiver as Array<{ $: Record<string, string> }>;
       expect(services).toHaveLength(1);
-      expect(services[0]!.$["android:name"]).toBe(".push.GitPulseMessagingService");
+      expect(services[0]!.$["android:name"]).toBe(".push.WaylodeMessagingService");
       expect(services[0]!.$["android:exported"]).toBe("false");
       expect(receivers).toHaveLength(1);
-      expect(receivers[0]!.$["android:name"]).toBe(".push.GitPulseNotificationActionReceiver");
+      expect(receivers[0]!.$["android:name"]).toBe(".push.WaylodeNotificationActionReceiver");
       expect(receivers[0]!.$["android:exported"]).toBe("false");
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -383,13 +383,13 @@ describe("Opus P0-4: ApprovalDecision rejects updatedInput and updatedPermission
 
 describe("Opus M2: JS bridge never exposes raw key bytes & enforces two-key hardware isolation", () => {
   it("ensureDeviceKeys returns ONLY public keys and throws if native returns private/seed bytes", async () => {
-    __setGitPulseCryptoBindingForTests(makeMockBinding());
-    const keys = await GitPulseCrypto.ensureDeviceKeys();
+    __setWaylodeCryptoBindingForTests(makeMockBinding());
+    const keys = await WaylodeCrypto.ensureDeviceKeys();
     expect(keys.approval_pub_p256_b64).toBeTruthy();
     expect(keys.ed25519_pub_b64).toBeTruthy();
     expect(keys.x25519_pub_b64).toBeTruthy();
 
-    __setGitPulseCryptoBindingForTests(
+    __setWaylodeCryptoBindingForTests(
       makeMockBinding({
         async ensureDeviceKeys() {
           return {
@@ -400,20 +400,20 @@ describe("Opus M2: JS bridge never exposes raw key bytes & enforces two-key hard
             hardware_backed: true,
             key_storage_backend: "ios_secure_enclave",
             ed25519_seed: "LEAKED_SEED",
-          } as unknown as Awaited<ReturnType<NativeGitPulseCryptoBinding["ensureDeviceKeys"]>>;
+          } as unknown as Awaited<ReturnType<NativeWaylodeCryptoBinding["ensureDeviceKeys"]>>;
         },
       }),
     );
 
-    await expect(GitPulseCrypto.ensureDeviceKeys()).rejects.toThrow(/Opus M2/i);
+    await expect(WaylodeCrypto.ensureDeviceKeys()).rejects.toThrow(/Opus M2/i);
     expect(() => assertNoRawKeyMaterial({ raw: new Uint8Array([1, 2, 3]) })).toThrow(/Opus M2/i);
   });
 
   it("signDenyWithoutApprove refuses allow_once even if called dynamically", async () => {
-    __setGitPulseCryptoBindingForTests(makeMockBinding());
+    __setWaylodeCryptoBindingForTests(makeMockBinding());
 
     await expect(
-      GitPulseCrypto.signDenyWithoutApprove({
+      WaylodeCrypto.signDenyWithoutApprove({
         host_id: "host-1",
         ticket_id: "tkt-1",
         input_sha256: "a".repeat(64),
@@ -422,7 +422,7 @@ describe("Opus M2: JS bridge never exposes raw key bytes & enforces two-key hard
       }),
     ).rejects.toThrow(/Opus M1/i);
 
-    const denyResult = await GitPulseCrypto.signDenyWithoutApprove({
+    const denyResult = await WaylodeCrypto.signDenyWithoutApprove({
       host_id: "host-1",
       ticket_id: "tkt-1",
       input_sha256: "a".repeat(64),
@@ -433,7 +433,7 @@ describe("Opus M2: JS bridge never exposes raw key bytes & enforces two-key hard
   });
 
   it("presentApprovalSheet rejects mismatched input_sha256 from native result", async () => {
-    __setGitPulseCryptoBindingForTests(
+    __setWaylodeCryptoBindingForTests(
       makeMockBinding({
         async presentApprovalSheet(req) {
           return {
@@ -450,14 +450,14 @@ describe("Opus M2: JS bridge never exposes raw key bytes & enforces two-key hard
     );
 
     await expect(
-      GitPulseCrypto.presentApprovalSheet({
+      WaylodeCrypto.presentApprovalSheet({
         host_id: "host-1",
         ticket_id: "tkt-1",
         tool_name: "Bash",
         tool_input_json: '{"command":"ls"}',
         cwd: "/repo",
         expected_input_sha256: "a".repeat(64),
-        repo_label: "GitPulse",
+        repo_label: "Waylode",
         harness_label: "claude",
         expires_at: Math.floor(Date.now() / 1000) + 600,
       }),
@@ -466,7 +466,7 @@ describe("Opus M2: JS bridge never exposes raw key bytes & enforces two-key hard
 
   it("native Swift and Kotlin modules enforce Secure Enclave / StrongBox P-256 and zeroize secrets", () => {
     const swiftModule = fs.readFileSync(
-      path.join(MOBILE_ROOT, "modules/gitpulse-crypto/ios/GitPulseCryptoModule.swift"),
+      path.join(MOBILE_ROOT, "modules/waylode-crypto/ios/WaylodeCryptoModule.swift"),
       "utf8",
     );
     expect(swiftModule).toContain("kSecAttrTokenIDSecureEnclave");
@@ -478,7 +478,7 @@ describe("Opus M2: JS bridge never exposes raw key bytes & enforces two-key hard
     const kotlinModule = fs.readFileSync(
       path.join(
         MOBILE_ROOT,
-        "modules/gitpulse-crypto/android/src/main/java/com/gitpulse/crypto/GitPulseCryptoModule.kt",
+        "modules/waylode-crypto/android/src/main/java/com/gitpulse/crypto/WaylodeCryptoModule.kt",
       ),
       "utf8",
     );
@@ -497,7 +497,7 @@ describe("Opus M3 & M5: app.config.ts mandates New Architecture & code-signed ex
     expect(cfg.updates.codeSigningMetadata.alg).toBe("rsa-v1_5-sha256");
     expect(
       (cfg.ios?.entitlements as Record<string, unknown>)["com.apple.security.application-groups"],
-    ).toContain(GITPULSE_IOS_APP_GROUP);
+    ).toContain(WAYLODE_IOS_APP_GROUP);
     expect(cfg.android?.permissions).not.toContain("android.permission.USE_FULL_SCREEN_INTENT");
   });
 
@@ -638,22 +638,22 @@ describe("Opus #23 P1: Steering authenticity via native biometric P-256 SignedSt
   });
 
   it("presentSteeringConfirmSheet enforces metadata & hash parity and rejects spoofing", async () => {
-    __setGitPulseCryptoBindingForTests(makeMockBinding());
-    const ok = await GitPulseCrypto.presentSteeringConfirmSheet({
+    __setWaylodeCryptoBindingForTests(makeMockBinding());
+    const ok = await WaylodeCrypto.presentSteeringConfirmSheet({
       host_id: "host-1",
       session_key: "claude:repo:1",
       request_id: "req-1",
       expect_route: "peer_inbox",
       delivery_mode: "immediate",
       text: "Run cargo test",
-      repo_label: "GitPulse",
+      repo_label: "Waylode",
       harness_label: "claude",
     });
     expect(ok.status).toBe("signed");
     expect(ok.signed_confirm?.text_sha256).toBe("c".repeat(64));
 
     // Spoofed session_key in returned signed_confirm must fail closed
-    __setGitPulseCryptoBindingForTests(
+    __setWaylodeCryptoBindingForTests(
       makeMockBinding({
         async presentSteeringConfirmSheet(req) {
           return {
@@ -672,14 +672,14 @@ describe("Opus #23 P1: Steering authenticity via native biometric P-256 SignedSt
     );
 
     await expect(
-      GitPulseCrypto.presentSteeringConfirmSheet({
+      WaylodeCrypto.presentSteeringConfirmSheet({
         host_id: "host-1",
         session_key: "claude:repo:1",
         request_id: "req-1",
         expect_route: "peer_inbox",
         delivery_mode: "immediate",
         text: "Run cargo test",
-        repo_label: "GitPulse",
+        repo_label: "Waylode",
         harness_label: "claude",
       }),
     ).rejects.toThrow(/Opus #23 P1/i);
@@ -687,7 +687,7 @@ describe("Opus #23 P1: Steering authenticity via native biometric P-256 SignedSt
 
   it("native Swift and Kotlin steering sheets render exact text and sign via hardware P-256", () => {
     const swiftSheet = fs.readFileSync(
-      path.join(MOBILE_ROOT, "modules/gitpulse-crypto/ios/GitPulseSteeringSheetView.swift"),
+      path.join(MOBILE_ROOT, "modules/waylode-crypto/ios/WaylodeSteeringSheetView.swift"),
       "utf8",
     );
     expect(swiftSheet).toContain("hashSteeringText");
@@ -698,7 +698,7 @@ describe("Opus #23 P1: Steering authenticity via native biometric P-256 SignedSt
     const kotlinSheet = fs.readFileSync(
       path.join(
         MOBILE_ROOT,
-        "modules/gitpulse-crypto/android/src/main/java/com/gitpulse/crypto/GitPulseSteeringSheetView.kt",
+        "modules/waylode-crypto/android/src/main/java/com/gitpulse/crypto/WaylodeSteeringSheetView.kt",
       ),
       "utf8",
     );

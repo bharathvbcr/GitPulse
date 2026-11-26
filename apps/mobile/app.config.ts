@@ -1,12 +1,12 @@
 import type { ConfigContext, ExpoConfig } from "expo/config";
 
-export const GITPULSE_IOS_APP_GROUP = "group.com.gitpulse.mobile";
-export const GITPULSE_BUNDLE_ID = "com.gitpulse.mobile";
-export const GITPULSE_NSE_BUNDLE_ID = "com.gitpulse.mobile.NotificationService";
-export const GITPULSE_ANDROID_PACKAGE = "com.gitpulse.mobile";
-export const GITPULSE_CODE_SIGNING_CERT_PATH = "./certificates/code-signing-certificate.pem";
+export const WAYLODE_IOS_APP_GROUP = "group.com.gitpulse.mobile";
+export const WAYLODE_BUNDLE_ID = "com.gitpulse.mobile";
+export const WAYLODE_NSE_BUNDLE_ID = "com.gitpulse.mobile.NotificationService";
+export const WAYLODE_ANDROID_PACKAGE = "com.gitpulse.mobile";
+export const WAYLODE_CODE_SIGNING_CERT_PATH = "./certificates/code-signing-certificate.pem";
 
-export interface GitPulseUpdatesConfig {
+export interface WaylodeUpdatesConfig {
   url: string;
   enabled: boolean;
   fallbackToCacheTimeout: number;
@@ -17,21 +17,21 @@ export interface GitPulseUpdatesConfig {
   };
 }
 
-export interface GitPulseMobileConfig extends ExpoConfig {
+export interface WaylodeMobileConfig extends ExpoConfig {
   newArchEnabled: boolean;
-  updates: GitPulseUpdatesConfig;
+  updates: WaylodeUpdatesConfig;
 }
 
-export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): GitPulseMobileConfig {
+export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): WaylodeMobileConfig {
   const base = context.config ?? {};
   const updatesUrl =
-    process.env.GITPULSE_UPDATES_URL ?? "https://u.expo.dev/00000000-0000-0000-0000-000000000000";
+    process.env.WAYLODE_UPDATES_URL ?? process.env.GITPULSE_UPDATES_URL ?? "https://u.expo.dev/00000000-0000-0000-0000-000000000000";
   const codeSigningCert =
-    process.env.GITPULSE_CODE_SIGNING_CERT ?? GITPULSE_CODE_SIGNING_CERT_PATH;
+    process.env.WAYLODE_CODE_SIGNING_CERT ?? process.env.GITPULSE_CODE_SIGNING_CERT ?? WAYLODE_CODE_SIGNING_CERT_PATH;
 
-  const config: GitPulseMobileConfig = {
+  const config: WaylodeMobileConfig = {
     ...base,
-    name: "GitPulse",
+    name: "Waylode",
     slug: "gitpulse-mobile",
     version: "0.1.0",
     orientation: "portrait",
@@ -50,29 +50,29 @@ export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): GitP
       fallbackToCacheTimeout: 0,
       codeSigningCertificate: codeSigningCert,
       codeSigningMetadata: {
-        keyid: process.env.GITPULSE_CODE_SIGNING_KEYID ?? "main",
+        keyid: process.env.WAYLODE_CODE_SIGNING_KEYID ?? process.env.GITPULSE_CODE_SIGNING_KEYID ?? "main",
         alg: "rsa-v1_5-sha256",
       },
     },
     ios: {
       supportsTablet: true,
-      bundleIdentifier: GITPULSE_BUNDLE_ID,
+      bundleIdentifier: WAYLODE_BUNDLE_ID,
       entitlements: {
-        "com.apple.security.application-groups": [GITPULSE_IOS_APP_GROUP],
+        "com.apple.security.application-groups": [WAYLODE_IOS_APP_GROUP],
         "aps-environment": "production",
-        "keychain-access-groups": [`$(AppIdentifierPrefix)${GITPULSE_IOS_APP_GROUP}`],
+        "keychain-access-groups": [`$(AppIdentifierPrefix)${WAYLODE_IOS_APP_GROUP}`],
       },
       infoPlist: {
         NSFaceIDUsageDescription:
-          "GitPulse uses Face ID to authorize hardware-signed P-256 tool approval decisions and step-up terminal input.",
+          "Waylode uses Face ID to authorize hardware-signed P-256 tool approval decisions and step-up terminal input.",
         NSCameraUsageDescription:
-          "GitPulse uses the camera to scan desktop QR codes for end-to-end encrypted device pairing.",
+          "Waylode uses the camera to scan desktop QR codes for end-to-end encrypted device pairing.",
         UIBackgroundModes: ["remote-notification"],
         ITSAppUsesNonExemptEncryption: false,
       },
     },
     android: {
-      package: GITPULSE_ANDROID_PACKAGE,
+      package: WAYLODE_ANDROID_PACKAGE,
       // Opus M5: Explicitly request biometric & notification permissions; NEVER USE_FULL_SCREEN_INTENT.
       permissions: [
         "android.permission.USE_BIOMETRIC",
@@ -102,15 +102,15 @@ export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): GitP
         "expo-camera",
         {
           cameraPermission:
-            "GitPulse uses the camera to scan desktop QR pairing codes.",
+            "Waylode uses the camera to scan desktop QR pairing codes.",
         },
       ],
       [
         "./plugins/with-nse",
         {
-          appGroup: GITPULSE_IOS_APP_GROUP,
-          nseBundleIdentifier: GITPULSE_NSE_BUNDLE_ID,
-          androidPackage: GITPULSE_ANDROID_PACKAGE,
+          appGroup: WAYLODE_IOS_APP_GROUP,
+          nseBundleIdentifier: WAYLODE_NSE_BUNDLE_ID,
+          androidPackage: WAYLODE_ANDROID_PACKAGE,
         },
       ],
     ],
@@ -118,7 +118,7 @@ export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): GitP
       typedRoutes: true,
     },
     extra: {
-      appGroup: GITPULSE_IOS_APP_GROUP,
+      appGroup: WAYLODE_IOS_APP_GROUP,
       otaSecurityScope: "non-security-ui-only",
     },
   };
@@ -130,7 +130,7 @@ export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): GitP
 /**
  * Fails closed if mandatory Opus M3/M5 security invariants are missing from app.config.ts.
  */
-export function validateMobileAppConfig(config: Partial<GitPulseMobileConfig>): void {
+export function validateMobileAppConfig(config: Partial<WaylodeMobileConfig>): void {
   if (config.newArchEnabled !== true) {
     throw new Error("SECURITY VIOLATION: React Native New Architecture (newArchEnabled: true) is mandatory.");
   }
@@ -162,9 +162,9 @@ export function validateMobileAppConfig(config: Partial<GitPulseMobileConfig>): 
   const iosGroups = (
     config.ios?.entitlements as Record<string, unknown> | undefined
   )?.["com.apple.security.application-groups"];
-  if (!Array.isArray(iosGroups) || !iosGroups.includes(GITPULSE_IOS_APP_GROUP)) {
+  if (!Array.isArray(iosGroups) || !iosGroups.includes(WAYLODE_IOS_APP_GROUP)) {
     throw new Error(
-      `SECURITY VIOLATION (Opus M2): iOS entitlements must include App Group ${GITPULSE_IOS_APP_GROUP}.`,
+      `SECURITY VIOLATION (Opus M2): iOS entitlements must include App Group ${WAYLODE_IOS_APP_GROUP}.`,
     );
   }
 
@@ -176,6 +176,6 @@ export function validateMobileAppConfig(config: Partial<GitPulseMobileConfig>): 
   }
 }
 
-export default function expoConfig(context: ConfigContext): GitPulseMobileConfig {
+export default function expoConfig(context: ConfigContext): WaylodeMobileConfig {
   return buildMobileAppConfig(context);
 }

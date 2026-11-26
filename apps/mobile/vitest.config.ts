@@ -5,7 +5,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
-      "@gitpulse/crypto": path.resolve(__dirname, "./modules/gitpulse-crypto/src/index.ts"),
+      "@waylode/crypto": path.resolve(__dirname, "./modules/waylode-crypto/src/index.ts"),
     },
   },
   test: {

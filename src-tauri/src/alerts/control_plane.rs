@@ -1,14 +1,14 @@
 //! Unified single-owner control-plane service trait (`ControlPlaneService`)
 //! behind `control-plane.lock` (Opus R4).
 //!
-//! Both GitPulse Desktop (local / Free mode) and `gitpulsed --relay` (paid
+//! Both Waylode Desktop (local / Free mode) and `wayloded --relay` (paid
 //! remote-control mode) host alerts + [`ApprovalBroker`] through this single
 //! interface, owned strictly by whoever holds `control-plane.lock`. There are
 //! zero duplicate socket-ownership paths:
 //!
 //! - When Desktop owns `control-plane.lock`, it runs [`InProcessControlPlane`]
 //!   and binds `agent-notify.sock` + `approval-broker.sock`.
-//! - When `gitpulsed --relay` owns `control-plane.lock`, it runs the exact
+//! - When `wayloded --relay` owns `control-plane.lock`, it runs the exact
 //!   same [`InProcessControlPlane`], and Desktop consumes read-only state via
 //!   [`SocketControlPlaneClient`].
 //! - Contract tests below exercise the shared [`ControlPlaneService`] surface
@@ -26,7 +26,7 @@ use super::approval_broker::{
 };
 use super::{HubStateRead, HubStateSnapshot, SessionAlertStatus, StandingAttention};
 
-/// Single-owner lock file inside GitPulse's config directory (`0600` in `0700`).
+/// Single-owner lock file inside Waylode's config directory (`0600` in `0700`).
 pub const LOCK_NAME: &str = "control-plane.lock";
 
 /// Which process currently owns `control-plane.lock` and the local control sockets.
@@ -159,8 +159,8 @@ pub fn inspect_owner(config_dir: &Path) -> Option<ControlPlaneOwner> {
     serde_json::from_slice(&buf).ok()
 }
 
-/// Unified control-plane service surface shared by GitPulse Desktop and
-/// `gitpulsed --relay` (Opus R4).
+/// Unified control-plane service surface shared by Waylode Desktop and
+/// `wayloded --relay` (Opus R4).
 pub trait ControlPlaneService: Send + Sync {
     /// Current session-alerts worker and bridge counters.
     fn alerts_status(&self) -> SessionAlertStatus;
@@ -312,7 +312,7 @@ impl ControlPlaneService for InProcessControlPlane {
 }
 
 /// Read-only socket-backed client consumed when another process (e.g.
-/// `gitpulsed --relay`) holds `control-plane.lock`.
+/// `wayloded --relay`) holds `control-plane.lock`.
 ///
 /// Enforces Opus #15: mutating/resolution calls are rejected on the socket
 /// client and never sent over the local Unix socket.

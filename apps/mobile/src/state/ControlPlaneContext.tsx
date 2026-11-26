@@ -1,10 +1,10 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
-  GitPulseCrypto,
+  WaylodeCrypto,
   type DevicePublicKeys,
   type NativeApprovalSheetOutcome,
   type NativeSteeringSheetOutcome,
-} from "@gitpulse/crypto";
+} from "@waylode/crypto";
 import {
   ControlPlaneClient,
   type ControlPlaneState,
@@ -95,7 +95,7 @@ export function ControlPlaneProvider({
   // Initialize hardware P-256 + Keychain/Keystore identity public keys (NEVER private bytes)
   useEffect(() => {
     let active = true;
-    GitPulseCrypto.ensureDeviceKeys()
+    WaylodeCrypto.ensureDeviceKeys()
       .then((keys) => {
         if (active) setDeviceKeys(keys);
       })
@@ -162,7 +162,7 @@ export function ControlPlaneProvider({
         if (!ticketId || !hostId || !inputSha256) return;
 
         const decision = actionId === ACTION_DENY_AND_INTERRUPT_ID ? "deny_and_interrupt" : "deny";
-        void GitPulseCrypto.signDenyWithoutApprove({
+        void WaylodeCrypto.signDenyWithoutApprove({
           host_id: hostId,
           ticket_id: ticketId,
           input_sha256: inputSha256,
@@ -188,7 +188,7 @@ export function ControlPlaneProvider({
       deviceKeys,
       client,
       async launchNativeApprovalSheet(ticket: ApprovalTicket): Promise<NativeApprovalSheetOutcome> {
-        const outcome = await GitPulseCrypto.presentApprovalSheet({
+        const outcome = await WaylodeCrypto.presentApprovalSheet({
           host_id: ticket.host_id,
           ticket_id: ticket.ticket_id,
           tool_name: ticket.tool_name,
@@ -212,7 +212,7 @@ export function ControlPlaneProvider({
         preview: SteeringPreviewResp,
         text: string,
       ) {
-        const sheet = await GitPulseCrypto.presentSteeringConfirmSheet({
+        const sheet = await WaylodeCrypto.presentSteeringConfirmSheet({
           host_id: session.host_id ?? "local-host",
           session_key: preview.session_key,
           request_id: preview.request_id,

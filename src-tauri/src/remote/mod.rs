@@ -1,9 +1,9 @@
-//! Remote control plane host modules for `gitpulsed --relay`.
+//! Remote control plane host modules for `wayloded --relay`.
 //!
 //! All Noise `IK` E2EE, 1024-bit sliding replay windows, Ed25519 WS signing,
 //! `DeviceCertificate` v2, `SignedRevocationList`, hardware P-256 approval &
 //! steering verification, and canonical JSON hashing delegate strictly to the
-//! single audited `gitpulse-protocol` crate (Opus R1/M4/#31).
+//! single audited `waylode-protocol` crate (Opus R1/M4/#31).
 
 pub mod codex_app_server;
 pub mod config;
@@ -25,7 +25,7 @@ use serde::Serialize;
 use std::path::Path;
 use tunnel::{now_unix_ms, now_unix_secs, write_remote_approval_state, RemoteApprovalState};
 
-/// Structured NDJSON status report emitted by `gitpulsed --relay` on startup
+/// Structured NDJSON status report emitted by `wayloded --relay` on startup
 /// or `--once` health probe.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelayStartupReport {
@@ -40,7 +40,7 @@ pub struct RelayStartupReport {
     pub status: String,
 }
 
-/// Production entrypoint for `gitpulsed --relay`.
+/// Production entrypoint for `wayloded --relay`.
 ///
 /// Always enforces:
 /// 1. **Hard Free/Local Invariant:** checks [`evaluate_relay_gate`] BEFORE
@@ -60,7 +60,7 @@ pub fn run_relay_mode(
     let cfg = match RemoteControlConfig::load_from_dir(config_dir) {
         Ok(cfg) => cfg,
         Err(err) => {
-            log::error!(target: "gitpulsed", "failed to load remote-control config: {err}");
+            log::error!(target: "wayloded", "failed to load remote-control config: {err}");
             return 1;
         }
     };
@@ -69,7 +69,7 @@ pub fn run_relay_mode(
         match evaluate_relay_gate(&cfg, pinned_org_key, now_unix_secs()) {
             Ok(effective) => effective,
             Err(refusal) => {
-                log::error!(target: "gitpulsed", "{refusal}");
+                log::error!(target: "wayloded", "{refusal}");
                 return refusal.exit_code();
             }
         };
@@ -98,7 +98,7 @@ pub fn run_relay_with_trust_anchor(
                 format!("trust_anchor_unavailable: {reason}")
             }
         };
-        log::error!(target: "gitpulsed", "refusing --relay startup: {code_reason}");
+        log::error!(target: "wayloded", "refusing --relay startup: {code_reason}");
         let _ = write_remote_approval_state(
             config_dir,
             &RemoteApprovalState::ReleasedToNative {
@@ -109,20 +109,20 @@ pub fn run_relay_with_trust_anchor(
         return EXIT_CODE_FREE_OR_DISABLED;
     }
 
-    let lock_dir = config_dir.join("gitpulsed");
+    let lock_dir = config_dir.join("wayloded");
     let _relay_lock = match acquire_relay_lock(&lock_dir, env!("CARGO_PKG_VERSION")) {
         crate::daemon_lock::Acquire::Held(lock) => lock,
         crate::daemon_lock::Acquire::Occupied(owner) => {
             log::error!(
-                target: "gitpulsed",
-                "another gitpulsed --relay already runs for this profile (pid {}, version {}); not starting a second",
+                target: "wayloded",
+                "another wayloded --relay already runs for this profile (pid {}, version {}); not starting a second",
                 owner.pid.map_or("unknown".into(), |pid| pid.to_string()),
                 owner.version.as_deref().unwrap_or("unknown"),
             );
             return 3;
         }
         crate::daemon_lock::Acquire::Unavailable(reason) => {
-            log::error!(target: "gitpulsed", "the relay daemon lock could not be taken: {reason}");
+            log::error!(target: "wayloded", "the relay daemon lock could not be taken: {reason}");
             return 1;
         }
     };
@@ -156,7 +156,7 @@ pub fn run_relay_with_trust_anchor(
     {
         Ok(rt) => rt,
         Err(err) => {
-            log::error!(target: "gitpulsed", "failed to start relay async runtime: {err}");
+            log::error!(target: "wayloded", "failed to start relay async runtime: {err}");
             return 1;
         }
     };

@@ -1,6 +1,6 @@
-//! Codex Tier 1 `codex app-server` JSON-RPC stdio adapter inside `gitpulsed`.
+//! Codex Tier 1 `codex app-server` JSON-RPC stdio adapter inside `wayloded`.
 //!
-//! Hosting `codex app-server` threads directly in `gitpulsed` gives Codex the
+//! Hosting `codex app-server` threads directly in `wayloded` gives Codex the
 //! highest-fidelity control-plane channel of any harness (Opus §4):
 //! - **Item-ID-bound approvals with no hook timeout:** server→client JSON-RPC
 //!   requests (`item/commandExecution/requestApproval`,
@@ -12,13 +12,11 @@
 //!      `sandbox_mode` (any attempt is refused loudly before hitting stdin).
 //!   2. Approval decisions accept ONLY `AllowOnce` / `Deny` / `DenyAndInterrupt`
 //!      (never `updatedInput` or `updatedPermissions`, Opus P0-4).
-//!   3. GitPulse never mutates Codex's trust store.
+//!   3. Waylode never mutates Codex's trust store.
 
 use crate::procguard::{self, Registration};
 use crate::remote::pty_gate::sha256_hex;
 use crate::supervisor;
-use gitpulse_protocol::canonical::canonical_json_string;
-use gitpulse_protocol::wire::ApprovalDecisionKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -31,6 +29,8 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, oneshot};
+use waylode_protocol::canonical::canonical_json_string;
+use waylode_protocol::wire::ApprovalDecisionKind;
 
 /// Forbidden parameter keys that remote callers must NEVER supply or relax.
 const FORBIDDEN_REMOTE_POLICY_KEYS: &[&str] = &[
@@ -278,7 +278,7 @@ fn reap(child: &mut Child, registration: &Registration) {
 /// In-flight JSON-RPC calls, keyed by request id, each waiting for its reply.
 type PendingCalls = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexError>>>>>;
 
-/// Active `codex app-server` JSON-RPC stdio client owned by `gitpulsed`.
+/// Active `codex app-server` JSON-RPC stdio client owned by `wayloded`.
 pub struct CodexAppServerClient {
     config: CodexLaunchConfig,
     child: Mutex<Option<(Child, Registration)>>,
@@ -434,7 +434,7 @@ impl CodexAppServerClient {
                 "initialize",
                 json!({
                     "clientInfo": {
-                        "name": "gitpulsed",
+                        "name": "wayloded",
                         "version": env!("CARGO_PKG_VERSION"),
                     }
                 }),

@@ -1,27 +1,14 @@
-//! Outbound-only zero-knowledge E2EE WebSocket relay tunnel (`gitpulsed --relay`).
+//! Outbound-only zero-knowledge E2EE WebSocket relay tunnel (`wayloded --relay`).
 //!
 //! All Noise `IK` handshakes, 1024-bit sliding replay protection, `GPTF` v1
 //! outer frames, Ed25519 WS request signing, and hardware P-256 approval &
 //! steering verification delegate directly to the single audited
-//! `gitpulse-protocol` crate (Opus R1/R2/R6, #20, #23, #31).
+//! `waylode-protocol` crate (Opus R1/R2/R6, #20, #23, #31).
 
 use crate::remote::config::{KeychainStatus, REMOTE_APPROVAL_STATE_FILE};
 use crate::remote::revocations::{RevocationCache, TrustAnchorError, TrustAnchorProvider};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-pub use gitpulse_protocol::canonical::steering_text_sha256_hex;
-pub use gitpulse_protocol::crypto::{
-    sign_relay_request, verify_approval_decision, verify_steering_confirm,
-    EpochHandshakeReplayGuard, NoiseHandshake, RelayAuthHeaders, RevocationPolicy, TunnelSession,
-    DEVICE_HEADER, NOISE_PARAMS, REPLAY_WINDOW_SIZE, SIGNATURE_HEADER, TIMESTAMP_HEADER,
-};
-pub use gitpulse_protocol::wire::{
-    ApprovalChannel, ApprovalDecisionKind, ApprovalOutcome, ApprovalResolvedEvent, ApprovalTicket,
-    CapabilitySet, ControlPlaneEvent, DeviceCertificate, FrameClass, OuterFrame, SessionSnapshot,
-    SignedApprovalDecision, SignedSteeringConfirm, SubagentSummary, WakePushFrame, GPTF_VERSION,
-    MAX_CONTROL_FRAME_BYTES, MAX_PTY_FRAME_BYTES,
-};
-use gitpulse_protocol::ProtocolError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +18,19 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
+pub use waylode_protocol::canonical::steering_text_sha256_hex;
+pub use waylode_protocol::crypto::{
+    sign_relay_request, verify_approval_decision, verify_steering_confirm,
+    EpochHandshakeReplayGuard, NoiseHandshake, RelayAuthHeaders, RevocationPolicy, TunnelSession,
+    DEVICE_HEADER, NOISE_PARAMS, REPLAY_WINDOW_SIZE, SIGNATURE_HEADER, TIMESTAMP_HEADER,
+};
+pub use waylode_protocol::wire::{
+    ApprovalChannel, ApprovalDecisionKind, ApprovalOutcome, ApprovalResolvedEvent, ApprovalTicket,
+    CapabilitySet, ControlPlaneEvent, DeviceCertificate, FrameClass, OuterFrame, SessionSnapshot,
+    SignedApprovalDecision, SignedSteeringConfirm, SubagentSummary, WakePushFrame, GPTF_VERSION,
+    MAX_CONTROL_FRAME_BYTES, MAX_PTY_FRAME_BYTES,
+};
+use waylode_protocol::ProtocolError;
 
 /// WS close code sent by `gitpulse-relay` on device revocation or tier downgrade.
 pub const WS_CLOSE_REVOKED_OR_DOWNGRADED: u16 = 4003;
@@ -78,7 +78,7 @@ pub enum SteeringIngressVerdict {
 /// Host-side remote steering ingress verifier (Opus #23).
 ///
 /// Delegates P-256 + `DeviceCertificate` + mandatory `RevocationPolicy::Enforced`
-/// verification directly to `gitpulse_protocol::crypto::verify_steering_confirm`
+/// verification directly to `waylode_protocol::crypto::verify_steering_confirm`
 /// and tracks single-use nonces in memory.
 pub struct SteeringIngressGate {
     host_id: String,
@@ -93,7 +93,7 @@ impl SteeringIngressGate {
         }
     }
 
-    /// Strictly verifies a remote [`SignedSteeringConfirm`] via `gitpulse-protocol`
+    /// Strictly verifies a remote [`SignedSteeringConfirm`] via `waylode-protocol`
     /// with a mandatory non-stale [`RevocationCache`].
     #[allow(clippy::too_many_arguments)]
     pub fn verify_strict(
@@ -141,7 +141,7 @@ impl SteeringIngressGate {
     }
 
     /// Classifies an incoming remote steering message: returns `HumanConfirmed`
-    /// ONLY if a valid [`SignedSteeringConfirm`] passes every `gitpulse-protocol`
+    /// ONLY if a valid [`SignedSteeringConfirm`] passes every `waylode-protocol`
     /// check; otherwise downgrades cleanly to `DowngradedToPeerAgent`.
     #[allow(clippy::too_many_arguments)]
     pub fn classify_remote_steering(
@@ -259,7 +259,7 @@ pub fn build_host_tunnel_url(
     Ok((full, request_uri))
 }
 
-/// Manages per-mobile-device `gitpulse_protocol::crypto::TunnelSession`s on the
+/// Manages per-mobile-device `waylode_protocol::crypto::TunnelSession`s on the
 /// host, tied to a single `host_epoch`, `EpochHandshakeReplayGuard`, and
 /// mandatory [`RevocationCache`].
 pub struct HostNoiseManager {
@@ -302,7 +302,7 @@ impl HostNoiseManager {
         self.host_epoch
     }
 
-    /// Completes a Noise `IK` responder handshake via `gitpulse-protocol`,
+    /// Completes a Noise `IK` responder handshake via `waylode-protocol`,
     /// enforcing mandatory `RevocationPolicy::Enforced`, `DeviceCertificate`
     /// static-key pinning, empty msg1 payload, and per-epoch msg1 replay guard.
     pub fn accept_mobile(
@@ -559,7 +559,7 @@ pub struct HostTunnelParams {
 
 /// Runs one outbound WSS connection to `gitpulse-relay`:
 /// 1. Verifies Keychain is unlocked (non-blocking) and revocation cache is fresh.
-/// 2. Signs WS upgrade headers via `gitpulse_protocol::crypto::sign_relay_request`.
+/// 2. Signs WS upgrade headers via `waylode_protocol::crypto::sign_relay_request`.
 /// 3. Connects outbound-only via `tokio-tungstenite`.
 /// 4. Writes `Active` to `remote-approval.state` and emits `inbox_snapshot` to
 ///    all active paired Noise sessions (Opus R6).

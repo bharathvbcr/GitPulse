@@ -10,7 +10,7 @@ function makeSession(overrides: Partial<SessionSnapshot>): SessionSnapshot {
   return {
     session_key: "sess-default",
     repo_path: "/repo",
-    repo_label: "GitPulse",
+    repo_label: "Waylode",
     worktree_path: "/repo",
     branch: "main",
     harness: "claude",

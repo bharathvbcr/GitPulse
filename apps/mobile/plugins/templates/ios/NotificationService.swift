@@ -2,25 +2,25 @@ import Foundation
 import Security
 import UserNotifications
 
-// Linked from src-tauri/crates/gitpulse-protocol XCFramework.
+// Linked from src-tauri/crates/waylode-protocol XCFramework.
 // NEVER link React Native or Hermes into the Notification Service Extension (24 MB memory budget).
-#if canImport(GitPulseProtocol)
-import GitPulseProtocol
+#if canImport(WaylodeProtocol)
+import WaylodeProtocol
 #endif
 
-/// GitPulse iOS Notification Service Extension (Opus M1, M2, R8, board #18).
+/// Waylode iOS Notification Service Extension (Opus M1, M2, R8, board #18).
 ///
 /// Security invariants:
 /// 1. Runs pure Swift + Rust XCFramework (zero Hermes / JS runtime).
 /// 2. Reads X25519 private key and pinned host Ed25519 pubkey from shared App Group Keychain
 ///    (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`) and zeroizes secret immediately.
 /// 3. Enforces `preview_ct_b64` raw bytes <= 2048 B (`"GPPV"` v1); never sends plaintext through APNs.
-/// 4. Assigns category `GITPULSE_APPROVAL` which ONLY exposes `Deny` and `Deny & Stop` actions.
+/// 4. Assigns category `WAYLODE_APPROVAL` which ONLY exposes `Deny` and `Deny & Stop` actions.
 ///    Lock-screen Approve is strictly forbidden (Opus M1): tapping opens the app to the native full-bytes sheet.
 final class NotificationService: UNNotificationServiceExtension {
     private static let appGroup = "__APP_GROUP__"
     private static let x25519KeyAccount = "gitpulse.identity.x25519.v1"
-    private static let approvalCategoryIdentifier = "GITPULSE_APPROVAL"
+    private static let approvalCategoryIdentifier = "WAYLODE_APPROVAL"
     private static let maxPreviewCiphertextBytes = 2048
 
     private var contentHandler: ((UNNotificationContent) -> Void)?
@@ -80,9 +80,9 @@ final class NotificationService: UNNotificationServiceExtension {
     }
 
     private func applyGenericFallback(to content: UNMutableNotificationContent) {
-        content.title = "GitPulse Approval Required"
+        content.title = "Waylode Approval Required"
         content.subtitle = ""
-        content.body = "Open GitPulse to inspect the full command and verify its hash before deciding."
+        content.body = "Open Waylode to inspect the full command and verify its hash before deciding."
         content.categoryIdentifier = Self.approvalCategoryIdentifier
         content.sound = .default
     }
@@ -119,8 +119,8 @@ final class NotificationService: UNNotificationServiceExtension {
             account: "gitpulse.host.\(expectedSenderDeviceId).ed25519_pub"
         )
 
-        #if canImport(GitPulseProtocol)
-        let plaintextBytes = try GitPulseProtocol.openPreview(
+        #if canImport(WaylodeProtocol)
+        let plaintextBytes = try WaylodeProtocol.openPreview(
             sealedBytes: sealedBytes,
             recipientX25519Secret: x25519Secret,
             senderEd25519Pub: senderEd25519Pub,

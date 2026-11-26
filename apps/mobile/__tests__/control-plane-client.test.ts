@@ -22,7 +22,7 @@ function makeTicket(id: string): ApprovalTicket {
     cwd: "/Users/dev/GitPulse",
     input_sha256: "a".repeat(64),
     summary: "Run cargo test",
-    repo_label: "GitPulse",
+    repo_label: "Waylode",
     issued_at: 1_700_000_000,
     expires_at: 1_700_001_800,
   };
@@ -32,7 +32,7 @@ function makeAntigravityIdleSession(): SessionSnapshot {
   return {
     session_key: "agy:repo:1",
     repo_path: "/Users/dev/GitPulse",
-    repo_label: "GitPulse",
+    repo_label: "Waylode",
     worktree_path: "/Users/dev/GitPulse",
     branch: "main",
     harness: "antigravity",
