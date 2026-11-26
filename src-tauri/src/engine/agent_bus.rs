@@ -3421,14 +3421,11 @@ fn merge_file_claims_into_radar_holders(
     holders
 }
 
-/// Runs Layer 3 ODB merge conflict checks via `insights::merge_conflicts`.
-/// INTEGRATOR: when `author-stream`'s `merge_conflicts_from_lanes` lands, swap
-/// `merge_conflicts_within` here to `merge_conflicts_from_lanes(anchor_path, non_bare, Some(active_paths), max_pairs, odb_budget)`.
+/// Runs Layer 3 ODB merge conflict checks via `insights::merge_conflicts::merge_conflicts_from_lanes`.
 fn radar_odb_conflicts(
-    repo_path: &str,
     anchor_path: &Path,
     non_bare: &[&WorktreeInfo],
-    _active_paths: &HashSet<String>,
+    active_paths: &HashSet<String>,
     max_pairs: usize,
     odb_budget: Duration,
 ) -> (Vec<OdbPairConflict>, bool, Vec<RadarScanError>) {
@@ -3444,8 +3441,13 @@ fn radar_odb_conflicts(
         return (Vec::new(), true, errors);
     }
 
-    let mc =
-        crate::insights::merge_conflicts::merge_conflicts_within(repo_path, max_pairs, odb_budget);
+    let mc = crate::insights::merge_conflicts::merge_conflicts_from_lanes(
+        anchor_path,
+        non_bare,
+        Some(active_paths),
+        max_pairs,
+        odb_budget,
+    );
     let branch_for = |path: &str| -> Option<String> {
         non_bare
             .iter()
@@ -3564,7 +3566,6 @@ pub fn scan_parallel_agent_radar(
     }
     let odb_budget = RADAR_ODB_BUDGET.min(radar_deadline.saturating_duration_since(Instant::now()));
     let (odb_merge_conflicts, odb_truncated, odb_errors) = radar_odb_conflicts(
-        repo_path,
         &anchor_path,
         &non_bare,
         &active_paths,
