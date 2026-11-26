@@ -52,7 +52,7 @@ const MSG1_REPLAY_GUARD_CAPACITY: usize = 256;
 #[serde(untagged)]
 pub enum RelayWireMessage {
     /// Relay cursor-gap event (`{type: "cursor_gap", current_epoch, oldest_available_seq, latest_seq}`).
-    CursorGap(ControlPlaneEvent),
+    CursorGap(Box<ControlPlaneEvent>),
     /// Metadata-free wake push (`{v: 1, kind, host_device, stream_seq, expires_at, preview_ct_b64?}`).
     WakePush(WakePushFrame),
     /// Zero-knowledge encrypted GPTF v1 outer frame (`{v: 1, frame_id, stream_id, ...}`).
@@ -778,7 +778,9 @@ pub async fn run_host_tunnel_once(
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(wire) = serde_json::from_str::<RelayWireMessage>(&text) {
                             match wire {
-                                RelayWireMessage::CursorGap(ControlPlaneEvent::CursorGap { .. }) => {
+                                RelayWireMessage::CursorGap(event)
+                                    if matches!(*event, ControlPlaneEvent::CursorGap { .. }) =>
+                                {
                                     snapshot_seq += 1;
                                     if let Err(err) = emit_inbox_snapshot(
                                         &mut ws_sink,

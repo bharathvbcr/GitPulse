@@ -38,6 +38,7 @@ use super::tunnel::{
 };
 use super::{run_relay_mode, run_relay_with_trust_anchor};
 use crate::daemon_lock;
+use crate::procguard::LockedSpawn;
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
@@ -323,7 +324,7 @@ fn dynamic_workspace_discovery_filters_untrusted_repos() {
         let out = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .unwrap();
         assert!(out.status.success());
     }
@@ -350,7 +351,7 @@ fn dynamic_workspace_discovery_filters_untrusted_repos() {
 
     crate::repository_trust::revoke(untrusted_canon.to_str().unwrap()).unwrap();
 
-    let discovery = discover_trusted_repositories(&[trusted_canon.clone()]);
+    let discovery = discover_trusted_repositories(std::slice::from_ref(&trusted_canon));
     assert_eq!(discovery.trusted.len(), 1);
     assert_eq!(discovery.trusted[0].root, trusted_canon);
     assert_eq!(discovery.skipped_untrusted.len(), 1);
@@ -546,6 +547,8 @@ fn noise_ik_roundtrip_sliding_window_replay_rejection_and_backoff_bounds() {
 }
 
 #[tokio::test]
+// The handshake callback's `Err` type is tungstenite's `ErrorResponse`, fixed by `accept_hdr_async`.
+#[allow(clippy::result_large_err)]
 async fn tunnel_emits_inbox_snapshot_on_connect_and_releases_state_on_4003() {
     let now = now_secs();
     let (_, identity_pub, _, mob_x_secret, mob_cert, rev_cache) =

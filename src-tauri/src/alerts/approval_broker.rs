@@ -749,12 +749,15 @@ enum TicketResolution {
     Expired,
 }
 
+/// What a held hook waits on until its ticket resolves.
+type TicketSignal = Arc<(Mutex<()>, Condvar)>;
+
 struct OpenTicket {
     summary: ApprovalTicketSummary,
     deadline: Instant,
     waiter_count: usize,
     resolution: TicketResolution,
-    signal: Arc<(Mutex<()>, Condvar)>,
+    signal: TicketSignal,
 }
 
 #[derive(Debug, Clone)]
@@ -1160,7 +1163,7 @@ impl ApprovalBroker {
     fn register_or_attach(
         &self,
         req: &RegisterApprovalRequest,
-    ) -> Result<(String, Arc<(Mutex<()>, Condvar)>, Instant), HookBrokerReply> {
+    ) -> Result<(String, TicketSignal, Instant), HookBrokerReply> {
         if !self.is_remote_approval_active() {
             return Err(HookBrokerReply::Bypass {
                 reason: "remote_inactive".to_owned(),
@@ -1282,7 +1285,7 @@ impl ApprovalBroker {
     fn wait_for_ticket(
         &self,
         ticket_id: &str,
-        signal: &Arc<(Mutex<()>, Condvar)>,
+        signal: &TicketSignal,
         deadline: Instant,
         mut peer_disconnected: impl FnMut() -> bool,
     ) -> HookBrokerReply {

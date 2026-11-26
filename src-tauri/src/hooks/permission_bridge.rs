@@ -167,9 +167,7 @@ pub fn run(input: &HookInput) -> Option<String> {
         return None;
     }
     let wait = wait_limit(std::env::var(WAIT_ENV).ok().as_deref());
-    let Some(socket_path) = default_socket_path() else {
-        return None;
-    };
+    let socket_path = default_socket_path()?;
     run_against_socket_with_trust_check(input, &socket_path, wait, is_trusted_repo_cwd)
 }
 

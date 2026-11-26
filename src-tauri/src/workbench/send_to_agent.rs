@@ -596,7 +596,7 @@ pub(super) fn send_with_homes(
         let route = decide_with_liveness(
             run,
             |session| mailbox.listening(session, SystemTime::now()),
-            |r, sid| probe_session_liveness(r, sid),
+            probe_session_liveness,
             || {
                 let checkout_exists = run["cwd"]
                     .as_str()

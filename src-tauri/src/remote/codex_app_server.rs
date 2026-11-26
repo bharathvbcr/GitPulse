@@ -251,13 +251,16 @@ pub fn refuse_remote_policy_change(
     Ok(())
 }
 
+/// In-flight JSON-RPC calls, keyed by request id, each waiting for its reply.
+type PendingCalls = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexError>>>>>;
+
 /// Active `codex app-server` JSON-RPC stdio client owned by `gitpulsed`.
 pub struct CodexAppServerClient {
     config: CodexLaunchConfig,
     child: Mutex<Option<Child>>,
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     next_id: AtomicU64,
-    pending_calls: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexError>>>>>,
+    pending_calls: PendingCalls,
     pending_approvals: Arc<Mutex<HashMap<String, CodexApprovalRequest>>>,
     approvals_rx: tokio::sync::Mutex<mpsc::Receiver<CodexApprovalRequest>>,
     notifications_rx: tokio::sync::Mutex<mpsc::Receiver<CodexNotification>>,
@@ -287,8 +290,7 @@ impl CodexAppServerClient {
             .take()
             .ok_or_else(|| CodexError::SpawnFailed("child stdout unavailable".into()))?;
 
-        let pending_calls: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexError>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending_calls: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
         let pending_approvals: Arc<Mutex<HashMap<String, CodexApprovalRequest>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (approvals_tx, approvals_rx) = mpsc::channel(128);

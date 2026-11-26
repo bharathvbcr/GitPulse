@@ -137,6 +137,7 @@ impl OrgPolicyBundle {
 
     /// Creates and signs an offline Enterprise policy bundle (primarily for
     /// tests and enterprise provisioning tooling).
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         signing_key: &SigningKey,
         org_id: impl Into<String>,

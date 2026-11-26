@@ -15,6 +15,7 @@ use gitpulse_lib::alerts::approval_broker::{
     ApprovalBroker, BrokerError, HookBrokerReply, MockPresenceProvider, RegisterApprovalRequest,
     ResolveStatus, TrustedApprovalKeyStore, UserPresence,
 };
+use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::remote::config::{
     RemoteControlConfig, Tier, EXIT_CODE_FREE_OR_DISABLED, RELAY_LOCK_FILE, REMOTE_CONFIG_FILE,
 };
@@ -121,7 +122,7 @@ fn go_toolchain_available() -> bool {
         .arg("version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status_locked()
         .is_ok_and(|s| s.success())
 }
 
@@ -158,7 +159,7 @@ fn build_relay_binary(relay_dir: &Path, out_dir: &Path) -> PathBuf {
         .args(["build", "-o"])
         .arg(&bin_path)
         .arg("./cmd/gitpulse-relay")
-        .output()
+        .output_locked()
         .expect("spawn go build for gitpulse-relay");
     assert!(
         output.status.success(),
@@ -193,7 +194,7 @@ impl RelayProcess {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .expect("spawn gitpulse-relay serve");
 
         let stderr = child.stderr.take().expect("relay stderr pipe");
@@ -565,7 +566,7 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
     let gitpulsed_out = Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
         .args(["--relay", "--once", "--config-dir"])
         .arg(&free_cfg_dir)
-        .output()
+        .output_locked()
         .expect("run real gitpulsed --relay binary");
     assert_eq!(
         gitpulsed_out.status.code(),
@@ -708,7 +709,7 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
             "--store-backend",
             "sqlite",
         ])
-        .output()
+        .output_locked()
         .expect("run gitpulse-relay grant");
     assert!(
         grant_out.status.success(),
