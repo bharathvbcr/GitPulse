@@ -2333,6 +2333,17 @@ mod tests {
         let (dir, repo) = seeded_repo();
         git_in(&repo, &["branch", "develop"]);
         for (remote, branch) in [("origin", "main"), ("upstream", "develop")] {
+            // checkout.defaultRemote only counts when it names a configured
+            // remote, so each one needs a remote.<name>.url, not just refs.
+            git_in(
+                &repo,
+                &[
+                    "remote",
+                    "add",
+                    remote,
+                    &format!("https://example.com/{remote}.git"),
+                ],
+            );
             git_in(
                 &repo,
                 &[
