@@ -763,11 +763,15 @@ async function runSmoke(opts) {
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
-  /** @type {{ platform: string, display: string, startedAt: string, scenarios: Array<{ name: string, ok: boolean, ms: number, detail?: string }>, screenshots: Array<{ name: string, path: string, bytes: number }> }} */
+  /** @type {{ platform: string, display: string, startedAt: string, ok: boolean, exitCode: number | null, scenarios: Array<{ name: string, ok: boolean, ms: number, detail?: string }>, screenshots: Array<{ name: string, path: string, bytes: number }> }} */
   const summary = {
     platform: process.platform,
     display,
     startedAt: new Date().toISOString(),
+    // The verdict, written last: a run that never finished has `ok: false`,
+    // so a wrapper that loses the exit code (gsudo) can still tell.
+    ok: false,
+    exitCode: null,
     scenarios: [],
     screenshots: [],
   };
@@ -1178,6 +1182,8 @@ async function runSmoke(opts) {
     }
     driverProc.stdout?.destroy();
     driverProc.stderr?.destroy();
+    summary.exitCode = exitCode;
+    summary.ok = exitCode === 0 && summary.scenarios.length > 0 && summary.scenarios.every((s) => s.ok);
     writeFileSync(path.join(opts.artifactsDir, "summary.json"), JSON.stringify(summary, null, 2));
     if (!opts.keepTemp) {
       try {

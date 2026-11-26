@@ -452,13 +452,26 @@ describe("check:workflows", () => {
     expect(prepare).not.toMatch(/\/grant\s+"?Everyone:/);
     // Each of these fails the prepare step by name instead of as a session timeout.
     expect(prepare).toContain("Medium Mandatory Level");
-    expect(prepare).toContain("$LASTEXITCODE -ne 7");
     expect(prepare).toContain("GITPULSE_GSUDO_PROBE");
     expect(prepare).toContain("gsudo changed the working directory");
     // gsudo by name: a `sudo` alias can resolve to Windows' own sudo.exe.
     expect(smoke).toContain("gsudo --integrity Medium node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows");
-    expect(smoke).toContain("exit $LASTEXITCODE");
     expect(smoke).not.toMatch(/^\s*node scripts\/e2e-driver-smoke\.mjs/m);
+    // gsudo returned 0 for a child that exited 7: the step's verdict is the
+    // smoke's own summary, removed first so a stale one cannot pass the step.
+    expect(smoke).not.toContain("exit $LASTEXITCODE");
+    expect(smoke).toContain("Remove-Item $summaryFile");
+    expect(smoke).toMatch(/\$summary\.ok -ne \$true\)[\s\S]*exit 1/);
+  });
+
+  it("writes the smoke's verdict into summary.json, false until a finished run says otherwise", () => {
+    const smoke = readFileSync(fileURLToPath(new URL("./e2e-driver-smoke.mjs", import.meta.url)), "utf8");
+    expect(smoke).toMatch(/startedAt: new Date\(\)\.toISOString\(\),[\s\S]{0,200}ok: false,/);
+    expect(smoke).toContain("summary.ok = exitCode === 0 && summary.scenarios.length > 0 && summary.scenarios.every((s) => s.ok);");
+    const verdict = smoke.indexOf("summary.ok = exitCode");
+    const write = smoke.indexOf('writeFileSync(path.join(opts.artifactsDir, "summary.json")');
+    expect(verdict, "the verdict is set before the summary is written").toBeGreaterThan(0);
+    expect(write).toBeGreaterThan(verdict);
   });
 
   it("keeps DEVMAP_REV, MANVI_REV, NEXTEST_VERSION, TAURI_DRIVER_VERSION, BUN_VERSION, and Node major identical across workflows, package.json, and Containerfile.linux-test", () => {

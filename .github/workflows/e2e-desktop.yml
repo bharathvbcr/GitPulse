@@ -558,10 +558,9 @@ jobs:
           # of what the smoke relies on does not carry across.
           $groups = & $exe.FullName --integrity Medium whoami /groups
           if (-not ($groups -match 'Medium Mandatory Level')) { throw "gsudo did not de-elevate: $($groups -match 'Mandatory Level')" }
-          # The program the smoke runs, so the probe has no quoting of its own:
-          # gsudo re-quotes `cmd /c 'exit 7'` and cmd answered 1.
-          & $exe.FullName --integrity Medium node -e 'process.exit(7)'
-          if ($LASTEXITCODE -ne 7) { throw "gsudo did not pass the exit code through (got $LASTEXITCODE)" }
+          # gsudo's exit code does not carry the child's here (a child that
+          # exited 7 came back as 1 through cmd and as 0 through node), so the
+          # smoke step takes its verdict from summary.json, never from it.
           $env:GITPULSE_GSUDO_PROBE = 'carried'
           $seen = "$(& $exe.FullName --integrity Medium node -e 'console.log(process.env.GITPULSE_GSUDO_PROBE)')".Trim()
           if ($seen -ne 'carried') { throw "gsudo did not carry the environment (saw '$seen')" }
@@ -573,8 +572,19 @@ jobs:
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
+          $summaryFile = '.gitpulse/scratch/e2e-windows/summary.json'
+          Remove-Item $summaryFile -ErrorAction SilentlyContinue
           gsudo --integrity Medium node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows
-          exit $LASTEXITCODE
+          $wrapperCode = $LASTEXITCODE
+          # The verdict is the smoke's own, written last: a run that died before
+          # writing it, or that wrote ok: false, fails whatever gsudo returned.
+          $summary = $null
+          if (Test-Path $summaryFile) { $summary = Get-Content $summaryFile -Raw | ConvertFrom-Json }
+          if ($null -eq $summary -or $summary.ok -ne $true) {
+            Write-Output "Windows smoke failed: summary ok=$($summary.ok) exitCode=$($summary.exitCode) (gsudo returned $wrapperCode)"
+            exit 1
+          }
+          Write-Output "Windows smoke passed: $(@($summary.scenarios).Count) scenarios (gsudo returned $wrapperCode)"
 
       - name: Publish Windows E2E Summary
         if: always()
