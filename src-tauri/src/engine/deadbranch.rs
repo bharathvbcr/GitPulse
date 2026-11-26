@@ -2343,6 +2343,15 @@ mod tests {
             git_in(
                 &repo,
                 &[
+                    "remote",
+                    "add",
+                    remote,
+                    &format!("https://example.com/{remote}.git"),
+                ],
+            );
+            git_in(
+                &repo,
+                &[
                     "update-ref",
                     &format!("refs/remotes/{remote}/{branch}"),
                     "HEAD",
