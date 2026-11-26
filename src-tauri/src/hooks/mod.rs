@@ -1097,8 +1097,22 @@ pub struct CollisionFacts {
     pub entity: Option<crate::insights::EntityCollisionVerdict>,
 }
 
-/// Claim-store findings for one path. They are notices. They never become
-/// `others`, so a declared claim is not itself a collision ask.
+/// Freshness window for shared-checkout edit lease enforcement (`5 min`).
+pub const SHARED_CHECKOUT_CLAIM_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Another live session holding a fresh (`< 5 min`) claim on the target path
+/// in a shared worktree (`>= 2` live sessions).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedClaimHolder {
+    pub session_id: String,
+    pub age_secs: u64,
+    pub lane_agent: Option<String>,
+}
+
+/// Claim-store findings for one path. They are notices unless `shared_holder`
+/// is populated in a shared worktree and `shared_checkout_guard` is `Ask` or
+/// `Enforce`. They never become `others`, so a cross-worktree declared claim is
+/// not itself a collision ask.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaimNotices {
     /// Holder and declared-run lines, already worded.
@@ -1113,6 +1127,10 @@ pub struct ClaimNotices {
     /// The store had unreadable lines. The write that follows tries to repair
     /// it; a read never does.
     pub unreadable_lines: bool,
+    /// Another live session holding a fresh (`< 5 min`) claim in this shared
+    /// worktree (`None` on `owner_unknown`, dead holder, expired claim, or
+    /// unreadable store).
+    pub shared_holder: Option<SharedClaimHolder>,
 }
 
 /// The collision-guard contract, over facts someone else gathered.
@@ -1245,6 +1263,128 @@ fn negative_claim_decision(facts: &CollisionFacts, claims: &ClaimNotices) -> Hoo
         message.push_str(&format!(" The check was INCOMPLETE: {}.", gaps.join("; ")));
     }
     HookOutput::notice(message)
+}
+
+fn format_shared_holder(holder: &SharedClaimHolder) -> String {
+    match holder.lane_agent.as_deref() {
+        Some(agent) => format!(
+            "live session {} (lane:{agent}, {}s ago)",
+            holder.session_id, holder.age_secs
+        ),
+        None => format!(
+            "live session {} ({}s ago)",
+            holder.session_id, holder.age_secs
+        ),
+    }
+}
+
+/// Evaluates `shared_checkout_guard` over collision facts + claim notices,
+/// returning `(waivable_output, post_bypass_deny)`.
+///
+/// Safety invariant: NEVER returns `post_bypass_deny` on `owner_unknown`, a
+/// degraded/unreadable claim store, a dead session, or an expired (`>= 5 min`)
+/// claim — always fails open to `Ask` or notice.
+fn shared_checkout_guard_decision(
+    facts: &CollisionFacts,
+    claims: &ClaimNotices,
+    mode: crate::tool_config::SharedCheckoutGuardMode,
+) -> (HookOutput, Option<HookOutput>) {
+    use crate::tool_config::SharedCheckoutGuardMode;
+
+    let base = collision_decision_with_claims(facts, claims);
+    if !facts.ok || !claims.store_error.is_empty() {
+        return (base, None);
+    }
+    let Some(holder) = claims.shared_holder.as_ref() else {
+        return (base, None);
+    };
+    let degraded = claims.unreadable_lines || !claims.store_degraded.is_empty();
+    let holder_desc = format_shared_holder(holder);
+    let target = or_unknown(&facts.target);
+
+    match mode {
+        SharedCheckoutGuardMode::Off => (base, None),
+        SharedCheckoutGuardMode::Ask => {
+            let mut note = format!(
+                "GitPulse: {target} is actively claimed in this shared worktree by {holder_desc}. \
+                 Confirm before editing to avoid overwriting concurrent work."
+            );
+            if !facts.partial.is_empty() {
+                note.push_str(&format!("\n(Scan was incomplete: {}.)", facts.partial));
+            }
+            if degraded && !claims.store_degraded.is_empty() {
+                note.push_str(&format!(
+                    "\n(Claim store was degraded: {}.)",
+                    claims.store_degraded
+                ));
+            }
+            let ask = match base.hook_specific_output {
+                Some(mut specific)
+                    if specific.permission_decision == Some(PermissionDecision::Ask) =>
+                {
+                    let combined = match specific.permission_decision_reason {
+                        Some(existing) if !existing.trim().is_empty() => {
+                            format!("{existing}\n{note}")
+                        }
+                        _ => note,
+                    };
+                    specific.permission_decision_reason = Some(combined);
+                    HookOutput {
+                        hook_specific_output: Some(specific),
+                        system_message: base.system_message,
+                    }
+                }
+                _ => HookOutput {
+                    hook_specific_output: Some(decision(
+                        PRE_TOOL_USE,
+                        PermissionDecision::Ask,
+                        note,
+                    )),
+                    system_message: base.system_message,
+                },
+            };
+            (ask, None)
+        }
+        SharedCheckoutGuardMode::Enforce => {
+            if degraded {
+                let mut reason = format!(
+                    "GitPulse: {target} is actively claimed in this shared worktree by {holder_desc}. \
+                     shared_checkout_guard failed open from enforce to ask because the claim store was degraded"
+                );
+                if !claims.store_degraded.is_empty() {
+                    reason.push_str(&format!(" ({})", claims.store_degraded));
+                }
+                reason.push('.');
+                return (
+                    HookOutput {
+                        hook_specific_output: Some(decision(
+                            PRE_TOOL_USE,
+                            PermissionDecision::Ask,
+                            reason,
+                        )),
+                        system_message: base.system_message,
+                    },
+                    None,
+                );
+            }
+            let mut deny_reason = format!(
+                "GitPulse blocked edit to {target} in this shared worktree: claimed by {holder_desc}. \
+                 Coordinate with that session or wait until the 5-minute claim expires or is released."
+            );
+            if !facts.partial.is_empty() {
+                deny_reason.push_str(&format!(" (Scan was incomplete: {}.)", facts.partial));
+            }
+            let deny = HookOutput {
+                hook_specific_output: Some(decision(
+                    PRE_TOOL_USE,
+                    PermissionDecision::Deny,
+                    deny_reason,
+                )),
+                system_message: None,
+            };
+            (base, Some(deny))
+        }
+    }
 }
 
 /// Closing sentence for a positive collision finding.
@@ -1418,12 +1558,13 @@ pub const BYPASS_PERMISSIONS: &str = "bypassPermissions";
 /// that passed.
 ///
 /// One exception, and it is deliberate: the host-load refusal
-/// (`load_gate`) is **not** passed through here. The refusals above are
-/// permission questions, which bypass mode exists to stop asking. A load refusal
-/// protects the machine from every session at once, not a permission the person
-/// waived, and the sessions that hung this Mac on 2026-11-14 ran in bypass mode.
-/// A person turns it down in Settings → Agents → Host load → Command gate
-/// (Advise says the same thing and refuses nothing; Off says nothing).
+/// (`load_gate`) and `shared_checkout_guard` in `Enforce` mode are **not**
+/// passed through here. The refusals above are permission questions, which
+/// bypass mode exists to stop asking. A load refusal protects the machine from
+/// every session at once, and `shared_checkout_guard = enforce` protects
+/// concurrent agents in a shared checkout from overwriting one another's
+/// active (< 5 min) edits, not a permission the person waived. A person turns
+/// either down in Settings / `tools.json`.
 ///
 /// The host is documented to enforce a hook `deny` in this mode: "A hook deny
 /// applies even in `bypassPermissions` mode."
@@ -1505,9 +1646,118 @@ fn lets_write_through(output: &HookOutput) -> bool {
         .is_none()
 }
 
-/// Reads the claim store for this edit. The collision scan's memo does not
-/// carry claims, and a failed read stays on `store_error` so the decision
-/// cannot look complete.
+#[derive(serde::Deserialize)]
+struct HookPeersFile {
+    #[serde(default)]
+    peers: Vec<HookPeerRecord>,
+}
+
+#[derive(serde::Deserialize)]
+struct HookPeerRecord {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    surface: String,
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    terminal_session_id: Option<String>,
+    #[serde(default)]
+    turn_state: String,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    proc_start_ns: Option<u64>,
+}
+
+/// Bounded, read-only read of `<git-common-dir>/gitpulse/lanes/peers.json`
+/// (never takes `.bus.lock`). Returns `None` if missing or unreadable so
+/// callers fail open.
+fn read_hook_peers(root: &Path) -> Option<Vec<HookPeerRecord>> {
+    const PEERS_MAX_BYTES: u64 = 4 * 1024 * 1024;
+    let common = crate::engine::git_cli::resolve_git_common_dir(root).ok()?;
+    let path = common.join("gitpulse").join("lanes").join("peers.json");
+    let file = std::fs::File::open(&path).ok()?;
+    let mut buf = Vec::new();
+    file.take(PEERS_MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.is_empty() || buf.len() as u64 > PEERS_MAX_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<HookPeersFile>(&buf)
+        .ok()
+        .map(|f| f.peers)
+}
+
+fn is_session_live_in_shared(
+    shared: &insights::SharedWorktree,
+    peers: &mut Option<Option<Vec<HookPeerRecord>>>,
+    agy_homes: &mut Option<Vec<PathBuf>>,
+    root: &Path,
+    candidate_id: &str,
+) -> bool {
+    if shared.sessions.iter().any(|s| {
+        s.session_id
+            .as_deref()
+            .is_some_and(|sid| sid.eq_ignore_ascii_case(candidate_id))
+            || s.terminal_session_id
+                .as_deref()
+                .is_some_and(|sid| sid.eq_ignore_ascii_case(candidate_id))
+    }) {
+        return true;
+    }
+    let loaded = peers.get_or_insert_with(|| read_hook_peers(root));
+    let Some(records) = loaded.as_deref() else {
+        return false;
+    };
+    records.iter().any(|peer| {
+        if peer.turn_state == "exited" {
+            return false;
+        }
+        let id_matches = peer
+            .provider_session_id
+            .as_deref()
+            .is_some_and(|sid| sid.eq_ignore_ascii_case(candidate_id))
+            || peer
+                .terminal_session_id
+                .as_deref()
+                .is_some_and(|sid| sid.eq_ignore_ascii_case(candidate_id));
+        if !id_matches {
+            return false;
+        }
+        let pid_alive = match (peer.pid, peer.proc_start_ns) {
+            (Some(pid), Some(start_ns)) => matches!(
+                crate::workbench::process_birth::running_since(pid, u128::from(start_ns)),
+                crate::workbench::process_birth::Liveness::Alive
+            ),
+            _ => false,
+        };
+        if pid_alive {
+            return true;
+        }
+        let provider = crate::engine::agent_bus::canonical_provider(&peer.provider);
+        let surface = crate::engine::agent_bus::canonical_surface(&peer.surface);
+        if provider == "agy" && surface == "ide" {
+            if let Some(sid) = peer
+                .provider_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| crate::workbench::terminal_command::is_canonical_uuid(s))
+            {
+                let homes =
+                    agy_homes.get_or_insert_with(crate::workbench::conversation::antigravity_homes);
+                return crate::engine::agent_bus::is_antigravity_presence_locked(
+                    homes,
+                    &sid.to_ascii_lowercase(),
+                );
+            }
+        }
+        false
+    })
+}
+
+/// Reads the unified claim stores (`file-claims.jsonl` + live `lanes/claims.json`)
+/// for this edit. The collision scan's memo does not carry claims, and a failed
+/// read stays on `store_error` so the decision cannot look complete.
 fn claim_notices(
     root: &Path,
     risk: &CollisionRisk,
@@ -1516,7 +1766,7 @@ fn claim_notices(
 ) -> ClaimNotices {
     use crate::insights::claims::{self, ClaimSource};
     let now = claims::now_ms();
-    let read = match claims::read_for_worktree(root, now) {
+    let read = match claims::read_unified(root, now) {
         Ok(read) => read,
         Err(error) => {
             return ClaimNotices {
@@ -1533,10 +1783,17 @@ fn claim_notices(
     let store_degraded = read.degraded().unwrap_or_default();
     let rows = read.rows;
     let wanted = claims::normalize_rel(target).unwrap_or_else(|_| target.to_string());
+    let shared_wt = risk
+        .shared_worktrees
+        .iter()
+        .find(|shared| same_path(&shared.path, root) && shared.sessions.len() >= 2);
+    let mut cached_peers: Option<Option<Vec<HookPeerRecord>>> = None;
+    let mut cached_agy_homes: Option<Vec<PathBuf>> = None;
     let mut covered = false;
     let mut lines = Vec::new();
     let mut seen_observed = std::collections::HashSet::new();
     let mut seen_declared = std::collections::HashSet::new();
+    let mut shared_holder: Option<SharedClaimHolder> = None;
     for claim in rows.iter().rev() {
         if claim.path != wanted && claim.path != target {
             continue;
@@ -1545,23 +1802,81 @@ fn claim_notices(
         match claim.source {
             ClaimSource::Observed => {
                 let id = claim.session_id.as_deref().unwrap_or("");
-                if id.is_empty() || id == session_id || !seen_observed.insert(id.to_string()) {
+                if id.is_empty() || id == session_id {
                     continue;
                 }
-                let age_s = now.saturating_sub(claim.ts_ms) / 1000;
-                lines.push(format!("holder: session {id}, {age_s} s ago"));
+                let age_ms = now.saturating_sub(claim.ts_ms);
+                let age_s = age_ms / 1000;
+                if seen_observed.insert(id.to_string()) {
+                    lines.push(format!("holder: session {id}, {age_s} s ago"));
+                }
+                if shared_holder.is_none()
+                    && age_ms < SHARED_CHECKOUT_CLAIM_TTL_MS
+                    && same_path(&claim.worktree, root)
+                {
+                    if let Some(shared) = shared_wt {
+                        if is_session_live_in_shared(
+                            shared,
+                            &mut cached_peers,
+                            &mut cached_agy_homes,
+                            root,
+                            id,
+                        ) {
+                            shared_holder = Some(SharedClaimHolder {
+                                session_id: id.to_string(),
+                                age_secs: age_s,
+                                lane_agent: None,
+                            });
+                        }
+                    }
+                }
             }
             ClaimSource::Declared => {
                 let run = claim.run_id.as_deref().unwrap_or("");
-                // The run working in this checkout already knows its own plan.
-                // Another checkout is told before the file is dirty.
-                if run.is_empty()
-                    || same_path(&claim.worktree, root)
-                    || !seen_declared.insert(run.to_string())
-                {
+                if run.is_empty() {
                     continue;
                 }
-                lines.push(format!("claimed by run {run}"));
+                let lane_agent = run.strip_prefix("lane:");
+                if lane_agent.is_some() {
+                    if claim
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|id| !session_id.is_empty() && id == session_id)
+                    {
+                        continue;
+                    }
+                } else if same_path(&claim.worktree, root) {
+                    // The run working in this checkout already knows its own plan.
+                    // Another checkout is told before the file is dirty.
+                    continue;
+                }
+                if seen_declared.insert(run.to_string()) {
+                    lines.push(format!("claimed by run {run}"));
+                }
+                if let (Some(agent), Some(holder_sid), Some(shared)) =
+                    (lane_agent, claim.session_id.as_deref(), shared_wt)
+                {
+                    let age_ms = now.saturating_sub(claim.ts_ms);
+                    if shared_holder.is_none()
+                        && !holder_sid.is_empty()
+                        && holder_sid != session_id
+                        && age_ms < SHARED_CHECKOUT_CLAIM_TTL_MS
+                        && same_path(&claim.worktree, root)
+                        && is_session_live_in_shared(
+                            shared,
+                            &mut cached_peers,
+                            &mut cached_agy_homes,
+                            root,
+                            holder_sid,
+                        )
+                    {
+                        shared_holder = Some(SharedClaimHolder {
+                            session_id: holder_sid.to_string(),
+                            age_secs: age_ms / 1000,
+                            lane_agent: Some(agent.to_string()),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1578,6 +1893,7 @@ fn claim_notices(
         store_error: String::new(),
         store_degraded,
         unreadable_lines: read.skipped > 0,
+        shared_holder,
     }
 }
 
@@ -1624,8 +1940,29 @@ fn collision_guard_with(
     budget: Duration,
     run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
 ) -> HookOutput {
-    let (decided, pending) = collision_guard_decided(input, budget, run);
-    record_let_through(input, pending, under_bypass(input, decided))
+    collision_guard_with_mode(
+        input,
+        budget,
+        crate::tool_config::shared_checkout_guard(),
+        run,
+    )
+}
+
+/// [`collision_guard_with`] with an explicit [`SharedCheckoutGuardMode`]
+/// (tests inject `Off`/`Ask`/`Enforce` directly or via `WAYLODE_TOOL_CONFIG`).
+fn collision_guard_with_mode(
+    input: &HookInput,
+    budget: Duration,
+    shared_mode: crate::tool_config::SharedCheckoutGuardMode,
+    run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
+) -> HookOutput {
+    let (waivable, enforced, pending) = collision_guard_evaluated(input, budget, shared_mode, run);
+    let after_bypass = under_bypass(input, waivable);
+    let final_output = match enforced {
+        Some(deny) => merge_outputs(after_bypass, deny),
+        None => after_bypass,
+    };
+    record_let_through(input, pending, final_output)
 }
 
 /// [`collision_guard_with`] before the permission mode is applied.
@@ -1633,11 +1970,12 @@ fn collision_guard_with(
 /// The pending claim is `Some` only when this call has a repo-relative path
 /// and did not refuse the write on scope. The caller records it after bypass,
 /// and only if the final answer still lets the write through.
-fn collision_guard_decided(
+fn collision_guard_evaluated(
     input: &HookInput,
     budget: Duration,
+    shared_mode: crate::tool_config::SharedCheckoutGuardMode,
     run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
-) -> (HookOutput, Option<PendingClaim>) {
+) -> (HookOutput, Option<HookOutput>, Option<PendingClaim>) {
     let started = std::time::Instant::now();
     if input.file_path.is_empty() {
         return (
@@ -1645,11 +1983,13 @@ fn collision_guard_decided(
                 "GitPulse collision check did NOT run: the tool call carried no file path.",
             ),
             None,
+            None,
         );
     }
     if input.cwd.is_empty() {
         return (
             unchecked(&input.file_path, "the hook payload carried no cwd"),
+            None,
             None,
         );
     }
@@ -1660,6 +2000,7 @@ fn collision_guard_decided(
                 &input.file_path,
                 &format!("{} is not inside a Git repository", input.cwd),
             ),
+            None,
             None,
         );
     };
@@ -1672,6 +2013,7 @@ fn collision_guard_decided(
                     &input.file_path,
                     &format!("the path could not be resolved: {why}"),
                 ),
+                None,
                 None,
             );
         }
@@ -1700,6 +2042,7 @@ fn collision_guard_decided(
                     &format!("the path is not inside the worktree at {}", here.display()),
                 ),
                 None,
+                None,
             );
         }
         // The nested checkout's owner could not be read, but the file lies
@@ -1726,6 +2069,7 @@ fn collision_guard_decided(
                     &input.file_path,
                     &format!("the checkout that owns the path could not be determined: {why}"),
                 ),
+                None,
                 None,
             );
         }
@@ -1759,6 +2103,7 @@ fn collision_guard_decided(
                  did not run the collision check either. It ran UNGATED.",
                 budget.as_secs()
             ))),
+            None,
             Some(pending_claim(&root, &target)),
         );
     };
@@ -1770,7 +2115,7 @@ fn collision_guard_decided(
                 .as_ref()
                 .is_some_and(|specific| specific.permission_decision.is_some())
             {
-                return (with_note(output), None);
+                return (with_note(output), None, None);
             }
             (output, judged.unscoped)
         }
@@ -1800,6 +2145,7 @@ fn collision_guard_decided(
                     &format!("the scan did not finish within {}s", budget.as_secs()),
                 ),
             )),
+            None,
             Some(pending_claim(&root, &target)),
         );
     };
@@ -1831,13 +2177,16 @@ fn collision_guard_decided(
     // claims are in that repository's store.
     let claims_root = if other == Some(false) { &root } else { &here };
     let notices = claim_notices(claims_root, &risk, &target, &input.session_id);
-    let output = merge_outputs(scoped, collision_decision_with_claims(&facts, &notices));
+    let (guard_waivable, guard_enforced) =
+        shared_checkout_guard_decision(&facts, &notices, shared_mode);
+    let output = merge_outputs(scoped, guard_waivable);
     let pending = PendingClaim {
         repair: notices.unreadable_lines,
         ..pending_claim(&root, &target)
     };
     (
         with_note(announce_unscoped(output, unscoped, Judged::Write, input)),
+        guard_enforced,
         Some(pending),
     )
 }
@@ -2486,7 +2835,13 @@ pub fn serve_collision(repo: &str, path: &str) -> Result<Value, String> {
         ));
     }
     answer.risk.items.retain(|item| item.path == path);
-    answer.risk.shared_worktrees.clear();
+    answer.risk.shared_worktrees.retain_mut(|shared| {
+        if !same_path(&shared.path, repo) {
+            return false;
+        }
+        shared.files.retain(|f| f == path);
+        true
+    });
     serde_json::to_value(answer).map_err(|error| error.to_string())
 }
 
@@ -2932,6 +3287,967 @@ fn scanned_by_app(_root: &str, _target: &str) -> Result<CollisionRisk, String> {
 /// thread `run` chooses.
 type CommandJob = Box<dyn FnOnce() -> ScopedVerdict + Send>;
 
+// ref_guard:begin
+/// Bash git ref-mutation guard (`refs/gitpulse/*`, DWIM decoy prefixes, and
+/// `> 1024`-byte ref targets), aligned with `git-ai` spec §6.
+///
+/// Pure string inspection: never runs `git` or writes any ref.
+mod ref_guard {
+    const MAX_REF_NAME_BYTES: usize = 1024;
+    const RESERVED_REF: &str = "refs/gitpulse";
+    const RESERVED_REF_PREFIX: &str = "refs/gitpulse/";
+    const DWIM_DECOY_PREFIXES: &[&str] = &[
+        "refs/refs/",
+        "refs/tags/refs/",
+        "refs/heads/refs/",
+        "refs/remotes/refs/",
+    ];
+
+    fn is_zero_oid(val: &str) -> bool {
+        matches!(val.len(), 40 | 64) && val.bytes().all(|b| b == b'0')
+    }
+
+    /// Expands a ref argument to its full refname.
+    ///
+    /// When `always_prepend` is `true` (commands like `git branch`, `git tag`,
+    /// `git checkout -b`, `git switch -c`, `git worktree add -b`), Git ALWAYS
+    /// prepends `refs/heads/` or `refs/tags/` even when the user passes a name
+    /// starting with `refs/` — which is how DWIM decoys (`refs/heads/refs/...`)
+    /// are created.
+    fn expand_ref(raw: &str, default_prefix: Option<&str>, always_prepend: bool) -> String {
+        let trimmed = raw.trim();
+        if always_prepend {
+            if let Some(prefix) = default_prefix {
+                return format!("{prefix}{trimmed}");
+            }
+        }
+        if trimmed.starts_with("refs/") || trimmed == "HEAD" {
+            trimmed.to_string()
+        } else if let Some(prefix) = default_prefix {
+            format!("{prefix}{trimmed}")
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn check_ref_target(
+        raw: &str,
+        default_prefix: Option<&str>,
+        always_prepend: bool,
+        is_delete: bool,
+    ) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let full = expand_ref(trimmed, default_prefix, always_prepend);
+        if full == RESERVED_REF || full.starts_with(RESERVED_REF_PREFIX) {
+            return Some(format!(
+                "GitPulse blocked git ref mutation targeting reserved namespace `{full}`: \
+                 `refs/gitpulse/*` is managed exclusively by GitPulse."
+            ));
+        }
+        if !is_delete {
+            if let Some(prefix) = DWIM_DECOY_PREFIXES
+                .iter()
+                .find(|prefix| full.starts_with(*prefix))
+            {
+                return Some(format!(
+                    "GitPulse blocked git ref mutation targeting DWIM decoy prefix `{prefix}` \
+                     (`{full}`): nested `refs/` prefixes shadow exact ref lookups."
+                ));
+            }
+            if full.len() > MAX_REF_NAME_BYTES {
+                return Some(format!(
+                    "GitPulse blocked git ref mutation: ref target `{}` ({} bytes) exceeds \
+                     the {MAX_REF_NAME_BYTES}-byte limit.",
+                    &full[..full.floor_char_boundary(96)],
+                    full.len()
+                ));
+            }
+        }
+        None
+    }
+
+    /// Splits a shell string into top-level command segments (`;`, `\n`, `|`,
+    /// `||`, `&&`, `&`), respecting `'...'`, `"..."`, and `\` escapes, and also
+    /// collects any `$(...)` / `` `...` `` sub-expressions for recursive checks.
+    fn split_segments_and_substitutions(command: &str) -> (Vec<String>, Vec<String>) {
+        let mut segments = Vec::new();
+        let mut substitutions = Vec::new();
+        let mut current = String::new();
+        let mut chars = command.chars().peekable();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while let Some(c) = chars.next() {
+            if escaped {
+                current.push(c);
+                escaped = false;
+                continue;
+            }
+            if in_single {
+                if c == '\'' {
+                    in_single = false;
+                }
+                current.push(c);
+                continue;
+            }
+            if c == '\\' {
+                current.push(c);
+                escaped = true;
+                continue;
+            }
+            if !in_double && c == '\'' {
+                in_single = true;
+                current.push(c);
+                continue;
+            }
+            if c == '"' {
+                in_double = !in_double;
+                current.push(c);
+                continue;
+            }
+            if c == '$' && chars.peek() == Some(&'(') {
+                chars.next();
+                if chars.peek() == Some(&'(') {
+                    current.push_str("$(");
+                    continue;
+                }
+                let mut depth = 1usize;
+                let mut inner = String::new();
+                let mut sub_single = false;
+                let mut sub_double = false;
+                let mut sub_esc = false;
+                for sc in chars.by_ref() {
+                    if sub_esc {
+                        inner.push(sc);
+                        sub_esc = false;
+                        continue;
+                    }
+                    if sub_single {
+                        if sc == '\'' {
+                            sub_single = false;
+                        }
+                        inner.push(sc);
+                        continue;
+                    }
+                    if sc == '\\' {
+                        inner.push(sc);
+                        sub_esc = true;
+                        continue;
+                    }
+                    if !sub_double && sc == '\'' {
+                        sub_single = true;
+                        inner.push(sc);
+                        continue;
+                    }
+                    if sc == '"' {
+                        sub_double = !sub_double;
+                        inner.push(sc);
+                        continue;
+                    }
+                    if !sub_double {
+                        if sc == '(' {
+                            depth += 1;
+                        } else if sc == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    inner.push(sc);
+                }
+                if !inner.trim().is_empty() {
+                    substitutions.push(inner);
+                }
+                continue;
+            }
+            if c == '`' {
+                let mut inner = String::new();
+                let mut bt_esc = false;
+                for sc in chars.by_ref() {
+                    if bt_esc {
+                        inner.push(sc);
+                        bt_esc = false;
+                        continue;
+                    }
+                    if sc == '\\' {
+                        bt_esc = true;
+                        continue;
+                    }
+                    if sc == '`' {
+                        break;
+                    }
+                    inner.push(sc);
+                }
+                if !inner.trim().is_empty() {
+                    substitutions.push(inner);
+                }
+                continue;
+            }
+            if in_double {
+                current.push(c);
+                continue;
+            }
+            match c {
+                ';' | '\n' | '|' => {
+                    if c == '|' && chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                    if !current.trim().is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                }
+                '&' => {
+                    if chars.peek() == Some(&'&') {
+                        chars.next();
+                    }
+                    if !current.trim().is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                }
+                _ => current.push(c),
+            }
+        }
+        if !current.trim().is_empty() {
+            segments.push(current);
+        }
+        (segments, substitutions)
+    }
+
+    fn tokenize_segment(segment: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut in_token = false;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        for c in segment.chars() {
+            if escaped {
+                current.push(c);
+                in_token = true;
+                escaped = false;
+                continue;
+            }
+            if in_single {
+                if c == '\'' {
+                    in_single = false;
+                } else {
+                    current.push(c);
+                }
+                in_token = true;
+                continue;
+            }
+            if in_double {
+                if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_double = false;
+                } else {
+                    current.push(c);
+                }
+                in_token = true;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    escaped = true;
+                    in_token = true;
+                }
+                '\'' => {
+                    in_single = true;
+                    in_token = true;
+                }
+                '"' => {
+                    in_double = true;
+                    in_token = true;
+                }
+                '(' | ')' if !in_token => {}
+                c if c.is_whitespace() => {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                }
+                _ => {
+                    current.push(c);
+                    in_token = true;
+                }
+            }
+        }
+        if in_token {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    fn is_env_assignment(token: &str) -> bool {
+        let Some((name, _)) = token.split_once('=') else {
+            return false;
+        };
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    fn is_git_exe(token: &str) -> bool {
+        let clean = token.trim_matches(|c| matches!(c, '(' | ')'));
+        clean == "git"
+            || clean == "git.exe"
+            || clean.ends_with("/git")
+            || clean.ends_with("\\git")
+            || clean.ends_with("\\git.exe")
+    }
+
+    fn is_shell_exe(token: &str) -> bool {
+        let base = token
+            .trim_matches(|c| matches!(c, '(' | ')'))
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(token);
+        matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh")
+    }
+
+    fn unwrap_prefixes(tokens: &[String]) -> usize {
+        let mut idx = 0;
+        while idx < tokens.len() {
+            let tok = tokens[idx].as_str();
+            if is_env_assignment(tok)
+                || matches!(
+                    tok,
+                    "command" | "nohup" | "nice" | "time" | "builtin" | "exec" | "("
+                )
+            {
+                idx += 1;
+                continue;
+            }
+            if tok == "env" || tok == "sudo" {
+                idx += 1;
+                while idx < tokens.len() {
+                    let arg = tokens[idx].as_str();
+                    if matches!(arg, "-u" | "-C" | "-S") && idx + 1 < tokens.len() {
+                        idx += 2;
+                    } else if arg.starts_with('-') || is_env_assignment(arg) {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+            break;
+        }
+        idx
+    }
+
+    fn extract_git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
+        let mut idx = unwrap_prefixes(tokens);
+        let exe = tokens.get(idx)?.as_str();
+        if !is_git_exe(exe) {
+            return None;
+        }
+        idx += 1;
+        while idx < tokens.len() {
+            let arg = tokens[idx].as_str();
+            if arg == "--" {
+                idx += 1;
+                break;
+            }
+            if matches!(arg, "--version" | "--help") {
+                return Some((arg, &tokens[idx + 1..]));
+            }
+            if matches!(
+                arg,
+                "-C" | "-c"
+                    | "--git-dir"
+                    | "--work-tree"
+                    | "--namespace"
+                    | "--super-prefix"
+                    | "--config-env"
+                    | "--exec-path"
+                    | "--attr-source"
+            ) {
+                idx += if idx + 1 < tokens.len() { 2 } else { 1 };
+                continue;
+            }
+            if arg.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+            return Some((arg, &tokens[idx + 1..]));
+        }
+        tokens
+            .get(idx)
+            .map(|sub| (sub.as_str(), &tokens[idx + 1..]))
+    }
+
+    fn extract_shell_c_script(tokens: &[String]) -> Option<&str> {
+        let idx = unwrap_prefixes(tokens);
+        let exe = tokens.get(idx)?.as_str();
+        if !is_shell_exe(exe) {
+            return None;
+        }
+        let mut i = idx + 1;
+        while i < tokens.len() {
+            let arg = tokens[i].as_str();
+            if arg == "--" {
+                break;
+            }
+            if arg == "-c"
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c'))
+            {
+                return tokens.get(i + 1).map(String::as_str);
+            }
+            if matches!(arg, "-o" | "+o") {
+                i += 2;
+                continue;
+            }
+            if arg.starts_with('-') || arg.starts_with('+') {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        None
+    }
+
+    fn check_update_ref_stdin_text(full_command: &str) -> Option<String> {
+        // Scan inline heredoc / printf / echo payloads for `git update-ref --stdin`.
+        for raw_line in full_command.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Check raw tokens inside the line (e.g. `update refs/gitpulse/ops/1 HEAD`
+            // or `printf 'update refs/gitpulse/ops/1 HEAD\n'`).
+            let tokens = tokenize_segment(line);
+            for (i, tok) in tokens.iter().enumerate() {
+                if matches!(tok.as_str(), "create" | "update" | "verify" | "delete") {
+                    let is_delete = tok == "delete";
+                    if let Some(target) = tokens.get(i + 1) {
+                        if let Some(reason) = check_ref_target(target, None, false, is_delete) {
+                            return Some(reason);
+                        }
+                    }
+                } else if tok.contains("refs/") {
+                    // Check embedded refs in single quoted printf/echo payloads (`"update refs/..."`).
+                    for subtok in tok.split_whitespace() {
+                        if subtok.starts_with("refs/") {
+                            let prev_is_delete =
+                                tok.split_whitespace().take_while(|&w| w != subtok).last()
+                                    == Some("delete");
+                            if let Some(reason) =
+                                check_ref_target(subtok, None, false, prev_is_delete)
+                            {
+                                return Some(reason);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn check_update_ref(rest: &[String], full_command: &str) -> Option<String> {
+        let mut is_delete = false;
+        let mut stdin_mode = false;
+        let mut positionals = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                positionals.extend(rest[i + 1..].iter().map(String::as_str));
+                break;
+            }
+            if matches!(arg, "-d" | "--delete") {
+                is_delete = true;
+            } else if arg == "--stdin" {
+                stdin_mode = true;
+            } else if arg == "-m" {
+                i += 2;
+                continue;
+            } else if arg.starts_with('-') {
+                // Other flags (`-z`, `--no-deref`, `--create-reflog`, `--batch-updates`).
+            } else {
+                positionals.push(arg);
+            }
+            i += 1;
+        }
+        if stdin_mode {
+            if let Some(reason) = check_update_ref_stdin_text(full_command) {
+                return Some(reason);
+            }
+        }
+        let ref_arg = positionals.first().copied()?;
+        let effective_delete = is_delete
+            || positionals
+                .get(1)
+                .is_some_and(|new_val| is_zero_oid(new_val));
+        check_ref_target(ref_arg, None, false, effective_delete)
+    }
+
+    fn check_symbolic_ref(rest: &[String]) -> Option<String> {
+        let mut is_delete = false;
+        let mut positionals = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                positionals.extend(rest[i + 1..].iter().map(String::as_str));
+                break;
+            }
+            if matches!(arg, "-d" | "--delete") {
+                is_delete = true;
+            } else if arg == "-m" {
+                i += 2;
+                continue;
+            } else if arg.starts_with('-') {
+                // `-q`, `--quiet`, `--short`, `--recurse`, `--no-recurse`.
+            } else {
+                positionals.push(arg);
+            }
+            i += 1;
+        }
+        if is_delete {
+            if let Some(name) = positionals.first().copied() {
+                return check_ref_target(name, None, false, true);
+            }
+            return None;
+        }
+        if positionals.len() >= 2 {
+            if let Some(reason) = check_ref_target(positionals[0], None, false, false) {
+                return Some(reason);
+            }
+            if let Some(reason) = check_ref_target(positionals[1], None, false, false) {
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    fn check_branch(rest: &[String]) -> Option<String> {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut is_delete = false;
+        let mut is_move_or_copy = false;
+        let mut is_list_or_query = false;
+        let mut positionals = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                positionals.extend(rest[i + 1..].iter().map(String::as_str));
+                break;
+            }
+            if matches!(arg, "-d" | "-D" | "--delete") {
+                is_delete = true;
+            } else if matches!(arg, "-m" | "-M" | "--move" | "-c" | "-C" | "--copy") {
+                is_move_or_copy = true;
+            } else if matches!(
+                arg,
+                "-l" | "--list"
+                    | "--show-current"
+                    | "-a"
+                    | "--all"
+                    | "-r"
+                    | "--remotes"
+                    | "-v"
+                    | "-vv"
+                    | "--verbose"
+                    | "--unset-upstream"
+                    | "--edit-description"
+            ) {
+                is_list_or_query = true;
+            } else if matches!(
+                arg,
+                "--sort"
+                    | "--format"
+                    | "--points-at"
+                    | "--contains"
+                    | "--no-contains"
+                    | "--merged"
+                    | "--no-merged"
+                    | "-u"
+                    | "--set-upstream-to"
+                    | "--abbrev"
+            ) {
+                if matches!(
+                    arg,
+                    "--contains" | "--no-contains" | "--merged" | "--no-merged" | "--points-at"
+                ) {
+                    is_list_or_query = true;
+                }
+                i += 2;
+                continue;
+            } else if arg.starts_with("--") {
+                if arg.starts_with("--contains=")
+                    || arg.starts_with("--no-contains=")
+                    || arg.starts_with("--merged=")
+                    || arg.starts_with("--no-merged=")
+                    || arg.starts_with("--points-at=")
+                    || arg.starts_with("--list")
+                {
+                    is_list_or_query = true;
+                }
+            } else if arg.starts_with('-') {
+                for ch in arg.chars().skip(1) {
+                    match ch {
+                        'd' | 'D' => is_delete = true,
+                        'm' | 'M' | 'c' | 'C' => is_move_or_copy = true,
+                        'l' | 'a' | 'r' | 'v' => is_list_or_query = true,
+                        _ => {}
+                    }
+                }
+            } else {
+                positionals.push(arg);
+            }
+            i += 1;
+        }
+        if is_delete {
+            for target in positionals {
+                if let Some(reason) = check_ref_target(target, Some("refs/heads/"), true, true) {
+                    return Some(reason);
+                }
+            }
+            return None;
+        }
+        if is_move_or_copy {
+            if let Some(new_name) = positionals.last().copied() {
+                return check_ref_target(new_name, Some("refs/heads/"), true, false);
+            }
+            return None;
+        }
+        if is_list_or_query {
+            return None;
+        }
+        if let Some(new_branch) = positionals.first().copied() {
+            return check_ref_target(new_branch, Some("refs/heads/"), true, false);
+        }
+        None
+    }
+
+    fn check_tag(rest: &[String]) -> Option<String> {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut is_delete = false;
+        let mut has_read_flag = false;
+        let mut has_write_flag = false;
+        let mut positionals = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                positionals.extend(rest[i + 1..].iter().map(String::as_str));
+                break;
+            }
+            if matches!(arg, "-d" | "--delete") {
+                is_delete = true;
+                has_write_flag = true;
+            } else if matches!(arg, "-l" | "--list" | "-v" | "--verify") {
+                has_read_flag = true;
+            } else if matches!(arg, "-m" | "-F" | "-u") {
+                has_write_flag = true;
+                i += 2;
+                continue;
+            } else if matches!(
+                arg,
+                "--cleanup"
+                    | "--format"
+                    | "--sort"
+                    | "--points-at"
+                    | "--contains"
+                    | "--no-contains"
+                    | "--merged"
+                    | "--no-merged"
+            ) {
+                i += 2;
+                continue;
+            } else if matches!(arg, "-a" | "-s" | "-f" | "--force") {
+                has_write_flag = true;
+            } else if arg.starts_with('-') {
+                if !arg.starts_with("--")
+                    && arg.chars().skip(1).any(|c| matches!(c, 'a' | 's' | 'f'))
+                {
+                    has_write_flag = true;
+                }
+                if !arg.starts_with("--") && arg.chars().skip(1).any(|c| c == 'd') {
+                    is_delete = true;
+                    has_write_flag = true;
+                }
+            } else {
+                positionals.push(arg);
+            }
+            i += 1;
+        }
+        if is_delete {
+            for tag in positionals {
+                if let Some(reason) = check_ref_target(tag, Some("refs/tags/"), true, true) {
+                    return Some(reason);
+                }
+            }
+            return None;
+        }
+        if has_read_flag && !has_write_flag {
+            return None;
+        }
+        if let Some(tag) = positionals.first().copied() {
+            return check_ref_target(tag, Some("refs/tags/"), true, false);
+        }
+        None
+    }
+
+    fn check_checkout_or_switch(sub: &str, rest: &[String]) -> Option<String> {
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                break;
+            }
+            let target = if sub == "checkout" {
+                if matches!(arg, "-b" | "-B" | "--orphan") {
+                    rest.get(i + 1).map(String::as_str)
+                } else if let Some(val) = arg
+                    .strip_prefix("-b")
+                    .or_else(|| arg.strip_prefix("-B"))
+                    .or_else(|| arg.strip_prefix("--orphan="))
+                    .filter(|v| !v.is_empty())
+                {
+                    return check_ref_target(val, Some("refs/heads/"), true, false);
+                } else {
+                    None
+                }
+            } else if matches!(
+                arg,
+                "-c" | "-C" | "--create" | "--force-create" | "--orphan"
+            ) {
+                rest.get(i + 1).map(String::as_str)
+            } else if let Some(val) = arg
+                .strip_prefix("-c")
+                .or_else(|| arg.strip_prefix("-C"))
+                .or_else(|| arg.strip_prefix("--create="))
+                .or_else(|| arg.strip_prefix("--force-create="))
+                .or_else(|| arg.strip_prefix("--orphan="))
+                .filter(|v| !v.is_empty())
+            {
+                return check_ref_target(val, Some("refs/heads/"), true, false);
+            } else {
+                None
+            };
+            if let Some(branch) = target {
+                return check_ref_target(branch, Some("refs/heads/"), true, false);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn check_worktree(rest: &[String]) -> Option<String> {
+        if rest.first().map(String::as_str) != Some("add") {
+            return None;
+        }
+        let mut i = 1;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                break;
+            }
+            if matches!(arg, "-b" | "-B") {
+                if let Some(branch) = rest.get(i + 1) {
+                    return check_ref_target(branch, Some("refs/heads/"), true, false);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn check_push(rest: &[String]) -> Option<String> {
+        let mut is_delete = false;
+        let mut positionals = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                positionals.extend(rest[i + 1..].iter().map(String::as_str));
+                break;
+            }
+            if matches!(arg, "-d" | "--delete") {
+                is_delete = true;
+            } else if matches!(
+                arg,
+                "--receive-pack" | "--exec" | "-o" | "--push-option" | "--repo"
+            ) {
+                i += 2;
+                continue;
+            } else if arg.starts_with('-') {
+                // Other push flags.
+            } else {
+                positionals.push(arg);
+            }
+            i += 1;
+        }
+        // First positional is `<repository>`, remaining are `<refspec>...`.
+        for raw_spec in positionals.into_iter().skip(1) {
+            let spec = raw_spec.strip_prefix('+').unwrap_or(raw_spec);
+            if let Some((src, dst)) = spec.split_once(':') {
+                let delete_spec = is_delete || src.is_empty();
+                if let Some(reason) = check_ref_target(dst, None, false, delete_spec) {
+                    return Some(reason);
+                }
+            } else if let Some(reason) = check_ref_target(spec, None, false, is_delete) {
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    fn check_fetch(rest: &[String]) -> Option<String> {
+        let mut multiple = false;
+        let mut positionals = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                positionals.extend(rest[i + 1..].iter().map(String::as_str));
+                break;
+            }
+            if matches!(arg, "--multiple" | "--all") {
+                multiple = true;
+            } else if let Some(refmap) = arg.strip_prefix("--refmap=") {
+                if let Some((_, dst)) = refmap.strip_prefix('+').unwrap_or(refmap).split_once(':') {
+                    if let Some(reason) = check_ref_target(dst, Some("refs/heads/"), false, false) {
+                        return Some(reason);
+                    }
+                }
+            } else if arg == "--refmap" {
+                if let Some(refmap) = rest.get(i + 1) {
+                    if let Some((_, dst)) =
+                        refmap.strip_prefix('+').unwrap_or(refmap).split_once(':')
+                    {
+                        if let Some(reason) =
+                            check_ref_target(dst, Some("refs/heads/"), false, false)
+                        {
+                            return Some(reason);
+                        }
+                    }
+                }
+                i += 2;
+                continue;
+            } else if matches!(
+                arg,
+                "--upload-pack"
+                    | "--reference"
+                    | "--depth"
+                    | "--deepen"
+                    | "--shallow-since"
+                    | "--shallow-exclude"
+                    | "--negotiation-tip"
+                    | "--server-option"
+                    | "-o"
+                    | "-j"
+                    | "--jobs"
+                    | "--recurse-submodules"
+                    | "--filter"
+            ) {
+                i += 2;
+                continue;
+            } else if arg.starts_with('-') {
+                // Other fetch flags.
+            } else {
+                positionals.push(arg);
+            }
+            i += 1;
+        }
+        if multiple {
+            return None;
+        }
+        for raw_spec in positionals.into_iter().skip(1) {
+            let spec = raw_spec.strip_prefix('+').unwrap_or(raw_spec);
+            if let Some((_, dst)) = spec.split_once(':') {
+                if !dst.is_empty() {
+                    if let Some(reason) = check_ref_target(dst, Some("refs/heads/"), false, false) {
+                        return Some(reason);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn check_notes(rest: &[String]) -> Option<String> {
+        let mut i = 0;
+        while i < rest.len() {
+            let arg = rest[i].as_str();
+            if arg == "--" {
+                break;
+            }
+            if arg == "--ref" {
+                if let Some(r) = rest.get(i + 1) {
+                    return check_ref_target(r, Some("refs/notes/"), false, false);
+                }
+            } else if let Some(r) = arg.strip_prefix("--ref=") {
+                return check_ref_target(r, Some("refs/notes/"), false, false);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn check_segment(tokens: &[String], full_command: &str) -> Option<String> {
+        if let Some((sub, rest)) = extract_git_subcommand(tokens) {
+            return match sub {
+                "update-ref" => check_update_ref(rest, full_command),
+                "symbolic-ref" => check_symbolic_ref(rest),
+                "branch" => check_branch(rest),
+                "tag" => check_tag(rest),
+                "checkout" | "switch" => check_checkout_or_switch(sub, rest),
+                "worktree" => check_worktree(rest),
+                "push" => check_push(rest),
+                "fetch" => check_fetch(rest),
+                "notes" => check_notes(rest),
+                _ => None,
+            };
+        }
+        if let Some(script) = extract_shell_c_script(tokens) {
+            return check_bash_command(script, 1);
+        }
+        None
+    }
+
+    pub(super) fn check_bash_command(command: &str, depth: usize) -> Option<String> {
+        if command.trim().is_empty() || depth > 8 {
+            return None;
+        }
+        let (segments, substitutions) = split_segments_and_substitutions(command);
+        for segment in segments {
+            let tokens = tokenize_segment(&segment);
+            if let Some(reason) = check_segment(&tokens, command) {
+                return Some(reason);
+            }
+        }
+        for sub in substitutions {
+            if let Some(reason) = check_bash_command(&sub, depth + 1) {
+                return Some(reason);
+            }
+        }
+        None
+    }
+}
+// ref_guard:end
+
 /// [`run_command_gate`] with the budgeted runner injected. The tests run the
 /// job on their own thread, because the sidecar's test serial guard is
 /// reentrant only on the thread that holds it — the budget's worker thread
@@ -2940,6 +4256,12 @@ fn command_gate_with(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
+    if let Some(reason) = ref_guard::check_bash_command(&input.command, 0) {
+        return HookOutput {
+            hook_specific_output: Some(decision(PRE_TOOL_USE, PermissionDecision::Deny, reason)),
+            system_message: None,
+        };
+    }
     let output = under_bypass(input, command_gate_decided(input, run));
     maybe_record_git_op(input, output)
 }
@@ -12861,8 +14183,28 @@ done
                 .split_once("\n#[cfg(test)]\nmod ")
                 .map(|(head, _)| head)
                 .unwrap_or(&raw);
+            let stripped = if let (Some(start), Some(end)) = (
+                prod.find("// ref_guard:begin"),
+                prod.find("// ref_guard:end"),
+            ) {
+                let guard_block = &prod[start..end];
+                // Prove `ref_guard` is pure string inspection and never spawns git or touches refs.
+                for forbidden in ["Command::", "git_cli", "GitWriter", "git_writer", "spawn"] {
+                    assert!(
+                        !guard_block.contains(forbidden),
+                        "ref_guard must stay pure string inspection and never reference {forbidden}"
+                    );
+                }
+                format!(
+                    "{}{}",
+                    &prod[..start],
+                    &prod[end + "// ref_guard:end".len()..]
+                )
+            } else {
+                prod.to_string()
+            };
             let sanitized =
-                prod.replace("\"symbolic-ref\", \"--quiet\", \"--short\", \"HEAD\"", "");
+                stripped.replace("\"symbolic-ref\", \"--quiet\", \"--short\", \"HEAD\"", "");
             for needle in [
                 "update-ref",
                 "commit-tree",
@@ -13540,6 +14882,451 @@ done
             peer_state().as_deref(),
             Some("working"),
             "the next tool call resumes it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_lanes_claims_surface_in_collision_guard_claim_notices() {
+        let repo = crate::test_support::git_repo();
+        let other_wt = tempfile::tempdir().unwrap();
+        let repo_str = repo.path().to_string_lossy().into_owned();
+        let other_str = other_wt.path().to_string_lossy().into_owned();
+
+        // Register a live lane claim on `a.rs` in another worktree.
+        crate::engine::agent_bus::register_or_update_lane(
+            &repo_str,
+            "alice",
+            "feat/alice",
+            Some(&other_str),
+            &[],
+            &["a.rs".to_string()],
+            &[],
+        )
+        .unwrap();
+
+        // Also write an expired/deleted-worktree legacy lane claim for `b.rs`
+        // that must NOT surface as live.
+        let common = crate::engine::git_cli::resolve_git_common_dir(repo.path()).unwrap();
+        let claims_path = common.join("gitpulse").join("lanes").join("claims.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&claims_path).unwrap()).unwrap();
+        raw["lanes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "agent_id": "zombie",
+                "branch": "feat/zombie",
+                "worktree_path": "/nonexistent/deleted/worktree/for/test",
+                "sparse_cone": [],
+                "claimed_files": ["b.rs"],
+                "claimed_symbols": [],
+                "updated_at_ms": 1_000_000_000u64,
+            }));
+        std::fs::write(&claims_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let risk = clean_risk(Vec::new());
+        let notices_a = claim_notices(repo.path(), &risk, "a.rs", "session-b");
+        assert!(
+            notices_a
+                .lines
+                .iter()
+                .any(|l| l == "claimed by run lane:alice"),
+            "expected live lane claim notice, got {notices_a:?}"
+        );
+
+        let notices_b = claim_notices(repo.path(), &risk, "b.rs", "session-b");
+        assert!(
+            notices_b.lines.is_empty(),
+            "dead-worktree lane claim must not surface: {notices_b:?}"
+        );
+
+        // End-to-end through `collision-guard` (`guard_here`).
+        let file = repo.path().join("a.rs");
+        let mut call = edit_call(&repo_str, &file.to_string_lossy());
+        call.session_id = "session-b".into();
+        let out = guard_here(&call);
+        let text = said(&out);
+        assert!(
+            text.contains("claimed by run lane:alice"),
+            "expected lane claim in collision-guard output: {text}"
+        );
+        assert!(
+            out.hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision)
+                .is_none(),
+            "cross-worktree declared lane claim is advisory notice only: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_ref_guard_blocks_reserved_and_dwim_decoy_and_oversized_refs() {
+        let repo = crate::test_support::git_repo();
+        let cwd = repo.path().to_string_lossy().into_owned();
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let long_name = "a".repeat(1025);
+
+        let blocked_commands = [
+            format!("git update-ref refs/gitpulse/ops/1 {oid}"),
+            "git update-ref -d refs/gitpulse/green/main".to_string(),
+            format!("git update-ref refs/heads/refs/heads/main {oid}"),
+            format!("git update-ref refs/tags/refs/foo {oid}"),
+            format!("git update-ref refs/remotes/refs/foo {oid}"),
+            format!("git update-ref refs/refs/foo {oid}"),
+            "git branch refs/heads/main".to_string(),
+            "git checkout -b refs/heads/main".to_string(),
+            "git switch -c refs/heads/main".to_string(),
+            "git tag refs/heads/main".to_string(),
+            "git symbolic-ref HEAD refs/gitpulse/ops/1".to_string(),
+            "git symbolic-ref refs/gitpulse/HEAD refs/heads/main".to_string(),
+            "git symbolic-ref HEAD refs/heads/refs/heads/main".to_string(),
+            "git push origin HEAD:refs/gitpulse/ops/1".to_string(),
+            "git push origin :refs/gitpulse/ops/1".to_string(),
+            "git push origin HEAD:refs/heads/refs/heads/main".to_string(),
+            "git fetch origin main:refs/gitpulse/ops/1".to_string(),
+            "git fetch origin main:refs/heads/refs/heads/main".to_string(),
+            format!("git update-ref refs/heads/{long_name} {oid}"),
+            format!("git branch {long_name}"),
+            "printf 'update refs/gitpulse/ops/1 HEAD\\n' | git update-ref --stdin".to_string(),
+            "sh -c 'git update-ref refs/gitpulse/ops/1 HEAD'".to_string(),
+            format!("git -C {cwd} update-ref refs/gitpulse/ops/1 {oid}"),
+        ];
+
+        for cmd in &blocked_commands {
+            let call = bash_call(&cwd, cmd);
+            let out = gate_here(&call);
+            assert_eq!(
+                out.hook_specific_output
+                    .as_ref()
+                    .and_then(|s| s.permission_decision),
+                Some(PermissionDecision::Deny),
+                "expected Deny for `{cmd}`, got {:?}",
+                out.render()
+            );
+            // Must remain blocked even in bypassPermissions mode.
+            let bypass_out = gate_here(&in_mode(call, BYPASS_PERMISSIONS));
+            assert_eq!(
+                bypass_out
+                    .hook_specific_output
+                    .as_ref()
+                    .and_then(|s| s.permission_decision),
+                Some(PermissionDecision::Deny),
+                "expected Deny under bypassPermissions for `{cmd}`, got {:?}",
+                bypass_out.render()
+            );
+        }
+
+        let allowed_commands = [
+            "git update-ref -d refs/heads/refs/heads/main".to_string(),
+            format!(
+                "git update-ref refs/heads/{long_name} 0000000000000000000000000000000000000000"
+            ),
+            format!("git update-ref refs/heads/feat/ok {oid}"),
+            "git branch feat/ok".to_string(),
+            "git branch -a".to_string(),
+            "git branch -D refs/heads/main".to_string(),
+            "git tag v1.0.0".to_string(),
+            "git symbolic-ref HEAD".to_string(),
+            "git push origin feat/ok".to_string(),
+            "git fetch origin main".to_string(),
+        ];
+
+        for cmd in &allowed_commands {
+            assert!(
+                ref_guard::check_bash_command(cmd, 0).is_none(),
+                "expected ref_guard to allow `{cmd}`"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_checkout_guard_modes_and_fail_open_invariants() {
+        use crate::tool_config::{self, SharedCheckoutGuardMode};
+        let repo = crate::test_support::git_repo();
+        let repo_str = repo.path().to_string_lossy().into_owned();
+        let file = repo.path().join("shared.rs");
+
+        // Record a fresh (< 5m) observed claim from `session-a`.
+        let now = crate::insights::claims::now_ms();
+        crate::insights::claims::record_observed(
+            repo.path(),
+            "session-a",
+            "shared.rs",
+            &repo_str,
+            now,
+        )
+        .unwrap();
+
+        let mut sess_a = live_here(101);
+        sess_a.session_id = Some("session-a".into());
+        let mut sess_b = live_here(102);
+        sess_b.session_id = Some("session-b".into());
+
+        let mut risk = clean_risk(Vec::new());
+        risk.shared_worktrees = vec![crate::insights::SharedWorktree {
+            path: repo_str.clone(),
+            branch: Some("main".into()),
+            sessions: vec![sess_a.clone(), sess_b.clone()],
+            files: vec!["shared.rs".into()],
+            scanned: true,
+            truncated: false,
+        }];
+
+        let notices = claim_notices(repo.path(), &risk, "shared.rs", "session-b");
+        assert!(
+            notices
+                .shared_holder
+                .as_ref()
+                .is_some_and(|h| h.session_id == "session-a"),
+            "expected live shared_holder session-a, got {notices:?}"
+        );
+        let facts = collision_facts(&risk, repo.path(), "shared.rs", &no_sessions);
+
+        // 1. Off -> advisory notice only.
+        let (off_waivable, off_enforced) =
+            shared_checkout_guard_decision(&facts, &notices, SharedCheckoutGuardMode::Off);
+        assert!(off_enforced.is_none());
+        assert_eq!(
+            off_waivable
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            None
+        );
+        assert!(said(&off_waivable).contains("holder: session session-a"));
+
+        // 2. Ask -> PermissionDecision::Ask naming holding session + age, waived under bypassPermissions.
+        let (ask_waivable, ask_enforced) =
+            shared_checkout_guard_decision(&facts, &notices, SharedCheckoutGuardMode::Ask);
+        assert!(ask_enforced.is_none());
+        assert_eq!(
+            ask_waivable
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            Some(PermissionDecision::Ask)
+        );
+        let ask_text = said(&ask_waivable);
+        assert!(ask_text.contains("session-a"), "{ask_text}");
+        assert!(ask_text.contains("s ago"), "{ask_text}");
+
+        let call_b = HookInput {
+            hook_event_name: PRE_TOOL_USE.to_string(),
+            tool_name: "Edit".to_string(),
+            cwd: repo_str.clone(),
+            file_path: file.to_string_lossy().into_owned(),
+            session_id: "session-b".into(),
+            permission_mode: BYPASS_PERMISSIONS.to_string(),
+            ..Default::default()
+        };
+        let waived_ask = under_bypass(&call_b, ask_waivable);
+        assert_eq!(
+            waived_ask
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            None,
+            "Ask mode must still be waived under bypassPermissions"
+        );
+
+        // 3. Enforce -> PermissionDecision::Deny post-under_bypass, even in bypassPermissions!
+        let (enf_waivable, enf_enforced) =
+            shared_checkout_guard_decision(&facts, &notices, SharedCheckoutGuardMode::Enforce);
+        assert!(enf_enforced.is_some());
+        let after_bypass = under_bypass(&call_b, enf_waivable);
+        let final_enf = merge_outputs(after_bypass, enf_enforced.unwrap());
+        assert_eq!(
+            final_enf
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            Some(PermissionDecision::Deny)
+        );
+        assert!(said(&final_enf).contains("session-a"));
+        assert!(!lets_write_through(&final_enf));
+
+        // 4. Critical safety guard: owner_unknown (human edit) must NEVER emit Deny.
+        let mut unknown_risk = risk.clone();
+        unknown_risk.shared_worktrees[0].files = vec!["human.rs".into()];
+        let unknown_notices = claim_notices(repo.path(), &unknown_risk, "human.rs", "session-b");
+        assert!(unknown_notices.owner_unknown && unknown_notices.shared_holder.is_none());
+        let unknown_facts = collision_facts(&unknown_risk, repo.path(), "human.rs", &no_sessions);
+        let (unk_waivable, unk_enforced) = shared_checkout_guard_decision(
+            &unknown_facts,
+            &unknown_notices,
+            SharedCheckoutGuardMode::Enforce,
+        );
+        assert!(unk_enforced.is_none());
+        assert_eq!(
+            unk_waivable
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            None
+        );
+        assert!(said(&unk_waivable).contains("owner unknown"));
+
+        // 5. Critical safety guard: degraded store (`skipped > 0`) must NEVER emit Deny (fails open to Ask).
+        let mut degraded_notices = notices.clone();
+        degraded_notices.unreadable_lines = true;
+        degraded_notices.store_degraded = "1 unreadable claim line skipped".into();
+        let (deg_waivable, deg_enforced) = shared_checkout_guard_decision(
+            &facts,
+            &degraded_notices,
+            SharedCheckoutGuardMode::Enforce,
+        );
+        assert!(
+            deg_enforced.is_none(),
+            "Enforce must NEVER emit post-bypass Deny when claim store is degraded"
+        );
+        assert_eq!(
+            deg_waivable
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            Some(PermissionDecision::Ask)
+        );
+
+        // 6. Critical safety guard: unreadable store (`store_error`) must NEVER emit Deny.
+        let err_notices = ClaimNotices {
+            store_error: "permission denied".into(),
+            ..ClaimNotices::default()
+        };
+        let (err_waivable, err_enforced) =
+            shared_checkout_guard_decision(&facts, &err_notices, SharedCheckoutGuardMode::Enforce);
+        assert!(err_enforced.is_none());
+        assert_eq!(
+            err_waivable
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            None
+        );
+        assert!(said(&err_waivable).contains("INCOMPLETE"));
+
+        // 7. Expired (>= 5 min) claim must NOT escalate to Ask or Deny.
+        let six_min_ago = now.saturating_sub(6 * 60 * 1000);
+        crate::insights::claims::record_observed(
+            repo.path(),
+            "session-c",
+            "expired.rs",
+            &repo_str,
+            six_min_ago,
+        )
+        .unwrap();
+        let mut sess_c = live_here(103);
+        sess_c.session_id = Some("session-c".into());
+        risk.shared_worktrees[0].sessions.push(sess_c);
+        let expired_notices = claim_notices(repo.path(), &risk, "expired.rs", "session-b");
+        assert!(
+            expired_notices.shared_holder.is_none(),
+            "expired >=5m claim must not trigger shared_holder: {expired_notices:?}"
+        );
+        let expired_facts = collision_facts(&risk, repo.path(), "expired.rs", &no_sessions);
+        let (exp_waivable, exp_enforced) = shared_checkout_guard_decision(
+            &expired_facts,
+            &expired_notices,
+            SharedCheckoutGuardMode::Enforce,
+        );
+        assert!(exp_enforced.is_none());
+        assert_eq!(
+            exp_waivable
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision),
+            None
+        );
+
+        // 8. Dead session (not in shared.sessions and not live in peers.json) must NOT escalate.
+        crate::insights::claims::record_observed(
+            repo.path(),
+            "dead-session",
+            "dead.rs",
+            &repo_str,
+            now,
+        )
+        .unwrap();
+        let dead_notices = claim_notices(repo.path(), &risk, "dead.rs", "session-b");
+        assert!(dead_notices.shared_holder.is_none());
+
+        // 9. Live session proven via `peers.json` (with our own live PID + proc_start_ns)
+        //    AND `lanes/claims.json` (`session_id` set) triggers Enforce -> Deny!
+        let common = crate::engine::git_cli::resolve_git_common_dir(repo.path()).unwrap();
+        let lanes_dir = common.join("gitpulse").join("lanes");
+        std::fs::create_dir_all(&lanes_dir).unwrap();
+        let my_pid = std::process::id();
+        let my_start = crate::workbench::process_birth::started_unix_nanos(my_pid);
+        let peer_sid = "11111111-2222-4333-8444-555555555555";
+        std::fs::write(
+            lanes_dir.join("peers.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "peers": [{
+                    "peer_id": "claude:peer-1",
+                    "provider": "claude",
+                    "surface": "cli",
+                    "provider_session_id": peer_sid,
+                    "worktree_path": repo_str,
+                    "turn_state": "working",
+                    "pid": my_pid,
+                    "proc_start_ns": my_start,
+                    "updated_at_ms": now,
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            lanes_dir.join("claims.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "lanes": [{
+                    "agent_id": "peer-lane",
+                    "branch": "main",
+                    "worktree_path": repo_str,
+                    "sparse_cone": [],
+                    "claimed_files": ["lane.rs"],
+                    "claimed_symbols": [],
+                    "updated_at_ms": now,
+                    "expires_at_ms": now + 600_000,
+                    "session_id": peer_sid,
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lane_notices = claim_notices(repo.path(), &risk, "lane.rs", "session-b");
+        assert_eq!(
+            lane_notices
+                .shared_holder
+                .as_ref()
+                .map(|h| h.session_id.as_str()),
+            Some(peer_sid)
+        );
+        assert_eq!(
+            lane_notices
+                .shared_holder
+                .as_ref()
+                .and_then(|h| h.lane_agent.as_deref()),
+            Some("peer-lane")
+        );
+
+        // 10. Config wiring check: WAYLODE_TOOL_CONFIG controls `tool_config::shared_checkout_guard()`.
+        let serial = crate::test_support::env::env_serial();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let tools_json = cfg_dir.path().join("tools.json");
+        std::fs::write(
+            &tools_json,
+            r#"{"version":1,"shared_checkout_guard":"enforce"}"#,
+        )
+        .unwrap();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(tool_config::TOOL_CONFIG_ENV, &tools_json)
+            .invalidating(tool_config::invalidate_cache);
+        assert_eq!(
+            tool_config::shared_checkout_guard(),
+            SharedCheckoutGuardMode::Enforce
         );
     }
 }
