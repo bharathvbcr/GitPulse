@@ -8,16 +8,16 @@
 
 mod common;
 
-use gitpulse_lib::engine::git_cli::validate_repo;
-use gitpulse_lib::secrets::{
-    scan_with_binary, ScanCompleteness, ScanTicket, SecretLocation, SecretsReport, MAX_FINDINGS,
-};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use waylode_lib::engine::git_cli::validate_repo;
+use waylode_lib::secrets::{
+    scan_with_binary, ScanCompleteness, ScanTicket, SecretLocation, SecretsReport, MAX_FINDINGS,
+};
 
 const PLANTED: &str = "ghp_StressPlantedTokenNeverSurvives00";
 
@@ -547,7 +547,7 @@ fn a_version_probe_cannot_smuggle_a_token() {
 #[test]
 fn live_kingfisher_report_holds_end_to_end() {
     let _serial = serial();
-    let Some(binary) = gitpulse_lib::secrets::resolve_kingfisher() else {
+    let Some(binary) = waylode_lib::secrets::resolve_kingfisher() else {
         eprintln!("SKIPPED live_kingfisher_report_holds_end_to_end: kingfisher is not installed");
         return;
     };

@@ -212,7 +212,11 @@ const JOURNAL_FILE: &str = "journal.v1.json";
 /// wrapper's nested-call marker and the slot shim's. Any value counts. Such a
 /// build is a holder of the lease board, and is eligible for rung B only while
 /// the board is refusing new builds.
-const LEASE_MARKERS: [&str; 2] = ["GITPULSE_LEASE_HELD", "CARGO_SLOT_HELD"];
+const LEASE_MARKERS: [&str; 3] = [
+    crate::hooks::lease_wrapper::HELD_ENV,
+    crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
+    crate::hooks::lease_wrapper::SHIM_HELD_ENV,
+];
 /// `mac_heavy.sh`'s marker: a heavy job a person started, never frozen.
 const HEAVY_MARKER: &str = "MAC_HEAVY_LABEL";
 /// What Claude Code's Bash tool shells carry in their arguments
@@ -352,7 +356,7 @@ impl ResumeReason {
             Self::Calmed => "memory pressure eased",
             Self::Off => "the supervisor was switched off",
             Self::Gone => "the subtree's process ended",
-            Self::Shutdown => "GitPulse stopped",
+            Self::Shutdown => "Waylode stopped",
             Self::LeaseOpened => "the build lease board is taking new builds again",
             Self::Watchdog => "the watchdog continued it when the sampler stopped ticking",
             Self::Continued => "something else continued it",
@@ -2275,7 +2279,7 @@ pub(crate) fn resume_up_to_within(
                 .is_some_and(|live| live == journal.writer_start_us)
         {
             out.refused = Some(format!(
-                "the frozen processes belong to GitPulse process {}",
+                "the frozen processes belong to Waylode process {}",
                 journal.writer_pid
             ));
             return out;
@@ -2609,7 +2613,7 @@ impl Relief {
             self.note(
                 ActionKind::Resume,
                 format!(
-                    "resumed {} stopped and restored {} slowed processes a previous GitPulse left",
+                    "resumed {} stopped and restored {} slowed processes a previous Waylode left",
                     replay.resumed, replay.restored
                 ),
             );
@@ -3562,7 +3566,7 @@ impl Relief {
             self.note(
                 ActionKind::Refused,
                 format!(
-                    "a request to end pid {} was ignored: GitPulse is not holding that process tree paused",
+                    "a request to end pid {} was ignored: Waylode is not holding that process tree paused",
                     request.pid
                 ),
             );
@@ -3893,7 +3897,7 @@ impl Relief {
             })
             .cloned()
         else {
-            return refuse(self, "it is not a tree GitPulse is offering to pause");
+            return refuse(self, "it is not a tree Waylode is offering to pause");
         };
         if offer.info.why != Some(super::relief_status::OfferWhy::Observed) {
             return refuse(self, "that repository is not trusted, so there is no pause");

@@ -37,7 +37,7 @@ fn an_integration_process_never_opens_the_per_user_spawn_budget() {
         .set("HOME", home.path())
         .set("XDG_CONFIG_HOME", home.path().join(".config"))
         .set("APPDATA", home.path().join("AppData"));
-    let config = gitpulse_lib::tool_config::default_config_dir()
+    let config = waylode_lib::tool_config::default_config_dir()
         .expect("a config directory resolves from the overridden environment");
     assert!(
         config.starts_with(home.path()),
@@ -46,7 +46,7 @@ fn an_integration_process_never_opens_the_per_user_spawn_budget() {
     );
 
     // The first spawn in this process builds the production gate.
-    let version = gitpulse_lib::engine::git_cli::git_global(&["--version"]).expect("git runs");
+    let version = waylode_lib::engine::git_cli::git_global(&["--version"]).expect("git runs");
     assert!(String::from_utf8_lossy(&version).starts_with("git version"));
 
     let mut created = Vec::new();
@@ -59,10 +59,10 @@ fn an_integration_process_never_opens_the_per_user_spawn_budget() {
     // Opting in after the gate exists cannot take effect, and must say so
     // rather than leave a shipped binary silently on its own budget.
     let late = std::panic::catch_unwind(
-        gitpulse_lib::engine::process::run_process_with_shared_spawn_budget,
+        waylode_lib::engine::process::run_process_with_shared_spawn_budget,
     );
     assert!(late.is_err(), "a late opt-in was accepted");
-    gitpulse_lib::engine::git_cli::git_global(&["--version"]).expect("git still runs");
+    waylode_lib::engine::git_cli::git_global(&["--version"]).expect("git still runs");
     let mut after = Vec::new();
     files_under(home.path(), &mut after);
     assert!(after.is_empty(), "the late opt-in opened it: {after:?}");

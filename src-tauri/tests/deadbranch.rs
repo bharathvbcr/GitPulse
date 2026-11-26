@@ -1,12 +1,12 @@
-use gitpulse_lib::engine::deadbranch::{
+use std::fs;
+use std::path::Path;
+use tempfile::TempDir;
+use waylode_lib::engine::deadbranch::{
     age_severity, clean_branches, create_backup, is_branch_merged_by_tree, list_backups,
     matches_glob, restore_backup, scan_stale_branches, DeadbranchConfig, StaleBranchInfo,
     TreeMerge,
 };
-use gitpulse_lib::engine::git_cli::git_text;
-use std::fs;
-use std::path::Path;
-use tempfile::TempDir;
+use waylode_lib::engine::git_cli::git_text;
 
 mod common;
 use common::run_git;

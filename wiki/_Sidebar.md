@@ -1,4 +1,4 @@
-**Using GitPulse**
+**Using Waylode**
 * [Documentation index](https://github.com/bharathvbcr/GitPulse/blob/main/docs/README.md)
 * [[Home]]
 * [[Installation]]
@@ -10,7 +10,7 @@
 
 **Agents & policy**
 * [Agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md)
-* [Why GitPulse](https://github.com/bharathvbcr/GitPulse/blob/main/docs/WHY_GITPULSE.md)
+* [Why Waylode](https://github.com/bharathvbcr/GitPulse/blob/main/docs/WHY_WAYLODE.md)
 * [[MCP and Agents]]
 * [[Policy and AI]]
 * [[Security]]

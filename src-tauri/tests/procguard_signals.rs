@@ -17,11 +17,11 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
 /// How long to wait for the shim to be spawned and record itself.
 const SPAWN_WAIT: Duration = Duration::from_secs(30);
@@ -236,11 +236,11 @@ fn sigterm_reaps_the_git_child_and_its_grandchild() {
     // The daemon takes a per-profile lock; a scratch profile keeps this test
     // off the developer's real one (and off a daemon running there).
     let profile = tempfile::tempdir().expect("profile dir");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_gitpulsed"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wayloded"));
     command
         .arg("--once")
         .arg(fixture.repo())
-        .env("GITPULSE_LOG_DIR", log_dir.path())
+        .env("WAYLODE_LOG_DIR", log_dir.path())
         .env("HOME", profile.path())
         .env("XDG_CONFIG_HOME", profile.path())
         .env("APPDATA", profile.path())
@@ -285,9 +285,9 @@ fn sigterm_reaps_the_git_child_and_its_grandchild() {
 fn closing_stdin_reaps_a_git_child_a_worker_left_running() {
     let fixture = Fixture::new();
     let log_dir = tempfile::tempdir().expect("log dir");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_waylode-mcp"));
     command
-        .env("GITPULSE_LOG_DIR", log_dir.path())
+        .env("WAYLODE_LOG_DIR", log_dir.path())
         .env("GITPULSE_MCP_CALL_TIMEOUT_MS", "300")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -417,7 +417,7 @@ fn the_shim_is_what_path_resolves_git_to() {
 /// bases.
 #[test]
 fn adversarial_signal_blast_radius_guard_blocks_host_tree() {
-    use gitpulse_lib::procguard::signal::{self, Basis, Me};
+    use waylode_lib::procguard::signal::{self, Basis, Me};
 
     let me = Me::current();
     assert!(me.pid > 1, "me.pid={}", me.pid);

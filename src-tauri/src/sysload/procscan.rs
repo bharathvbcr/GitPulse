@@ -50,14 +50,15 @@
 #![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 
 use super::sensor::{Reading, Why};
-use super::RUN_ID_ENV;
+use super::{LEGACY_RUN_ID_ENV, RUN_ID_ENV};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The environment variable every GitPulse PTY child carries.
+/// The environment variable every Waylode PTY child carries.
 pub(crate) const SESSION_ENV: &str = crate::alerts::bridge::SESSION_ENV;
+pub(crate) const LEGACY_SESSION_ENV: &str = crate::alerts::bridge::LEGACY_SESSION_ENV;
 
 /// Upper bound on the processes one scan reads; past it the table is a scan
 /// that could not finish, never a prefix judged as the whole.
@@ -604,8 +605,8 @@ impl LaunchKey {
             .or_else(|| self.session_id.as_ref().map(|id| format!("session:{id}")))
     }
 
-    /// Picks `GITPULSE_RUN_ID` and `GITPULSE_SESSION_ID` out of `NAME=value`
-    /// strings. An empty, oversized or non-printable value is ignored.
+    /// Picks `WAYLODE_RUN_ID` / `WAYLODE_SESSION_ID` (with `GITPULSE_*` fallback)
+    /// out of `NAME=value` strings. An empty, oversized or non-printable value is ignored.
     pub(crate) fn from_env<'a>(vars: impl IntoIterator<Item = &'a str>) -> Option<Self> {
         let clean = |v: &str| {
             (!v.is_empty()
@@ -613,20 +614,37 @@ impl LaunchKey {
                 && v.chars().all(|c| c.is_ascii_graphic()))
             .then(|| v.to_string())
         };
-        let mut key = Self::default();
+        let mut primary_run_id = None;
+        let mut legacy_run_id = None;
+        let mut primary_session_id = None;
+        let mut legacy_session_id = None;
         for var in vars {
             if let Some(v) = var
                 .strip_prefix(RUN_ID_ENV)
                 .and_then(|r| r.strip_prefix('='))
             {
-                key.run_id = clean(v);
+                primary_run_id = clean(v);
+            } else if let Some(v) = var
+                .strip_prefix(LEGACY_RUN_ID_ENV)
+                .and_then(|r| r.strip_prefix('='))
+            {
+                legacy_run_id = clean(v);
             } else if let Some(v) = var
                 .strip_prefix(SESSION_ENV)
                 .and_then(|r| r.strip_prefix('='))
             {
-                key.session_id = clean(v);
+                primary_session_id = clean(v);
+            } else if let Some(v) = var
+                .strip_prefix(LEGACY_SESSION_ENV)
+                .and_then(|r| r.strip_prefix('='))
+            {
+                legacy_session_id = clean(v);
             }
         }
+        let key = Self {
+            run_id: primary_run_id.or(legacy_run_id),
+            session_id: primary_session_id.or(legacy_session_id),
+        };
         (key.run_id.is_some() || key.session_id.is_some()).then_some(key)
     }
 }
@@ -1643,7 +1661,7 @@ fn terminate_confirmed(
 /// Everything that made `pid` an orphan, checked again on the live process.
 fn still_orphaned(pid: i32, start_us: u64) -> Result<Orphan, String> {
     if pid <= 1 || start_us == 0 || i32::try_from(std::process::id()).ok() == Some(pid) {
-        return Err("that process is not one GitPulse will terminate".into());
+        return Err("that process is not one Waylode will terminate".into());
     }
     let f = probe_one(pid).ok_or("the process is no longer running; nothing was signalled")?;
     if f.start_us != start_us {
@@ -1658,10 +1676,10 @@ fn still_orphaned(pid: i32, start_us: u64) -> Result<Orphan, String> {
         return Err("the process belongs to another user; nothing was signalled".into());
     }
     if f.ident.memguard {
-        return Err("GitPulse never terminates memguard".into());
+        return Err("Waylode never terminates memguard".into());
     }
     if f.ident.launch.is_some() {
-        return Err("the process belongs to a GitPulse launch; the supervisor owns it".into());
+        return Err("the process belongs to a Waylode launch; the supervisor owns it".into());
     }
     if f.ident.kind.is_some() {
         return Err("the process is an agent session; nothing was signalled".into());
@@ -1861,7 +1879,12 @@ impl Scanner {
         }
         matches!(
             f.ident.name.to_ascii_lowercase().as_str(),
-            "gitpulse"
+            "waylode"
+                | "wayloded"
+                | "waylode-mcp"
+                | "waylode-hook"
+                | "waylode-ptyd"
+                | "gitpulse"
                 | "gitpulsed"
                 | "gitpulse-mcp"
                 | "gitpulse-hook"
@@ -2064,7 +2087,7 @@ fn linux_may_slow(current: i32, rlimit_nice: u64, privileged: bool) -> Result<bo
         return Ok(true);
     }
     Err(format!(
-        "Linux would not let GitPulse put its priority back (its RLIMIT_NICE is {rlimit_nice}, nice {current} needs {needed}), so it was left at normal priority"
+        "Linux would not let Waylode put its priority back (its RLIMIT_NICE is {rlimit_nice}, nice {current} needs {needed}), so it was left at normal priority"
     ))
 }
 
@@ -2199,7 +2222,7 @@ pub(crate) fn set_background_throttle(
         return Err("process belongs to another user".into());
     }
     if facts.memguard {
-        return Err("GitPulse never modifies memguard scheduling".into());
+        return Err("Waylode never modifies memguard scheduling".into());
     }
 
     #[cfg(target_os = "macos")]
@@ -2285,7 +2308,7 @@ pub(crate) fn set_background_throttle(
             }
             if slowed.len() >= MAX_LINUX_SLOWED && !slowed.contains_key(&(pid, start_us)) {
                 return Err(
-                    "GitPulse already holds as many slowed processes as it can put back".into(),
+                    "Waylode already holds as many slowed processes as it can put back".into(),
                 );
             }
             set_nice(LINUX_SLOW_NICE)?;
@@ -5680,7 +5703,7 @@ pub(crate) mod tests {
         })
         .expect_err("pid 1");
         assert!(
-            refused.contains("not one GitPulse will terminate"),
+            refused.contains("not one Waylode will terminate"),
             "{refused}"
         );
         assert!(!asked.get());
@@ -6844,6 +6867,16 @@ pub(crate) mod tests {
         ])
         .unwrap();
         assert_eq!(key.tree().as_deref(), Some("run:run-7"));
+        let waylode_wins = LaunchKey::from_env([
+            "GITPULSE_RUN_ID=old-run",
+            "WAYLODE_RUN_ID=new-run",
+            "GITPULSE_SESSION_ID=old-term",
+            "WAYLODE_SESSION_ID=new-term",
+        ])
+        .unwrap();
+        assert_eq!(waylode_wins.tree().as_deref(), Some("run:new-run"));
+        let waylode_session = LaunchKey::from_env(["WAYLODE_SESSION_ID=wterm-1"]).unwrap();
+        assert_eq!(waylode_session.tree().as_deref(), Some("session:wterm-1"));
         let session = LaunchKey::from_env(["GITPULSE_SESSION_ID=term-1-2"]).unwrap();
         assert_eq!(session.tree().as_deref(), Some("session:term-1-2"));
         let long = format!("GITPULSE_RUN_ID={}", "x".repeat(MAX_ID_CHARS + 1));

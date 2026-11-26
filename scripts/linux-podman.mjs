@@ -243,7 +243,7 @@ export function buildContainerScript(opts, display) {
       return [
         "set -euo pipefail",
         buildDistFresh,
-        "cargo build --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --bin gitpulse --bin gitpulse-ptyd --example e2e_seed_trust",
+        "cargo build --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --bin waylode --bin waylode-ptyd --example e2e_seed_trust",
         `with-display ${display} node scripts/e2e-driver-smoke.mjs --artifacts /e2e-artifacts/linux-${display}`,
       ].join("\n");
 

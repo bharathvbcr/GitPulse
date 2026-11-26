@@ -11,10 +11,10 @@
 #![cfg(unix)]
 
 mod common;
-use gitpulse_lib::procguard::{self, LockedSpawn};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::{self, LockedSpawn};
 
 const ROLE: &str = "GITPULSE_SIGNAL_TEARDOWN_DIR";
 

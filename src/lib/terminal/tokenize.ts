@@ -101,7 +101,7 @@ export function tokenizeCommand(line: string): TokenizeResult {
       return {
         ok: false,
         error:
-          `"${describeMetacharacter(ch)}" is shell syntax; GitPulse runs one command ` +
+          `"${describeMetacharacter(ch)}" is shell syntax; Waylode runs one command ` +
           "at a time without a shell. Run the steps separately.",
       };
     }

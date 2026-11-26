@@ -39,7 +39,7 @@ function packageDefaultRun(): string | undefined {
 
 describe("the bundled binary is chosen, not inherited from cargo's ordering", () => {
   it("names the main binary in tauri.conf.json", () => {
-    expect(TAURI_CONF.mainBinaryName).toBe("gitpulse");
+    expect(TAURI_CONF.mainBinaryName).toBe("waylode");
   });
 
   it("selects the GUI when Tauri dev invokes cargo run without --bin", () => {
@@ -72,13 +72,13 @@ describe("the bundled binary is chosen, not inherited from cargo's ordering", ()
   });
 
   it("gives the GUI a name no other binary shadows by prefix", () => {
-    // `gitpulse` and `gitpulsed` differ by one character, and a bundler that
+    // `waylode` and `wayloded` differ by one character, and a bundler that
     // globs or sorts can take the wrong one. Nothing forbids the names; this
     // records that they collide, so the explicit declarations above are load
     // bearing rather than decorative.
     const names = declaredBinaries().map((b) => b.name);
-    expect(names).toContain("gitpulse");
-    const shadowing = names.filter((n) => n !== "gitpulse" && n.startsWith("gitpulse"));
+    expect(names).toContain("waylode");
+    const shadowing = names.filter((n) => n !== "waylode" && n.startsWith("waylode"));
     expect(
       shadowing.length,
       `${shadowing.join(", ")} share the GUI's prefix — mainBinaryName and the ` +

@@ -172,7 +172,7 @@ export interface UnreadAttention extends RecordVersion {
   read_at: number | null; dismissed_at: number | null; snoozed_until: number | null;
 }
 export type AttentionRow = Attention | UnreadAttention;
-export const UNREADABLE_TITLE = "A notice this version of GitPulse cannot read";
+export const UNREADABLE_TITLE = "A notice this version of Waylode cannot read";
 const SIGNAL_KIND_OF = { run_ci_passed: "ci_passed", run_ci_failed: "ci_failed", run_ci_cancelled: "ci_cancelled" } as const;
 function attentionSignal(value: unknown, kind: keyof typeof SIGNAL_KIND_OF): AttentionSignal {
   const raw = object(value), source = CI_SOURCES.find((s) => s === raw.source);

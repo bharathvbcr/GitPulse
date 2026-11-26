@@ -35,11 +35,11 @@ mod common;
 
 use common::fixture::{git, trust_repo};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::leak_scan::range::{resolve_push, scan_range, PushRefs, RangeLimits};
-use gitpulse_lib::leak_scan::staged::scan_staged;
-use gitpulse_lib::leak_scan::{parse_patch, Tally};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
+use waylode_lib::leak_scan::range::{resolve_push, scan_range, PushRefs, RangeLimits};
+use waylode_lib::leak_scan::staged::scan_staged;
+use waylode_lib::leak_scan::{parse_patch, Tally};
+use waylode_lib::procguard::LockedSpawn;
 
 /// Deterministic text: a rotating set of line shapes a real repository has,
 /// with a credential-shaped line every `plant_every` lines.
@@ -231,7 +231,7 @@ fn staged_case<'a>(name: &str, repo: &'a str) -> Case<'a> {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("leak_scan");
     let opts = &report.opts;
     let temp = tempfile::tempdir().expect("temp dir");

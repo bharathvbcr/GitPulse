@@ -19,9 +19,6 @@
 //!
 //! Set `DEEP_FUZZ_SCALE=20` to widen the random sweeps for a longer run.
 
-use gitpulse_lib::desktop::shell::resolve_worktree_path;
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -29,6 +26,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
+use waylode_lib::desktop::shell::resolve_worktree_path;
+use waylode_lib::engine::GitReader;
+use waylode_lib::procguard::LockedSpawn;
 
 /// The same LCG the lane fuzzer uses, so seeds behave the same way here.
 struct Lcg(u64);
@@ -500,7 +500,7 @@ fn hostile_repository_roots_are_refused_or_handled() {
 fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking() {
     // Char-boundary safety, not the production spawn rate: one detail read per
     // commit would otherwise run at the sustained rate once the burst is spent.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().expect("temp dir");
     let repo = dir.path();
     git_in(repo, &["init", "-q", "-b", "main"]);
@@ -573,7 +573,7 @@ fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking(
 #[test]
 fn randomized_multibyte_commit_bodies_never_panic() {
     // Char-boundary safety, not the production spawn rate (see above).
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().expect("temp dir");
     let repo = dir.path();
     git_in(repo, &["init", "-q", "-b", "main"]);

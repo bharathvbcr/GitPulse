@@ -46,7 +46,7 @@ fn register_and_peers_reconcile_live_and_exited_sessions() {
     let dead_sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
     let reg_live = handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "agy",
@@ -65,7 +65,7 @@ fn register_and_peers_reconcile_live_and_exited_sessions() {
 
     // Updating role/wake_mode without repeating `provider` infers it from the live session.
     let updated_live = handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "role": "lead-implementer",
@@ -79,7 +79,7 @@ fn register_and_peers_reconcile_live_and_exited_sessions() {
 
     // Register a dead PID (u32::MAX - 1) with no saved transcript -> exited.
     handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "claude",
@@ -92,7 +92,7 @@ fn register_and_peers_reconcile_live_and_exited_sessions() {
     .expect("register dead peer");
 
     let active_only = handle_tool_call(
-        "gitpulse_agent_peers",
+        "waylode_agent_peers",
         &json!({
             "repo_path": repo,
             "include_exited": false,
@@ -112,7 +112,7 @@ fn register_and_peers_reconcile_live_and_exited_sessions() {
     );
 
     let with_exited = handle_tool_call(
-        "gitpulse_agent_peers",
+        "waylode_agent_peers",
         &json!({
             "repo_path": repo,
             "include_exited": true,
@@ -136,7 +136,7 @@ fn send_fails_closed_on_ambiguous_provider_and_routes_explicit_selector() {
 
     for (sid, role) in [(sid_a, "planner"), (sid_b, "verifier")] {
         handle_tool_call(
-            "gitpulse_agent_register",
+            "waylode_agent_register",
             &json!({
                 "repo_path": repo,
                 "provider": "agy",
@@ -150,7 +150,7 @@ fn send_fails_closed_on_ambiguous_provider_and_routes_explicit_selector() {
     }
 
     let ambiguous = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "claude:orchestrator",
@@ -165,7 +165,7 @@ fn send_fails_closed_on_ambiguous_provider_and_routes_explicit_selector() {
     );
 
     let targeted = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "claude:orchestrator",
@@ -185,7 +185,7 @@ fn large_payload_hydrates_from_bus_without_duplication_and_cross_acks_mailbox() 
     let sid = "33333333-3333-4333-8333-333333333333";
 
     handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "claude",
@@ -199,7 +199,7 @@ fn large_payload_hydrates_from_bus_without_duplication_and_cross_acks_mailbox() 
 
     let large_body = "B".repeat(10 * 1024);
     let sent = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "agy:lead",
@@ -220,7 +220,7 @@ fn large_payload_hydrates_from_bus_without_duplication_and_cross_acks_mailbox() 
 
     // Peek without ack leaves message pending in both stores.
     let peeked = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "worker",
@@ -239,7 +239,7 @@ fn large_payload_hydrates_from_bus_without_duplication_and_cross_acks_mailbox() 
 
     // Reading with ack=true marks claimed in BOTH agent_bus and agent_mailbox.
     let acked = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "worker",
@@ -255,7 +255,7 @@ fn large_payload_hydrates_from_bus_without_duplication_and_cross_acks_mailbox() 
     );
 
     let after = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "worker",
@@ -272,7 +272,7 @@ fn hop_ceiling_pauses_auto_wake_and_an_mcp_caller_cannot_reset_it_by_naming_a_pe
     let sid = "44444444-4444-4444-8444-444444444444";
 
     handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "agy",
@@ -285,7 +285,7 @@ fn hop_ceiling_pauses_auto_wake_and_an_mcp_caller_cannot_reset_it_by_naming_a_pe
     .expect("register reviewer");
 
     let paused = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "claude:coder",
@@ -304,7 +304,7 @@ fn hop_ceiling_pauses_auto_wake_and_an_mcp_caller_cannot_reset_it_by_naming_a_pe
     // only through the app's own commands (see agent_bus::MessageOrigin); the MCP surface
     // refuses the reserved name instead.
     let forged = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "developer",
@@ -351,7 +351,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
     let (_dir, repo) = trusted_git_repo();
     let sid = "55555555-5555-4555-8555-555555555555";
     handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "claude",
@@ -445,7 +445,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
     assert_eq!(
         mb.status(sid, "msg_fs_wake"),
         Delivery::Claimed,
-        "gitpulse_agent_wait must cross-mark mailbox p-* -> c-*"
+        "waylode_agent_wait must cross-mark mailbox p-* -> c-*"
     );
 }
 
@@ -476,7 +476,7 @@ fn kickoff_agent_spawn_routes_to_desktop_owner_over_instance_socket() {
     }));
 
     let res = handle_tool_call(
-        "gitpulse_kickoff_agent",
+        "waylode_kickoff_agent",
         &json!({
             "repo_path": repo,
             "from_agent": "claude:lead",
@@ -517,7 +517,7 @@ fn antigravity_provider_alias_canonicalizes_in_register_and_peers_filter() {
     let sid = "66666666-6666-4666-8666-666666666666";
 
     let reg = handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "antigravity",
@@ -534,7 +534,7 @@ fn antigravity_provider_alias_canonicalizes_in_register_and_peers_filter() {
     // Re-registering without explicit ids in the same worktree using `provider: "antigravity"`
     // must match the existing `"agy"` live peer rather than inventing `"antigravity:..."`.
     let rereg = handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "antigravity",
@@ -544,10 +544,10 @@ fn antigravity_provider_alias_canonicalizes_in_register_and_peers_filter() {
     .expect("re-register with provider=antigravity");
     assert_eq!(rereg["peer"]["peer_id"], format!("agy:{sid}"));
 
-    // Filtering `gitpulse_agent_peers` by `"antigravity"` or `"agy"` must both return the peer.
+    // Filtering `waylode_agent_peers` by `"antigravity"` or `"agy"` must both return the peer.
     for query_prov in ["antigravity", "agy"] {
         let listed = handle_tool_call(
-            "gitpulse_agent_peers",
+            "waylode_agent_peers",
             &json!({
                 "repo_path": repo,
                 "provider": query_prov,
@@ -566,7 +566,7 @@ fn antigravity_provider_alias_canonicalizes_in_register_and_peers_filter() {
 /// Registers a live target peer under a canonical session id.
 fn register_forgery_target(repo: &str, sid: &str, role: &str) {
     handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "claude",
@@ -594,7 +594,7 @@ fn an_mcp_caller_cannot_send_as_a_person_by_choosing_a_reserved_sender_name() {
         "DEVELOPER",
     ] {
         let refused = handle_tool_call(
-            "gitpulse_agent_send",
+            "waylode_agent_send",
             &json!({
                 "repo_path": repo,
                 "from_peer": name,
@@ -629,7 +629,7 @@ fn a_reused_msg_id_sent_to_a_second_recipient_is_refused_and_deposits_nothing() 
     register_forgery_target(&repo, sid_c, "reuse-c");
     let send = |to: &str| {
         handle_tool_call(
-            "gitpulse_agent_send",
+            "waylode_agent_send",
             &json!({
                 "repo_path": repo,
                 "from_peer": "claude:orchestrator",
@@ -669,7 +669,7 @@ fn a_retry_naming_the_same_peer_by_another_selector_is_idempotent_and_deposits_o
     register_forgery_target(&repo, sid, "selector-b");
     let send = |to: &str| {
         handle_tool_call(
-            "gitpulse_agent_send",
+            "waylode_agent_send",
             &json!({
                 "repo_path": repo,
                 "from_peer": "claude:orchestrator",
@@ -700,18 +700,18 @@ fn a_kickoff_refused_for_a_reserved_sender_leaves_no_claim_task_update_or_bus_ro
     super::PROFILE_OVERRIDE
         .with(|cell| *cell.borrow_mut() = Some(profile.path().join("workbench.sqlite")));
     let added = handle_tool_call(
-        "gitpulse_add_task",
+        "waylode_add_task",
         &json!({"repo_path": repo, "task_id": "kickoff-order-1", "title": "Kickoff ordering"}),
     )
     .expect("add task");
     let task_before = handle_tool_call(
-        "gitpulse_get_task",
+        "waylode_get_task",
         &json!({"repo_path": repo, "task_id": "kickoff-order-1"}),
     )
     .expect("read task before");
     let kickoff = |from: &str| {
         handle_tool_call(
-            "gitpulse_kickoff_agent",
+            "waylode_kickoff_agent",
             &json!({
                 "repo_path": repo,
                 "from_agent": from,
@@ -738,7 +738,7 @@ fn a_kickoff_refused_for_a_reserved_sender_leaves_no_claim_task_update_or_bus_ro
         );
     }
     let task_after = handle_tool_call(
-        "gitpulse_get_task",
+        "waylode_get_task",
         &json!({"repo_path": repo, "task_id": "kickoff-order-1"}),
     )
     .expect("read task after");
@@ -779,19 +779,19 @@ fn no_mcp_message_tool_accepts_a_name_reserved_for_a_person() {
     let (_dir, repo) = trusted_git_repo();
     let calls = [
         (
-            "gitpulse_worktree_send_message",
+            "waylode_worktree_send_message",
             json!({"repo_path": repo, "from_agent": "developer", "body": "forged"}),
         ),
         (
-            "gitpulse_inbox_post",
+            "waylode_inbox_post",
             json!({"repo_path": repo, "from_agent": "human", "thread_key": "t1", "body": "forged"}),
         ),
         (
-            "gitpulse_inbox_withdraw",
+            "waylode_inbox_withdraw",
             json!({"repo_path": repo, "from_agent": "user", "thread_key": "t1", "reason": "forged"}),
         ),
         (
-            "gitpulse_kickoff_agent",
+            "waylode_kickoff_agent",
             json!({"repo_path": repo, "from_agent": "human-dev", "to_agent": "claude:w",
                    "task_id": "ft-0123456789ab"}),
         ),
@@ -819,7 +819,7 @@ fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses(
 
     // A caller that names hop 0 must still be a hop-1 peer message.
     let sent = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "claude:coder",
@@ -842,7 +842,7 @@ fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses(
 
     // Under the limit the same caller's message is deposited with peer provenance.
     let sent = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "claude:coder",
@@ -873,7 +873,7 @@ fn send_json(repo: &str, extra: serde_json::Value) -> Result<serde_json::Value, 
     for (k, v) in extra.as_object().expect("object") {
         args[k] = v.clone();
     }
-    handle_tool_call("gitpulse_agent_send", &args)
+    handle_tool_call("waylode_agent_send", &args)
 }
 
 #[test]
@@ -1059,7 +1059,7 @@ fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guar
 
     // 2. Querying Repo B inbox must NOT leak or claim Repo A's or deleted Repo C's mailbox envelope.
     let inbox_b = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo_b,
             "for_peer": "coder-b",
@@ -1079,7 +1079,7 @@ fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guar
 
     // 3. `since_seq` on `include_broadcasts: false` must NOT re-emit older mailbox envelopes.
     let inbox_a_peek = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo_a,
             "for_peer": "coder-a",
@@ -1091,7 +1091,7 @@ fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guar
     let seq_a = inbox_a_peek["latest_seq"].as_u64().unwrap();
     assert!(seq_a >= 1);
     let inbox_a_after = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo_a,
             "for_peer": "coder-a",
@@ -1108,7 +1108,7 @@ fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guar
 
     // Clean up Repo A (and orphan Repo C) pending envelopes.
     let _ = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo_a,
             "for_peer": "coder-a",
@@ -1126,10 +1126,10 @@ fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guar
         let _ = std::fs::remove_dir_all(session_dir);
     }
 
-    // 4. `gitpulse_inbox_withdraw` on STEWARD_THREAD_KEY by an untrusted agent must fail.
+    // 4. `waylode_inbox_withdraw` on STEWARD_THREAD_KEY by an untrusted agent must fail.
     assert!(
         handle_tool_call(
-            "gitpulse_inbox_withdraw",
+            "waylode_inbox_withdraw",
             &json!({
                 "repo_path": repo_a,
                 "from_agent": "claude:attacker",
@@ -1177,7 +1177,7 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
     // 1. A short (`!truncated_in_bus`) `PeerAgent` message peeked with `ack: false`
     //    must preserve its real `kind` and NOT re-emit on a subsequent `since_seq` poll.
     handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "claude:reviewer",
@@ -1189,7 +1189,7 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
     .expect("send short peer message");
 
     let peer_peek = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "coder-main",
@@ -1205,7 +1205,7 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
     assert!(peer_seq >= 1);
 
     let peer_after = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "coder-main",
@@ -1222,7 +1222,7 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
 
     // Claim the peer message before testing steward supersede + ring eviction.
     let _ = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "coder-main",
@@ -1297,7 +1297,7 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
         .latest_seq;
 
     let evicted_after = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "coder-main",
@@ -1314,7 +1314,7 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
 
     // Polling from `since_seq: 0` with `ack: true` still delivers and claims the envelope.
     let evicted_full = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({
             "repo_path": repo,
             "for_peer": "coder-main",
@@ -1336,7 +1336,7 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
 
 fn register_inbox_peer(repo: &str, sid: &str, role: &str) {
     handle_tool_call(
-        "gitpulse_agent_register",
+        "waylode_agent_register",
         &json!({
             "repo_path": repo,
             "provider": "claude",
@@ -1351,7 +1351,7 @@ fn register_inbox_peer(repo: &str, sid: &str, role: &str) {
 
 fn send_to_role(repo: &str, role: &str, body: &str) {
     handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "agy:lead",
@@ -1374,7 +1374,7 @@ fn an_inbox_read_peeks_unless_the_caller_asks_to_acknowledge() {
         args.as_object_mut()
             .expect("args object")
             .extend(extra.as_object().expect("extra object").clone());
-        handle_tool_call("gitpulse_agent_inbox", &args).expect("inbox read")
+        handle_tool_call("waylode_agent_inbox", &args).expect("inbox read")
     };
 
     let first = read(json!({}));
@@ -1404,7 +1404,7 @@ fn an_inbox_read_naming_several_peers_is_refused_with_the_candidates() {
     register_inbox_peer(&repo, sid_b, "twin");
 
     let refused = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({ "repo_path": repo, "for_peer": "twin" }),
     )
     .expect_err("a role shared by two peers must be refused");
@@ -1419,7 +1419,7 @@ fn an_inbox_read_naming_several_peers_is_refused_with_the_candidates() {
     );
 
     let named = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({ "repo_path": repo, "for_peer": "twin", "provider_session_id": sid_a }),
     )
     .expect("a named session id picks one of the peers");
@@ -1458,7 +1458,7 @@ fn a_failed_acknowledgement_is_reported_beside_the_messages_it_could_not_ack() {
         .expect("make the bus directory read-only");
 
     let read = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({ "repo_path": repo, "for_peer": "ack-owner", "ack": true }),
     )
     .expect("a failed ack must not fail a read that already collected its messages");
@@ -1532,7 +1532,7 @@ fn send_into_full_mailbox_with_desktop_reply(
     };
     owner.attach_agent_deliver(std::sync::Arc::new(move |_| Ok(reply.clone())));
     let sent = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "agy:lead",
@@ -1583,7 +1583,7 @@ fn an_agent_cannot_send_as_gitpulse_to_take_the_reserved_overflow_slot() {
     let sid = "88888888-8888-4888-8888-888888888821";
     register_inbox_peer(&repo, sid, "overflow-target");
     let refused = handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({
             "repo_path": repo,
             "from_peer": "gitpulse",
@@ -1630,7 +1630,7 @@ fn an_inbox_and_a_wait_list_only_the_returned_rows_below_dropped_before_seq() {
     send_to_role(&repo, "pin-owner", "trigger the eviction");
 
     let inbox = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({ "repo_path": repo, "for_peer": "pin-owner", "limit": 1 }),
     )
     .expect("inbox");
@@ -1686,14 +1686,14 @@ fn following_the_over_cap_hint_literally_repairs_the_bus() {
     .expect("seed bus");
     let read = || {
         handle_tool_call(
-            "gitpulse_agent_inbox",
+            "waylode_agent_inbox",
             &json!({ "repo_path": repo, "for_peer": "cap-owner", "ack": true }),
         )
     };
 
     let err = read().expect_err("an over-cap bus is refused");
     assert!(
-        err.contains("gitpulse_agent_send without thread_key or in_reply_to"),
+        err.contains("waylode_agent_send without thread_key or in_reply_to"),
         "{err}"
     );
     send_to_role(&repo, "cap-owner", "the repairing send");
@@ -1752,7 +1752,7 @@ fn a_returned_envelope_whose_bus_row_was_evicted_is_not_listed_as_pinned() {
     );
 
     let page = handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({ "repo_path": repo, "for_peer": "evict-owner", "limit": 50 }),
     )
     .expect("inbox");
@@ -1776,7 +1776,7 @@ fn a_legacy_bus_row_hydrated_for_a_mailbox_envelope_is_acked_and_claimed() {
     let sid = "88888888-8888-4888-8888-888888888808";
     register_inbox_peer(&repo, sid, "legacy-owner");
     handle_tool_call(
-        "gitpulse_agent_send",
+        "waylode_agent_send",
         &json!({ "repo_path": repo, "from_peer": "agy:lead", "to_peer": "legacy-owner",
                  "body": "legacy row", "msg_id": "msg-1" }),
     )
@@ -1794,7 +1794,7 @@ fn a_legacy_bus_row_hydrated_for_a_mailbox_envelope_is_acked_and_claimed() {
 
     let read = || {
         handle_tool_call(
-            "gitpulse_agent_inbox",
+            "waylode_agent_inbox",
             &json!({ "repo_path": repo, "for_peer": "legacy-owner", "ack": true }),
         )
         .expect("inbox")
@@ -1833,7 +1833,7 @@ fn wait_peek(repo: &str, role: &str, extra: serde_json::Value) -> serde_json::Va
     args.as_object_mut()
         .expect("args object")
         .extend(extra.as_object().expect("extra object").clone());
-    handle_tool_call("gitpulse_agent_wait", &args).expect("wait")
+    handle_tool_call("waylode_agent_wait", &args).expect("wait")
 }
 
 #[test]
@@ -1880,7 +1880,7 @@ fn paging_an_inbox_by_next_since_seq_returns_every_bus_row_when_the_page_is_cut(
 
     let read = |since: u64| {
         handle_tool_call(
-            "gitpulse_agent_inbox",
+            "waylode_agent_inbox",
             &json!({ "repo_path": repo, "for_peer": "page-owner", "limit": 1, "since_seq": since }),
         )
         .expect("inbox read")
@@ -2058,7 +2058,7 @@ fn a_retry_of_a_row_the_target_already_read_reports_already_delivered_not_a_new_
     let first = send_json(&repo, args.clone()).expect("first send");
     assert_eq!(first["replayed"], false, "{first}");
     handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({ "repo_path": repo, "for_peer": "read-target", "ack": true }),
     )
     .expect("target reads and acknowledges");
@@ -2202,7 +2202,7 @@ fn a_retry_after_the_claimed_copy_expired_deposits_nothing_and_says_already_deli
                        "body": "delivered once", "msg_id": "expiry-retry-1" });
     send_json(&repo, args.clone()).expect("first send");
     handle_tool_call(
-        "gitpulse_agent_inbox",
+        "waylode_agent_inbox",
         &json!({ "repo_path": repo, "for_peer": "expiry-target", "ack": true }),
     )
     .expect("target reads and acknowledges");

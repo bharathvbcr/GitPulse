@@ -321,7 +321,7 @@ fn firebase_cli_probe_with(
                     next_step: format!(
                         "Install it with `npm install -g firebase-tools`. If it is already \
                          installed under nvm, fnm or volta, set {FIREBASE_BIN_ENV} to the \
-                         absolute path of `firebase` and relaunch GitPulse."
+                         absolute path of `firebase` and relaunch Waylode."
                     ),
                     permission: None,
                     role: None,
@@ -345,10 +345,9 @@ fn startup_failure() -> FirebaseFailure {
     FirebaseFailure {
         kind: FirebaseFailureKind::CliStartup,
         title: "The Firebase CLI could not start".into(),
-        next_step:
-            "It was found but did not answer `firebase --version`. Run that in a terminal; \
-                    if it works there, copy the diagnostics below — they include what GitPulse saw."
-                .into(),
+        next_step: "It was found but did not answer `firebase --version`. Run that in a terminal; \
+                    if it works there, copy the diagnostics below — they include what Waylode saw."
+            .into(),
         permission: None,
         role: None,
         api: None,

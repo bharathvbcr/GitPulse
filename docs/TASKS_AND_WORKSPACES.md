@@ -1,12 +1,12 @@
 # Tasks and workspaces
 
-GitPulse is the successor to the deprecated
+Waylode is the successor to the deprecated
 [LiquiTask](https://github.com/bharathvbcr/LiquiTask) workbench. Use this app —
 not LiquiTask — for new boards and agent handoff.
 
 Profile tasks and briefs are **Manvi** workbench modules. Repository execution
 tasks and leases shown in **Work → Overview** are **DevCouncil** store modules.
-GitPulse presents both; it does not reimplement them.
+Waylode presents both; it does not reimplement them.
 
 Use **Tasks**, beside Fleet above the repository tabs, to organize work across
 repositories. Use **Work → Tasks** for the active repository. The command palette
@@ -92,7 +92,7 @@ For anything longer:
 
 One control links repositories and picks the primary among them. It is a
 dropdown, and its closed label is the answer: "2 repositories linked · primary
-GitPulse", or "No repository linked yet — a task needs one." Open it to check a
+Waylode", or "No repository linked yet — a task needs one." Open it to check a
 repository to link it, then choose **Primary** on any linked row; the label
 updates without the dropdown closing, so linking several in a row is one
 gesture. Past six repositories it offers a filter; a linked repository is never
@@ -114,7 +114,7 @@ an empty workspace.
 
 The navigator's **Repositories +** adds to the profile, and in a workspace scope
 it also joins what it adds to that workspace — its label names the workspace, as
-does the confirmation. It offers the repositories already open in GitPulse, the
+does the confirmation. It offers the repositories already open in Waylode, the
 registered ones that workspace has not joined yet, and a folder picker.
 
 A saved task's sheet has two panes. **Task** is the whole task in two columns:
@@ -276,7 +276,7 @@ succeed; the board reports failures. They are not a transaction across all tasks
 ## Draft and review with Manvi or Apple Intelligence
 
 In the editor, **Draft with Manvi** uses notes; **Improve with Manvi** uses the
-task text. GitPulse saves the task first, then asks the configured Manvi provider
+task text. Waylode saves the task first, then asks the configured Manvi provider
 and model for title and/or description suggestions. A linked repository and a
 title or notes are required. **Save task** also works with notes alone: the first
 line supplies a missing title and the notes are appended to an existing
@@ -359,7 +359,7 @@ before copying if they should be part of the agent's brief.
 
 **Send to agent** on a card, and the **Agent** pane of a saved task, are the same
 form: agent, connection, working checkout and permission mode. The checkout is
-offered rather than typed — a repository tab GitPulse already has open, or the
+offered rather than typed — a repository tab Waylode already has open, or the
 folder beside that repository's git directory, marked as derived. The form
 re-reads the saved task and refuses a revision that changed elsewhere, locks
 every control while a preparation outcome is unknown so a retry replays that
@@ -387,13 +387,13 @@ launch. A terminal handoff opens a dedicated task-bound session in the existing
 finishing the process does not accept the task or mark it Done.
 
 The agent marks it Done itself. Its launch prompt tells it to call
-`gitpulse_complete_task` on the GitPulse MCP server once every acceptance
+`gitpulse_complete_task` on the Waylode MCP server once every acceptance
 criterion is met and its verification passed, using the id on the brief's
 `Task:` line, or to move it to **Review** and say what remains when it is not
 finished. Only the status changes; the agent's summary of what it changed and
 how it verified it is appended to the task's **Logs**, and the board picks the change
 up as it does any external write. An agent never reopens a task that is already
-Done, and an agent without the GitPulse MCP server configured cannot move it at
+Done, and an agent without the Waylode MCP server configured cannot move it at
 all — the card then stays where it was for you to move.
 
 An agent filing work keeps the board small. `gitpulse_add_task` refuses a new
@@ -429,14 +429,14 @@ An agent can also delete a card, with `gitpulse_delete_task`, when the task
 should not exist — a duplicate, or one it merged into another. It must give a
 reason, which is added to the task's **Logs** before the delete, so the task's
 history says why it went. It is the same delete as the board's own: the card
-leaves the board, its id is never reused, and its history stays in your GitPulse
+leaves the board, its id is never reused, and its history stays in your Waylode
 profile. An agent cannot bring a deleted card back, cannot delete a card of
 another repository, and cannot delete a card linked to more than one repository.
 
 ### Running several tasks at once
 
 One working tree holds one agent; a repository can hold several. Tick **Run in
-a new worktree** and GitPulse creates `.gitpulse/worktrees/<task>-<id>` in the
+a new worktree** and Waylode creates `.gitpulse/worktrees/<task>-<id>` in the
 repository's main checkout on a new `gitpulse/<task>-<id>` branch from the
 selected checkout, keeps that folder out of `git status` through
 `.git/info/exclude`, and runs the agent there. When the selected checkout
@@ -454,7 +454,7 @@ free its terminal waits, saying so, until one closes or you raise the limit. Eac
 elsewhere while it opens.
 
 An attempt holds its checkout until its process is known to have ended. If
-GitPulse crashed or was force-quit while an agent ran, the next start — or the
+Waylode crashed or was force-quit while an agent ran, the next start — or the
 next launch into that checkout — releases the attempt once its agent process is
 provably gone, and the inbox says so. **Release checkout** on a run asks for that
 check directly; an agent that is still running is never released, and the
@@ -468,7 +468,7 @@ names that process, since Manvi 18fc2c6). This needs no particular Manvi
 version, so attempts claimed by an older Manvi no longer stay held.
 
 None of those releases is final while anything still works in the attempt's own
-worktree. The recorded agent process being gone — or the GitPulse or Manvi that
+worktree. The recorded agent process being gone — or the Waylode or Manvi that
 launched it — says nothing about a descendant that left its session (`setsid`,
 a double fork, `nohup`), and a launch that crashed between starting the agent
 and recording it recorded no process at all. Such a process keeps the directory
@@ -490,7 +490,7 @@ A repository can require that a person review an agent attempt's commits
 before they land: **Merge review** on an attempt's worktree turns it on for
 that repository, and shows the attempt's commit range and its review. With it
 on, merging or cherry-picking an attempt's branch — from the panels, the
-attempt's **Merge** button or the GitPulse terminal — is refused until someone
+attempt's **Merge** button or the Waylode terminal — is refused until someone
 approves exactly that range, or records a merge without review and says why.
 A commit after the approval needs a new one. See
 [AGENT_OUTPUT_REVIEW.md](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENT_OUTPUT_REVIEW.md).

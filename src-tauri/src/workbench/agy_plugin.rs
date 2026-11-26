@@ -1,8 +1,8 @@
-//! Managed Antigravity (`agy`) Agent Plugins 1.0.0 sync (`~/.gemini/config/plugins/gitpulse`).
+//! Managed Antigravity (`agy`) Agent Plugins 1.0.0 sync (`~/.gemini/config/plugins/waylode`).
 //!
 //! Why this exists:
 //! - Claude Code accepts per-launch `--settings '{"hooks": ...}'` on the CLI,
-//!   so `claude_hook.rs` injects `gitpulse-hook` without touching disk.
+//!   so `claude_hook.rs` injects `waylode-hook` without touching disk.
 //! - Antigravity (`agy`) discovers Agent Plugins 1.0.0 bundles exclusively from
 //!   `~/.gemini/config/plugins/<name>/` (`plugin.json`, `hooks.json`, `mcp.json`,
 //!   `skills/<skill>/SKILL.md`), and `agy plugin validate --strict` rejects
@@ -11,24 +11,25 @@
 //!
 //! Safety & hygiene rules:
 //! 1. Sync runs ONLY when `session_alerts.enabled && session_alerts.configure_agents`.
-//!    Turning either off removes the managed copy cleanly.
+//!    Turning either off removes the managed copy cleanly. Any legacy
+//!    `.gitpulse-managed` copy at `~/.gemini/config/plugins/gitpulse` is also removed.
 //! 2. Every parent directory and the target directory itself are checked with
-//!    `symlink_metadata`; symlinks and directories lacking our `.gitpulse-managed`
+//!    `symlink_metadata`; symlinks and directories lacking our `.waylode-managed`
 //!    producer marker are NEVER overwritten or deleted.
-//! 3. Helper binaries (`gitpulse-mcp` and `gitpulse-hook`) are wrapped inside
-//!    `bin/gitpulse-mcp` and `bin/gitpulse-hook` (`0755`) inside the plugin:
-//!    - `mcp.json` invokes `"./bin/gitpulse-mcp"` (satisfying strict Agent
+//! 3. Helper binaries (`waylode-mcp` and `waylode-hook`) are wrapped inside
+//!    `bin/waylode-mcp` and `bin/waylode-hook` (`0755`) inside the plugin:
+//!    - `mcp.json` invokes `"./bin/waylode-mcp"` (satisfying strict Agent
 //!      Plugins 1.0.0 validation while still resolving an unindexed app bundle).
-//!    - `bin/gitpulse-hook` fails closed (`exit 2` with `"decision":"block"`)
-//!      when invoked inside a GitPulse PTY (`GITPULSE_SESSION_ID` or
-//!      `GITPULSE_TERMINAL_SESSION` set) if the binary disappears, while exiting
-//!      `0` outside GitPulse so moving `GitPulse.app` to Trash never bricks
+//!    - `bin/waylode-hook` fails closed (`exit 2` with `"decision":"block"`)
+//!      when invoked inside a Waylode PTY (`WAYLODE_SESSION_ID` /
+//!      `WAYLODE_TERMINAL_SESSION` or legacy `GITPULSE_*` set) if the binary disappears,
+//!      while exiting `0` outside Waylode so moving `Waylode.app` to Trash never bricks
 //!      standalone `agy` sessions.
 //! 4. No `PreToolUse` hook is registered. Antigravity IDE 2.32.1 turned every
 //!    answer from one that was not `"decision":"allow"` — `{}` included — into
 //!    "tool call denied by pre-tool hook", so the collision guard and command
 //!    gate blocked every edit and command. `"allow"` would override the user's
-//!    own approval settings, so Antigravity runs ungated; GitPulse still records
+//!    own approval settings, so Antigravity runs ungated; Waylode still records
 //!    its edits through `PostToolUse`.
 
 #[cfg(unix)]
@@ -37,79 +38,81 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-const PLUGIN_JSON: &str = include_str!("../../../plugins/gitpulse/plugin.json");
+const PLUGIN_JSON: &str = include_str!("../../../plugins/waylode/plugin.json");
 #[cfg(unix)]
-const HOOKS_JSON: &str = include_str!("../../../plugins/gitpulse/hooks.json");
+const HOOKS_JSON: &str = include_str!("../../../plugins/waylode/hooks.json");
 #[cfg(unix)]
-const SKILL_COLLISIONS: &str = include_str!("../../../plugins/gitpulse/skills/collisions/SKILL.md");
+const SKILL_COLLISIONS: &str = include_str!("../../../plugins/waylode/skills/collisions/SKILL.md");
 #[cfg(unix)]
 const SKILL_COMMIT_AND_MERGE: &str =
-    include_str!("../../../plugins/gitpulse/skills/commit-and-merge/SKILL.md");
+    include_str!("../../../plugins/waylode/skills/commit-and-merge/SKILL.md");
 #[cfg(unix)]
-const SKILL_INSIGHTS: &str = include_str!("../../../plugins/gitpulse/skills/insights/SKILL.md");
+const SKILL_INSIGHTS: &str = include_str!("../../../plugins/waylode/skills/insights/SKILL.md");
 #[cfg(unix)]
-const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/load/SKILL.md");
+const SKILL_LOAD: &str = include_str!("../../../plugins/waylode/skills/load/SKILL.md");
 #[cfg(unix)]
-const SKILL_MERGE_PRS: &str = include_str!("../../../plugins/gitpulse/skills/merge-prs/SKILL.md");
+const SKILL_MERGE_PRS: &str = include_str!("../../../plugins/waylode/skills/merge-prs/SKILL.md");
 #[cfg(unix)]
 const SKILL_MERGE_TRAIN: &str =
-    include_str!("../../../plugins/gitpulse/skills/merge-train/SKILL.md");
+    include_str!("../../../plugins/waylode/skills/merge-train/SKILL.md");
 #[cfg(unix)]
 const MERGE_TRAIN_FAILSET_GO_MOD: &str =
-    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/go.mod");
+    include_str!("../../../plugins/waylode/skills/merge-train/failset/go.mod");
 #[cfg(unix)]
 const MERGE_TRAIN_FAILSET_MAIN: &str =
-    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/main.go");
+    include_str!("../../../plugins/waylode/skills/merge-train/failset/main.go");
 #[cfg(unix)]
 const MERGE_TRAIN_FAILSET_TEST: &str =
-    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/main_test.go");
+    include_str!("../../../plugins/waylode/skills/merge-train/failset/main_test.go");
 #[cfg(unix)]
-const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/tasks/SKILL.md");
+const SKILL_TASKS: &str = include_str!("../../../plugins/waylode/skills/tasks/SKILL.md");
 #[cfg(unix)]
-const SKILL_TERMINAL: &str = include_str!("../../../plugins/gitpulse/skills/terminal/SKILL.md");
+const SKILL_TERMINAL: &str = include_str!("../../../plugins/waylode/skills/terminal/SKILL.md");
 #[cfg(unix)]
-const SKILL_WRAP_UP: &str = include_str!("../../../plugins/gitpulse/skills/wrap-up/SKILL.md");
+const SKILL_WRAP_UP: &str = include_str!("../../../plugins/waylode/skills/wrap-up/SKILL.md");
 
-/// Producer marker proving GitPulse created `~/.gemini/config/plugins/gitpulse`.
+/// Producer marker proving Waylode created `~/.gemini/config/plugins/waylode`.
 #[cfg(unix)]
-pub(crate) const PRODUCER_MARKER: &str = ".gitpulse-managed";
+pub(crate) const PRODUCER_MARKER: &str = ".waylode-managed";
 #[cfg(unix)]
-const PRODUCER_MARKER_BODY: &str = "managed_by=gitpulse\nschema=agent-plugins-1.0.0\n";
+const PRODUCER_MARKER_BODY: &str = "managed_by=waylode\nschema=agent-plugins-1.0.0\n";
+#[cfg(unix)]
+const LEGACY_PRODUCER_MARKER: &str = ".gitpulse-managed";
 
 /// Antigravity runs a plugin's skill as a bare `/<skill-name>`, with no plugin
-/// namespace, so its copies keep this prefix (`/gitpulse-insights`). Hosts
-/// that namespace by plugin read `plugins/gitpulse/skills/<name>` as it is and
-/// show `gitpulse:insights`.
-pub(crate) const ANTIGRAVITY_SKILL_PREFIX: &str = "gitpulse-";
+/// namespace, so its copies keep this prefix (`/waylode-insights`). Hosts
+/// that namespace by plugin read `plugins/waylode/skills/<name>` as it is and
+/// show `waylode:insights`.
+pub(crate) const ANTIGRAVITY_SKILL_PREFIX: &str = "waylode-";
 
 /// Installed directory name, then the bundled `SKILL.md` it is written from.
 #[cfg(unix)]
 const SKILLS: [(&str, &str); 9] = [
-    ("gitpulse-collisions", SKILL_COLLISIONS),
-    ("gitpulse-commit-and-merge", SKILL_COMMIT_AND_MERGE),
-    ("gitpulse-insights", SKILL_INSIGHTS),
-    ("gitpulse-load", SKILL_LOAD),
-    ("gitpulse-merge-prs", SKILL_MERGE_PRS),
-    ("gitpulse-merge-train", SKILL_MERGE_TRAIN),
-    ("gitpulse-tasks", SKILL_TASKS),
-    ("gitpulse-terminal", SKILL_TERMINAL),
-    ("gitpulse-wrap-up", SKILL_WRAP_UP),
+    ("waylode-collisions", SKILL_COLLISIONS),
+    ("waylode-commit-and-merge", SKILL_COMMIT_AND_MERGE),
+    ("waylode-insights", SKILL_INSIGHTS),
+    ("waylode-load", SKILL_LOAD),
+    ("waylode-merge-prs", SKILL_MERGE_PRS),
+    ("waylode-merge-train", SKILL_MERGE_TRAIN),
+    ("waylode-tasks", SKILL_TASKS),
+    ("waylode-terminal", SKILL_TERMINAL),
+    ("waylode-wrap-up", SKILL_WRAP_UP),
 ];
 
 #[cfg(unix)]
 const SKILL_SUBFILES: [(&str, &str, &str); 3] = [
     (
-        "gitpulse-merge-train",
+        "waylode-merge-train",
         "failset/go.mod",
         MERGE_TRAIN_FAILSET_GO_MOD,
     ),
     (
-        "gitpulse-merge-train",
+        "waylode-merge-train",
         "failset/main.go",
         MERGE_TRAIN_FAILSET_MAIN,
     ),
     (
-        "gitpulse-merge-train",
+        "waylode-merge-train",
         "failset/main_test.go",
         MERGE_TRAIN_FAILSET_TEST,
     ),
@@ -137,14 +140,21 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn resolve_helper_binary(env_var: &str, name: &str, exe: Option<&Path>) -> Result<PathBuf, String> {
-    if let Some(explicit) = std::env::var_os(env_var).filter(|v| !v.is_empty()) {
+fn resolve_helper_binary(
+    primary_env: &str,
+    legacy_env: &str,
+    name: &str,
+    exe: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(explicit) =
+        crate::env_compat::var_os_compat(primary_env, legacy_env).filter(|v| !v.is_empty())
+    {
         let candidate = PathBuf::from(explicit);
         if is_executable_file(&candidate) {
             return Ok(candidate);
         }
         return Err(format!(
-            "{env_var} points to {}, which is not an executable file",
+            "{primary_env} points to {}, which is not an executable file",
             candidate.display()
         ));
     }
@@ -216,15 +226,15 @@ fn write_regular_file(path: &Path, contents: &[u8], executable: bool) -> Result<
 #[cfg(unix)]
 fn rewrite_agy_hooks(raw_hooks_json: &str, wrapper_hook_path: &Path) -> Result<String, String> {
     let mut parsed: Value = serde_json::from_str(raw_hooks_json)
-        .map_err(|e| format!("plugins/gitpulse/hooks.json is invalid JSON: {e}"))?;
+        .map_err(|e| format!("plugins/waylode/hooks.json is invalid JSON: {e}"))?;
     let quoted_hook = shell_single_quote(&wrapper_hook_path.to_string_lossy());
-    let prefix = "gitpulse-hook ";
+    let prefix = "waylode-hook ";
 
     let root = parsed
-        .get_mut("gitpulse")
+        .get_mut("waylode")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| {
-            "plugins/gitpulse/hooks.json missing top-level 'gitpulse' object".to_owned()
+            "plugins/waylode/hooks.json missing top-level 'waylode' object".to_owned()
         })?;
 
     for (_event, entries) in root.iter_mut() {
@@ -258,7 +268,7 @@ fn rewrite_agy_hooks(raw_hooks_json: &str, wrapper_hook_path: &Path) -> Result<S
 fn build_mcp_wrapper(mcp_bin: &Path) -> String {
     let quoted = shell_single_quote(&mcp_bin.to_string_lossy());
     format!(
-        "#!/bin/sh\nif [ -x {quoted} ]; then\n  exec {quoted} \"$@\"\nfi\nexec gitpulse-mcp \"$@\"\n"
+        "#!/bin/sh\nif [ -x {quoted} ]; then\n  exec {quoted} \"$@\"\nfi\nexec waylode-mcp \"$@\"\n"
     )
 }
 
@@ -266,12 +276,12 @@ fn build_mcp_wrapper(mcp_bin: &Path) -> String {
 fn build_hook_wrapper(hook_bin: &Path) -> String {
     let quoted = shell_single_quote(&hook_bin.to_string_lossy());
     format!(
-        "#!/bin/sh\nif [ -x {quoted} ]; then\n  exec {quoted} \"$@\"\nfi\nif command -v gitpulse-hook >/dev/null 2>&1; then\n  exec gitpulse-hook \"$@\"\nfi\nif [ -z \"${{GITPULSE_SESSION_ID:-}}${{GITPULSE_TERMINAL_SESSION:-}}\" ]; then\n  exit 0\nfi\nprintf '%s\\n' '{{\"decision\":\"block\",\"reason\":\"GitPulse safety hook binary is missing from this terminal session.\"}}'\nexit 2\n"
+        "#!/bin/sh\nif [ -x {quoted} ]; then\n  exec {quoted} \"$@\"\nfi\nif command -v waylode-hook >/dev/null 2>&1; then\n  exec waylode-hook \"$@\"\nfi\nif command -v gitpulse-hook >/dev/null 2>&1; then\n  exec gitpulse-hook \"$@\"\nfi\nif [ -z \"${{WAYLODE_SESSION_ID:-}}${{WAYLODE_TERMINAL_SESSION:-}}${{GITPULSE_SESSION_ID:-}}${{GITPULSE_TERMINAL_SESSION:-}}\" ]; then\n  exit 0\nfi\nprintf '%s\\n' '{{\"decision\":\"block\",\"reason\":\"Waylode safety hook binary is missing from this terminal session.\"}}'\nexit 2\n"
     )
 }
 
 #[cfg(unix)]
-fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
+fn verify_owned_or_absent_with(plugin_dir: &Path, marker_name: &str) -> Result<bool, String> {
     match std::fs::symlink_metadata(plugin_dir) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -286,19 +296,24 @@ fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
                     plugin_dir.display()
                 ));
             }
-            let marker = plugin_dir.join(PRODUCER_MARKER);
+            let marker = plugin_dir.join(marker_name);
             match std::fs::symlink_metadata(&marker) {
                 Ok(m) if !m.file_type().is_symlink() && m.is_file() => Ok(true),
                 _ => Err(format!(
                     "refusing to touch {} because it lacks {}",
                     plugin_dir.display(),
-                    PRODUCER_MARKER
+                    marker_name
                 )),
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(format!("could not inspect {}: {err}", plugin_dir.display())),
     }
+}
+
+#[cfg(unix)]
+fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
+    verify_owned_or_absent_with(plugin_dir, PRODUCER_MARKER)
 }
 
 /// What a skill is called where `provider` runs it: Antigravity has no plugin
@@ -308,12 +323,12 @@ pub(crate) fn skill_reference(provider: &str, skill: &str) -> String {
     if provider == "agy" {
         format!("{ANTIGRAVITY_SKILL_PREFIX}{skill}")
     } else {
-        format!("gitpulse:{skill}")
+        format!("waylode:{skill}")
     }
 }
 
 /// The bundled `SKILL.md` as Antigravity's copy at `installed`: the frontmatter
-/// `name:` becomes the installed directory name, and every `gitpulse:<skill>`
+/// `name:` becomes the installed directory name, and every `waylode:<skill>`
 /// reference to a bundled skill becomes its Antigravity name, so the copy
 /// names skills the way Antigravity runs them.
 #[cfg(unix)]
@@ -332,40 +347,52 @@ fn for_antigravity(installed: &str, body: &str) -> String {
     }
     for (other, _) in SKILLS {
         if let Some(short) = other.strip_prefix(ANTIGRAVITY_SKILL_PREFIX) {
-            out = out.replace(&format!("gitpulse:{short}"), other);
+            out = out.replace(&format!("waylode:{short}"), other);
         }
     }
     out
 }
 
 #[cfg(unix)]
-fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
-    let exists = verify_owned_or_absent(plugin_dir)?;
+fn remove_managed_bundle(
+    plugin_dir: &Path,
+    skill_prefix: &str,
+    marker_name: &str,
+    mcp_wrapper: &str,
+    hook_wrapper: &str,
+) -> Result<(), String> {
+    let exists = verify_owned_or_absent_with(plugin_dir, marker_name)?;
     if !exists {
         return Ok(());
     }
     for (skill_name, rel_path, _) in SKILL_SUBFILES {
-        let subfile = plugin_dir.join("skills").join(skill_name).join(rel_path);
-        let _ = std::fs::remove_file(&subfile);
-        if let Some(parent) = subfile.parent() {
-            let _ = std::fs::remove_dir(parent);
+        if let Some(short) = skill_name.strip_prefix(ANTIGRAVITY_SKILL_PREFIX) {
+            let dir_name = format!("{skill_prefix}{short}");
+            let subfile = plugin_dir.join("skills").join(dir_name).join(rel_path);
+            let _ = std::fs::remove_file(&subfile);
+            if let Some(parent) = subfile.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
         }
     }
     for (skill_name, _) in SKILLS {
-        let skill_dir = plugin_dir.join("skills").join(skill_name);
-        let skill_file = skill_dir.join("SKILL.md");
-        let _ = std::fs::remove_file(&skill_file);
-        let _ = std::fs::remove_dir(&skill_dir);
+        if let Some(short) = skill_name.strip_prefix(ANTIGRAVITY_SKILL_PREFIX) {
+            let dir_name = format!("{skill_prefix}{short}");
+            let skill_dir = plugin_dir.join("skills").join(dir_name);
+            let skill_file = skill_dir.join("SKILL.md");
+            let _ = std::fs::remove_file(&skill_file);
+            let _ = std::fs::remove_dir(&skill_dir);
+        }
     }
     let _ = std::fs::remove_dir(plugin_dir.join("skills"));
     for rel in [
-        "bin/gitpulse-mcp",
-        "bin/gitpulse-hook",
+        &format!("bin/{mcp_wrapper}"),
+        &format!("bin/{hook_wrapper}"),
         "plugin.json",
         "hooks.json",
         "mcp.json",
         "mcp_config.json",
-        PRODUCER_MARKER,
+        marker_name,
     ] {
         let _ = std::fs::remove_file(plugin_dir.join(rel));
     }
@@ -374,7 +401,34 @@ fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Synchronizes `<home_root>/.gemini/config/plugins/gitpulse` deterministically.
+#[cfg(unix)]
+fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
+    remove_managed_bundle(
+        plugin_dir,
+        ANTIGRAVITY_SKILL_PREFIX,
+        PRODUCER_MARKER,
+        "waylode-mcp",
+        "waylode-hook",
+    )
+}
+
+#[cfg(unix)]
+fn cleanup_legacy_gitpulse_plugin(plugins_dir: &Path) {
+    let legacy_dir = plugins_dir.join("gitpulse");
+    if let Ok(true) = verify_owned_or_absent_with(&legacy_dir, LEGACY_PRODUCER_MARKER) {
+        let _ = remove_managed_bundle(
+            &legacy_dir,
+            "gitpulse-",
+            LEGACY_PRODUCER_MARKER,
+            "gitpulse-mcp",
+            "gitpulse-hook",
+        );
+    }
+}
+
+/// Synchronizes `<home_root>/.gemini/config/plugins/waylode` deterministically,
+/// and removes any legacy managed `<home_root>/.gemini/config/plugins/gitpulse`
+/// directory marked with `.gitpulse-managed`.
 #[cfg(unix)]
 pub(crate) fn sync_under_home(
     home_root: &Path,
@@ -385,7 +439,7 @@ pub(crate) fn sync_under_home(
     let gemini_dir = home_root.join(".gemini");
     let config_dir = gemini_dir.join("config");
     let plugins_dir = config_dir.join("plugins");
-    let plugin_dir = plugins_dir.join("gitpulse");
+    let plugin_dir = plugins_dir.join("waylode");
 
     for ancestor in [&gemini_dir, &config_dir, &plugins_dir] {
         if let Ok(meta) = std::fs::symlink_metadata(ancestor) {
@@ -398,13 +452,15 @@ pub(crate) fn sync_under_home(
         }
     }
 
+    cleanup_legacy_gitpulse_plugin(&plugins_dir);
+
     if !enabled {
         return remove_managed_plugin(&plugin_dir);
     }
 
     let (Some(mcp_bin), Some(hook_bin)) = (mcp_bin, hook_bin) else {
         return Err(
-            "missing gitpulse-mcp or gitpulse-hook binary path for Antigravity plugin sync".into(),
+            "missing waylode-mcp or waylode-hook binary path for Antigravity plugin sync".into(),
         );
     };
 
@@ -422,8 +478,8 @@ pub(crate) fn sync_under_home(
 
     let bin_dir = plugin_dir.join("bin");
     ensure_non_symlink_dir(&bin_dir)?;
-    let wrapper_mcp = bin_dir.join("gitpulse-mcp");
-    let wrapper_hook = bin_dir.join("gitpulse-hook");
+    let wrapper_mcp = bin_dir.join("waylode-mcp");
+    let wrapper_hook = bin_dir.join("waylode-hook");
     write_regular_file(&wrapper_mcp, build_mcp_wrapper(mcp_bin).as_bytes(), true)?;
     write_regular_file(&wrapper_hook, build_hook_wrapper(hook_bin).as_bytes(), true)?;
 
@@ -435,9 +491,9 @@ pub(crate) fn sync_under_home(
 
     let mut mcp_json = serde_json::to_string_pretty(&json!({
         "mcpServers": {
-            "gitpulse": {
+            "waylode": {
                 "type": "stdio",
-                "command": "./bin/gitpulse-mcp"
+                "command": "./bin/waylode-mcp"
             }
         }
     }))
@@ -447,7 +503,7 @@ pub(crate) fn sync_under_home(
 
     let mut mcp_config_json = serde_json::to_string_pretty(&json!({
         "mcpServers": {
-            "gitpulse": {
+            "waylode": {
                 "command": wrapper_mcp.to_string_lossy()
             }
         }
@@ -511,14 +567,24 @@ pub(crate) fn apply_from_settings() {
         return;
     }
     let exe = std::env::current_exe().ok();
-    let mcp = match resolve_helper_binary("GITPULSE_MCP_PATH", "gitpulse-mcp", exe.as_deref()) {
+    let mcp = match resolve_helper_binary(
+        "WAYLODE_MCP_PATH",
+        "GITPULSE_MCP_PATH",
+        "waylode-mcp",
+        exe.as_deref(),
+    ) {
         Ok(p) => p,
         Err(reason) => {
             log::debug!(target: "workbench", "Antigravity plugin sync skipped ({reason})");
             return;
         }
     };
-    let hook = match resolve_helper_binary("GITPULSE_HOOK_PATH", "gitpulse-hook", exe.as_deref()) {
+    let hook = match resolve_helper_binary(
+        "WAYLODE_HOOK_PATH",
+        "GITPULSE_HOOK_PATH",
+        "waylode-hook",
+        exe.as_deref(),
+    ) {
         Ok(p) => p,
         Err(reason) => {
             log::debug!(target: "workbench", "Antigravity plugin sync skipped ({reason})");
@@ -553,30 +619,30 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let bin_dir = tmp.path().join("bins");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let mcp = make_dummy_bin(&bin_dir, "gitpulse-mcp");
-        let hook = make_dummy_bin(&bin_dir, "gitpulse-hook");
+        let mcp = make_dummy_bin(&bin_dir, "waylode-mcp");
+        let hook = make_dummy_bin(&bin_dir, "waylode-hook");
 
         sync_under_home(&home, true, Some(&mcp), Some(&hook)).expect("stage plugin");
 
-        let plugin_dir = home.join(".gemini/config/plugins/gitpulse");
+        let plugin_dir = home.join(".gemini/config/plugins/waylode");
         assert!(plugin_dir.join(PRODUCER_MARKER).is_file());
         assert!(plugin_dir.join("plugin.json").is_file());
-        assert!(plugin_dir.join("bin/gitpulse-mcp").is_file());
-        assert!(plugin_dir.join("bin/gitpulse-hook").is_file());
+        assert!(plugin_dir.join("bin/waylode-mcp").is_file());
+        assert!(plugin_dir.join("bin/waylode-hook").is_file());
         assert!(plugin_dir
-            .join("skills/gitpulse-terminal/SKILL.md")
+            .join("skills/waylode-terminal/SKILL.md")
             .is_file());
-        assert!(plugin_dir.join("skills/gitpulse-load/SKILL.md").is_file());
+        assert!(plugin_dir.join("skills/waylode-load/SKILL.md").is_file());
         assert!(plugin_dir
-            .join("skills/gitpulse-merge-train/SKILL.md")
+            .join("skills/waylode-merge-train/SKILL.md")
             .is_file());
         assert!(plugin_dir
-            .join("skills/gitpulse-merge-train/failset/go.mod")
+            .join("skills/waylode-merge-train/failset/go.mod")
             .is_file());
         for landing in [
-            "gitpulse-commit-and-merge",
-            "gitpulse-merge-prs",
-            "gitpulse-wrap-up",
+            "waylode-commit-and-merge",
+            "waylode-merge-prs",
+            "waylode-wrap-up",
         ] {
             assert!(
                 plugin_dir
@@ -604,8 +670,8 @@ mod tests {
             for (other, _) in SKILLS {
                 let short = other.strip_prefix(ANTIGRAVITY_SKILL_PREFIX).unwrap();
                 assert!(
-                    !body.contains(&format!("gitpulse:{short}")),
-                    "{installed} names gitpulse:{short}, which Antigravity cannot run"
+                    !body.contains(&format!("waylode:{short}")),
+                    "{installed} names waylode:{short}, which Antigravity cannot run"
                 );
             }
         }
@@ -614,8 +680,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(plugin_dir.join("mcp.json")).unwrap())
                 .unwrap();
         assert_eq!(
-            mcp_json["mcpServers"]["gitpulse"]["command"],
-            "./bin/gitpulse-mcp"
+            mcp_json["mcpServers"]["waylode"]["command"],
+            "./bin/waylode-mcp"
         );
 
         let hooks_json: Value =
@@ -624,42 +690,42 @@ mod tests {
         // No pre-tool gate: Antigravity IDE 2.32.1 denied every call such a
         // hook answered without `"decision":"allow"`, `{}` included.
         assert!(
-            hooks_json["gitpulse"].get("PreToolUse").is_none(),
+            hooks_json["waylode"].get("PreToolUse").is_none(),
             "Antigravity must get no PreToolUse hook: {hooks_json}"
         );
-        let brief_cmd = hooks_json["gitpulse"]["SessionStart"][0]["command"]
+        let brief_cmd = hooks_json["waylode"]["SessionStart"][0]["command"]
             .as_str()
             .unwrap();
         assert!(
-            brief_cmd.contains("bin/gitpulse-hook' --host=agy session-brief"),
+            brief_cmd.contains("bin/waylode-hook' --host=agy session-brief"),
             "unexpected hook command: {brief_cmd}"
         );
-        let session_inbox_cmd = hooks_json["gitpulse"]["SessionStart"][1]["command"]
+        let session_inbox_cmd = hooks_json["waylode"]["SessionStart"][1]["command"]
             .as_str()
             .unwrap();
         assert!(
-            session_inbox_cmd.contains("bin/gitpulse-hook' --host=agy peer-inbox"),
+            session_inbox_cmd.contains("bin/waylode-hook' --host=agy peer-inbox"),
             "missing SessionStart peer-inbox: {session_inbox_cmd}"
         );
-        assert_eq!(hooks_json["gitpulse"]["PostToolUse"][0]["matcher"], "*");
+        assert_eq!(hooks_json["waylode"]["PostToolUse"][0]["matcher"], "*");
         assert!(
-            hooks_json["gitpulse"]["PostToolUse"][0]["hooks"][0]["command"]
+            hooks_json["waylode"]["PostToolUse"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .contains("bin/gitpulse-hook' --host=agy notify tool_finished")
+                .contains("bin/waylode-hook' --host=agy notify tool_finished")
         );
-        assert!(hooks_json["gitpulse"]["PreInvocation"][0]["command"]
+        assert!(hooks_json["waylode"]["PreInvocation"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("bin/gitpulse-hook' --host=agy peer-inbox"));
-        assert!(hooks_json["gitpulse"]["PostInvocation"][0]["command"]
+            .contains("bin/waylode-hook' --host=agy peer-inbox"));
+        assert!(hooks_json["waylode"]["PostInvocation"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("bin/gitpulse-hook' --host=agy peer-inbox"));
-        assert!(hooks_json["gitpulse"]["Stop"][0]["command"]
+            .contains("bin/waylode-hook' --host=agy peer-inbox"));
+        assert!(hooks_json["waylode"]["Stop"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("bin/gitpulse-hook' --host=agy stop-or-notify"));
+            .contains("bin/waylode-hook' --host=agy stop-or-notify"));
 
         // If `agy` is installed on the host, run `agy plugin validate --strict --json`.
         use crate::procguard::LockedSpawn;
@@ -686,18 +752,62 @@ mod tests {
     }
 
     #[test]
+    fn cleans_up_legacy_gitpulse_managed_plugin_only_when_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let legacy_dir = home.join(".gemini/config/plugins/gitpulse");
+        std::fs::create_dir_all(legacy_dir.join("bin")).unwrap();
+        std::fs::create_dir_all(legacy_dir.join("skills/gitpulse-insights")).unwrap();
+        std::fs::write(
+            legacy_dir.join(".gitpulse-managed"),
+            "managed_by=gitpulse\n",
+        )
+        .unwrap();
+        std::fs::write(legacy_dir.join("plugin.json"), "{}").unwrap();
+        std::fs::write(legacy_dir.join("bin/gitpulse-mcp"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            legacy_dir.join("skills/gitpulse-insights/SKILL.md"),
+            "---\n",
+        )
+        .unwrap();
+
+        let bin_dir = tmp.path().join("bins");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let mcp = make_dummy_bin(&bin_dir, "waylode-mcp");
+        let hook = make_dummy_bin(&bin_dir, "waylode-hook");
+
+        sync_under_home(&home, true, Some(&mcp), Some(&hook))
+            .expect("stage waylode and clean legacy");
+        assert!(
+            !legacy_dir.exists(),
+            "legacy .gitpulse-managed bundle must be removed"
+        );
+        assert!(home
+            .join(".gemini/config/plugins/waylode/.waylode-managed")
+            .is_file());
+
+        // An unmanaged legacy `gitpulse` folder (no `.gitpulse-managed`) is left untouched
+        // without blocking `waylode` sync.
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("custom.txt"), "keep").unwrap();
+        sync_under_home(&home, false, None, None)
+            .expect("cleanup disabled must tolerate unmanaged legacy");
+        assert!(legacy_dir.join("custom.txt").is_file());
+    }
+
+    #[test]
     fn refuses_to_overwrite_or_delete_unmanaged_or_symlinked_plugin_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
-        let unmanaged = home.join(".gemini/config/plugins/gitpulse");
+        let unmanaged = home.join(".gemini/config/plugins/waylode");
         std::fs::create_dir_all(&unmanaged).unwrap();
         let custom_file = unmanaged.join("custom.txt");
         std::fs::write(&custom_file, "user-owned").unwrap();
 
         let bin_dir = tmp.path().join("bins");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let mcp = make_dummy_bin(&bin_dir, "gitpulse-mcp");
-        let hook = make_dummy_bin(&bin_dir, "gitpulse-hook");
+        let mcp = make_dummy_bin(&bin_dir, "waylode-mcp");
+        let hook = make_dummy_bin(&bin_dir, "waylode-hook");
 
         assert!(sync_under_home(&home, true, Some(&mcp), Some(&hook)).is_err());
         assert!(sync_under_home(&home, false, None, None).is_err());
@@ -705,14 +815,14 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_plugin_hooks_match_gitpulse_agy_lifecycle_and_subcommands() {
+    fn antigravity_plugin_hooks_match_waylode_agy_lifecycle_and_subcommands() {
         let embedded: Value = serde_json::from_str(HOOKS_JSON).unwrap();
         let agy_ref: Value =
-            serde_json::from_str(include_str!("../../../plugins/gitpulse-agy/hooks.json")).unwrap();
+            serde_json::from_str(include_str!("../../../plugins/waylode-agy/hooks.json")).unwrap();
 
         let extract = |root: &Value| -> Vec<(String, String, String)> {
             let mut out = Vec::new();
-            for (event, entries) in root["gitpulse"].as_object().unwrap() {
+            for (event, entries) in root["waylode"].as_object().unwrap() {
                 for entry in entries.as_array().unwrap() {
                     if let Some(nested) = entry.get("hooks").and_then(Value::as_array) {
                         let matcher = entry["matcher"].as_str().unwrap_or_default().to_owned();

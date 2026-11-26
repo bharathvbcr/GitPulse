@@ -22,10 +22,10 @@
 mod common;
 
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::watcher::bench_seam::StormClassifier;
 use notify::event::{DataChange, ModifyKind};
 use notify::{Event, EventKind};
 use std::path::{Path, PathBuf};
+use waylode_lib::watcher::bench_seam::StormClassifier;
 
 const EVENTS: usize = 10_000;
 const IGNORED_PREFIXES: usize = 600;

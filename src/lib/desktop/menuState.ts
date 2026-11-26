@@ -733,7 +733,7 @@ export function buildMenuState(
     hideDockWhenClosed: prefs.hideDockWhenClosed,
     trayTitle,
     status: {
-      repository: menuText(activeRepo?.label ?? repo.currentPath?.split(/[\\/]/).pop() ?? "GitPulse", 100),
+      repository: menuText(activeRepo?.label ?? repo.currentPath?.split(/[\\/]/).pop() ?? "Waylode", 100),
       branch: menuText(branch, 120),
       changed: loaded && !repo.isBare ? changes : null,
       staged: loaded && !repo.isBare ? staged : null,
@@ -766,7 +766,7 @@ export function buildMenuState(
     traySummary: { id: trayTarget, text: menuText([brief, sync,
       repo.watch.status === "degraded" ? "Not live" : "", elsewhere ? `${elsewhere} running elsewhere` : ""].filter(Boolean).join(" · "), 72) },
     trayDetail: hasRepo ? [menuText(activeRepo?.label ?? repo.currentPath?.split(/[\\/]/).pop() ?? "Repository", 32),
-      menuText(branch, 36)].join(" · ") : "GitPulse",
+      menuText(branch, 36)].join(" · ") : "Waylode",
     agentsWaiting: effectiveWaiting,
     agentRequests,
     agentRequestsHidden,

@@ -445,9 +445,10 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
             lease: LeaseSource::Live,
             steward_throttle,
             relief,
-            terminal_session: std::env::var(crate::alerts::bridge::SESSION_ENV)
-                .ok()
-                .filter(|id| !id.is_empty()),
+            terminal_session: crate::env_compat::var_compat(
+                crate::alerts::bridge::SESSION_ENV,
+                crate::alerts::bridge::LEGACY_SESSION_ENV,
+            ),
             session_root,
         }
     };
@@ -787,7 +788,7 @@ fn unchecked_relief(input: &HookInput, g: &Gathered, kind: &str, why: &str) -> O
     match first_notice(g, input, &format!("relief: {kind}")) {
         Notice::Repeat => None,
         notice => Some(format!(
-            "GitPulse could NOT check whether its memory protection has paused a build or test ({why}). \
+            "Waylode could NOT check whether its memory protection has paused a build or test ({why}). \
              Do not assume nothing is paused: a command that hangs without output may be.{}",
             notice.suffix()
         )),
@@ -819,7 +820,7 @@ fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
             MAX_ECHOED_COMMAND,
         );
         return Some(format!(
-            "GitPulse's memory protection ended `{command}` (pid {}) because {}. \
+            "Waylode's memory protection ended `{command}` (pid {}) because {}. \
              The build was ended by memory protection: it did not finish, and it must not be re-run (or another build started in parallel) until memory pressure clears.",
             tree.pid,
             status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
@@ -833,7 +834,7 @@ fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
             MAX_ECHOED_COMMAND,
         );
         return Some(format!(
-            "GitPulse's memory protection asked `{command}` (pid {}) to end because {}; it has not confirmed it ended yet. \
+            "Waylode's memory protection asked `{command}` (pid {}) to end because {}; it has not confirmed it ended yet. \
              Do not re-run it, and do not start it or another build in parallel, until memory pressure clears.",
             tree.pid,
             status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
@@ -846,7 +847,7 @@ fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
             MAX_ECHOED_COMMAND,
         );
         return Some(format!(
-            "GitPulse's memory protection paused `{command}` (pid {}) because {}. \
+            "Waylode's memory protection paused `{command}` (pid {}) because {}. \
              It will resume automatically. Do not retry it, and do not re-run it or another build in parallel; wait for it to resume.",
             tree.pid,
             status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
@@ -855,7 +856,7 @@ fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
     // `slowed` counts processes really slowed, so Advise mode (0) says nothing.
     if status.slowed > 0 {
         return Some(format!(
-            "GitPulse's memory protection has lowered the priority of {} agent process(es) because {}, so builds and tests run slower. Run one at a time.",
+            "Waylode's memory protection has lowered the priority of {} agent process(es) because {}, so builds and tests run slower. Run one at a time.",
             status.slowed,
             status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
         ));

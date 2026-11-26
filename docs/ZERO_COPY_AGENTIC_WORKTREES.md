@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Feature reference](FEATURES.md) · [Architecture](ARCHITECTURE.md)
 
-This document records the systems research, failure-mode analysis, and architectural design behind GitPulse's zero-copy branching, sparse worktree provisioning, parallel DevMap delta overlays, content-addressed `gitpulse-rustc` build cache, and multi-agent coordination bus.
+This document records the systems research, failure-mode analysis, and architectural design behind Waylode's zero-copy branching, sparse worktree provisioning, parallel DevMap delta overlays, content-addressed `gitpulse-rustc` build cache, and multi-agent coordination bus.
 
 ---
 
@@ -19,7 +19,7 @@ Running multiple autonomous coding agents in parallel against one repository str
 | **GitButler Virtual Branches** | Multiple virtual lanes multiplexed inside a single working directory | Single working tree | Single shared index | Single `target/` directory | Disjoint hunk assignment in one tree | Breaks down when two parallel agents edit the same file or run incompatible build/test processes simultaneously |
 | **Dagger `container-use` & Worktrunk** | Ephemeral container checkouts (`container-use`) or branch-addressed Git worktrees with CoW cache copy (`Worktrunk`) | Container layer or full Git worktree |Copied or rebuilt per lane | Whole-directory `target/` reflink when unlocked | Post-hoc merge / PR review | When an active build holds `.cargo-lock`, whole-directory `target/` cloning must skip the build directory |
 | **`sccache` (`RUSTC_WRAPPER`)** | Content-addressed compiler wrapper hashing `rustc -vV`, flags, and pre-processed/source inputs | N/A (compiler layer) | N/A | Shared `.rlib` / `.rmeta` object cache across directories | N/A | Copies bytes into `--out-dir` rather than APFS/FICLONE CoW reflinking; external daemon setup required |
-| **GitPulse Zero-Copy Engine** | Carried-churn branching + DevMap-guided `--cone` sparse checkouts + `<512 B` DevMap base pointers + Blake3/CAS AST overlays + `gitpulse-rustc` CoW cache + `<git-common-dir>` lane bus | Only transitive `--cone` directories materialized on disk | Shared anchor `devmap.sqlite` + mmap `.csr` + per-lane `overlay.json` & `RoaringBitmap` dirty CSR mask | Whole-`target/` CoW clone when idle **plus** lock-free per-crate `gitpulse-rustc` CoW cache when `.cargo-lock` is held | Pre-edit file/symbol claims + bounded message ring + 3-layer CSR/ODB collision radar | Zero server infrastructure, zero FUSE kernel extensions, 100% compatible with standard Git remotes |
+| **Waylode Zero-Copy Engine** | Carried-churn branching + DevMap-guided `--cone` sparse checkouts + `<512 B` DevMap base pointers + Blake3/CAS AST overlays + `gitpulse-rustc` CoW cache + `<git-common-dir>` lane bus | Only transitive `--cone` directories materialized on disk | Shared anchor `devmap.sqlite` + mmap `.csr` + per-lane `overlay.json` & `RoaringBitmap` dirty CSR mask | Whole-`target/` CoW clone when idle **plus** lock-free per-crate `gitpulse-rustc` CoW cache when `.cargo-lock` is held | Pre-edit file/symbol claims + bounded message ring + 3-layer CSR/ODB collision radar | Zero server infrastructure, zero FUSE kernel extensions, 100% compatible with standard Git remotes |
 
 ---
 
@@ -38,7 +38,7 @@ Running multiple autonomous coding agents in parallel against one repository str
 
 ---
 
-## 3. GitPulse's Five-Pillar Zero-Copy Architecture
+## 3. Waylode's Five-Pillar Zero-Copy Architecture
 
 ```mermaid
 flowchart TB
@@ -112,11 +112,11 @@ flowchart LR
   - Instead of copying `devmap.sqlite` into every worktree (which violates SQLite inode locks and `pending_state.repo_root` ownership), `provision_worktree_devmap_zero_copy` writes a `<512 B` atomic JSON pointer ([`ZeroCopyBaseRef`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/codeintel/worktree_overlay.rs#L64-L73) at `codeintel/base_store_ref.json`) referencing the anchor repository's read-only `devmap.sqlite`, mmap `.csr` edge index, and content-addressed `cas/ast/` store, pinned to `anchor_generation_id` and `anchor_head_sha`.
   - When an agent modifies, adds, or deletes files in its worktree, `sync_worktree_overlay` diffs the lane against `anchor_head_sha` (including untracked files), stores Blake3-addressed symbol AST blobs under `<anchor>/.devmap/codeintel/cas/ast/<2-hex>/<blake3>.ast`, computes a `RoaringBitmap` of invalidated CSR node IDs (`dirty_nodes`), and atomically writes `overlay.json`. Unchanged files consume zero per-worktree graph storage.
   - Dependency build caches are cloned using filesystem Copy-on-Write ([`cow_clone.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/engine/cow_clone.rs#L1-L60)), sharing physical disk blocks across worktrees with bounds enforced by `CowCaps` (`MAX_COW_DEPTH = 64`, `MAX_COW_ENTRIES = 1,000,000`, `MAX_COW_BYTES = 8 GiB`).
-  - **Limit (measured 2026-11-06, [§7](#7-measured-what-a-new-agent-lane-gets-from-devmap)):** the pointer is read only by GitPulse's in-process readers. The `devmap` binary that agents query (CLI and `devmap mcp`) does not read `base_store_ref.json`: in a pointer-only lane `devmap status` answers `query_ready: false`, and DevMap's SessionStart hook starts a cold `devmap build` there, which lands a full ~289 MB store beside the pointer. For agent lanes, the CoW-cloned store (`provision_worktree_devmap`, `DevmapMode::Copy`) is the seamless mode.
+  - **Limit (measured 2026-11-06, [§7](#7-measured-what-a-new-agent-lane-gets-from-devmap)):** the pointer is read only by Waylode's in-process readers. The `devmap` binary that agents query (CLI and `devmap mcp`) does not read `base_store_ref.json`: in a pointer-only lane `devmap status` answers `query_ready: false`, and DevMap's SessionStart hook starts a cold `devmap build` there, which lands a full ~289 MB store beside the pointer. For agent lanes, the CoW-cloned store (`provision_worktree_devmap`, `DevmapMode::Copy`) is the seamless mode.
   - Active agent processes (Claude Code, Codex, Antigravity) are tracked via host load process scanning ([`live_sessions.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/insights/live_sessions.rs#L1-L50)), and overlapping file edits are classified by joining uncommitted diff intervals against DevMap symbol spans ([`entity_collision.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/insights/entity_collision.rs#L1-L40)).
 
-### Pillar 4: Two-Stage Zero-Copy Compiler Wrapper (`gitpulse-rustc` & `gitpulse-worktree build`)
-- **Owners**: [`../crates/gitpulse-worktree/src/build_cache.rs`](../crates/gitpulse-worktree/src/build_cache.rs), [`../crates/gitpulse-worktree/src/bin/gitpulse-rustc.rs`](../crates/gitpulse-worktree/src/bin/gitpulse-rustc.rs), [`../crates/gitpulse-worktree/src/main.rs`](../crates/gitpulse-worktree/src/main.rs).
+### Pillar 4: Two-Stage Zero-Copy Compiler Wrapper (`waylode-rustc` & `waylode-worktree build`)
+- **Owners**: [`../crates/waylode-worktree/src/build_cache.rs`](../crates/waylode-worktree/src/build_cache.rs), [`../crates/waylode-worktree/src/bin/waylode-rustc.rs`](../crates/waylode-worktree/src/bin/waylode-rustc.rs), [`../crates/waylode-worktree/src/main.rs`](../crates/waylode-worktree/src/main.rs).
 - **Problem Solved**: Shares compiled `.rlib`, `.rmeta`, `.dylib`, `.so`, and `.dll` crate outputs across sibling worktrees with zero lock contention even when an active anchor build holds `<target>/<profile>/.cargo-lock` and `target/` could not be CoW-cloned.
 - **Two-Stage Soundness Protocol**:
   1. **Stage 1 (Direct Key)**: Expands bounded `@<rspfile>` response files, hashes compiler toolchain identity (`rustc -vV` cached in `compilers.json` by canonical binary path, byte size, and mtime nanoseconds), normalized `rustc` flags (stripping worktree-local `--out-dir`, `-L`, and canonical/symlinked source prefixes while preserving `-C metadata` and `-C extra-filename` so `StableCrateId` and symbol mangling remain sound), sorted `CARGO_PKG_*` / `CARGO_CFG_*` / `CARGO_FEATURE_*` / `RUSTFLAGS` environment variables, the entry `.rs` file's Blake3 digest, and sorted `--extern` crate artifact Blake3 digests. Library, `rlib`, `proc-macro`, `dylib`, `cdylib`, and `staticlib` crates are cached; compiler probes (`-vV`, `--print`), `build_script_build` / binary / `--test` targets, and `-C incremental` invocations pass straight through to `rustc`.
@@ -124,7 +124,7 @@ flowchart LR
   3. **Zero-Copy Materialization & Pipelined Stderr Rewriting**: Verified hits clone cached artifacts from `<git-common-dir>/gitpulse/build-cache/blobs/<2-hex>/<blake3>` into a process-unique sibling path via `reflink_copy_file` (`clonefile` / `FICLONE`) and atomically `rename(2)` into Cargo's `--out-dir`. Both the emitted `.d` dep-info file and `rustc`'s JSON `"$message_type": "artifact"` lines on stderr are path-rewritten across canonical and symlinked checkout paths so Cargo's pipelined compilation remains coherent.
 
 ### Pillar 5: Multi-Agent Coordination Bus & 3-Layer Collision Radar (CLI + MCP)
-- **Owners**: [`agent_bus.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/engine/agent_bus.rs#L1-L142), [`mod.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/mcp/mod.rs), [`main.rs`](file:///Users/bharath/Code/devtools/GitPulse/crates/gitpulse-worktree/src/main.rs#L1-L135).
+- **Owners**: [`agent_bus.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/engine/agent_bus.rs#L1-L142), [`mod.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/mcp/mod.rs), [`main.rs`](file:///Users/bharath/Code/devtools/GitPulse/crates/waylode-worktree/src/main.rs#L1-L135).
 - **Decoupled Common State**: Coordination state lives exclusively under `<git-common-dir>/gitpulse/lanes/` and never inside working trees or Git references, ensuring parallel agent actions do not taint working directories or Git status.
 - **Concurrency & File Locking Model**:
   - Inter-process synchronization uses advisory `libc::flock` on `.bus.lock` with exponential backoff (1–25 ms) and a 10-second timeout (`BUS_LOCK_TIMEOUT`).
@@ -161,7 +161,7 @@ sequenceDiagram
 - **Pre-Edit Intent Claim Registry (`claims.json`)**:
   - Tracks active agent lanes via [`AgentLaneClaim`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/engine/agent_bus.rs#L46-L56) (`agent_id`, `branch`, `worktree_path`, `sparse_cone`, `claimed_files`, `claimed_symbols`, and `updated_at_ms`).
   - Bounded to `MAX_ACTIVE_LANES = 64` lanes and `MAX_CLAIMED_ITEMS = 128` files/symbols per lane.
-  - Lanes are registered via `register_or_update_lane` (CLI `gitpulse-worktree claim`) and released via `release_lane` or during worktree merge/prune teardown so lane slots never leak.
+  - Lanes are registered via `register_or_update_lane` (CLI `waylode-worktree claim`) and released via `release_lane` or during worktree merge/prune teardown so lane slots never leak.
 - **Monotonic Coordination Message Ring (`messages.json`)**:
   - Implements a bounded ring buffer via [`AgentBusMessage`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/engine/agent_bus.rs#L63-L80) (`seq`, `from_agent`, `to_agent`, `kind`, `body`, `branch`, `created_at_ms`).
   - Capped at `MAX_BUS_MESSAGES = 256` messages with a maximum body length of `MAX_MESSAGE_BODY_BYTES = 16 KiB`.
@@ -203,11 +203,11 @@ flowchart TD
 
 ## 4. CLI & MCP Reference
 
-### Standalone Binaries (`crates/gitpulse-worktree`)
+### Standalone Binaries (`crates/waylode-worktree`)
 
 ```bash
 # 1. Create a DevMap-guided sparse worktree with a <512B zero-copy DevMap pointer and register an agent lane
-gitpulse-worktree create \
+waylode-worktree create \
   --repo /path/to/repo \
   --branch agent/auth-refactor \
   --sparse packages/auth \
@@ -216,30 +216,30 @@ gitpulse-worktree create \
   --json
 
 # 2. Compile uncommitted changes into overlay.json + Blake3 CAS ASTs + RoaringBitmap CSR mask
-gitpulse-worktree compile-overlay --worktree /path/to/worktree --json
+waylode-worktree compile-overlay --worktree /path/to/worktree --json
 
 # 3. Coordinate intent, handoffs, and 3-layer collision radar across parallel agents
-gitpulse-worktree claim --repo /path/to/repo --agent claude-auth --branch agent/auth-refactor \
+waylode-worktree claim --repo /path/to/repo --agent claude-auth --branch agent/auth-refactor \
   --files packages/auth/lib.rs --symbols verify_token --json
-gitpulse-worktree msg-send --repo /path/to/repo --from claude-auth --kind interface_change \
+waylode-worktree msg-send --repo /path/to/repo --from claude-auth --kind interface_change \
   --body "Updated verify_token signature in packages/auth/lib.rs" --json
-gitpulse-worktree msg-inbox --repo /path/to/repo --agent claude-api --since-seq 0 --json
-gitpulse-worktree radar --repo /path/to/repo --json
+waylode-worktree msg-inbox --repo /path/to/repo --agent claude-api --since-seq 0 --json
+waylode-worktree radar --repo /path/to/repo --json
 
-# 4. Build in any worktree using zero-copy content-addressed gitpulse-rustc caching
-gitpulse-worktree build --repo /path/to/repo --worktree /path/to/worktree --json -- build --workspace
+# 4. Build in any worktree using zero-copy content-addressed waylode-rustc caching
+waylode-worktree build --repo /path/to/repo --worktree /path/to/worktree --json -- build --workspace
 
 # 5. Inspect or prune <git-common-dir>/gitpulse/build-cache
-gitpulse-worktree cache-stats --repo /path/to/repo --prune --max-bytes 2147483648 --json
+waylode-worktree cache-stats --repo /path/to/repo --prune --max-bytes 2147483648 --json
 ```
 
-`gitpulse-rustc` can also wrap standard `cargo` directly in any Git worktree:
+`waylode-rustc` can also wrap standard `cargo` directly in any Git worktree:
 
 ```bash
-CARGO_INCREMENTAL=0 RUSTC_WRAPPER=gitpulse-rustc cargo check --workspace
+CARGO_INCREMENTAL=0 RUSTC_WRAPPER=waylode-rustc cargo check --workspace
 ```
 
-| `gitpulse-worktree` Subcommand | Purpose | Key Flags |
+| `waylode-worktree` Subcommand | Purpose | Key Flags |
 | --- | --- | --- |
 | `create` | Create a full, `--zero-copy`, or DevMap-expanded `--sparse` `--cone` worktree and optionally register an agent lane | `--repo`, `--branch`, `--base`, `--target`, `--sparse <p1,p2>`, `--zero-copy`, `--no-cache`, `--exec <cmd>`, `--agent <id>` |
 | `switch` | Resolve an existing worktree path for a branch, or create one on demand | `--repo`, `--branch`, `--create`, `--base` |
@@ -255,7 +255,7 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=gitpulse-rustc cargo check --workspace
 | `verify` | Run the 6-point branch integration check (ancestry, patch-id, ODB tree equality, squash-diff emptiness, remote tracking, working-tree cleanliness) | `--repo`, `--branch`, `--target` |
 | `merge` | Execute ODB-quarantined squash or non-squash merge, CAS `update-ref`, optional clean `--ff-only`, and worktree teardown | `--repo`, `--source`, `--target`, `--no-squash`, `--message`, `--keep-worktree` |
 | `prune` | Reap orphan processes inside worktree roots and remove clean, 6-point-integrated worktrees | `--repo`, `--branch`, `--dry-run`, `--force`, `--no-reap` |
-| `build` | Invoke `cargo` inside a worktree with `RUSTC_WRAPPER=gitpulse-rustc` wired to `<git-common-dir>/gitpulse/build-cache` | `--repo`, `--worktree`, `--rustc-wrapper`, `-- <cargo args...>` |
+| `build` | Invoke `cargo` inside a worktree with `RUSTC_WRAPPER=waylode-rustc` wired to `<git-common-dir>/gitpulse/build-cache` | `--repo`, `--worktree`, `--rustc-wrapper`, `-- <cargo args...>` |
 | `cache-stats` | Measure `<git-common-dir>/gitpulse/build-cache` hits/misses/bytes and optionally evict oldest blobs down to a byte budget | `--repo`, `--prune`, `--max-bytes` |
 
 ### MCP Tools (`gitpulse-mcp`)
@@ -278,7 +278,7 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=gitpulse-rustc cargo check --workspace
 
 ## 5. Desktop UI & Frontend Store Integration
 
-- **Worktrees Panel (`WorktreesPanel.svelte`)**: Exposes checkboxes for **Copy-on-Write dependency caches** (`node_modules`, `target`) and **Seed DevMap index** (`seedDevmap`, on by default: a CoW-cloned store, then built for the worktree, §7), with the **Zero-copy DevMap pointer** opt-in (`zeroCopyDevmap`, off by default; only GitPulse reads it), plus a **Sparse cone paths** field that passes repo-relative directories or files to `cmd_add_worktree` (`add_worktree_configured`). When `sparsePaths` are supplied, the backend runs `add_sparse_worktree_zero_copy` and returns the DevMap-expanded cone alongside CoW cache and `.gitpulse/hooks.toml` execution reports.
+- **Worktrees Panel (`WorktreesPanel.svelte`)**: Exposes checkboxes for **Copy-on-Write dependency caches** (`node_modules`, `target`) and **Seed DevMap index** (`seedDevmap`, on by default: a CoW-cloned store, then built for the worktree, §7), with the **Zero-copy DevMap pointer** opt-in (`zeroCopyDevmap`, off by default; only Waylode reads it), plus a **Sparse cone paths** field that passes repo-relative directories or files to `cmd_add_worktree` (`add_worktree_configured`). When `sparsePaths` are supplied, the backend runs `add_sparse_worktree_zero_copy` and returns the DevMap-expanded cone alongside CoW cache and `.gitpulse/hooks.toml` execution reports.
 - **Map & Health Status Honesty (`OpenedRepoStore::ZeroCopy`)**: In-process DevMap readers (`src-tauri/src/codeintel/store.rs`) recognize `base_store_ref.json` when a linked worktree has no local `devmap.sqlite`, verify that the worktree and anchor share the exact canonical `<git-common-dir>` (`evaluate_zero_copy_status`), and open the anchor's read-only SQLite snapshot without copying it while preserving explicit `stale` freshness reasons whenever `HEAD`, `overlay.json`, or dirty files diverge from `anchor_head_sha`.
 - **Single-Facet Branch Refresh (`repoStore.ts`)**: `createBranch`, `renameBranch`, and `deleteBranch` call `hydrateFacet(path, "branches")` rather than reloading unrelated status, commit-graph, or stash facets. `withCarriedChurn` carries verified `ahead`/`behind`/`insertions`/`deletions` across matching commit tips (including unshadowed remote-tracking tips), and `sessionBook.statsDrained` short-circuits progressive `fetchBranchStats` sweeps once all eligible branches are verified against the current default base.
 
@@ -287,7 +287,7 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=gitpulse-rustc cargo check --workspace
 ## 6. Security, Concurrency & Fail-Closed Boundaries
 
 - **Cross-Repo Pointer Verification**: Both `load_zero_copy_base_ref` and `OpenedRepoStore::open` verify via `resolve_git_common_dir` that `anchor_repo_root` belongs to the same Git repository family as the linked worktree and contains no `..` traversal components; crafted `base_store_ref.json` files pointing at unrelated repositories or arbitrary SQLite files are refused.
-- **Managed Task-Lane Directory Reservation**: `refuse_gitpulse_lane_target` rejects manual, CLI, and MCP worktree targets inside `<repo>/.gitpulse/worktrees/` so user or external agent checkouts cannot collide with GitPulse's managed task-attempt lanes.
+- **Managed Task-Lane Directory Reservation**: `refuse_gitpulse_lane_target` rejects manual, CLI, and MCP worktree targets inside `<repo>/.gitpulse/worktrees/` so user or external agent checkouts cannot collide with Waylode's managed task-attempt lanes.
 - **Path-Traversal & Payload Bounds on the Agent Bus**: `sanitize_claim_paths` rejects absolute paths, `..` segments, and NUL bytes. Advisory `flock(2)` on `<git-common-dir>/gitpulse/lanes/.bus.lock` serializes concurrent readers and writers across processes, enforcing hard caps of 64 active lanes, 128 claimed files/symbols per lane, 256 retained messages, 16 KiB per message body, and a 64 KiB MCP wire ceiling on `gitpulse_worktree_radar` (which sets `truncated: true` rather than exceeding the frame limit).
 - **Bounded Compiler Wrapper Inputs & Sound `OUT_DIR` Reuse**: `gitpulse-rustc` refuses `@<rspfile>` response files larger than 8 MiB or nested deeper than four levels, skips caching whenever `-C incremental` or `build_script_build` is active, and strips comments and string literals (`has_compile_only_out_dir_tokens`) before exempting `# env-dep:OUT_DIR` so crates embedding `env!("OUT_DIR")` at runtime never reuse another worktree's path.
 
@@ -304,7 +304,7 @@ Measured 2026-11-06 on this repository (main at `5394f4d3`, 3,193 indexed files,
 | Cold `devmap build --manifest` (3) | 7.56 / 7.61 / 7.79 s | ~38.7 CPU-s | 366 MB per lane | `ba04666f…` |
 | Bare CoW clone: `clonefile` store + manifests, rebind `repo_root` in shell (3) | 0.077 / 0.079 / 0.098 s (`query_ready: true`) | — | 3.9–16.5 MB | — |
 | …then incremental `devmap build --manifest` (3) | +2.41 / 2.41 / 2.77 s | — | +0.4 MB | `ba04666f…` (identical) |
-| **GitPulse's `provision_worktree_devmap`** (the seed lanes now get; debug build, separate run on a rebuilt anchor) (3) | 1.13 / 1.14 / 1.19 s (`is_cow: true`, `query_ready: true`, `is_fresh: true`). The second over the bare clone is the seeder's own work, most likely building the CSR sidecar the anchor lacks (not profiled) | — | 7.3–19.8 MB | — |
+| **Waylode's `provision_worktree_devmap`** (the seed lanes now get; debug build, separate run on a rebuilt anchor) (3) | 1.13 / 1.14 / 1.19 s (`is_cow: true`, `query_ready: true`, `is_fresh: true`). The second over the bare clone is the seeder's own work, most likely building the CSR sidecar the anchor lacks (not profiled) | — | 7.3–19.8 MB | — |
 | …then incremental `devmap build --manifest` (3) | +2.47 / 2.49 / 2.56 s | — | +0.4 MB | identical to a cold lane with `generation_id` masked (`5ae26d36…`) |
 | Zero-copy pointer only (1) | never: `query_ready: false`, and the hook cold-builds a 289 MB store beside the pointer | as cold | as cold | — |
 | 8 lanes at once, cold (1 run of 8) | 40.7–41.5 s each, 41.6 s wall | 8 × cold | 2.93 GB | 8/8 `ba04666f…` |
@@ -325,11 +325,11 @@ Measured 2026-11-06 on this repository (main at `5394f4d3`, 3,193 indexed files,
 
 **Fix (this change):** `workbench::agent_worktree::provision_with`, the only creator of managed agent lanes, now does two things:
 1. It creates lanes through `add_worktree_with_devmap(…, DevmapMode::Copy)`. The store is cloned and rebound before the agent starts, so the hook finds a store and starts no cold build.
-2. Once the lane's setup has completed, it asks GitPulse's own live refresh for the lane (`devmap::live::start_refresh(lane, false)`). This is the same gate every open repository gets: it probes `devmap status`, builds only when the store is not fresh, runs the incremental build on a supervised background thread under the lane's writer slot, and returns without waiting.
+2. Once the lane's setup has completed, it asks Waylode's own live refresh for the lane (`devmap::live::start_refresh(lane, false)`). This is the same gate every open repository gets: it probes `devmap status`, builds only when the store is not fresh, runs the incremental build on a supervised background thread under the lane's writer slot, and returns without waiting.
 
 The lane is therefore queryable at once, and is honestly marked stale until its own build lands, about 2.5 s later on this repository. Like the build caches, a skipped or failed seed is logged and never refuses the lane, because DevMap's hook still covers it. `a_lane_cut_from_an_indexed_checkout_gets_its_own_seeded_devmap_store` fails against the previous code. `a_seeded_lane_whose_index_is_not_fresh_gets_its_own_build_started` fails with the refresh removed: a stub `devmap` reporting `is_fresh: false` must see a `build` run in the lane. **Not measured:** the seed's cost when the anchor's store trails HEAD by many commits (a larger overlay diff), and when the anchor's `-wal` is live, which takes the `VACUUM INTO` path (284 MB written, above). The 1.2 s figure is for a clean anchor at the same HEAD. The general `add_worktree_cached` API stays opt-in, so `a_worktree_created_without_asking_seeds_no_devmap_store_and_says_so` still holds.
 
-**Every GitPulse seeding path, one owner.** `devmap::live::refresh_seeded_worktree` is the single "seed, then bring it to this tree" step. Every path that CoW-seeds a store calls it, and none runs a build of its own:
+**Every Waylode seeding path, one owner.** `devmap::live::refresh_seeded_worktree` is the single "seed, then bring it to this tree" step. Every path that CoW-seeds a store calls it, and none runs a build of its own:
 
 | Path | Seeds | Then |
 | --- | --- | --- |
@@ -351,20 +351,20 @@ The lane, MCP and CLI tests each failed with the change removed. The CLI test fa
 - **Tests:** they run the rule on a local map, so they never evict other tests' outcomes. Each half failed when mutated away, and the prune test repeats over ten fresh maps so arbitrary eviction can't pass it by luck.
 
 **Owned elsewhere or deferred, named:**
-1. **DevCouncil hook (owner: DevCouncil).** Worktrees made outside GitPulse (Claude Code `.claude/worktrees/`, Codex, Cursor, Conductor) still get a cold build. The fix belongs in `devmap`:
+1. **DevCouncil hook (owner: DevCouncil).** Worktrees made outside Waylode (Claude Code `.claude/worktrees/`, Codex, Cursor, Conductor) still get a cold build. The fix belongs in `devmap`:
    - `devmap build --seed-from <main checkout>` clones the main store when the target store is missing, rebinds `pending_state.repo_root` and `generations.repo_root`, then continues as an incremental build;
    - `unindexed_worktree_notice` passes `--seed-from` in `detach_build` when the main checkout is indexed.
    
-   It lands as a DevCouncil branch, then a `devmap` reinstall and `bun run check:schema-parity`. It changes no schema. Once it lands, GitPulse's seed and that hook agree, and the pointer is redundant for agents.
+   It lands as a DevCouncil branch, then a `devmap` reinstall and `bun run check:schema-parity`. It changes no schema. Once it lands, Waylode's seed and that hook agree, and the pointer is redundant for agents.
 
    **Built, not landed:** DevCouncil branch `feat/devmap-seed-from` (`d1ca9808`, on the integration branch's head `e5f87197`; 8 files, +895/−10, no dependency change).
    - **Tests:** the 3 seed integration tests and the 3 hook tests pass when re-run here. The seed tests cover graph equality with a cold build, refusal of unrelated, sibling and forged sources, and a live-WAL source read through SQLite.
-   - **Measured** (release build, GitPulse clone, n=3): a clean seeded worktree in 0.27 / 0.28 / 0.38 s with 16–33 MB physical, against 5.98 / 6.07 / 8.55 s and ~700 MB cold.
+   - **Measured** (release build, Waylode clone, n=3): a clean seeded worktree in 0.27 / 0.28 / 0.38 s with 16–33 MB physical, against 5.98 / 6.07 / 8.55 s and ~700 MB cold.
    - **Clippy:** the repository's clippy gate was already red on `e5f87197`, in files the branch does not touch, so there is no clean clippy proof for the new files.
    - **Linux:** checked in a `rust:1.99.0` container (aarch64, overlay filesystem). `devmap-store` and `devmap-cli` compile for all targets, including the `FICLONE` path. The 3 seed tests pass; overlay has no reflink, so this ran the plain-copy fallback. The 3 new hook tests pass. The one failure, `an_unremovable_stale_lock_terminates`, is pre-existing: it cannot build its condition as root ("running as root?").
    - **Unexplained, not yet trusted:** the agent reported ~440–510 MB `df` growth after a 20-file incremental build in a seeded worktree. That was a different run from the page-level measurement below: its own binary and seed path, measured by `df` on a shared volume. The two are not yet reconciled. One candidate is that its seed took the `VACUUM INTO` fallback, which happens whenever the source's `-wal` is non-empty and is a full ~290 MB rewrite. Re-measure its binary on a dedicated APFS image before relying on that number.
 
-**How much sharing survives the first real build (measured).** A lane was CoW-seeded on GitPulse's path, 20 Rust files in it were edited, and `devmap build --manifest` ran (6.6 s).
+**How much sharing survives the first real build (measured).** A lane was CoW-seeded on Waylode's path, 20 Rust files in it were edited, and `devmap build --manifest` ran (6.6 s).
 - **The store is written in place:** its inode is unchanged, so APFS keeps every block nobody wrote shared.
 - **What diverged:** a 16 KiB-page comparison against the seed found 1,838 changed or new pages, 28.7 MiB, which is 10% of the store. Of that, 16.8 MiB is one index (`idx_payload_literals_value`), and the rest is mostly `generations`, `generation_dead_symbols` and the payload rows of the edited files. The `repo_root` rebind alone touches 4 MiB (`generations`).
 - **The largest unshared cost is outside the store:** `code_graph.json` (71 MB) and `repo_map.json` (0.9 MB) are rewritten whole on every manifest build.
@@ -410,15 +410,15 @@ Each option is judged on the five things a new agent worktree needs:
 | # | Option | Create | Isolate | Lazy | Store per worktree | Share with main | Evidence | Verdict |
 |---|---|---|---|---|---|---|---|---|
 | 1 | Cold `devmap build` per worktree (before) | 7.6 s, 38 CPU-s; 41 s each with 8 at once | Full | None | 366 MB | None | Measured | Replaced |
-| 2 | Zero-copy pointer (`base_store_ref.json`) | Instant for GitPulse; never for the `devmap` agents run | Reads the anchor | Total | under 1 KB, plus a cold build the hook adds anyway | Read-only anchor | Measured: `query_ready:false`, cold build lands beside it | Opt-in only. Redundant once 4 lands |
-| 3 | **CoW-clone the store, rebind, refresh** (shipped in GitPulse) | ~1.2 s seeder (debug), then ~2.5 s own build | Own inode, `nlink` 1, own `repo_root` | Block-level CoW: only written pages diverge | 7–20 MB, then ~29 MiB of pages + ~72 MB of JSON (71 MB `code_graph.json` + 0.9 MB `repo_map.json`) after a 20-file build | APFS blocks with main until written | Measured | **Shipped** for lanes, panel, MCP, CLI |
+| 2 | Zero-copy pointer (`base_store_ref.json`) | Instant for Waylode; never for the `devmap` agents run | Reads the anchor | Total | under 1 KB, plus a cold build the hook adds anyway | Read-only anchor | Measured: `query_ready:false`, cold build lands beside it | Opt-in only. Redundant once 4 lands |
+| 3 | **CoW-clone the store, rebind, refresh** (shipped in Waylode) | ~1.2 s seeder (debug), then ~2.5 s own build | Own inode, `nlink` 1, own `repo_root` | Block-level CoW: only written pages diverge | 7–20 MB, then ~29 MiB of pages + ~72 MB of JSON (71 MB `code_graph.json` + 0.9 MB `repo_map.json`) after a 20-file build | APFS blocks with main until written | Measured | **Shipped** for lanes, panel, MCP, CLI |
 | 4 | **`devmap build --seed-from`** in DevCouncil's hook | 0.27–0.38 s for a clean seed (release) | As 3 | As 3 | As 3; one ~440–510 MB figure unexplained (§7) | As 3 | Measured by its agent; tests re-run on macOS and on Linux (copy fallback) | **Built**: DevCouncil branch, owner to land |
-| 5 | **Block-stable manifest rewrite**: `code_graph.json` written by clone-and-patch (stage a CoW clone of the old file, rewrite only the 4 KiB blocks that differ, read back, rename), with JSON-whitespace padding so unchanged records keep their offsets | Build ~4.7 s against ~4.5 s (agent-measured) | Unchanged: atomic rename kept | Block-level: only changed blocks are written | 20-file edit: **93 of 18,956 blocks** (0.49%) against 14,689 of 17,511 (84%); **~0.45 MiB** physical against ~68 MiB (n=3, isolated APFS image); file +8.3% | Patched file keeps sharing blocks with the one it was cloned from | Agent-measured. I re-ran its CLI block test (1/1) and layout tests (12/12). JSON value unchanged; consumers in DevCouncil, GitPulse and Manvi checked (see below). End to end with the installed `devmap`: a hook-seeded lane after 20 edits differs from main's graph in **113 of 18,957 blocks (0.60%)**, n=3 | **Landed and installed** (DevCouncil `c03c1a84`, then `fc5bb329`) |
+| 5 | **Block-stable manifest rewrite**: `code_graph.json` written by clone-and-patch (stage a CoW clone of the old file, rewrite only the 4 KiB blocks that differ, read back, rename), with JSON-whitespace padding so unchanged records keep their offsets | Build ~4.7 s against ~4.5 s (agent-measured) | Unchanged: atomic rename kept | Block-level: only changed blocks are written | 20-file edit: **93 of 18,956 blocks** (0.49%) against 14,689 of 17,511 (84%); **~0.45 MiB** physical against ~68 MiB (n=3, isolated APFS image); file +8.3% | Patched file keeps sharing blocks with the one it was cloned from | Agent-measured. I re-ran its CLI block test (1/1) and layout tests (12/12). JSON value unchanged; consumers in DevCouncil, Waylode and Manvi checked (see below). End to end with the installed `devmap`: a hook-seeded lane after 20 edits differs from main's graph in **113 of 18,957 blocks (0.60%)**, n=3 | **Landed and installed** (DevCouncil `c03c1a84`, then `fc5bb329`) |
 | 6 | Index churn: `idx_payload_literals_value` rewrote 16.8 of 28.7 MiB on a 20-file build | — | — | — | ~−17 MB per diverged worktree | — | Measured, page-level | Next: insert in key order, or move literals to a per-file blob |
-| 7 | Shared content-addressed extraction cache (blob SHA + extractor version) under the git common dir | Cold builds in new repos reuse parses | Read-mostly shared CAS; per-worktree generations | Parse once per blob, across all worktrees | Saves parse CPU more than bytes: payload rows are only ~1.1 MiB of a 20-file divergence | Every worktree and the main checkout | Measured divergence says bytes are not the bottleneck; CPU is unmeasured | **Deprioritized**: a schema change across DevCouncil, GitPulse, Manvi and Jarvis, for little storage |
+| 7 | Shared content-addressed extraction cache (blob SHA + extractor version) under the git common dir | Cold builds in new repos reuse parses | Read-mostly shared CAS; per-worktree generations | Parse once per blob, across all worktrees | Saves parse CPU more than bytes: payload rows are only ~1.1 MiB of a 20-file divergence | Every worktree and the main checkout | Measured divergence says bytes are not the bottleneck; CPU is unmeasured | **Deprioritized**: a schema change across DevCouncil, Waylode, Manvi and Jarvis, for little storage |
 | 8 | Glean-style base + overlay read path in `devmap` | Instant | Overlay per worktree | Total | Overlay only | Base DB | Glean 2022 post; not built | Only if 3–6 still cost too much; every query path must learn overlays |
 | 9 | Pinned live-WAL clone instead of `VACUUM INTO` | 0.02–0.13 s copy plus 2.18 s cold `quick_check` | As 3 | Block-level | ~0 instead of 284 MB | As 3 | Measured: 25/25 consistent; control weak | **Deferred**: slower than `VACUUM INTO` once checked, and rare |
-| 10 | Sparse cone checkout (`--sparse`) | Fewer files written | Full | Directory-level | Proportional to the cone | Object store | Existing GitPulse feature; not re-measured | Keep for narrow tasks; DevMap-expanded cone |
+| 10 | Sparse cone checkout (`--sparse`) | Fewer files written | Full | Directory-level | Proportional to the cone | Object store | Existing Waylode feature; not re-measured | Keep for narrow tasks; DevMap-expanded cone |
 | 11 | Virtual file system (EdenFS / ProjFS / FUSE) | Instant | Full | File-level on read | Materialized files only | Server or daemon | §8 research | Rejected: daemon, entitlements, server |
 | 12 | One working tree, many lanes (GitButler style) | Instant | **None between agents' builds** | — | 0 | Total | §8 research | Rejected for parallel agents |
 | 13 | Build artifacts: per-lane `target/` CoW clone, `build.build-dir` under one root, cleanup on teardown | Seconds to clone; path crates rebuild | Per lane | Block-level | Diverges at the first build (14 lanes ate 250 GiB) | Until the first build | Memory notes plus Cargo docs (§8) | **Measured 2026-11-07 (below):** `gitpulse-rustc` saves the same ~1.1 GiB per lane as a `cp -c` target clone and no CPU, so it is not wired in by default. Teardown of an in-tree `target/` already reclaims it, and a test pins that. Sccache and Cargo's CAS store are third-party or not yet shipped |
@@ -426,7 +426,7 @@ Each option is judged on the five things a new agent worktree needs:
 
 **Option 5 in detail.** Built by a Sonnet agent on DevCouncil `feat/devmap-manifest-blocks` (`bccaf1eb`, 8 files, +1,268/−11, no schema or dependency change).
 - **Consumers it checked:**
-  - Readers that load the whole file and parse it: DevCouncil `devmap-query` `host.rs`, which GitPulse also uses; the Go `repomap` loader (run on a padded file, `DeepEqual` to the compact one); the streaming `artifact.go` (run as well); and Manvi's `json.load`.
+  - Readers that load the whole file and parse it: DevCouncil `devmap-query` `host.rs`, which Waylode also uses; the Go `repomap` loader (run on a padded file, `DeepEqual` to the compact one); the streaming `artifact.go` (run as well); and Manvi's `json.load`.
   - The stamp reader in `artifacts.rs`: it uses size, mtime and inode, and fails closed by regenerating.
   - None hashes the file or depends on its exact bytes.
 - **Agent-reported costs:**
@@ -448,7 +448,7 @@ Each option is judged on the five things a new agent worktree needs:
 - Workload: `cargo build --lib --locked --manifest-path src-tauri/Cargo.toml` (debug, `CARGO_INCREMENTAL=0` on every arm, because the wrapper never caches `-C incremental` units). Lane A at `ee34b538` primes; lane B at `a92a68dc` (`ee34b538~6`, 7 files, +700/-52 under `src-tauri/src` and `crates`) is the measured lane.
 - Everything lived on a dedicated 70 GiB sparse APFS image, so `df` on the image counts clone and CoW bytes exactly (`du` does not). Bytes below are the `df` used-space delta over the arm, including the clone and any CAS growth. The image was detached and deleted afterwards, and so were the scratch worktrees.
 - Arms, each on a fresh lane B worktree and a fresh target, run interleaved (round 1 cold, cp, cas; round 2 reversed; round 3 cp, cas, cas-same-commit, cold). The CAS is re-cloned from the one primed copy before each CAS run, so no run sees the previous run's own artifacts. n=3 per arm.
-- Reproduce: `crates/gitpulse-worktree` `gitpulse-rustc` built from the lane; `RUSTC_WRAPPER=<gitpulse-rustc> GITPULSE_BUILD_CACHE_DIR=<dir> CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<fresh> cargo build --lib --locked --manifest-path src-tauri/Cargo.toml`; counters from `<dir>/stats.json`. Driver scripts and raw logs: session scratchpad `.../scratchpad/w5/bc/` (`arm.sh`, `results.tsv`, `log-*.txt`).
+- Reproduce: `crates/waylode-worktree` `gitpulse-rustc` built from the lane; `RUSTC_WRAPPER=<gitpulse-rustc> GITPULSE_BUILD_CACHE_DIR=<dir> CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<fresh> cargo build --lib --locked --manifest-path src-tauri/Cargo.toml`; counters from `<dir>/stats.json`. Driver scripts and raw logs: session scratchpad `.../scratchpad/w5/bc/` (`arm.sh`, `results.tsv`, `log-*.txt`).
 
 *Results* (CPU is `/usr/bin/time -l` user+sys over the whole `cargo` run; disk is the `df` delta; wall is Cargo's own "Finished in", which excludes the slot-gate wait):
 
@@ -471,11 +471,11 @@ Each option is judged on the five things a new agent worktree needs:
 
 *Recommendation.* Do not wire `gitpulse-rustc` into agent lanes by default. At this scale it matches the existing CoW target clone on bytes, loses to it on CPU, and costs 74% extra CPU on the lane that fills it. Keep the clone. The CAS has one real edge the clone lacks: it does not need an idle anchor, because `cp -c` of a `target/` that is mid-build races half-written files (§2 failure mode). If that matters, offer it as an opt-in for lanes cut while the anchor is building. The 14-lanes-ate-250-GiB case came from lanes that stayed alive and diverged, so the lever is reclaiming the `target/` of idle kept lanes, not sharing artifacts (inferred: 14 lanes at 2.96 GiB is 41 GiB for this debug build, so the 250 GiB had to come from release or test profiles).
 
-*Teardown (verified by test).* GitPulse creates only in-tree `target/` (the CoW copy at provision; nothing in `src-tauri` sets `CARGO_TARGET_DIR` or `RUSTC_WRAPPER`, and nothing in `src-tauri` uses `gitpulse-worktree`), and `reclaim` on an unclaimed lane removes the whole worktree directory, `target/` included, with nothing left beside it. The CAS lives under the git common dir, is shared, and is bounded by `cache-stats --prune`, so nothing in it belongs to a lane. Two tests in `workbench::agent_worktree` pin this, including that a `target` symlink to a shared directory is unlinked and never followed. What remains uncovered: a lane whose attempt was claimed is never reclaimed by this module, and a `CARGO_TARGET_DIR` that an agent sets outside the tree is unknown to GitPulse.
+*Teardown (verified by test).* Waylode creates only in-tree `target/` (the CoW copy at provision; nothing in `src-tauri` sets `CARGO_TARGET_DIR` or `RUSTC_WRAPPER`, and nothing in `src-tauri` uses `gitpulse-worktree`), and `reclaim` on an unclaimed lane removes the whole worktree directory, `target/` included, with nothing left beside it. The CAS lives under the git common dir, is shared, and is bounded by `cache-stats --prune`, so nothing in it belongs to a lane. Two tests in `workbench::agent_worktree` pin this, including that a `target` symlink to a shared directory is unlinked and never followed. What remains uncovered: a lane whose attempt was claimed is never reclaimed by this module, and a `CARGO_TARGET_DIR` that an agent sets outside the tree is unknown to Waylode.
 
 **Ranked next steps, from the measurements:**
 1. ~~Land 3, 4 and 5~~: landed on 2026-11-06 with owner approval, and the binaries were reinstalled from clean trees.
-   - GitPulse main is at `b53767c9` (includes the `finished_builds` bound); `gitpulse-mcp` and `gitpulse-hook` are reinstalled and `mcp:doctor` is OK.
+   - Waylode main is at `b53767c9` (includes the `finished_builds` bound); `gitpulse-mcp` and `gitpulse-hook` are reinstalled and `mcp:doctor` is OK.
    - DevCouncil is at `fc5bb329`, and `devmap` is build `fc5bb3298668`.
    - `check:schema-parity` is 8/8.
    - GitPulse.app is not yet rebuilt; the owner will do that, and the app's own lane and panel seeding goes live then.

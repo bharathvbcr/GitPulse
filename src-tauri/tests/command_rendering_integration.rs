@@ -21,9 +21,9 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::harness::render_command;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
+use waylode_lib::harness::render_command;
+use waylode_lib::procguard::LockedSpawn;
 
 /// Parse a rendered command line with a real shell and return its argv.
 fn shell_parse(rendered: &str) -> Vec<String> {

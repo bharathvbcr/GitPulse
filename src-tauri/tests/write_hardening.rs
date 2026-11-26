@@ -1,5 +1,5 @@
 //! File saves must not modify other names sharing a destination inode.
-use gitpulse_lib::engine::git_cli::sandbox_write;
+use waylode_lib::engine::git_cli::sandbox_write;
 mod common;
 
 #[test]
@@ -34,7 +34,7 @@ fn nested_and_large_editor_saves_preserve_complete_content() {
     let repo = fixture();
     let root = repo.path().to_str().unwrap();
     sandbox_write(root, "new/deep/note.txt", "").unwrap();
-    let contents = "x".repeat(gitpulse_lib::engine::budget::MAX_FILE_BYTES as usize);
+    let contents = "x".repeat(waylode_lib::engine::budget::MAX_FILE_BYTES as usize);
     sandbox_write(root, "new/deep/note.txt", &contents).unwrap();
     assert_eq!(
         std::fs::read(repo.path().join("new/deep/note.txt")).unwrap(),
@@ -48,7 +48,7 @@ fn nested_and_large_editor_saves_preserve_complete_content() {
         1,
         "successful saves must clean recovery artifacts"
     );
-    let oversized = "x".repeat(gitpulse_lib::engine::budget::MAX_FILE_BYTES as usize + 1);
+    let oversized = "x".repeat(waylode_lib::engine::budget::MAX_FILE_BYTES as usize + 1);
     assert!(sandbox_write(root, "new/deep/note.txt", &oversized)
         .unwrap_err()
         .contains("save limit"));

@@ -38,30 +38,41 @@ const REPO_ARG: Argument = Argument {
     required: true,
 };
 
+const PROMPT_PREFIX: &str = "waylode_";
+const LEGACY_PROMPT_PREFIX: &str = "gitpulse_";
+
+/// Canonicalize a legacy `gitpulse_<x>` prompt name to `waylode_<x>`.
+pub fn canonical_prompt_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.strip_prefix(LEGACY_PROMPT_PREFIX) {
+        Some(rest) if !rest.is_empty() => std::borrow::Cow::Owned(format!("{PROMPT_PREFIX}{rest}")),
+        _ => std::borrow::Cow::Borrowed(name),
+    }
+}
+
 const CATALOG: &[Prompt] = &[
     Prompt {
-        name: "gitpulse_preflight",
+        name: "waylode_preflight",
         title: "Preflight before editing",
-        description: "What is in flight in this repository right now — other worktrees, their uncommitted files, and the files already dirty in more than one worktree. It cannot know which file you will edit, so a clean worktree shows no overlap even when another worktree holds the file you are about to touch: read the other worktrees' files below, and ask gitpulse_collision_risk with the file's path before editing it. Run before the first edit of a session.",
+        description: "What is in flight in this repository right now — other worktrees, their uncommitted files, and the files already dirty in more than one worktree. It cannot know which file you will edit, so a clean worktree shows no overlap even when another worktree holds the file you are about to touch: read the other worktrees' files below, and ask waylode_collision_risk with the file's path before editing it. Run before the first edit of a session.",
         arguments: &[REPO_ARG],
         facets: &["context", "collisions", "elsewhere"],
     },
     Prompt {
-        name: "gitpulse_collision_triage",
+        name: "waylode_collision_triage",
         title: "Triage overlapping work",
         description: "Every file with uncommitted changes in more than one worktree, or in a worktree two live agent sessions share, with the parties involved, so the overlap can be resolved before it becomes a conflict.",
         arguments: &[REPO_ARG],
         facets: &["collisions"],
     },
     Prompt {
-        name: "gitpulse_handoff",
+        name: "waylode_handoff",
         title: "Hand off this worktree",
         description: "A summary of one worktree's in-flight state — branch, dirty files, parked merge or rebase, bound task — written for the next agent or person to pick it up.",
         arguments: &[REPO_ARG],
         facets: &["context", "changes"],
     },
     Prompt {
-        name: "gitpulse_session_brief",
+        name: "waylode_session_brief",
         title: "Brief me on this repository",
         description: "A full snapshot: worktrees, agent sessions, changes, collisions, ledger, and code-graph availability, with unavailable facets called out as unavailable.",
         arguments: &[REPO_ARG],
@@ -75,22 +86,49 @@ pub fn capability() -> Value {
     json!({})
 }
 
+fn prompt_entry(name: &str, title: &str, description: &str, arguments: &[Argument]) -> Value {
+    json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "arguments": arguments.iter().map(|arg| json!({
+            "name": arg.name,
+            "description": arg.description,
+            "required": arg.required,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 pub fn list() -> Vec<Value> {
-    CATALOG
+    let mut out: Vec<Value> = CATALOG
         .iter()
         .map(|prompt| {
-            json!({
-                "name": prompt.name,
-                "title": prompt.title,
-                "description": prompt.description,
-                "arguments": prompt.arguments.iter().map(|arg| json!({
-                    "name": arg.name,
-                    "description": arg.description,
-                    "required": arg.required,
-                })).collect::<Vec<_>>(),
-            })
+            prompt_entry(
+                prompt.name,
+                prompt.title,
+                prompt.description,
+                prompt.arguments,
+            )
         })
-        .collect()
+        .collect();
+    if super::expose_legacy_aliases() {
+        for prompt in CATALOG {
+            if let Some(rest) = prompt.name.strip_prefix(PROMPT_PREFIX) {
+                let legacy_name = format!("{LEGACY_PROMPT_PREFIX}{rest}");
+                let legacy_desc = format!(
+                    "[DEPRECATED alias for {}] {}",
+                    prompt.name, prompt.description
+                );
+                out.push(prompt_entry(
+                    &legacy_name,
+                    prompt.title,
+                    &legacy_desc,
+                    prompt.arguments,
+                ));
+            }
+        }
+    }
+    out
 }
 
 pub fn names() -> Vec<&'static str> {
@@ -99,9 +137,10 @@ pub fn names() -> Vec<&'static str> {
 
 /// Argument names a prompt accepts, for `completion/complete`.
 pub fn argument_names(prompt: &str) -> Vec<&'static str> {
+    let canonical = canonical_prompt_name(prompt);
     CATALOG
         .iter()
-        .find(|p| p.name == prompt)
+        .find(|p| p.name == canonical.as_ref())
         .map(|p| p.arguments.iter().map(|a| a.name).collect())
         .unwrap_or_default()
 }
@@ -123,12 +162,16 @@ impl PromptError {
 
 /// Resolve one prompt against live repository state.
 pub fn get(name: &str, arguments: &Value) -> Result<Value, PromptError> {
-    let prompt = CATALOG.iter().find(|p| p.name == name).ok_or_else(|| {
-        PromptError::InvalidParams(format!(
-            "no prompt named {name:?}; known: [{}]",
-            names().join(", ")
-        ))
-    })?;
+    let canonical = canonical_prompt_name(name);
+    let prompt = CATALOG
+        .iter()
+        .find(|p| p.name == canonical.as_ref())
+        .ok_or_else(|| {
+            PromptError::InvalidParams(format!(
+                "no prompt named {name:?}; known: [{}]",
+                names().join(", ")
+            ))
+        })?;
 
     // Prompt arguments are always strings on the wire, so this is the same
     // required/unknown check the tool schemas get, expressed against the
@@ -176,7 +219,7 @@ pub fn get(name: &str, arguments: &Value) -> Result<Value, PromptError> {
     let repo = provided["repo_path"].as_str().unwrap_or_default();
     let mut content = vec![json!({
         "type": "text",
-        "text": format!("{}\n\nRepository: {repo}\n\nThe blocks below are live GitPulse state, read at the moment this prompt was resolved. A facet marked `\"ok\": false` was not scanned — treat it as unknown, never as clean.", prompt.description),
+        "text": format!("{}\n\nRepository: {repo}\n\nThe blocks below are live Waylode state, read at the moment this prompt was resolved. A facet marked `\"ok\": false` was not scanned — treat it as unknown, never as clean.", prompt.description),
     })];
 
     for facet in prompt.facets {
@@ -232,7 +275,7 @@ mod tests {
     #[test]
     fn a_resolved_prompt_carries_one_block_per_facet_plus_the_instruction() {
         let resolved = get(
-            "gitpulse_preflight",
+            "waylode_preflight",
             &json!({ "repo_path": "/no/such/repo" }),
         )
         .expect("resolves even when the repository does not");
@@ -245,6 +288,15 @@ mod tests {
             assert_eq!(block["type"], "resource");
         }
         assert_eq!(resolved["messages"][0]["role"], "user");
+        // Legacy gitpulse_* prompt name resolves to the exact same payload.
+        assert_eq!(
+            get(
+                "gitpulse_preflight",
+                &json!({ "repo_path": "/no/such/repo" })
+            )
+            .expect("legacy alias resolves"),
+            resolved
+        );
     }
 
     #[test]
@@ -252,7 +304,7 @@ mod tests {
         // The honesty case: a prompt that quietly omitted the collision block
         // would be indistinguishable from one that found no collisions.
         let resolved = get(
-            "gitpulse_collision_triage",
+            "waylode_collision_triage",
             &json!({ "repo_path": "/no/such/repo" }),
         )
         .expect("resolves");
@@ -265,7 +317,7 @@ mod tests {
 
     #[test]
     fn the_instruction_tells_the_model_how_to_read_an_unavailable_facet() {
-        let resolved = get("gitpulse_session_brief", &json!({ "repo_path": "/tmp" })).unwrap();
+        let resolved = get("waylode_session_brief", &json!({ "repo_path": "/tmp" })).unwrap();
         let text = resolved["messages"][0]["content"][0]["text"]
             .as_str()
             .unwrap();
@@ -275,7 +327,7 @@ mod tests {
     #[test]
     fn an_unknown_prompt_names_the_ones_that_exist() {
         let error = get("nope", &json!({})).expect_err("unknown prompt");
-        assert!(error.message().contains("gitpulse_preflight"));
+        assert!(error.message().contains("waylode_preflight"));
     }
 
     #[test]
@@ -285,21 +337,21 @@ mod tests {
             json!({ "repo_path": "" }),
             json!({ "repo_path": "   " }),
         ] {
-            let error = get("gitpulse_preflight", &arguments).expect_err("{arguments}");
+            let error = get("waylode_preflight", &arguments).expect_err("{arguments}");
             assert!(error.message().contains("repo_path"), "{}", error.message());
         }
     }
 
     #[test]
     fn a_non_string_argument_is_refused_rather_than_stringified() {
-        let error = get("gitpulse_preflight", &json!({ "repo_path": 7 })).expect_err("number");
+        let error = get("waylode_preflight", &json!({ "repo_path": 7 })).expect_err("number");
         assert!(error.message().contains("must be a string"));
     }
 
     #[test]
     fn an_unknown_argument_is_refused_and_the_accepted_ones_named() {
         let error = get(
-            "gitpulse_preflight",
+            "waylode_preflight",
             &json!({ "repo_path": "/tmp", "repoo_path": "/tmp" }),
         )
         .expect_err("typo");
@@ -311,9 +363,27 @@ mod tests {
     fn prompt_names_are_unique_and_namespaced() {
         let mut seen = std::collections::BTreeSet::new();
         for name in names() {
-            assert!(name.starts_with("gitpulse_"), "{name} is not namespaced");
+            assert!(name.starts_with("waylode_"), "{name} is not namespaced");
             assert!(seen.insert(name), "{name} is listed twice");
         }
+    }
+
+    #[test]
+    fn expose_legacy_includes_the_four_deprecated_gitpulse_prompts() {
+        let serial = crate::test_support::env::env_serial();
+        {
+            let _off = crate::test_support::env::bind_env(&serial)
+                .remove(super::super::EXPOSE_LEGACY_ENV)
+                .remove(super::super::LEGACY_EXPOSE_LEGACY_ENV);
+            assert_eq!(list().len(), 4);
+        }
+
+        let _on =
+            crate::test_support::env::bind_env(&serial).set(super::super::EXPOSE_LEGACY_ENV, "1");
+        let expanded = list();
+        assert_eq!(expanded.len(), 8);
+        assert!(expanded.iter().any(|p| p["name"] == "gitpulse_preflight"));
+        assert!(expanded.iter().any(|p| p["name"] == "waylode_preflight"));
     }
 
     #[test]

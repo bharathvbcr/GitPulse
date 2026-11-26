@@ -6508,7 +6508,7 @@ mod tests {
         let sec_item = sec_dir.join("item");
         let sec_legacy = sec_dir.join("item-legacy");
         let sec_script = format!(
-            "#!/bin/sh\npick() {{\n  case \"$1\" in\n    com.gitpulse.desktop*) item='{legacy}' ;;\n    *) item='{item}' ;;\n  esac\n}}\ncase \"$1\" in\n  -i)\n    read -r line\n    key=${{line##* -w }}\n    svc=${{line#* -s }}; svc=${{svc%% *}}\n    pick \"$svc\"\n    printf '%s' \"$key\" > \"$item\"\n    exit 0 ;;\n  find-generic-password)\n    pick \"$3\"\n    [ -f \"$item\" ] || exit 44\n    cat \"$item\"; echo; exit 0 ;;\n  delete-generic-password)\n    pick \"$3\"\n    rm -f \"$item\"; exit 0 ;;\nesac\nexit 2\n",
+            "#!/bin/sh\npick() {{\n  case \"$1\" in\n    dev.vbcr.gitpulse*|com.gitpulse.desktop*) item='{legacy}' ;;\n    *) item='{item}' ;;\n  esac\n}}\ncase \"$1\" in\n  -i)\n    read -r line\n    key=${{line##* -w }}\n    svc=${{line#* -s }}; svc=${{svc%% *}}\n    pick \"$svc\"\n    printf '%s' \"$key\" > \"$item\"\n    exit 0 ;;\n  find-generic-password)\n    pick \"$3\"\n    [ -f \"$item\" ] || exit 44\n    cat \"$item\"; echo; exit 0 ;;\n  delete-generic-password)\n    pick \"$3\"\n    rm -f \"$item\"; exit 0 ;;\nesac\nexit 2\n",
             item = sec_item.display(),
             legacy = sec_legacy.display(),
         );

@@ -1,14 +1,14 @@
-# GitPulse Wiki
+# Waylode Wiki
 
-**GitPulse is a workspace, not a chat window: a local-first command centre for agentic coding.** It is built for the agentic era and gives the same information and the same tools to the people and to the agents doing the work. It runs Claude Code, Codex and other agents side by side across your repositories, each in its own worktree with a policy guard and a code map, and keeps a full Git client, a task board and a terminal in the same window. A native Rust backend (Tauri 2) owns every privileged operation; a Svelte 5 frontend renders the graph, diffs, and audits. Nothing is sent to a GitPulse server — there isn't one. GitPulse is free and MIT-licensed. It is tested on macOS; Windows and Linux builds exist but have not been tested.
+**Waylode is a workspace, not a chat window: a local-first command centre for agentic coding.** It is built for the agentic era and gives the same information and the same tools to the people and to the agents doing the work. It runs Claude Code, Codex and other agents side by side across your repositories, each in its own worktree with a policy guard and a code map, and keeps a full Git client, a task board and a terminal in the same window. A native Rust backend (Tauri 2) owns every privileged operation; a Svelte 5 frontend renders the graph, diffs, and audits. Nothing is sent to a Waylode server — there isn't one. Waylode is free and MIT-licensed. It is tested on macOS; Windows and Linux builds exist but have not been tested.
 
-**Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is components and modules. [Manvi](https://github.com/bharathvbcr/Manvi) wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil modules for code intelligence. Update them independently; this app does not require the whole suite.
+**Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is components and modules. [Manvi](https://github.com/bharathvbcr/Manvi) wraps them. Waylode uses Manvi for policy, workbench, and agent hosting, and DevCouncil modules for code intelligence. Update them independently; this app does not require the whole suite.
 
-GitPulse is also the successor to the deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask) agentic task workbench. New boards and agent handoff belong here.
+Waylode is also the successor to the deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask) agentic task workbench. New boards and agent handoff belong here.
 
 [Website](https://gitpulse.vbcr.dev/) · [Releases](https://github.com/bharathvbcr/GitPulse/releases) · [Repository](https://github.com/bharathvbcr/GitPulse)
 
-![GitPulse: a Claude Code agent working in its own worktree, with Follow agent showing each file it edits](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/hero-agents.webp)
+![Waylode: a Claude Code agent working in its own worktree, with Follow agent showing each file it edits](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/hero-agents.webp)
 
 [Complete documentation index](https://github.com/bharathvbcr/GitPulse/blob/main/docs/README.md)
 
@@ -23,7 +23,7 @@ GitPulse is also the successor to the deprecated [LiquiTask](https://github.com/
 | Look up a shortcut | [[Keyboard Shortcuts]] |
 | Run agents: launch, guards, messaging, collisions | [Agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md) |
 | Connect an agent (MCP) and look up tools | [[MCP and Agents]] |
-| See how GitPulse compares with other tools | [Why GitPulse](https://github.com/bharathvbcr/GitPulse/blob/main/docs/WHY_GITPULSE.md) |
+| See how Waylode compares with other tools | [Why Waylode](https://github.com/bharathvbcr/GitPulse/blob/main/docs/WHY_WAYLODE.md) |
 | Contribute or build from source | [[Development]] |
 | Understand the security model | [[Security]] |
 
@@ -51,7 +51,7 @@ flowchart LR
 
 ## Design rules you will see on screen
 
-GitPulse refuses to present a missing measurement as a clean result:
+Waylode refuses to present a missing measurement as a clean result:
 
 - A worktree that was not scanned does not show `0` dirty files.
 - A coverage or audit cell is a **value**, **not scanned**, or **could not read** — never a reassuring zero.
@@ -66,7 +66,7 @@ This wiki is the GitHub-facing guide. Longer technical write-ups live in the rep
 - [Architecture](https://github.com/bharathvbcr/GitPulse/blob/main/docs/ARCHITECTURE.md)
 - [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md)
 - [Features by area](https://github.com/bharathvbcr/GitPulse/blob/main/docs/FEATURES.md) and the [view reference](https://github.com/bharathvbcr/GitPulse/blob/main/docs/VIEW_REFERENCE.md)
-- [Why GitPulse](https://github.com/bharathvbcr/GitPulse/blob/main/docs/WHY_GITPULSE.md)
+- [Why Waylode](https://github.com/bharathvbcr/GitPulse/blob/main/docs/WHY_WAYLODE.md)
 - [Agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md)
 - [Contributing](https://github.com/bharathvbcr/GitPulse/blob/main/CONTRIBUTING.md)
 - [Security](https://github.com/bharathvbcr/GitPulse/blob/main/docs/SECURITY.md)

@@ -388,7 +388,7 @@ pub(crate) const REPLAY_SAFE_READS: &[&str] = &[
 ];
 
 /// The `cmd_*` function a command body's closure belongs to, from the closure's
-/// type name (`gitpulse_lib::commands::inspect::cmd_get_status::{{closure}}`).
+/// type name (`waylode_lib::commands::inspect::cmd_get_status::{{closure}}`).
 pub(crate) fn command_name(type_name: &str) -> Option<&str> {
     type_name
         .split("::")

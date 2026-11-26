@@ -59,9 +59,11 @@ import {
   type MenuStateFixture,
 } from "./helpers/fixtures";
 
-const LOGO_TRUNK_FRAGMENT = "M24.04 9.25A10.5";
-const LEGACY_PLUGIN_LOGO_SHA256 =
-  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
+const LOGO_TRUNK_FRAGMENT = "M23.8 9.0A10.5";
+const RETIRED_LOGO_SHA256S = new Set([
+  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1",
+  "1cf0341b1cc7b556701b5bfb17c3ed02b2eba2e87863928b4de8e1cc7225fd3b",
+]);
 const PATHS = { caseInsensitive: false };
 
 function assertMenuRequestMatches(
@@ -730,7 +732,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       const canonical = render(Logo, { props: { size: 28, variant: "badge" } }).body;
       expect(canonical).toContain(LOGO_TRUNK_FRAGMENT);
 
-      const iconSvg = readRepoFile("public/gitpulse-icon.svg");
+      const iconSvg = readRepoFile("public/waylode-icon.svg");
       expect(iconSvg).toContain(LOGO_TRUNK_FRAGMENT);
 
       const popoverHtml = render(StatusPopover, {

@@ -97,7 +97,7 @@ fn comment(state: &str, headline: &str, sha: &str, record: Option<&Record>) -> S
             ));
         }
     }
-    body.push_str("\nPosted from GitPulse on request. Details are in GitPulse.");
+    body.push_str("\nPosted from Waylode on request. Details are in Waylode.");
     body
 }
 

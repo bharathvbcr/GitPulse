@@ -56,9 +56,9 @@ site | src/alerts/intake_adv_tests.rs | answers_flat_out_do_not_cost_other_sessi
 # src/alerts/intake_tests.rs
 site | src/alerts/intake_tests.rs | fifty_thousand_bells_on_one_session_drop_no_hook_report | 0 | spacing
 
-# src/bin/gitpulse-mcp.rs
-site | src/bin/gitpulse-mcp.rs | Trickle::write | 0 | fixture-delay
-site | src/bin/gitpulse-mcp.rs | a_request_whose_thread_cannot_start_is_still_answered_once | 0 | bounded-poll
+# src/bin/waylode-mcp.rs
+site | src/bin/waylode-mcp.rs | Trickle::write | 0 | fixture-delay
+site | src/bin/waylode-mcp.rs | a_request_whose_thread_cannot_start_is_still_answered_once | 0 | bounded-poll
 
 # src/codeintel/mod.rs
 site | src/codeintel/mod.rs | an_earlier_registration_wakes_a_timer_waiting_on_a_later_one | 0 | race-widen

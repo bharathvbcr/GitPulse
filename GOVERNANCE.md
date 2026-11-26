@@ -1,6 +1,6 @@
-# GitPulse Governance
+# Waylode Governance
 
-GitPulse is a small project with one maintainer. This page says how decisions
+Waylode is a small project with one maintainer. This page says how decisions
 get made, so contributors know what to expect.
 
 ## Roles
@@ -21,7 +21,7 @@ get made, so contributors know what to expect.
 - **Scoped, actionable work** is an issue, opened from the
   [issue forms](https://github.com/bharathvbcr/GitPulse/issues/new/choose).
 - **Code and documentation changes** are pull requests. The maintainer decides
-  on the merits: does it fit what GitPulse is for, is it tested, does it keep
+  on the merits: does it fit what Waylode is for, is it tested, does it keep
   the contracts in [CONTRIBUTING.md](CONTRIBUTING.md) (section 4) green. A change
   that alters behaviour, an IPC payload or a security boundary is discussed in an
   issue first.

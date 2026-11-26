@@ -9,16 +9,16 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::host::client::HostConfig;
-use gitpulse_lib::terminal::{
-    attach_session, kill_session, list_sessions, spawn_session, write_to_session, KillOrigin,
-    OutputSink, TerminalSessions,
-};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::host::client::HostConfig;
+use waylode_lib::terminal::{
+    attach_session, kill_session, list_sessions, spawn_session, write_to_session, KillOrigin,
+    OutputSink, TerminalSessions,
+};
 
 mod common;
 
@@ -27,7 +27,7 @@ const DIR_ENV: &str = "HOST_TEST_DIR";
 const REPO_ENV: &str = "HOST_TEST_REPO";
 
 fn host_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_gitpulse-ptyd"))
+    PathBuf::from(env!("CARGO_BIN_EXE_waylode-ptyd"))
 }
 
 /// A host directory short enough for `sun_path`, canonical so no component
@@ -52,7 +52,7 @@ fn terminals(dir: &Path) -> TerminalSessions {
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -63,8 +63,8 @@ fn repo() -> tempfile::TempDir {
     // Saved, in the hermetic home: the host is another process, and a
     // session grant never reaches another process (`repository_trust::grant`).
     let path = dir.path().to_str().unwrap();
-    let preview = gitpulse_lib::repository_trust::inspect(path).unwrap();
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, true).unwrap();
+    let preview = waylode_lib::repository_trust::inspect(path).unwrap();
+    waylode_lib::repository_trust::grant(path, &preview.identity, true).unwrap();
     dir
 }
 
@@ -72,7 +72,7 @@ fn repo() -> tempfile::TempDir {
 /// repository this app trusted only for its own session is refused there.
 #[test]
 fn trust_is_checked_in_the_host_and_a_session_grant_does_not_reach_it() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = host_dir();
     let repo = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
@@ -82,8 +82,8 @@ fn trust_is_checked_in_the_host_and_a_session_grant_does_not_reach_it() {
         .unwrap()
         .success());
     let path = repo.path().to_str().unwrap();
-    let preview = gitpulse_lib::repository_trust::inspect(path).unwrap();
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, false).unwrap();
+    let preview = waylode_lib::repository_trust::inspect(path).unwrap();
+    waylode_lib::repository_trust::grant(path, &preview.identity, false).unwrap();
     let app = App::new(dir.path());
     let _stop = Stop(app.state.clone());
     let refused = spawn_session(
@@ -122,7 +122,7 @@ struct App {
 impl App {
     fn new(dir: &Path) -> Self {
         let app = tauri::test::mock_builder()
-            .build(gitpulse_lib::context())
+            .build(waylode_lib::context())
             .unwrap();
         let state = terminals(dir);
         state.bind_app(app.handle());
@@ -132,7 +132,7 @@ impl App {
             let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
             let id = data["id"].as_str().unwrap().to_string();
             let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
-            let _ = gitpulse_lib::terminal::acknowledge_output(&acks, &id, bytes.len());
+            let _ = waylode_lib::terminal::acknowledge_output(&acks, &id, bytes.len());
             seen.lock().unwrap().push((id, bytes));
         });
         let losses: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
@@ -214,7 +214,7 @@ fn wait_for(within: Duration, done: impl Fn() -> bool) -> bool {
 struct Stop(TerminalSessions);
 impl Drop for Stop {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("host test cleanup incomplete: {error}");
         }
     }
@@ -253,8 +253,8 @@ fn the_host_socket_and_its_directory_are_the_users_alone() {
     let _stop = Stop(app.state.clone());
     let id = app.shell(repo.path(), "read x");
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    let socket = dir.path().join(gitpulse_lib::terminal::host::socket_name(
-        gitpulse_lib::terminal::host::PROTOCOL,
+    let socket = dir.path().join(waylode_lib::terminal::host::socket_name(
+        waylode_lib::terminal::host::PROTOCOL,
     ));
     assert!(std::fs::metadata(&socket).unwrap().file_type().is_socket());
     assert_eq!(mode(&socket), 0o600);
@@ -432,7 +432,7 @@ fn a_quit_that_leaves_sessions_running_disconnects_and_the_next_app_finds_them()
         first.state.leaves_sessions_running(),
         "the default for a host"
     );
-    gitpulse_lib::teardown::close_terminals(&first.state);
+    waylode_lib::teardown::close_terminals(&first.state);
     drop(first);
 
     let next = App::new(dir.path());
@@ -455,7 +455,7 @@ fn a_quit_that_stops_sessions_stops_them() {
     let id = app.shell(repo.path(), "read x");
     app.state.set_leave_running(false);
     assert!(!app.state.leaves_sessions_running());
-    gitpulse_lib::teardown::close_terminals(&app.state);
+    waylode_lib::teardown::close_terminals(&app.state);
     let exit = app.exit_of(&id, Duration::from_secs(10));
     assert_eq!(exit["reaped"], true);
     let next = App::new(dir.path());
@@ -466,8 +466,8 @@ fn a_quit_that_stops_sessions_stops_them() {
 /// A fake host of another protocol in the host directory, answering the
 /// frozen hello with `sessions`, and recording whether it was asked to retire.
 fn fake_host(dir: &Path, protocol: u32, sessions: usize) -> Arc<Mutex<Vec<String>>> {
-    use gitpulse_lib::terminal::host::proto;
-    let path = dir.join(gitpulse_lib::terminal::host::socket_name(protocol));
+    use waylode_lib::terminal::host::proto;
+    let path = dir.join(waylode_lib::terminal::host::socket_name(protocol));
     std::fs::create_dir_all(dir).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let asked: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -527,13 +527,13 @@ fn a_host_of_another_protocol_is_reported_with_its_sessions_or_retired_when_idle
 #[test]
 fn a_host_that_answers_with_another_protocol_is_refused_by_name() {
     let dir = host_dir();
-    let protocol = gitpulse_lib::terminal::host::PROTOCOL;
+    let protocol = waylode_lib::terminal::host::PROTOCOL;
     // A fake on this version's own socket name, speaking another version.
     {
-        use gitpulse_lib::terminal::host::proto;
+        use waylode_lib::terminal::host::proto;
         let path = dir
             .path()
-            .join(gitpulse_lib::terminal::host::socket_name(protocol));
+            .join(waylode_lib::terminal::host::socket_name(protocol));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -562,11 +562,10 @@ fn a_host_that_answers_with_another_protocol_is_refused_by_name() {
 fn transcript_text(
     state: &TerminalSessions,
     session: &str,
-) -> (String, gitpulse_lib::terminal::TranscriptTail) {
-    match gitpulse_lib::terminal::session_transcript(state, session, 64 * 1024, false, None)
-        .unwrap()
+) -> (String, waylode_lib::terminal::TranscriptTail) {
+    match waylode_lib::terminal::session_transcript(state, session, 64 * 1024, false, None).unwrap()
     {
-        gitpulse_lib::terminal::TranscriptRead::Found(tail) => (
+        waylode_lib::terminal::TranscriptRead::Found(tail) => (
             String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
             tail,
         ),
@@ -603,7 +602,7 @@ fn a_finished_sessions_output_is_read_back_after_the_app_and_the_host_restart() 
     .1
     .live));
     let host = first.state.host_pid().expect("a host");
-    gitpulse_lib::teardown::close_terminals(&first.state);
+    waylode_lib::teardown::close_terminals(&first.state);
     drop(first);
     // SAFETY: signal 0 only asks whether the process exists.
     let gone = || unsafe { libc::kill(host as i32, 0) } != 0;
@@ -621,9 +620,9 @@ fn a_finished_sessions_output_is_read_back_after_the_app_and_the_host_restart() 
     );
     assert_ne!(next.state.host_pid(), Some(host));
     assert_eq!(
-        gitpulse_lib::terminal::session_transcript(&next.state, "term-1-1", 100, false, None)
+        waylode_lib::terminal::session_transcript(&next.state, "term-1-1", 100, false, None)
             .unwrap(),
-        gitpulse_lib::terminal::TranscriptRead::Missing,
+        waylode_lib::terminal::TranscriptRead::Missing,
         "a session the host never ran is missing, not unreadable"
     );
 }
@@ -651,7 +650,7 @@ fn output_printed_while_no_app_was_there_is_in_the_transcript() {
     assert!(wait_for(Duration::from_secs(10), || first
         .text(&id)
         .contains("before")));
-    gitpulse_lib::teardown::close_terminals(&first.state);
+    waylode_lib::teardown::close_terminals(&first.state);
     drop(first);
     std::fs::write(&go, b"").unwrap();
     assert!(
@@ -664,9 +663,9 @@ fn output_printed_while_no_app_was_there_is_in_the_transcript() {
     let seen = std::cell::RefCell::new((String::new(), None));
     let arrived = wait_for(Duration::from_secs(10), || {
         let read =
-            gitpulse_lib::terminal::session_transcript(&next.state, &id, 64 * 1024, false, None);
+            waylode_lib::terminal::session_transcript(&next.state, &id, 64 * 1024, false, None);
         let now = match read {
-            Ok(gitpulse_lib::terminal::TranscriptRead::Found(tail)) => (
+            Ok(waylode_lib::terminal::TranscriptRead::Found(tail)) => (
                 String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
                 Some(tail),
             ),
@@ -698,7 +697,7 @@ fn a_missing_host_binary_fails_closed_instead_of_running_in_process() {
         log_dir: Some(dir.path().join("logs")),
     });
     assert!(
-        gitpulse_lib::terminal::session_transcript(&state, "term-1-1", 100, false, None).is_err()
+        waylode_lib::terminal::session_transcript(&state, "term-1-1", 100, false, None).is_err()
     );
     assert!(list_sessions(&state).is_err());
     assert!(

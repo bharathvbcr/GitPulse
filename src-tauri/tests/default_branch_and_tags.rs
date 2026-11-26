@@ -1,7 +1,7 @@
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::engine::GitReader;
+use waylode_lib::procguard::LockedSpawn;
 
 mod common;
 use common::run_git;
@@ -69,7 +69,7 @@ fn seed_remote_head(repo: &TestRepo, remote: &str, target: &str) {
     );
 }
 
-fn default_branch(branches: &[gitpulse_lib::engine::BranchInfo]) -> &str {
+fn default_branch(branches: &[waylode_lib::engine::BranchInfo]) -> &str {
     branches
         .iter()
         .filter(|b| b.is_default)

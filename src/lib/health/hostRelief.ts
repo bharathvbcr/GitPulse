@@ -330,7 +330,7 @@ export function offerRows(status: ReliefStatus, now: number): OfferRow[] {
       note: canPause
         ? null
         : tree.why === "untrusted"
-          ? "GitPulse does not trust this repository, so it will not pause this build."
+          ? "Waylode does not trust this repository, so it will not pause this build."
           : "Memory protection is not in Act mode, so there is no pause to offer.",
     };
   });
@@ -359,7 +359,7 @@ export function endConfirmCopy(tree: FrozenTree): { title: string; message: stri
 export function pauseConfirmCopy(tree: FrozenTree): { title: string; message: string; confirmLabel: string } {
   return {
     title: "Pause this build?",
-    message: `This pauses ${tree.command} (pid ${tree.pid}) under an agent GitPulse did not start. It resumes when memory pressure eases, or after 10 minutes.`,
+    message: `This pauses ${tree.command} (pid ${tree.pid}) under an agent Waylode did not start. It resumes when memory pressure eases, or after 10 minutes.`,
     confirmLabel: "Pause it",
   };
 }
@@ -420,7 +420,7 @@ export function reliefHeadline(outcome: ReliefOutcome | null): string {
       }
       if (s.slowed > 0) return `${s.slowed} agent process(es) slowed; nothing is paused.`;
       if (s.offers.length > 0) {
-        return `Memory is tight. ${s.offers.length} build or test could be paused if you ask. GitPulse pauses nothing in an agent it did not start without your say-so.`;
+        return `Memory is tight. ${s.offers.length} build or test could be paused if you ask. Waylode pauses nothing in an agent it did not start without your say-so.`;
       }
       if (s.wouldPause.length > 0 || s.wouldSlow > 0) {
         return "Memory is tight. Memory protection is in Advise mode, so nothing was paused or slowed.";

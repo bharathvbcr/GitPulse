@@ -230,7 +230,7 @@
           <p>
             The code map powers Code → Map and symbol search.
             Manvi adds local policy checks for git mutations.
-            Both are optional — GitPulse works without them.
+            Both are optional — Waylode works without them.
           </p>
           <p class="text-textMuted text-meta">
             Install order: PATH → prebuilt release → cargo/go install → local checkout.
@@ -291,7 +291,7 @@
           {#if $wizard.tool === "devmap" && installSpec}
             <p class="text-meta text-textMuted">
               {#if $wizard.preset === "devmap"}
-                In-app Install uses GitPulse’s ladder (PATH, prebuilt, cargo, checkout). Copy or run the command to install from the documented scripts instead.
+                In-app Install uses Waylode’s ladder (PATH, prebuilt, cargo, checkout). Copy or run the command to install from the documented scripts instead.
               {:else}
                 Analysis and full DevCouncil install in Terminal. In-app Install covers only the code map (DevMap).
               {/if}

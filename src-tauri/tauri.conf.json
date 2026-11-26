@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
-  "productName": "GitPulse",
+  "productName": "Waylode",
   "version": "0.2.0-beta.1",
-  "mainBinaryName": "gitpulse",
-  "identifier": "dev.vbcr.gitpulse",
+  "mainBinaryName": "waylode",
+  "identifier": "dev.vbcr.waylode",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -16,7 +16,7 @@
       {
         "label": "main",
         "create": false,
-        "title": "GitPulse",
+        "title": "Waylode",
         "width": 1280,
         "height": 850,
         "minWidth": 900,
@@ -64,7 +64,11 @@
     },
     "windows": {
       "wix": {
-        "version": "0.2.0.1"
+        "version": "0.2.0.1",
+        "upgradeCode": "b6ba8858-9476-58c2-a749-8f985b9a9d0a"
+      },
+      "nsis": {
+        "installerHooks": "windows/nsis-hooks.nsh"
       }
     },
     "targets": [
@@ -84,9 +88,9 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Fast, local-first Git desktop client and code intelligence workspace",
-    "longDescription": "GitPulse is a high-performance native desktop Git client, code intelligence engine, and task workspace built with Rust (Tauri 2) and Svelte 5.",
+    "longDescription": "Waylode is a high-performance native desktop Git client, code intelligence engine, and task workspace built with Rust (Tauri 2) and Svelte 5.",
     "resources": {
-      "../plugins/gitpulse/": "plugin/"
+      "../plugins/waylode/": "plugin/"
     },
     "fileAssociations": [
       {

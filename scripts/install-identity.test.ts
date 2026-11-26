@@ -129,7 +129,7 @@ describe("install record provenance", () => {
   /** A real file so `fileDigest` has something to read. */
   function binary(body: string): { path: string; digest: string } {
     const root = tree({ "src-tauri/src/main.rs": "fn main() {}\n" });
-    const file = path.join(root, "gitpulse-hook");
+    const file = path.join(root, "waylode-hook");
     writeFileSync(file, body);
     return { path: file, digest: fileDigest(file) as string };
   }
@@ -210,7 +210,7 @@ describe("what the recorder records", () => {
     // An empty parse must throw rather than write down an empty record.
     const names = installedBinNames();
     expect(names.length).toBeGreaterThan(0);
-    expect(names).toContain("gitpulse-hook");
-    expect(names).toContain("gitpulse-mcp");
+    expect(names).toContain("waylode-hook");
+    expect(names).toContain("waylode-mcp");
   });
 });

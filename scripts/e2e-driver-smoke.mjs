@@ -3,7 +3,7 @@
  * Real-binary Tauri WebDriver (`tauri-driver`) E2E smoke + screenshot suite
  * for Linux (X11/Xvfb and headless Wayland/Weston) and Windows (WebView2).
  *
- * Drives the real compiled `gitpulse` binary through W3C WebDriver HTTP
+ * Drives the real compiled `waylode` binary through W3C WebDriver HTTP
  * against an isolated profile directory and verifies five real desktop
  * invariants:
  *   1. Cold start with isolated profile (real UI boot, zero uncaught crashes)
@@ -52,13 +52,13 @@ const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
  */
 
 /**
- * Resolves the default compiled `gitpulse` binary path, honoring `CARGO_TARGET_DIR`.
+ * Resolves the default compiled `waylode` binary path, honoring `CARGO_TARGET_DIR`.
  * @param {NodeJS.Platform} [platform]
  * @param {Record<string, string | undefined>} [env]
  * @param {string} [repoRoot]
  */
 export function defaultAppBinary(platform = process.platform, env = process.env, repoRoot = REPO_ROOT) {
-  const exe = platform === "win32" ? "gitpulse.exe" : "gitpulse";
+  const exe = platform === "win32" ? "waylode.exe" : "waylode";
   const targetDir = env.CARGO_TARGET_DIR
     ? path.resolve(repoRoot, env.CARGO_TARGET_DIR)
     : path.join(repoRoot, "src-tauri", "target");
@@ -532,7 +532,7 @@ async function runSmoke(opts) {
     return 2;
   }
   if (!existsSync(opts.binary)) {
-    console.error(`FAIL: gitpulse binary not found at ${opts.binary}. Build it with: cargo build --manifest-path src-tauri/Cargo.toml --locked --bin gitpulse`);
+    console.error(`FAIL: waylode binary not found at ${opts.binary}. Build it with: cargo build --manifest-path src-tauri/Cargo.toml --locked --bin waylode`);
     return 2;
   }
   if (!existsSync(opts.seedBin)) {
@@ -922,7 +922,7 @@ async function runSmoke(opts) {
 
     await step("clean-shutdown", async () => {
       await client.deleteSession();
-      const isPtyHost = (/** @type {string} */ line) => /\bgitpulse-ptyd\b/.test(line);
+      const isPtyHost = (/** @type {string} */ line) => /\b(?:waylode|gitpulse)-ptyd\b/.test(line);
       const exitDeadline = Date.now() + Math.min(5_000, Math.max(1_000, overallDeadlineMs - Date.now()));
       let remaining = findOrphanProcesses(workRoot);
       let leaked = remaining.filter((line) => !isPtyHost(line));
@@ -934,7 +934,7 @@ async function runSmoke(opts) {
       if (leaked.length > 0) {
         throw new Error(`Orphaned process(es) remained after shutdown: ${leaked.join(" | ")}`);
       }
-      // `gitpulse-ptyd` is intentionally detached with a 30s idle-exit timer so
+      // `waylode-ptyd` is intentionally detached with a 30s idle-exit timer so
       // terminals survive GUI restarts. Verify it obeys SIGTERM cleanly before
       // the isolated profile directory is removed.
       const ptyHosts = remaining.filter(isPtyHost);
@@ -951,11 +951,11 @@ async function runSmoke(opts) {
         }
         const stuck = findOrphanProcesses(workRoot);
         if (stuck.length > 0) {
-          throw new Error(`gitpulse-ptyd did not exit cleanly on SIGTERM: ${stuck.join(" | ")}`);
+          throw new Error(`waylode-ptyd did not exit cleanly on SIGTERM: ${stuck.join(" | ")}`);
         }
       }
       return ptyHosts.length > 0
-        ? `session closed cleanly; ${ptyHosts.length} detached gitpulse-ptyd exited cleanly on SIGTERM`
+        ? `session closed cleanly; ${ptyHosts.length} detached waylode-ptyd exited cleanly on SIGTERM`
         : "session closed cleanly, zero orphaned processes";
     });
   };

@@ -8,13 +8,6 @@
 //! implementation on this branch; where git's actual behavior diverges from
 //! intuition it is called out in a comment.
 
-use gitpulse_lib::analyzer::loc_counter::DiffChurn;
-use gitpulse_lib::engine::git_cli::resolve_git_dir;
-#[cfg(unix)]
-use gitpulse_lib::engine::git_cli::sandbox_join_canonical;
-use gitpulse_lib::engine::git_writer::validate_ref_name;
-use gitpulse_lib::engine::{GitReader, GitWriter};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::File;
 use std::path::Path;
 use std::process::Command;
@@ -22,6 +15,13 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use waylode_lib::analyzer::loc_counter::DiffChurn;
+use waylode_lib::engine::git_cli::resolve_git_dir;
+#[cfg(unix)]
+use waylode_lib::engine::git_cli::sandbox_join_canonical;
+use waylode_lib::engine::git_writer::validate_ref_name;
+use waylode_lib::engine::{GitReader, GitWriter};
+use waylode_lib::procguard::LockedSpawn;
 
 /// These tests are about hostile repository shapes, not the production spawn
 /// rate. Every fixture starts at `git_in`, and the binary's tests share one
@@ -29,7 +29,7 @@ use tempfile::TempDir;
 /// defers a `GitReader` call mid-test ("local bucket: 0 token(s)"). The switch
 /// is order-independent and idempotent, like the other integration suites'.
 fn unmetered_spawns() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
 }
 
 fn git_in(dir: &Path, args: &[&str]) {
@@ -93,7 +93,7 @@ fn a_fixture_built_binary_does_not_spend_the_production_spawn_burst() {
             .map(|_| {
                 scope.spawn(|| {
                     for n in 0..40 {
-                        gitpulse_lib::engine::git_cli::git_text(path, &["rev-parse", "HEAD"])
+                        waylode_lib::engine::git_cli::git_text(path, &["rev-parse", "HEAD"])
                             .unwrap_or_else(|error| {
                                 panic!("spawn {n} was refused: {error}", error = error.message())
                             });
@@ -478,7 +478,7 @@ fn watcher_storm_keeps_session_responsive() {
     let path = repo.path();
     let git_dir = resolve_git_dir(path).expect("resolve git dir");
 
-    let watcher = gitpulse_lib::watcher::RepoFileWatcher::watch_repo(&git_dir, Some(path), None)
+    let watcher = waylode_lib::watcher::RepoFileWatcher::watch_repo(&git_dir, Some(path), None)
         .expect("watcher starts");
     let receiver = &watcher.receiver;
     // Give the OS backend time to install its watches before the storm.

@@ -576,3 +576,36 @@ describe("the material floor follows the palette in force", () => {
     expect(plan.notes.map((note) => note.id)).toContain("material-floor");
   });
 });
+
+describe("brand logo style & palette appearance tokens", () => {
+  it("sanitizes unknown logoStyle and logoPalette values back to defaults", () => {
+    const clean = sanitizeAppearance({ logoStyle: "compass", logoPalette: "neon" });
+    expect(clean.logoStyle).toBe("way-arc");
+    expect(clean.logoPalette).toBe("cobalt");
+
+    const valid = sanitizeAppearance({ logoStyle: "lode-compass", logoPalette: "oxblood" });
+    expect(valid.logoStyle).toBe("lode-compass");
+    expect(valid.logoPalette).toBe("oxblood");
+  });
+
+  it("leaves --brand-gradient unset for default cobalt palette and writes it for non-default palettes", () => {
+    expect(MANAGED_VARS).toContain("--brand-gradient");
+    expect(planAppearance(prefs(), mac).vars["--brand-gradient"]).toBeUndefined();
+
+    const lodestarDark = planAppearance(prefs({ logoPalette: "lodestar" }), mac);
+    expect(lodestarDark.vars["--brand-gradient"]).toBe(
+      "linear-gradient(135deg, #fbbf24 0%, #2dd4bf 52%, #38bdf8 100%)",
+    );
+
+    const lodestarLight = planAppearance(prefs({ logoPalette: "lodestar" }), macLight);
+    expect(lodestarLight.vars["--brand-gradient"]).toBe(
+      "linear-gradient(135deg, #d97706 0%, #0d9488 52%, #0284c7 100%)",
+    );
+
+    const oxbloodDark = planAppearance(prefs({ logoPalette: "oxblood" }), mac);
+    expect(oxbloodDark.vars["--brand-gradient"]).toContain("#f87171");
+
+    const gildedDark = planAppearance(prefs({ logoPalette: "gilded" }), mac);
+    expect(gildedDark.vars["--brand-gradient"]).toContain("#fef08a");
+  });
+});

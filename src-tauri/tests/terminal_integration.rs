@@ -7,12 +7,12 @@
 //! refused before a process starts. These run against real repositories and
 //! real child processes.
 
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{run_manvi_action, run_terminal, ManviActionKind};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{run_manvi_action, run_terminal, ManviActionKind};
 
 fn run_git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")

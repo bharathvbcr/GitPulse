@@ -5,12 +5,12 @@
 
 mod common;
 
-use gitpulse_lib::analyzer::coverage::CoverageScanner;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::analyzer::coverage::CoverageScanner;
+use waylode_lib::procguard::LockedSpawn;
 
 fn git_repo() -> TempDir {
     common::unmetered_spawns();

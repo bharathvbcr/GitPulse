@@ -78,7 +78,7 @@
     <AlertTriangle size={11} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
     <div class="min-w-0 flex-1">
       <p class="text-meta leading-snug">
-        This repository was approved before GitPulse covered worktrees, so only its main
+        This repository was approved before Waylode covered worktrees, so only its main
         checkout can be read. The others are left out of comparisons and collision checks.
       </p>
       <button

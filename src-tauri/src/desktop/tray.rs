@@ -105,7 +105,7 @@ pub fn tray_tooltip(state: &MenuState) -> String {
     // repository controls: each is cleaned to one line, and the newlines here
     // are the tooltip's own.
     format!(
-        "GitPulse\n{pressure}{agents}{}\n{}",
+        "Waylode\n{pressure}{agents}{}\n{}",
         crate::alerts::text::sanitize(&state.tray_detail),
         crate::alerts::text::sanitize(&state.tray_summary.text)
     )
@@ -172,8 +172,8 @@ pub fn dispatch_click<R: Runtime>(app: &AppHandle<R>, click: TrayClick) {
     }
 }
 
-/// Current GitPulse G-ring + heartbeat + commit-node mark, 4× supersampled then
-/// box-filtered into an alpha-only template matching `Logo.svelte`.
+/// Waylode Concept 2 ("Lodestone Way-Arc") + lodestar mark, 4× supersampled
+/// then box-filtered into an alpha-only template matching `Logo.svelte`.
 fn pulse_icon(variant: GlyphVariant) -> tauri::image::Image<'static> {
     const SIZE: u32 = 36;
     const SUPER: u32 = 4;
@@ -214,9 +214,9 @@ fn pulse_icon(variant: GlyphVariant) -> tauri::image::Image<'static> {
         )
     };
 
-    // Open G arc from commit node (24.04, 9.25) counter-clockwise in SVG y-down to (26.5, 16).
+    // Open Way-Arc from lodestar node (23.8, 9.0) counter-clockwise in SVG y-down to (26.5, 16.0).
     const ARC_STEPS: usize = 240;
-    let theta_start = (-6.75_f32).atan2(8.04_f32);
+    let theta_start = (-7.0_f32).atan2(7.8_f32);
     let theta_end = -2.0 * std::f32::consts::PI;
     for step in 0..=ARC_STEPS {
         let t = step as f32 / ARC_STEPS as f32;
@@ -226,16 +226,14 @@ fn pulse_icon(variant: GlyphVariant) -> tauri::image::Image<'static> {
         stamp_disc(&mut hi, x, y, stroke);
     }
 
-    // Heartbeat crossbar matching `H22.6 L20.2 21 L16.8 9.9 L14.4 16 H11.8`.
-    let crossbar = [
+    // Rising way-crest matching `H21.0 L16.2 11.6 L11.4 18.8`.
+    let way_crest = [
         map_svg(26.5, 16.0),
-        map_svg(22.6, 16.0),
-        map_svg(20.2, 21.0),
-        map_svg(16.8, 9.9),
-        map_svg(14.4, 16.0),
-        map_svg(11.8, 16.0),
+        map_svg(21.0, 16.0),
+        map_svg(16.2, 11.6),
+        map_svg(11.4, 18.8),
     ];
-    for pair in crossbar.windows(2) {
+    for pair in way_crest.windows(2) {
         let (x0, y0) = pair[0];
         let (x1, y1) = pair[1];
         let steps = (x1 - x0).abs().max((y1 - y0).abs()).ceil().max(1.0) as i32;
@@ -245,8 +243,8 @@ fn pulse_icon(variant: GlyphVariant) -> tauri::image::Image<'static> {
         }
     }
 
-    // Commit node matching `<circle cx="24.04" cy="9.25" r="2.9"/>`.
-    let (node_x, node_y) = map_svg(24.04, 9.25);
+    // Lodestar node matching `<circle cx="23.8" cy="9.0" r="2.8"/>`.
+    let (node_x, node_y) = map_svg(23.8, 9.0);
     let node_r = (2.8 * super_f).round() as i32;
     stamp_disc(&mut hi, node_x, node_y, node_r);
 
@@ -301,7 +299,7 @@ enum TrayMenuEntry {
 fn tray_menu_plan(state: &MenuState) -> Vec<TrayMenuEntry> {
     let mut entries = vec![TrayMenuEntry::Item {
         id: "show".into(),
-        label: "Open GitPulse".into(),
+        label: "Open Waylode".into(),
     }];
     let waiting_requests: Vec<&super::state::MenuAgentRequest> = state
         .agent_requests
@@ -382,7 +380,7 @@ fn tray_menu_plan(state: &MenuState) -> Vec<TrayMenuEntry> {
     });
     entries.push(TrayMenuEntry::Item {
         id: "quit".into(),
-        label: "Quit GitPulse".into(),
+        label: "Quit Waylode".into(),
     });
     entries
 }
@@ -791,27 +789,27 @@ mod tests {
         state.tray_summary.text = "Clean\u{2066}\nsecond line".into();
         assert_eq!(
             tray_tooltip(&state),
-            "GitPulse\nrepognp.exe · main\nClean second line"
+            "Waylode\nrepognp.exe · main\nClean second line"
         );
     }
 
     #[test]
     fn tray_tooltip_names_the_agents_waiting_and_is_unchanged_without_them() {
         let mut state = MenuState {
-            tray_detail: "GitPulse · main".into(),
+            tray_detail: "Waylode · main".into(),
             ..Default::default()
         };
         state.tray_summary.text = "Clean".into();
-        assert_eq!(tray_tooltip(&state), "GitPulse\nGitPulse · main\nClean");
+        assert_eq!(tray_tooltip(&state), "Waylode\nWaylode · main\nClean");
         state.agents_waiting = 1;
         assert_eq!(
             tray_tooltip(&state),
-            "GitPulse\n1 agent needs you\nGitPulse · main\nClean"
+            "Waylode\n1 agent needs you\nWaylode · main\nClean"
         );
         state.agents_waiting = 2;
         assert_eq!(
             tray_tooltip(&state),
-            "GitPulse\n2 agents need you\nGitPulse · main\nClean"
+            "Waylode\n2 agents need you\nWaylode · main\nClean"
         );
     }
 
@@ -831,21 +829,28 @@ mod tests {
     }
 
     #[test]
-    fn status_glyph_draws_open_g_ring_commit_node_and_heartbeat_crossbar() {
+    fn status_glyph_draws_way_arc_lodestar_and_crest() {
         let icon = pulse_icon(GlyphVariant::Plain);
         let alpha = |x: u32, y: u32| icon.rgba()[((y * 36 + x) * 4 + 3) as usize];
         let region_ink = |xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| -> u32 {
             ys.flat_map(|y| xs.clone().map(move |x| alpha(x, y) as u32))
                 .sum()
         };
-        // Top, left, bottom quadrants of the G-ring, commit node, and heartbeat crossbar have ink.
-        assert!(region_ink(14..22, 5..10) > 0, "top G-ring arc");
-        assert!(region_ink(4..9, 14..23) > 0, "left G-ring arc");
-        assert!(region_ink(14..22, 27..32) > 0, "bottom G-ring arc");
-        assert!(region_ink(24..29, 9..14) > 0, "commit node");
-        assert!(region_ink(16..22, 11..25) > 0, "heartbeat crossbar");
-        // The G opening gap on the upper-right remains open.
-        assert_eq!(alpha(30, 14), 0, "G opening gap stays open");
+        // Top, left, bottom quadrants of the Way-Arc, lodestar node, and rising way-crest have ink.
+        assert!(region_ink(14..22, 5..10) > 0, "top Way-Arc");
+        assert!(region_ink(4..9, 14..23) > 0, "left Way-Arc");
+        assert!(region_ink(14..22, 27..32) > 0, "bottom Way-Arc");
+        assert!(region_ink(23..30, 8..15) > 0, "lodestar node");
+        assert!(region_ink(11..23, 12..23) > 0, "rising way-crest");
+        // Negative-space interior and the upper-right opening gap stay open.
+        assert_eq!(alpha(19, 21), 0, "Way-Arc lower interior stays clear");
+        assert_eq!(alpha(17, 24), 0, "Way-Arc bottom interior stays clear");
+        assert_eq!(alpha(30, 14), 0, "Way-Arc opening gap stays open");
+        // Attention dot clears the lodestar node without clipping.
+        let attention = pulse_icon(GlyphVariant::Attention);
+        let att_alpha = |x: u32, y: u32| attention.rgba()[((y * 36 + x) * 4 + 3) as usize];
+        assert_eq!(att_alpha(30, 5), 255, "attention dot core is solid");
+        assert_eq!(att_alpha(28, 8), 0, "knockout ring clears lodestar");
     }
 
     #[test]
@@ -856,7 +861,7 @@ mod tests {
             source: "terminal".into(),
             provider: "claude".into(),
             agent_label: "Claude\u{202e}Code".into(),
-            repo_label: "GitPulse".into(),
+            repo_label: "Waylode".into(),
             repo_path: Some("/r/gp".into()),
             urgency: "blocking".into(),
             reason: "Needs your permission\nnow".into(),
@@ -867,13 +872,13 @@ mod tests {
             agents_waiting: 4,
             agent_requests: vec![req.clone()],
             agent_requests_hidden: 3,
-            tray_detail: "GitPulse · main".into(),
+            tray_detail: "Waylode · main".into(),
             ..Default::default()
         };
         state.tray_summary.text = "Clean".into();
         let tip = tray_tooltip(&state);
         assert!(tip.contains("4 agents need you\n"));
-        assert!(tip.contains("• ClaudeCode · GitPulse — Needs your permission now\n"));
+        assert!(tip.contains("• ClaudeCode · Waylode — Needs your permission now\n"));
         assert!(tip.contains("+3 more waiting\n"));
 
         let mut changed_req = state.clone();
@@ -883,14 +888,14 @@ mod tests {
         let mut quiet = MenuState {
             agents_running: 2,
             agents_informational: 1,
-            tray_detail: "GitPulse · main".into(),
+            tray_detail: "Waylode · main".into(),
             ..Default::default()
         };
         quiet.tray_summary.text = "Clean".into();
         assert_eq!(glyph_variant(&quiet), GlyphVariant::Plain);
         assert_eq!(
             tray_tooltip(&quiet),
-            "GitPulse\n2 running · 1 finished\nGitPulse · main\nClean"
+            "Waylode\n2 running · 1 finished\nWaylode · main\nClean"
         );
         let mut quiet_more = quiet.clone();
         quiet_more.agents_running = 3;
@@ -947,7 +952,7 @@ mod tests {
             vec![
                 TrayMenuEntry::Item {
                     id: "show".into(),
-                    label: "Open GitPulse".into()
+                    label: "Open Waylode".into()
                 },
                 TrayMenuEntry::Item {
                     id: "settings".into(),
@@ -955,7 +960,7 @@ mod tests {
                 },
                 TrayMenuEntry::Item {
                     id: "quit".into(),
-                    label: "Quit GitPulse".into()
+                    label: "Quit Waylode".into()
                 },
             ]
         );
@@ -976,7 +981,7 @@ mod tests {
             vec![
                 TrayMenuEntry::Item {
                     id: "show".into(),
-                    label: "Open GitPulse".into()
+                    label: "Open Waylode".into()
                 },
                 TrayMenuEntry::Separator,
                 TrayMenuEntry::Item {
@@ -990,7 +995,7 @@ mod tests {
                 },
                 TrayMenuEntry::Item {
                     id: "quit".into(),
-                    label: "Quit GitPulse".into()
+                    label: "Quit Waylode".into()
                 },
             ]
         );
@@ -1017,7 +1022,7 @@ mod tests {
             vec![
                 TrayMenuEntry::Item {
                     id: "show".into(),
-                    label: "Open GitPulse".into()
+                    label: "Open Waylode".into()
                 },
                 TrayMenuEntry::Separator,
                 TrayMenuEntry::Item {
@@ -1031,7 +1036,7 @@ mod tests {
                 },
                 TrayMenuEntry::Item {
                     id: "quit".into(),
-                    label: "Quit GitPulse".into()
+                    label: "Quit Waylode".into()
                 },
             ]
         );

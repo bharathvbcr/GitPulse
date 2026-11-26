@@ -300,7 +300,7 @@ fn ensure_window<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindow<R>, Str
         window
     } else {
         let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("status.html".into()))
-            .title("GitPulse Status")
+            .title("Waylode Status")
             .inner_size(WIDTH, 400.0)
             .decorations(false)
             .resizable(false)

@@ -1,20 +1,20 @@
 mod common;
 
-use gitpulse_lib::engine::approve_worktree_hooks;
-use gitpulse_lib::engine::git_cli::git_text;
-use gitpulse_lib::engine::worktree::{
+use std::path::Path;
+use waylode_lib::engine::approve_worktree_hooks;
+use waylode_lib::engine::git_cli::git_text;
+use waylode_lib::engine::worktree::{
     add_worktree_extended, agent_layout, fork_worktree_extended, is_gitpulse_lane,
     read_base_record, write_base_record, DevmapMode,
 };
-use gitpulse_lib::workbench::agent_worktree::plan_fork_target;
-use gitpulse_lib::workbench::conversation::{
+use waylode_lib::workbench::agent_worktree::plan_fork_target;
+use waylode_lib::workbench::conversation::{
     claude_project_dir_name, latest_claude_session_for_checkout,
 };
-use gitpulse_lib::workbench::terminal_command::{
+use waylode_lib::workbench::terminal_command::{
     fork_resume, fork_resume_for_checkout, interactive_args, refuse_raw_session_args,
     LaunchOptions, CLAUDE_FORK_DOC_URL, CLAUDE_FORK_SESSION_FLAG, CLAUDE_FORK_VERIFIED_VERSION,
 };
-use std::path::Path;
 
 fn setup_repo_with_source_worktree(hooks: Option<&str>) -> (tempfile::TempDir, tempfile::TempDir) {
     common::unmetered_spawns();

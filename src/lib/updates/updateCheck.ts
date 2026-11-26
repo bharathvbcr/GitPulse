@@ -80,12 +80,12 @@ export function describeUpdateCheck(result: UpdateCheck): UpdateStatus {
   if (result.updateAvailable) {
     return {
       kind: "available",
-      message: `GitPulse ${result.latestVersion} is available (you have ${result.currentVersion}).`,
+      message: `Waylode ${result.latestVersion} is available (you have ${result.currentVersion}).`,
     };
   }
   return {
     kind: "current",
-    message: `GitPulse ${result.currentVersion} is the latest release.`,
+    message: `Waylode ${result.currentVersion} is the latest release.`,
   };
 }
 

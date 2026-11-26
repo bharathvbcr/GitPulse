@@ -70,11 +70,11 @@ async function scratchTree(
     pluginCodex: base,
     ...versions,
   };
-  const dir = await mkdtemp(path.join(tmpdir(), `gitpulse-relver-${prefix}-`));
+  const dir = await mkdtemp(path.join(tmpdir(), `waylode-relver-${prefix}-`));
   tempDirs.push(dir);
   await mkdir(path.join(dir, "src-tauri"), { recursive: true });
-  await mkdir(path.join(dir, "plugins", "gitpulse", ".claude-plugin"), { recursive: true });
-  await mkdir(path.join(dir, "plugins", "gitpulse", ".codex-plugin"), { recursive: true });
+  await mkdir(path.join(dir, "plugins", "waylode", ".claude-plugin"), { recursive: true });
+  await mkdir(path.join(dir, "plugins", "waylode", ".codex-plugin"), { recursive: true });
 
   await writeFile(
     path.join(dir, "package.json"),
@@ -87,7 +87,7 @@ async function scratchTree(
     path.join(dir, "src-tauri", "tauri.conf.json"),
     JSON.stringify(
       {
-        productName: "GitPulse",
+        productName: "Waylode",
         version: v.tauri,
         ...(Object.keys(bundle).length === 0 ? {} : { bundle }),
       },
@@ -106,15 +106,15 @@ async function scratchTree(
     `version = 3\n\n[[package]]\nname = "serde"\nversion = "1.0.203"\n\n[[package]]\nname = "${CRATE_NAME}"\nversion = "${v.cargoLock}"\ndependencies = [\n "serde",\n]\n`,
   );
   await writeFile(
-    path.join(dir, "plugins", "gitpulse", "plugin.json"),
+    path.join(dir, "plugins", "waylode", "plugin.json"),
     JSON.stringify({ name: CRATE_NAME, version: v.plugin }, null, 2),
   );
   await writeFile(
-    path.join(dir, "plugins", "gitpulse", ".claude-plugin", "plugin.json"),
+    path.join(dir, "plugins", "waylode", ".claude-plugin", "plugin.json"),
     JSON.stringify({ name: CRATE_NAME, version: v.pluginClaude }, null, 2),
   );
   await writeFile(
-    path.join(dir, "plugins", "gitpulse", ".codex-plugin", "plugin.json"),
+    path.join(dir, "plugins", "waylode", ".codex-plugin", "plugin.json"),
     JSON.stringify({ name: CRATE_NAME, version: v.pluginCodex }, null, 2),
   );
   return dir;
@@ -130,10 +130,10 @@ describe("release version gate", () => {
       "src-tauri/tauri.conf.json",
       "src-tauri/Cargo.toml",
       `src-tauri/Cargo.lock (${CRATE_NAME})`,
-      `crates/gitpulse-worktree/Cargo.lock (${CRATE_NAME})`,
-      "plugins/gitpulse/plugin.json",
-      "plugins/gitpulse/.claude-plugin/plugin.json",
-      "plugins/gitpulse/.codex-plugin/plugin.json",
+      `crates/waylode-worktree/Cargo.lock (${CRATE_NAME})`,
+      "plugins/waylode/plugin.json",
+      "plugins/waylode/.claude-plugin/plugin.json",
+      "plugins/waylode/.codex-plugin/plugin.json",
     ]) {
       expect(stdout).toContain(label);
     }
@@ -165,18 +165,18 @@ describe("release version gate", () => {
   });
 
   it("fails when a crates/<name>/Cargo.lock that records the app crate lags", async () => {
-    // crates/gitpulse-worktree depends on the app crate by path, so its own
+    // crates/waylode-worktree depends on the app crate by path, so its own
     // lock records the app version too. Bumping only src-tauri left it at the
     // old version and every `--locked` build of that crate refused to start.
     const dir = await scratchTree("crate-lock-lag");
-    await mkdir(path.join(dir, "crates", "gitpulse-worktree"), { recursive: true });
+    await mkdir(path.join(dir, "crates", "waylode-worktree"), { recursive: true });
     await writeFile(
-      path.join(dir, "crates", "gitpulse-worktree", "Cargo.lock"),
-      `version = 4\n\n[[package]]\nname = "${CRATE_NAME}"\nversion = "0.4.1"\n\n[[package]]\nname = "gitpulse-worktree"\nversion = "9.9.9"\n`,
+      path.join(dir, "crates", "waylode-worktree", "Cargo.lock"),
+      `version = 4\n\n[[package]]\nname = "${CRATE_NAME}"\nversion = "0.4.1"\n\n[[package]]\nname = "waylode-worktree"\nversion = "9.9.9"\n`,
     );
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
-    expect(stdout).toMatch(new RegExp(`crates/gitpulse-worktree/Cargo\\.lock \\(${CRATE_NAME}\\) = "0\\.4\\.1"`));
+    expect(stdout).toMatch(new RegExp(`crates/waylode-worktree/Cargo\\.lock \\(${CRATE_NAME}\\) = "0\\.4\\.1"`));
   });
 
   it("ignores a crate's Cargo.lock that does not record the app crate", async () => {
@@ -211,7 +211,7 @@ describe("release version gate", () => {
     const dir = await scratchTree("plugin-drift", { plugin: "0.4.1" });
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
-    expect(stdout).toMatch(/plugins\/gitpulse\/plugin\.json = "0\.4\.1"/);
+    expect(stdout).toMatch(/plugins\/waylode\/plugin\.json = "0\.4\.1"/);
     expect(stdout).toMatch(/FAIL: release version gate violated/);
   });
 
@@ -221,24 +221,24 @@ describe("release version gate", () => {
     const dir = await scratchTree("plugin-claude-drift", { pluginClaude: "0.4.1" });
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
-    expect(stdout).toMatch(/plugins\/gitpulse\/\.claude-plugin\/plugin\.json = "0\.4\.1"/);
+    expect(stdout).toMatch(/plugins\/waylode\/\.claude-plugin\/plugin\.json = "0\.4\.1"/);
   });
 
   it("fails when the native Codex manifest drifts from the package", async () => {
     const dir = await scratchTree("plugin-codex-drift", { pluginCodex: "0.4.1" });
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
-    expect(stdout).toMatch(/plugins\/gitpulse\/\.codex-plugin\/plugin\.json = "0\.4\.1"/);
+    expect(stdout).toMatch(/plugins\/waylode\/\.codex-plugin\/plugin\.json = "0\.4\.1"/);
   });
 
   it("reports a missing plugin manifest rather than passing on the remaining sources", async () => {
     // Discovery must not turn a deleted manifest into "nothing to check":
     // plugin.json is required per package for exactly this reason.
     const dir = await scratchTree("plugin-missing");
-    await rm(path.join(dir, "plugins", "gitpulse", "plugin.json"));
+    await rm(path.join(dir, "plugins", "waylode", "plugin.json"));
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
-    expect(stdout).toMatch(/unreadable: plugins\/gitpulse\/plugin\.json yielded no version/);
+    expect(stdout).toMatch(/unreadable: plugins\/waylode\/plugin\.json yielded no version/);
   });
 
   it("discovers a second package under plugins/ without being told about it", async () => {
@@ -423,17 +423,17 @@ describe("discoverPluginPackages", () => {
   it("does not resurrect the retired top-level plugin/ directory", async () => {
     // The package moved to plugins/<name>/; a leftover plugin/ on someone's
     // disk must not be picked up as a second package and gate the release.
-    const dir = await bareTree("retired", ["plugin", "plugins/gitpulse"]);
+    const dir = await bareTree("retired", ["plugin", "plugins/waylode"]);
     expect(discoverPluginPackages(dir).map((p: string) => path.relative(dir, p))).toEqual([
-      path.join("plugins", "gitpulse"),
+      path.join("plugins", "waylode"),
     ]);
   });
 
   it("ignores loose files beside the packages", async () => {
-    const dir = await bareTree("files", ["plugins/gitpulse"]);
+    const dir = await bareTree("files", ["plugins/waylode"]);
     await writeFile(path.join(dir, "plugins", "README.md"), "not a package");
     expect(discoverPluginPackages(dir).map((p: string) => path.relative(dir, p))).toEqual([
-      path.join("plugins", "gitpulse"),
+      path.join("plugins", "waylode"),
     ]);
   });
 

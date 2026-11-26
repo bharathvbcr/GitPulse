@@ -77,7 +77,7 @@ export async function mainCheckoutOf(cwd: string): Promise<string> {
     }
     root = familyFromCommonDir(resolved.common_dir, opts)?.root ?? null;
   }
-  if (!root) throw new Error(`GitPulse couldn't tell which repository ${cwd} belongs to, so it will not merge or remove it.`);
+  if (!root) throw new Error(`Waylode couldn't tell which repository ${cwd} belongs to, so it will not merge or remove it.`);
   if (identityKey(root, opts) === key) throw new Error("This run worked in the repository's main worktree, so there is no separate worktree to merge or discard.");
   return root;
 }

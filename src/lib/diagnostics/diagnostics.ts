@@ -1316,7 +1316,7 @@ export function formatDiagnosticReport(
   const occurrences = (severity: DiagnosticSeverity) =>
     entries.reduce((total, entry) => (entry.severity === severity ? total + entry.count : total), 0);
   if (entries.length === 0) {
-    return [`GitPulse diagnostics — nothing recorded as of ${generatedAt.toISOString()}`, ...storageNotes].join("\n");
+    return [`Waylode diagnostics — nothing recorded as of ${generatedAt.toISOString()}`, ...storageNotes].join("\n");
   }
   const blocks = entries.map((entry) => {
     const repeats = entry.count > 1 ? ` x${entry.count}` : "";
@@ -1331,8 +1331,8 @@ export function formatDiagnosticReport(
     return `${header}\n${body}`;
   });
   return [
-    `GitPulse diagnostics — ${occurrences("error")} error(s), ${occurrences("warning")} warning(s), ${entries.length} distinct`,
-    `Generated: ${generatedAt.toISOString()} by GitPulse ${runningVersion}`,
+    `Waylode diagnostics — ${occurrences("error")} error(s), ${occurrences("warning")} warning(s), ${entries.length} distinct`,
+    `Generated: ${generatedAt.toISOString()} by Waylode ${runningVersion}`,
     `Running build: ${APP_BUILD_ID}`,
     ...storageNotes,
     "",

@@ -1860,7 +1860,7 @@ impl Cleaner {
         if lapsed {
             let now = super::now();
             let why = if approval.previewed_at == 0 {
-                "it was never previewed by this version of GitPulse"
+                "it was never previewed by this version of Waylode"
             } else if approval.previewed_at > now {
                 "its preview is dated in the future (the clock was set back), so its age cannot be told"
             } else {
@@ -1868,13 +1868,13 @@ impl Cleaner {
             };
             push_issue(
                 &mut run.issues,
-                format!("Agent scratch removal was skipped: {why}, so it does not count as approved. Nothing was examined or removed for it. Preview it again in GitPulse."),
+                format!("Agent scratch removal was skipped: {why}, so it does not count as approved. Nothing was examined or removed for it. Preview it again in Waylode."),
             );
         }
         if config.scopes.any() && !scopes.any() && !lapsed {
             push_issue(
                 &mut run.issues,
-                "Reclaim scopes are enabled but have not been previewed since they last changed, so this run used none of them. Inspect saved roots in GitPulse to preview them.".into(),
+                "Reclaim scopes are enabled but have not been previewed since they last changed, so this run used none of them. Inspect saved roots in Waylode to preview them.".into(),
             );
         }
         // An incomplete workspace inventory is a reason not to claim complete
@@ -2182,7 +2182,7 @@ impl Cleaner {
                     // ran. A "skipped" row would read as a policy answer.
                     row.status = "unexamined".into();
                     row.message = format!(
-                        "Could not examine: {} Nothing was judged; GitPulse tries again sooner than the schedule.",
+                        "Could not examine: {} Nothing was judged; Waylode tries again sooner than the schedule.",
                         e.message()
                     );
                     run.unexamined = run.unexamined.saturating_add(1);

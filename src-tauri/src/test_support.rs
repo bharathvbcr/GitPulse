@@ -1335,7 +1335,7 @@ mod tests {
     fn copies_left_by_dead_processes_are_swept_and_live_ones_are_not() {
         use super::{fs, sweep_dead_isolates};
         let dir = tempfile::tempdir().unwrap();
-        let name = |pid: u32, seq: u32| format!("gitpulse_lib-abc-isolate-{pid}-{seq}");
+        let name = |pid: u32, seq: u32| format!("waylode_lib-abc-isolate-{pid}-{seq}");
         let ours = std::process::id();
         for file in [
             name(4_000_001, 0),
@@ -1343,12 +1343,12 @@ mod tests {
             name(ours, 0),
             // Not ours to touch: another stem, and no pid at all.
             "other_lib-abc-isolate-4000001-0".to_owned(),
-            "gitpulse_lib-abc-isolate-notapid-0".to_owned(),
-            "gitpulse_lib-abc".to_owned(),
+            "waylode_lib-abc-isolate-notapid-0".to_owned(),
+            "waylode_lib-abc".to_owned(),
         ] {
             fs::write(dir.path().join(file), b"image").unwrap();
         }
-        let removed = sweep_dead_isolates(dir.path(), "gitpulse_lib-abc", |pid| pid == ours);
+        let removed = sweep_dead_isolates(dir.path(), "waylode_lib-abc", |pid| pid == ours);
         assert_eq!(removed, 2);
         let left: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
@@ -1357,8 +1357,8 @@ mod tests {
         for kept in [
             name(ours, 0),
             "other_lib-abc-isolate-4000001-0".to_owned(),
-            "gitpulse_lib-abc-isolate-notapid-0".to_owned(),
-            "gitpulse_lib-abc".to_owned(),
+            "waylode_lib-abc-isolate-notapid-0".to_owned(),
+            "waylode_lib-abc".to_owned(),
         ] {
             assert!(left.contains(&kept), "{kept} was removed: {left:?}");
         }

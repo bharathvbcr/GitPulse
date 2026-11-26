@@ -140,7 +140,7 @@
       <span>
         {bypassing.map(launcherLabel).join(" and ")}
         {bypassing.length > 1 ? "start" : "starts"} with no permission checks and no sandbox.
-        GitPulse asks you to confirm each of those sessions before it opens.
+        Waylode asks you to confirm each of those sessions before it opens.
       </span>
     </div>
   {/if}

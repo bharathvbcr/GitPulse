@@ -8,10 +8,10 @@
 //! skip on stderr when it is not enabled, so a run without a model server never
 //! looks like a run that passed.
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
+use waylode_lib::procguard::LockedSpawn;
 
-use gitpulse_lib::ai::{self, AiSelection};
+use waylode_lib::ai::{self, AiSelection};
 
 fn live_ai_enabled(test_name: &str) -> bool {
     if std::env::var("GITPULSE_LIVE_AI").as_deref() == Ok("1") {

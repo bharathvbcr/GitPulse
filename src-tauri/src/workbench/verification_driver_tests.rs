@@ -1774,7 +1774,7 @@ fn a_host_that_is_closing_refuses_the_wait() {
     let fake = Fake::new();
     fake.cancelled.set(true);
     let (result, _) = judge(&store, &fake, &repo, &id, &head);
-    assert!(result.unwrap_err().contains("GitPulse closed"));
+    assert!(result.unwrap_err().contains("Waylode closed"));
     assert!(fake.starts.borrow().is_empty());
 }
 

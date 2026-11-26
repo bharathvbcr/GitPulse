@@ -90,6 +90,6 @@ describe("ManviConnection capability truth", () => {
   it("reports a failed status read and a blocked gate as failures, not as no news", () => {
     expect(source).toContain("Couldn't check Manvi status");
     expect(source).toContain("Policy gate failed — mutations blocked");
-    expect(source).toContain("GitPulse will not treat a timed-out");
+    expect(source).toContain("Waylode will not treat a timed-out");
   });
 });

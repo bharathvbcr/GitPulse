@@ -6,14 +6,14 @@
 //! wrong answer here is not a cosmetic defect, it is the UI telling a user the
 //! repository is clean while it is mid-rebase.
 
-use gitpulse_lib::engine::repo_op::{self, OperationAction, OperationKind};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
+use waylode_lib::engine::repo_op::{self, OperationAction, OperationKind};
+use waylode_lib::procguard::LockedSpawn;
 
 fn run_git(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -173,7 +173,7 @@ fn a_conflict_larger_than_the_listing_cap_reports_the_true_total() {
 #[test]
 fn concurrent_detection_is_consistent_under_load() {
     // Consistency under contention, not the production spawn rate.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let repo = init_repo();
     let dir = repo.path();
     commit(dir, "f.txt", "base\n", "base");
@@ -313,7 +313,7 @@ fn corrupt_control_files_never_panic_and_never_lose_the_escape() {
 /// up here as one repo reporting another's operation.
 #[test]
 fn parallel_repositories_never_report_each_others_operations() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let kinds: &[(&str, OperationKind)] = &[
         ("merge", OperationKind::Merge),
         ("cherry-pick", OperationKind::CherryPick),

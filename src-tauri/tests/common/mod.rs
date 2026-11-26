@@ -15,8 +15,8 @@
 // used by four of the five reads as dead in the fifth.
 #![allow(dead_code)]
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
+use waylode_lib::procguard::LockedSpawn;
 
 /// The test environment owner: the hermetic home every test process runs in,
 /// the one environment lock, and the scoped `bind_env` guard. Declaring `common`
@@ -37,7 +37,7 @@ use std::process::Command;
 /// Order-independent and idempotent. Not for the suites that measure the gate
 /// itself (`tests/process_admission.rs` lists them).
 pub fn unmetered_spawns() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
 }
 
 /// Runs `git` in `cwd` and asserts it succeeded.
@@ -80,14 +80,14 @@ pub fn run_git(cwd: &Path, args: &[&str]) {
 /// fixture with REPOSITORY_TRUST_REQUIRED.
 pub fn trust_repo(repo: &Path) {
     let path = repo.to_str().expect("fixture path");
-    let preview = gitpulse_lib::repository_trust::inspect(path).expect("inspect fixture");
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, true).expect("approve fixture");
+    let preview = waylode_lib::repository_trust::inspect(path).expect("inspect fixture");
+    waylode_lib::repository_trust::grant(path, &preview.identity, true).expect("approve fixture");
 }
 
 /// A session registry on the selected backend. On Unix every registry gets a
 /// host of its own, in a directory of its own, so suites running side by side
 /// never share sessions.
-pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
+pub fn terminals() -> waylode_lib::terminal::TerminalSessions {
     #[cfg(unix)]
     {
         let base = std::env::temp_dir().canonicalize().expect("temp dir");
@@ -98,9 +98,9 @@ pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
             .tempdir_in(base)
             .expect("host dir")
             .keep();
-        gitpulse_lib::terminal::TerminalSessions::with_host(
-            gitpulse_lib::terminal::host::client::HostConfig {
-                binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
+        waylode_lib::terminal::TerminalSessions::with_host(
+            waylode_lib::terminal::host::client::HostConfig {
+                binary: Some(env!("CARGO_BIN_EXE_waylode-ptyd").into()),
                 idle_exit: Some(std::time::Duration::from_secs(3)),
                 // GITPULSE_LOG_DIR for the host: never the user's real log.
                 log_dir: Some(dir.join("logs")),
@@ -110,7 +110,7 @@ pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
     }
     #[cfg(not(unix))]
     {
-        gitpulse_lib::terminal::TerminalSessions::default()
+        waylode_lib::terminal::TerminalSessions::default()
     }
 }
 

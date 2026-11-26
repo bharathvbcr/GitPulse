@@ -2155,7 +2155,7 @@ fn javascript_provider_setup(repo: &Path) -> Option<(String, String)> {
     Some((
         format!("npm install --save-dev {DEFAULT_JS_COVERAGE_PROVIDER}"),
         format!(
-            "Vitest is present but no coverage provider is declared. GitPulse will add {DEFAULT_JS_COVERAGE_PROVIDER} to devDependencies."
+            "Vitest is present but no coverage provider is declared. Waylode will add {DEFAULT_JS_COVERAGE_PROVIDER} to devDependencies."
         ),
     ))
 }
@@ -2215,7 +2215,7 @@ fn python_coverage_plan(repo: &Path, has_python_tests: bool) -> LanguageCoverage
             // Say which rule it failed rather than silently falling back to
             // the host interpreter or planning a step the gate would refuse.
             return LanguageCoveragePlan::unavailable(&format!(
-                "The project virtualenv {reason}, so GitPulse will not use it. Recreate it with `python3 -m venv .venv`, then rescan."
+                "The project virtualenv {reason}, so Waylode will not use it. Recreate it with `python3 -m venv .venv`, then rescan."
             ));
         }
     };
@@ -2273,7 +2273,7 @@ fn python_coverage_plan(repo: &Path, has_python_tests: bool) -> LanguageCoverage
         ],
         tool_ready: false,
         tool_detail: format!(
-            "pytest is not installed. GitPulse will create {MANAGED_VENV_DIR} in this repository and install pytest there; your system Python is not touched."
+            "pytest is not installed. Waylode will create {MANAGED_VENV_DIR} in this repository and install pytest there; your system Python is not touched."
         ),
         duration_hint:
             "Creating the virtualenv, installing pytest and generating coverage can take a few minutes."
@@ -2375,7 +2375,7 @@ fn gcovr_route(repo: &Path) -> GcovrRoute {
         Ok(found) => found,
         Err(reason) => {
             return GcovrRoute::None(format!(
-                "The project virtualenv {reason}, so GitPulse will not use it to install gcovr. Recreate it with `python3 -m venv .venv`, then rescan."
+                "The project virtualenv {reason}, so Waylode will not use it to install gcovr. Recreate it with `python3 -m venv .venv`, then rescan."
             ))
         }
     };
@@ -2480,7 +2480,7 @@ fn native_coverage_plan(repo: &Path, cmake_ready: bool, gcovr: GcovrRoute) -> La
         setup,
         tool_ready: false,
         tool_detail: format!(
-            "gcovr is not installed. GitPulse will install it into {MANAGED_VENV_DIR} in this repository; your system Python is not touched."
+            "gcovr is not installed. Waylode will install it into {MANAGED_VENV_DIR} in this repository; your system Python is not touched."
         ),
         duration_hint:
             "Installing gcovr and running an instrumented C/C++ build can take several minutes."
@@ -2654,7 +2654,7 @@ fn apply_language_plan(status: &mut CoverageFamilyStatus, plan: LanguageCoverage
         status.tool_ready = false;
         if status.tool_detail.is_empty() {
             status.tool_detail =
-                "GitPulse could not plan a coverage generator for this repository layout.".into();
+                "Waylode could not plan a coverage generator for this repository layout.".into();
         }
         // A duration for a command that does not exist is noise.
         status.duration_hint.clear();
@@ -2780,12 +2780,12 @@ fn fill_suggested_commands(
             // no artifact for a generate command to produce. Say that rather
             // than leaving a row the user cannot act on or explain.
             "beam" => LanguageCoveragePlan::unavailable(
-                "GitPulse cannot parse Elixir/Erlang coverage output, so no generator is planned.",
+                "Waylode cannot parse Elixir/Erlang coverage output, so no generator is planned.",
             ),
             // Fail closed: an unrecognized family has had no readiness check
             // at all, and must not claim one.
             _ => LanguageCoveragePlan::unavailable(
-                "GitPulse has no coverage generator for this ecosystem.",
+                "Waylode has no coverage generator for this ecosystem.",
             ),
         };
         apply_language_plan(status, plan);

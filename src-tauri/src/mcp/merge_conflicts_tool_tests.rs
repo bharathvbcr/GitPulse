@@ -1,4 +1,4 @@
-//! `gitpulse_merge_conflicts` as an agent meets it: advertised read-only, its
+//! `waylode_merge_conflicts` as an agent meets it: advertised read-only, its
 //! answer matches its declared schema, the three states reach the wire, and the
 //! repository's object database is the same afterwards.
 
@@ -37,7 +37,7 @@ fn object_store(repo: &Path) -> Vec<(String, u64, Vec<u8>)> {
 fn it_is_advertised_as_a_read_only_tool_with_the_repo_path_argument_only() {
     let tool = tools()
         .into_iter()
-        .find(|t| t["name"] == "gitpulse_merge_conflicts")
+        .find(|t| t["name"] == "waylode_merge_conflicts")
         .expect("advertised");
     assert_eq!(tool["annotations"]["readOnlyHint"], true);
     assert_eq!(tool["annotations"]["destructiveHint"], false);
@@ -56,11 +56,11 @@ fn the_three_states_reach_the_wire_and_the_object_store_is_untouched() {
     let before = object_store(&root);
 
     let arguments = json!({ "repo_path": root.to_str().unwrap() });
-    let payload = handle_tool_call("gitpulse_merge_conflicts", &arguments).expect("call");
+    let payload = handle_tool_call("waylode_merge_conflicts", &arguments).expect("call");
 
     let schema = tools()
         .into_iter()
-        .find(|t| t["name"] == "gitpulse_merge_conflicts")
+        .find(|t| t["name"] == "waylode_merge_conflicts")
         .unwrap()["outputSchema"]
         .clone();
     let violations: Vec<String> = validate::validate(&payload, &schema)
@@ -87,7 +87,7 @@ fn the_three_states_reach_the_wire_and_the_object_store_is_untouched() {
 fn a_path_that_is_not_a_repository_is_a_failed_read_and_not_an_empty_clean_one() {
     let dir = tempfile::tempdir().unwrap();
     let arguments = json!({ "repo_path": dir.path().to_str().unwrap() });
-    let payload = handle_tool_call("gitpulse_merge_conflicts", &arguments).expect("call");
+    let payload = handle_tool_call("waylode_merge_conflicts", &arguments).expect("call");
     assert_eq!(payload["ok"], false, "{payload}");
     assert!(!payload["error"].as_str().unwrap_or_default().is_empty());
     assert_eq!(payload["clean"], 0);

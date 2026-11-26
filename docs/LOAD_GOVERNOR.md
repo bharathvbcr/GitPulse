@@ -1,8 +1,8 @@
 # Load governor
 
-GitPulse runs agents. On the Mac this was built on, agents and the tools they
+Waylode runs agents. On the Mac this was built on, agents and the tools they
 start brought the machine down three times in one week. The host-load governor
-is GitPulse's answer, built as a series of cards. This page describes the
+is Waylode's answer, built as a series of cards. This page describes the
 series and what each card owns. It then covers the part that exists today, the
 **sensor** (card 1): what it measures, how other processes read it, where its
 limits are, and what has been verified.
@@ -17,7 +17,7 @@ limits are, and what has been verified.
 - **Windows reports unavailable.** No sensor runs there. Readers see the
   sensor as dead, and Health says "ungoverned: no sensor".
 - **Cursor and Codex get advice only.** Their sessions are counted (Codex by
-  executable), but GitPulse holds no lease over them.
+  executable), but Waylode holds no lease over them.
 - **"Time slots" means a priority queue with leases, not calendar booking.**
   That queue is card 1d's.
 
@@ -30,7 +30,7 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
   GitPulse.app's coalition), and an `rg` memguard killed at 40.8 GiB (V, its
   log).
 - **A foreign orphan.** A `/usr/bin/grep` at 21–22 GiB ran at 100 % CPU for
-  19–22 h with no parent (V). No layer below GitPulse catches that shape. The
+  19–22 h with no parent (V). No layer below Waylode catches that shape. The
   sensor now detects it (see Orphans).
 - **The panics.** The two on 10-02 were launchd SIGBUS, probably the OS or
   hardware (I). The one on 10-07 was a watchdog timeout with the compressor
@@ -39,13 +39,13 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
 - **Sessions were undercounted.** Insights counted 5 of 7 live Claude
   sessions. The cause (V, 2026-10-10): Claude Code writes its session registry
   under the session's own `CLAUDE_CONFIG_DIR`, and this host runs sessions
-  under several. GitPulse read one directory.
+  under several. Waylode read one directory.
 
 ## Ownership
 
 | Trigger | Owner | Notes |
 |---|---|---|
-| One process over 32 GiB, or pressure level 4 for 3 samples | memguard | GitPulse never kills a single process for its footprint. |
+| One process over 32 GiB, or pressure level 4 for 3 samples | memguard | Waylode never kills a single process for its footprint. |
 | A `mac_heavy.sh` job tree over its RSS cap | mac_heavy | Card 4 exempts trees carrying `MAC_HEAVY_LABEL`. |
 | A tree's processes while **memory** is short, and a runaway subtree that keeps making it worse | Card 4 (pressure relief, `sysload::relief`) | Slow and freeze by default, with a setting (`host_load_supervisor`: off, advise, act). Terminate (rung C) is opt-in (`host_load_supervisor_terminate`) and ends only a tree the relief itself froze, at the cap or on a person's click; observed agents and untrusted repositories are only ever offered a pause. See Pressure relief. |
 | Admission and shedding | Cards 1b and 1c, one verdict (`sysload::governor`) | See Admission and shedding. |
@@ -61,7 +61,7 @@ in Health. That signal is re-checked on the live process before it is sent
 |---|---|---|
 | 1 (sensor) | This page: sampler, `host-load.v1`, sensor states, sessions by process scan, `GITPULSE_RUN_ID`, memguard health, orphans, Health | Implemented |
 | 1b | Admission of agent launches on the sensor state | Implemented (see Admission and shedding) |
-| 1c | Shedding GitPulse's own background and reactive work | Implemented (see Admission and shedding) |
+| 1c | Shedding Waylode's own background and reactive work | Implemented (see Admission and shedding) |
 | 1d | Leases and the priority queue ("time slots"), and idle-session advice and parking | Implemented (see Build leases and idle sessions). The shim cutover is the owner's |
 | 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases are card 1d's. `gitpulse_system_load` and launch-environment caps are not |
 | Per-call gate cost | The hook's per-call budget | Separate card |
@@ -119,7 +119,7 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
 
 - **Header:** MAGIC `GPHL`, VERSION (1), length, flags, sequence.
 - **Writer identity:** pid, process start time, binary path and version, so
-  Health can say *which* GitPulse is sampling when a dev build and the
+  Health can say *which* Waylode is sampling when a dev build and the
   installed app coexist.
 - **`host_load.enabled`:** carried in the flags, so hooks never read
   settings and a flip reaches every reader on the next tick.
@@ -272,7 +272,7 @@ beside it, in the same directory, that keeps them.
 
 ## Where it runs
 
-Only in the GitPulse app process. `lib.rs::run` starts the sampler from its
+Only in the Waylode app process. `lib.rs::run` starts the sampler from its
 setup (`start_host_load_sampler`). `tests/host_load_sampler_scope.rs` pins that
 this is the only start, and that no other shipped binary (`gitpulsed`,
 `gitpulse-mcp`, `gitpulse-hook`) reaches it.
@@ -349,12 +349,12 @@ the same kind is a wrapper's target (Codex's npm shim starting the native
 `codex`), not a second session. A Claude run from a shell under another session
 is its own session.
 
-**Launched vs observed.** Every PTY GitPulse starts carries
+**Launched vs observed.** Every PTY Waylode starts carries
 `GITPULSE_SESSION_ID`; a task attempt's also carries `GITPULSE_RUN_ID`.
 `GITPULSE_RUN_ID` is the launch table's environment half
 (`terminal_command::launch_env`, beside `policy()`'s flags). The PTY spawn path
 sets it after the caller's own environment, so an IPC caller cannot file a
-session under another run. It is *removed* from plain terminals, so a GitPulse
+session under another run. It is *removed* from plain terminals, so a Waylode
 started inside an attempt does not hand that attempt's id to every shell tab.
 
 A process belongs to the launched tree of its nearest ancestor-or-self carrying
@@ -416,7 +416,7 @@ log's modification time. Health warns on a governed platform when:
 - its log path cannot be read; or
 - it has not written for more than twice its `-heartbeat` interval.
 
-GitPulse never starts, restarts or signals memguard.
+Waylode never starts, restarts or signals memguard.
 
 ## Orphans (advise only)
 
@@ -426,9 +426,9 @@ A foreign process is listed as an orphan when all of these hold:
 - it belongs to this user;
 - its working directory is in a git checkout;
 - it has spent at least 80 % of its life on a CPU, over more than 30 minutes;
-- it is in no session and no GitPulse launch, and is not memguard.
+- it is in no session and no Waylode launch, and is not memguard.
 
-GitPulse launches that outlive their run are card 4's, not listed here. Health
+Waylode launches that outlive their run are card 4's, not listed here. Health
 lists each orphan with **Terminate**, which takes two clicks. The backend then
 re-checks everything on the live process: same pid and start time, still this
 user's, still parented by launchd, still no launch id or session, still
@@ -440,7 +440,7 @@ host cannot draw, or anything changed refuses and signals nothing.
 Security impact: `cmd_host_load_terminate_orphan` is granted to the main
 window, so any script that reaches the IPC bridge can ask for it. The two
 clicks are DOM and are not the boundary; the native dialog is, as for the
-other grants that widen what GitPulse will do (repository trust, tool paths).
+other grants that widen what Waylode will do (repository trust, tool paths).
 The signal is SIGTERM to a process this user already owns and could `kill`
 from a shell; no access is widened beyond that. The other three host-load
 grants (`cmd_host_load_status`, `cmd_host_load_settings`,
@@ -502,14 +502,14 @@ sets them they follow this computer's memory (see Disk guards).
 |---|---|---|---|---|
 | `compressor_segments` | `vm.compressor.segment.total / vm.compressor.segment.limit` | refuse | 0.60 | 0.80 |
 | `swap` | swap USED / PHYSICAL memory (never swap total: macOS grows swap on demand, so the total reads 0 after boot) | refuse | 0.50x | 0.75x |
-| `low_disk` | free space on the volume holding GitPulse's state; lower is worse | refuse | below the larger of 20 GiB and half of physical memory (32 GiB on a 64 GiB Mac) | below the larger of 10 GiB and a quarter of it (16 GiB on a 64 GiB Mac) |
+| `low_disk` | free space on the volume holding Waylode's state; lower is worse | refuse | below the larger of 20 GiB and half of physical memory (32 GiB on a 64 GiB Mac) | below the larger of 10 GiB and a quarter of it (16 GiB on a 64 GiB Mac) |
 | `disk_filling` | how fast that free space is falling, as minutes until the severe floor (see Disk guards) | refuse | under 30 minutes | under 10 minutes |
 | `thermal` | `NSProcessInfo.thermalState` | shed | serious | critical (refuse mode only) |
 | `cpu_load` | 1-minute load average / logical CPUs | shed | 3.0 | 6.0 |
 | `battery` | running on battery | off | on battery | never |
 
 Modes: **off** ignores the input; **shed** lets it raise the tier to Elevated at
-most (GitPulse slows its own background work, launches are admitted);
+most (Waylode slows its own background work, launches are admitted);
 **refuse** lets it reach Severe too (reactive work is shed and launches are
 refused). Refusal is still subject to `host_load.govern_launches`: with that
 off nothing ever refuses.
@@ -566,8 +566,8 @@ spawns no git child (a pure IPC read) is not shed by this card.
 ## The command gate
 
 On 2026-11-14 this Mac hung with swap at 0.9x RAM and a load of 120 on 18
-cores, under sessions GitPulse only observes, so launch admission never touched
-them. The only GitPulse code that runs inside those sessions is the plugin's
+cores, under sessions Waylode only observes, so launch admission never touched
+them. The only Waylode code that runs inside those sessions is the plugin's
 `PreToolUse` `command-gate` hook, so the hook reads the app's published verdict
 (`PublishedVerdict`, above) and acts on it. It never samples the host and never
 re-derives a threshold: it refuses what the governor refuses to admit.
@@ -582,7 +582,7 @@ gate are combined, so the harness's 5 s budget expiring cannot drop it.
 | heavy | not admitted; sensor fresh or stale-recent | `enforce`: **deny** with a reason; `advise`: the same text as context |
 | heavy | elevated, admitted | one line of advice, with the capped form |
 | heavy | clear | nothing |
-| heavy | no verdict: sensor stale-old or dead, no snapshot, a record with no verdict (an older GitPulse), measurement switched off | one line: **not** load-checked, and why, said once per session per distinct reason (an exclusive `loadnote-<session>-<reason>` marker in the same private directory as the loop breaker's; the line says it will not repeat). With no session id, or a directory that cannot keep the marker, it is said every time, never dropped. Never a refusal |
+| heavy | no verdict: sensor stale-old or dead, no snapshot, a record with no verdict (an older Waylode), measurement switched off | one line: **not** load-checked, and why, said once per session per distinct reason (an exclusive `loadnote-<session>-<reason>` marker in the same private directory as the loop breaker's; the line says it will not repeat). With no session id, or a directory that cannot keep the marker, it is said every time, never dropped. Never a refusal |
 | heavy, but the line could not be read | | the same "not load-checked" line, once per session |
 | `grep -r` with `-z`/`-a`/`--null-data` or no `--exclude-dir`; `rg -uu`/`--no-ignore` with no `-g '!…'`; `go test ./...` or `-fuzz` with no `-timeout`; `python` with `train` or `bench` in its argv | elevated or severe | one line of advice. Never a refusal; silent on a quiet host |
 
@@ -713,7 +713,7 @@ build's own process exits. State is under `<config>/GitPulse/leases/`:
 - `paths/leasepath-<session>` and `leasemiss-*` markers (see below).
 
 Service order is `(priority, slots the session already holds, enqueue time,
-pid)`, with priority GitPulse terminal, then task run, then observed session.
+pid)`, with priority Waylode terminal, then task run, then observed session.
 A waiter takes a free slot only when its rank is below the number of free
 slots. The board reads the queue before the slots and a grant re-counts after
 it takes a file, releasing if it went over, so a race can only under-grant.
@@ -797,7 +797,7 @@ build's own children, and a proxy's child (rustup's `cargo`) are not counted.
 
 ### How a session reaches the wrapper
 
-- GitPulse terminal and task-run PTYs for an agent launcher get `lease-bin`
+- Waylode terminal and task-run PTYs for an agent launcher get `lease-bin`
   first on `PATH` and `GITPULSE_LEASE_BIN` (`sysload::lease::launch_env`), and
   only when the `cargo` and `go` links resolve to a file that answers as a
   lease wrapper.
@@ -841,7 +841,7 @@ makes it **not known**, never idle:
    Finished) for at least `host_load_idle.idle_after_s` (default 900);
 2. its whole process tree used under 5% of one core over the last tick (a
    first tick, or an unreadable member, is unknown);
-3. where GitPulse holds the PTY, the terminal has been quiet for the same time;
+3. where Waylode holds the PTY, the terminal has been quiet for the same time;
 4. it holds no build slot and is not queued.
 
 A PTY that is quiet is not enough, and neither is a low CPU reading: an agent
@@ -852,8 +852,8 @@ and sessions with no hook reports are always "not known".
 conversation so the existing reopen offer ("Resume") brings it back. It is not
 SIGSTOP. It is offered, and enforced by the backend, once a session has been
 idle for `host_load_idle.park_after_s` (default 3600). Only a terminal that
-GitPulse launched as that agent can be parked: a plain shell tab with `claude`
-typed into it carries a GitPulse session id too, and closing it would close the
+Waylode launched as that agent can be parked: a plain shell tab with `claude`
+typed into it carries a Waylode session id too, and closing it would close the
 shell, so it is refused, as is a terminal that hosts two agents. It is a click in Health, then a
 native system dialog that page script cannot answer, with the session checked
 again before the dialog and after it. The session's row is marked for the
@@ -865,14 +865,14 @@ for reopening, because neither the terminal's listing (which marks a session
 as ending before its first signal) nor the agent's process (alive through its
 hangup grace) tells that case from a slow close. It is **not reachable over MCP** and
 nothing is parked on its own. An observed session is never parked, and Codex
-cannot be resumed from GitPulse, so neither is offered.
+cannot be resumed from Waylode, so neither is offered.
 
 ### Owner action: the shim cutover
 
-GitPulse does not edit `~/.claude-bin/cargo`, `~/.zshenv` or any other file
+Waylode does not edit `~/.claude-bin/cargo`, `~/.zshenv` or any other file
 outside its own config. Until the owner puts `<config>/GitPulse/lease-bin`
 ahead of `~/.claude-bin` on `PATH` (or has the shim delegate to
-`gitpulse-hook lease -- cargo`), builds from a shell GitPulse did not start are
+`gitpulse-hook lease -- cargo`), builds from a shell Waylode did not start are
 gated by the shim's own slots and not by this. `bun run mcp:doctor` has a
 `lease:` row. It first runs the link's target with `--version`: a target that
 answers without `lease` is `stale` (it would exit 0 without building) and
@@ -885,7 +885,7 @@ is `unverifiable`, not ok.
 
 On this machine `~/.zshenv` re-prepends `~/.claude-bin` for every zsh, so the
 row honestly reports `shadowed` until the owner moves that line behind the
-lease folder (or `~/.zprofile` reorders it), or retires the shim. GitPulse does
+lease folder (or `~/.zprofile` reorders it), or retires the shim. Waylode does
 not edit either file. Until then a session is gated through the env-file line
 alone, and a build from a shell that line does not reach is not.
 
@@ -906,11 +906,11 @@ alone, and a build from a shell that line does not reach is not.
 ## Pressure relief (card 4)
 
 On 2026-11-24 the Mac hung for two hours on memory-compressor exhaustion and
-about eighteen agent sessions in GitPulse terminals were lost. The governor
-shed GitPulse's own work and refused new launches; nothing acted on the agent
+about eighteen agent sessions in Waylode terminals were lost. The governor
+shed Waylode's own work and refused new launches; nothing acted on the agent
 trees already running. The relief (`sysload::relief`) does, and it is the one
 card that touches an agent's processes. It kills nothing for its footprint, and
-memguard (above) stays the only thing that ends a process for it: **GitPulse
+memguard (above) stays the only thing that ends a process for it: **Waylode
 never kills a single process for its footprint.** The one thing it can end is a
 tree *it froze itself*, on a host that is still exhausted, when the person opted
 in or clicked End (rung C, below): that is card 4's row, not memguard's.
@@ -978,7 +978,7 @@ so their sessions are slowed and never frozen.
 ### Exemptions
 
 One predicate (`Scanner::throttle_exempt` in `procscan`) serves both rungs and
-the steward's slowdown: the session root, `memguard`, GitPulse's, Manvi's,
+the steward's slowdown: the session root, `memguard`, Waylode's, Manvi's,
 ptyd's and devmap's binaries, an IDE host's non-agent children, Manvi worker
 trees. Rung B adds, and **one exempt member spares the whole subtree**:
 
@@ -1039,7 +1039,7 @@ continue.
 ### Rung C: ending a paused tree (opt-in)
 
 Rung C acts on host exhaustion **plus a tree rung B froze**, which is card 4's
-row above; it is not memguard's footprint rule, and the line "GitPulse never
+row above; it is not memguard's footprint rule, and the line "Waylode never
 kills a single process for its footprint" stands: nothing is ended because of
 how big it is, only because the host is still failing ten minutes after the
 relief stopped it, and the person said so (the setting) or clicked **End**.
@@ -1084,7 +1084,7 @@ early if `SIGTERM` was enough, otherwise after the grace and `SIGKILL`, re-read
 read, or one somebody else stopped is recorded in `failures` ("was not confirmed
 ended"), never as ended; nothing at all signalled is a failure too. A person's
 **Resume** in the grace (the journal entries go) cancels it: it is neither killed
-nor ended. The setting leaving `act` or going off, or GitPulse stopping, abandons
+nor ended. The setting leaving `act` or going off, or Waylode stopping, abandons
 the pending kill. `ending` is optional with a default, like `ended`. `last_action`
 has kind `terminate`; the command-gate hook tells the agent whose build it was
 that it was "asked to end" while the status says `ending`, and "ended by memory
@@ -1100,7 +1100,7 @@ the file Unreadable (loud, not silent).
 
 ### Offers and the two request files
 
-Rung B never freezes an agent GitPulse did not launch (the Claude desktop app, a
+Rung B never freezes an agent Waylode did not launch (the Claude desktop app, a
 terminal started elsewhere: an *observed* session) or one in an untrusted
 repository. When it would have picked a tree there (the same screening, the same
 "worsening for 60 s" trigger), it publishes the tree as an **offer**:
@@ -1140,7 +1140,7 @@ function, and write the file off the notification delegate's thread. IPC:
 window only.
 
 Security impact: neither IPC sends a signal; each leaves one small file in
-GitPulse's own config directory. The files are *not* behind the IPC grant: any
+Waylode's own config directory. The files are *not* behind the IPC grant: any
 process of the same user, a paused agent included, can write them. They can only
 name what the supervisor itself published, and it acts only on a tree it holds
 (paused, for terminate; offered and observed, for pause), after the expiry, the
@@ -1167,9 +1167,9 @@ of its own, and a watchdog thread continues what is past the cap plus 60 s, or
 everything when the tick has not advanced for 60 s (a hung sampler, or one that
 lost the writer election with a freeze standing). The teardown waits at most 2 s
 for a tick that is mid-action, then continues from that copy and leaves the
-journal for the next start. A journal a *live* GitPulse wrote stays that
-GitPulse's, whatever its age: its own watchdog continues what it stopped, and a
-second GitPulse that guessed at the entries by age could continue a process the
+journal for the next start. A journal a *live* Waylode wrote stays that
+Waylode's, whatever its age: its own watchdog continues what it stopped, and a
+second Waylode that guessed at the entries by age could continue a process the
 user had paused.
 
 **Only what the relief stopped is the relief's to continue.** Immediately
@@ -1219,7 +1219,7 @@ could not start, that is a `failures` entry, not only a log line.
 
 ### Slowing has one owner
 
-Every priority change GitPulse makes to an agent's process goes through the
+Every priority change Waylode makes to an agent's process goes through the
 relief's ledger. The steward's slowdown (`slow_critical`, opt-in, needs Manvi)
 now delegates to it (`relief::steward_throttle`): it may slow what the relief
 has not, and it cannot put back what the relief slowed. Before this, a steward
@@ -1281,7 +1281,7 @@ request stays frozen. It is recorded as the last action. The resume request can
 only end a pause; the two newer requests (below, "Offers and the two request
 files") can start one or end a process, and are bounded there.
 
-Only the writer's relief acts, and a journal belongs to the GitPulse that wrote
+Only the writer's relief acts, and a journal belongs to the Waylode that wrote
 it: a process that lost the writer election and quits does not continue or
 restore what the writer's relief did (the steward's journal follows the same
 rule). Rung A runs at once when a slowing begins and then every fifth sample;
@@ -1343,7 +1343,7 @@ Health → **Host load** (machine-wide, under every repository's Health) shows:
 - the readings;
 - Claude and Codex sessions, launched and observed;
 - launched trees with footprint and write rate;
-- the five heaviest processes GitPulse did not start, with the 6 s lag note;
+- the five heaviest processes Waylode did not start, with the 6 s lag note;
 - the memguard line and its warnings;
 - orphans;
 - the governor: which classes are shed and why, whether launches are refused and for how long, **Admit anyway**, and "ungoverned" when the sensor is stale-old or dead;
@@ -1372,12 +1372,12 @@ leaves the switch on and costs no other setting.
 
 **Settings → Agents → Host load → "Refuse agent launches when the machine is
 overloaded"** (`host_load.govern_launches`, on by default, written only when
-off). Off still sheds GitPulse's own work under load but never refuses a
+off). Off still sheds Waylode's own work under load but never refuses a
 launch; it is what the 30-minute notice flips.
 
 **Settings → Agents → Host load inputs.** One row per input (swap, memory
 compressor, CPU load, heat, battery power, free disk space), each its own
-Settings search entry: a mode ("Off", "Slow GitPulse's background work", "Also
+Settings search entry: a mode ("Off", "Slow Waylode's background work", "Also
 refuse agent launches"), its two thresholds with units, the live reading beside
 it ("now 0.12x"), and a per-row reset. "Reset to defaults" in the Host load card
 resets them all. A value that fails validation is refused with the rule it

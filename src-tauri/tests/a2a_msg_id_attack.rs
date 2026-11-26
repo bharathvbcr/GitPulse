@@ -4,13 +4,13 @@
 
 mod common;
 
-use gitpulse_lib::engine::agent_bus::{
+use std::sync::Barrier;
+use tempfile::TempDir;
+use waylode_lib::engine::agent_bus::{
     ack_messages, post_peer_message, read_messages, read_messages_for_peer, AgentBusMessage,
     MessageOrigin, MAX_BUS_MESSAGES,
 };
-use gitpulse_lib::ipc_error::CommandError;
-use std::sync::Barrier;
-use tempfile::TempDir;
+use waylode_lib::ipc_error::CommandError;
 
 fn repo() -> TempDir {
     common::unmetered_spawns();

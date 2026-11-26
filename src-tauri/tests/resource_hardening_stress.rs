@@ -6,17 +6,17 @@
 //! and peak memory under concurrent worst-case reads, which is the number the
 //! whole exercise exists to hold down.
 
-use gitpulse_lib::engine::budget;
-use gitpulse_lib::engine::git_cli;
-use gitpulse_lib::engine::process;
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use waylode_lib::engine::budget;
+use waylode_lib::engine::git_cli;
+use waylode_lib::engine::process;
+use waylode_lib::engine::GitReader;
+use waylode_lib::procguard::LockedSpawn;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")

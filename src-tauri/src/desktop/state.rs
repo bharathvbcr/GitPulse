@@ -72,7 +72,7 @@ pub struct StatusCard {
 impl Default for StatusCard {
     fn default() -> Self {
         Self {
-            repository: "GitPulse".into(),
+            repository: "Waylode".into(),
             branch: String::new(),
             changed: None,
             staged: None,

@@ -199,7 +199,7 @@ describe("isSentenceCase", () => {
 
 describe("the exported lists", () => {
   it("name every proper noun the brief lists", () => {
-    for (const noun of ["GitPulse", "GitHub", "Manvi", "DevMap", "Git", "macOS", "Windows", "Linux", "Claude", "Codex", "Firebase", "Tauri", "MCP"]) {
+    for (const noun of ["Waylode", "GitPulse", "GitHub", "Manvi", "DevMap", "Git", "macOS", "Windows", "Linux", "Claude", "Codex", "Firebase", "Tauri", "MCP"]) {
       expect(PROPER_NOUNS).toContain(noun);
     }
   });

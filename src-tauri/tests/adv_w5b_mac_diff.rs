@@ -11,11 +11,11 @@
 
 mod common;
 
-use gitpulse_lib::hooks::signal_guard::{check_command, live_match_pids};
-use gitpulse_lib::hooks::PermissionDecision;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
+use waylode_lib::hooks::signal_guard::{check_command, live_match_pids};
+use waylode_lib::hooks::PermissionDecision;
+use waylode_lib::procguard::LockedSpawn;
 
 const LINES: &str = include_str!("fixtures/adv_w5b_lines.txt");
 const SHAPES: &str = include_str!("fixtures/adv_w5b_shapes.txt");

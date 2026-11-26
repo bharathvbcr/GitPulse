@@ -2,7 +2,7 @@
 
 Canonical guide: [CONTRIBUTING.md](https://github.com/bharathvbcr/GitPulse/blob/main/CONTRIBUTING.md). This page is the short path.
 
-**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and selected DevCouncil modules for code intelligence. Update them independently; this app does not require the whole suite. See [Module integration](https://github.com/bharathvbcr/GitPulse/blob/main/docs/MODULE_INTEGRATION.md).
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. Waylode uses Manvi for policy, workbench, and agent hosting, and selected DevCouncil modules for code intelligence. Update them independently; this app does not require the whole suite. See [Module integration](https://github.com/bharathvbcr/GitPulse/blob/main/docs/MODULE_INTEGRATION.md).
 
 ## Prerequisites
 
@@ -87,4 +87,4 @@ Security issues: do **not** file a public issue. See [[Security]].
 
 ## Recognition
 
-GitPulse follows [All Contributors](https://allcontributors.org/). Comment `@all-contributors please add @username for code, doc` on any issue or PR.
+Waylode follows [All Contributors](https://allcontributors.org/). Comment `@all-contributors please add @username for code, doc` on any issue or PR.

@@ -79,7 +79,7 @@ fn without_a_process_only_a_provably_gone_owner_releases() {
     let decide = |owner: Liveness| judge(&held, Some(false), no_child, move |_, _| owner.clone());
     assert!(matches!(decide(Liveness::Gone), Verdict::Release(_)));
     assert!(
-        matches!(decide(Liveness::Alive), Verdict::Keep(r) if r.contains("Another running GitPulse"))
+        matches!(decide(Liveness::Alive), Verdict::Keep(r) if r.contains("Another running Waylode"))
     );
     assert!(matches!(
         decide(Liveness::Unknown("denied".into())),

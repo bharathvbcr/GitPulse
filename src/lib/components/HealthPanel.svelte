@@ -1396,7 +1396,7 @@
         data-size="sm"
         bind:this={agentRunButton}
         aria-label={`Run ${agentActionLabel} in ${PROVIDER_LABELS[agentLauncher]}`}
-        title="Runs in GitPulse’s terminal with this repository as the working directory"
+        title="Runs in Waylode’s terminal with this repository as the working directory"
         disabled={!agentPrompt || agentLaunching}
         onclick={() => void runHealthAgent()}
       >
@@ -1487,7 +1487,7 @@
         </span>
       </summary>
       <p id="dependabot-permission-note" class="pt-2 leading-relaxed">
-        GitHub alerts are checked when GitPulse starts and when this repository
+        GitHub alerts are checked when Waylode starts and when this repository
         opens, unless turned off in Settings → Analysis. The check uses the GitHub CLI,
         its credentials, and the network to fetch Dependabot and code scanning alerts.
         Critical and high findings raise a warning.
@@ -1713,7 +1713,7 @@
         {/if}
         {#if !shownReport.npm_cli_present && shownReport.manifests.length > 0}
           <div role="status" class="gp-notice" data-tone="unknown">
-            <div class="min-w-0 flex-1">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</div>
+            <div class="min-w-0 flex-1">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. Waylode does not apply <span class="font-mono">npm audit fix</span>.</div>
           </div>
         {:else if visibleVulns.length === 0}
           {#if shownReport.audit.total !== 0}

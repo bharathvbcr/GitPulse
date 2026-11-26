@@ -281,7 +281,7 @@ fn pause_notice(status: &ReliefStatus, tree: &FrozenTree) -> Notice {
     };
     Notice {
         kind: NoticeKind::Paused,
-        heading: "GitPulse paused a build",
+        heading: "Waylode paused a build",
         body: format!(
             "`{}`{also} ({}) under the agent in {} was paused because {why}. \
              It resumes automatically when pressure eases, or after 10 minutes. \
@@ -303,7 +303,7 @@ fn pause_notice_terminating(status: &ReliefStatus, tree: &FrozenTree) -> Notice 
     );
     Notice {
         kind: NoticeKind::Paused,
-        heading: "GitPulse paused a build",
+        heading: "Waylode paused a build",
         body: format!(
             "`{}` ({}) under the agent in {} was paused because {why}. \
              It resumes when pressure eases; if it is still paused after 10 minutes it is \
@@ -325,7 +325,7 @@ fn offer_notice(tree: &FrozenTree) -> Notice {
             kind: NoticeKind::Advice,
             heading: "Memory is running out",
             body: format!(
-                "`{command}` ({}) under the agent in {repo} is using a lot of it. GitPulse \
+                "`{command}` ({}) under the agent in {repo} is using a lot of it. Waylode \
                  does not trust that repository, so it will not pause the build.",
                 gib(tree.footprint_bytes),
             ),
@@ -336,7 +336,7 @@ fn offer_notice(tree: &FrozenTree) -> Notice {
             heading: "Memory is running out",
             body: format!(
                 "Memory is running out. Pause `{command}` ({}) under the agent in {repo}? \
-                 GitPulse did not start that agent, so it asks first.",
+                 Waylode did not start that agent, so it asks first.",
                 gib(tree.footprint_bytes),
             ),
             target: Some(relief_status::TreeId::of(tree)),
@@ -348,7 +348,7 @@ fn cap_notice(detail: &str) -> Notice {
     let detail = clean(detail, 120);
     Notice {
         kind: NoticeKind::CapResumed,
-        heading: "GitPulse resumed a paused build",
+        heading: "Waylode resumed a paused build",
         body: if detail.is_empty() {
             "The 10-minute limit on a pause was reached, so it was resumed even though memory is still tight.".to_string()
         } else {
@@ -562,7 +562,7 @@ mod tests {
         assert!(severe.needs_glance());
         assert_eq!(
             severe.tooltip_lines(),
-            ["Host load is severe: swap in use is above GitPulse's limit for it"]
+            ["Host load is severe: swap in use is above Waylode's limit for it"]
         );
 
         let paused = HostPressure::of(
@@ -586,7 +586,7 @@ mod tests {
         let lines = disk.tooltip_lines();
         assert_eq!(
             lines,
-            ["Host load is severe: free disk space is below GitPulse's floor"]
+            ["Host load is severe: free disk space is below Waylode's floor"]
         );
         assert!(!lines[0].to_lowercase().contains("memory"));
         // A severe verdict naming nothing still says only what is known.

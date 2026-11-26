@@ -483,7 +483,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_active_changes": {
+  "waylode_active_changes": {
     "additionalProperties": false,
     "properties": {
       "limit": {
@@ -510,7 +510,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_add_task": {
+  "waylode_add_task": {
     "additionalProperties": false,
     "properties": {
       "acceptance_criteria": {
@@ -534,7 +534,7 @@
         "type": "string"
       },
       "expected_revision": {
-        "description": "With overwrite: true, only replace the task if it is still at this revision (from gitpulse_get_task or gitpulse_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
+        "description": "With overwrite: true, only replace the task if it is still at this revision (from waylode_get_task or waylode_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
         "maximum": 9007199254740991,
         "minimum": 1,
         "type": "integer"
@@ -570,7 +570,7 @@
         "type": "string"
       },
       "parent_task_id": {
-        "description": "File this task as a subtask of an existing task in this repository: its task_id, or an item_id from gitpulse_list_tasks. A task has at most one parent, the parent must be live, a cycle is refused, and the chain may be only so deep. The parent you name is not held back as 'related work'",
+        "description": "File this task as a subtask of an existing task in this repository: its task_id, or an item_id from waylode_list_tasks. A task has at most one parent, the parent must be live, a cycle is refused, and the chain may be only so deep. The parent you name is not held back as 'related work'",
         "maxLength": 128,
         "minLength": 1,
         "type": "string"
@@ -666,7 +666,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_agent_inbox": {
+  "waylode_agent_inbox": {
     "additionalProperties": false,
     "properties": {
       "ack": {
@@ -726,7 +726,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_agent_peers": {
+  "waylode_agent_peers": {
     "additionalProperties": false,
     "properties": {
       "include_exited": {
@@ -756,7 +756,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_agent_register": {
+  "waylode_agent_register": {
     "additionalProperties": false,
     "properties": {
       "branch": {
@@ -862,7 +862,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_agent_send": {
+  "waylode_agent_send": {
     "additionalProperties": false,
     "properties": {
       "body": {
@@ -934,7 +934,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_agent_wait": {
+  "waylode_agent_wait": {
     "additionalProperties": false,
     "properties": {
       "ack": {
@@ -1000,7 +1000,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_browser_open": {
+  "waylode_browser_open": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -1022,7 +1022,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_campaign_audit": {
+  "waylode_campaign_audit": {
     "additionalProperties": false,
     "properties": {
       "limit": {
@@ -1049,7 +1049,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_change_context": {
+  "waylode_change_context": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -1070,7 +1070,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_codeintel_dead_symbols": {
+  "waylode_codeintel_dead_symbols": {
     "additionalProperties": false,
     "properties": {
       "budget": {
@@ -1091,7 +1091,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_codeintel_dependencies": {
+  "waylode_codeintel_dependencies": {
     "additionalProperties": false,
     "properties": {
       "budget": {
@@ -1119,7 +1119,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_codeintel_impact": {
+  "waylode_codeintel_impact": {
     "additionalProperties": false,
     "properties": {
       "budget": {
@@ -1147,7 +1147,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_codeintel_search": {
+  "waylode_codeintel_search": {
     "additionalProperties": false,
     "properties": {
       "budget": {
@@ -1175,7 +1175,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_codeintel_suspects": {
+  "waylode_codeintel_suspects": {
     "additionalProperties": false,
     "properties": {
       "depth": {
@@ -1210,7 +1210,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_codeintel_trace": {
+  "waylode_codeintel_trace": {
     "additionalProperties": false,
     "properties": {
       "budget": {
@@ -1245,7 +1245,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_collision_risk": {
+  "waylode_collision_risk": {
     "additionalProperties": false,
     "properties": {
       "path": {
@@ -1266,11 +1266,11 @@
     ],
     "type": "object"
   },
-  "gitpulse_complete_task": {
+  "waylode_complete_task": {
     "additionalProperties": false,
     "properties": {
       "expected_revision": {
-        "description": "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
+        "description": "Only move it if the task is still at this revision (from your brief or waylode_get_task); otherwise it is refused so you can re-read it",
         "maximum": 9007199254740991,
         "minimum": 1,
         "type": "integer"
@@ -1316,7 +1316,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_delete_task": {
+  "waylode_delete_task": {
     "additionalProperties": false,
     "properties": {
       "even_if_running": {
@@ -1324,7 +1324,7 @@
         "type": "boolean"
       },
       "expected_revision": {
-        "description": "Only delete it if the task is still at this revision (from gitpulse_list_tasks or gitpulse_get_task); otherwise it is refused so you can re-read it",
+        "description": "Only delete it if the task is still at this revision (from waylode_list_tasks or waylode_get_task); otherwise it is refused so you can re-read it",
         "maximum": 9007199254740991,
         "minimum": 1,
         "type": "integer"
@@ -1348,7 +1348,7 @@
         "type": "string"
       },
       "task_id": {
-        "description": "The task_id it was filed with, or its board item_id from gitpulse_list_tasks",
+        "description": "The task_id it was filed with, or its board item_id from waylode_list_tasks",
         "maxLength": 128,
         "minLength": 1,
         "type": "string"
@@ -1361,7 +1361,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_get_task": {
+  "waylode_get_task": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -1383,7 +1383,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_import_tasks": {
+  "waylode_import_tasks": {
     "additionalProperties": false,
     "properties": {
       "replace": {
@@ -1408,7 +1408,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_inbox_post": {
+  "waylode_inbox_post": {
     "additionalProperties": false,
     "properties": {
       "body": {
@@ -1468,7 +1468,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_inbox_read": {
+  "waylode_inbox_read": {
     "additionalProperties": false,
     "properties": {
       "agent_id": {
@@ -1507,7 +1507,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_inbox_withdraw": {
+  "waylode_inbox_withdraw": {
     "additionalProperties": false,
     "properties": {
       "from_agent": {
@@ -1543,7 +1543,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_insights": {
+  "waylode_insights": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -1558,7 +1558,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_kickoff_agent": {
+  "waylode_kickoff_agent": {
     "additionalProperties": false,
     "properties": {
       "branch": {
@@ -1643,7 +1643,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_landed": {
+  "waylode_landed": {
     "additionalProperties": false,
     "properties": {
       "base": {
@@ -1671,7 +1671,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_ledger_events": {
+  "waylode_ledger_events": {
     "additionalProperties": false,
     "properties": {
       "action": {
@@ -1749,7 +1749,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_list_tasks": {
+  "waylode_list_tasks": {
     "additionalProperties": false,
     "properties": {
       "archived": {
@@ -1792,7 +1792,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_merge_conflicts": {
+  "waylode_merge_conflicts": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -1807,7 +1807,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_merge_tasks": {
+  "waylode_merge_tasks": {
     "additionalProperties": false,
     "properties": {
       "even_if_running": {
@@ -1874,7 +1874,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_provenance": {
+  "waylode_provenance": {
     "additionalProperties": false,
     "properties": {
       "base_branch": {
@@ -1902,7 +1902,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_sessions": {
+  "waylode_sessions": {
     "additionalProperties": false,
     "properties": {
       "limit": {
@@ -1923,7 +1923,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_status": {
+  "waylode_status": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -1938,7 +1938,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_task_view": {
+  "waylode_task_view": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -1959,7 +1959,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_close": {
+  "waylode_terminal_close": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
@@ -1993,7 +1993,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_exec": {
+  "waylode_terminal_exec": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
@@ -2059,7 +2059,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_list": {
+  "waylode_terminal_list": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
@@ -2086,7 +2086,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_open_file": {
+  "waylode_terminal_open_file": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
@@ -2132,7 +2132,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_read": {
+  "waylode_terminal_read": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
@@ -2180,7 +2180,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_send": {
+  "waylode_terminal_send": {
     "additionalProperties": false,
     "properties": {
       "append_newline": {
@@ -2225,7 +2225,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_spawn": {
+  "waylode_terminal_spawn": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
@@ -2329,7 +2329,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_wait": {
+  "waylode_terminal_wait": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
@@ -2385,7 +2385,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_turn_checkpoints": {
+  "waylode_turn_checkpoints": {
     "additionalProperties": false,
     "properties": {
       "against": {
@@ -2418,7 +2418,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_claim": {
+  "waylode_worktree_claim": {
     "additionalProperties": false,
     "properties": {
       "agent_id": {
@@ -2480,7 +2480,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_create": {
+  "waylode_worktree_create": {
     "additionalProperties": false,
     "properties": {
       "base": {
@@ -2540,7 +2540,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_inbox": {
+  "waylode_worktree_inbox": {
     "additionalProperties": false,
     "properties": {
       "agent_id": {
@@ -2579,7 +2579,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_isolate": {
+  "waylode_worktree_isolate": {
     "additionalProperties": false,
     "properties": {
       "cache_directories": {
@@ -2614,7 +2614,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_merge": {
+  "waylode_worktree_merge": {
     "additionalProperties": false,
     "properties": {
       "commit_message": {
@@ -2656,7 +2656,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_overlay_sync": {
+  "waylode_worktree_overlay_sync": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -2677,7 +2677,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_prune": {
+  "waylode_worktree_prune": {
     "additionalProperties": false,
     "properties": {
       "branch": {
@@ -2710,7 +2710,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_radar": {
+  "waylode_worktree_radar": {
     "additionalProperties": false,
     "properties": {
       "repo_path": {
@@ -2725,7 +2725,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_release": {
+  "waylode_worktree_release": {
     "additionalProperties": false,
     "properties": {
       "agent_id": {
@@ -2747,7 +2747,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_send_message": {
+  "waylode_worktree_send_message": {
     "additionalProperties": false,
     "properties": {
       "body": {
@@ -2800,7 +2800,7 @@
     ],
     "type": "object"
   },
-  "gitpulse_worktree_switch": {
+  "waylode_worktree_switch": {
     "additionalProperties": false,
     "properties": {
       "base": {

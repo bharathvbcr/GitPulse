@@ -1,6 +1,6 @@
-# GitPulse documentation
+# Waylode documentation
 
-GitPulse brings Git, code exploration, tasks, and repository insights into one
+Waylode brings Git, code exploration, tasks, and repository insights into one
 local-first desktop workspace with 11 specialized sections across 5 views. This is the index for maintained documentation.
 
 [Download the 0.2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1) ·
@@ -14,10 +14,10 @@ local-first desktop workspace with 11 specialized sections across 5 views. This 
 | Install the app or update it | [Installation](INSTALLATION.md) |
 | Open a repository and review my first change | [Getting started](GETTING_STARTED.md) |
 | Understand the walkthrough or OS permissions | [Onboarding and permissions](ONBOARDING.md) |
-| See what GitPulse does, by area | [Features](FEATURES.md) |
+| See what Waylode does, by area | [Features](FEATURES.md) |
 | Look up a view or section in detail | [View reference](VIEW_REFERENCE.md) |
 | Run agents on a task board, with guards and collision warnings | [Agents guide](AGENTS_GUIDE.md) |
-| Compare GitPulse with other tools | [Why GitPulse](WHY_GITPULSE.md) |
+| Compare Waylode with other tools | [Why Waylode](WHY_WAYLODE.md) |
 | Find a command or keyboard shortcut | [Command palette](COMMAND_PALETTE.md) · [Keyboard shortcuts](../wiki/Keyboard%20Shortcuts.md) |
 | Explore topics, tags and SEO | [Topics and SEO](../README.md#topics-tags--discoverability) |
 
@@ -41,7 +41,7 @@ local-first desktop workspace with 11 specialized sections across 5 views. This 
   network boundaries, MCP access, and vulnerability reporting.
 - [MCP and agents](../wiki/MCP%20and%20Agents.md): installation, compatible hosts,
   repository context, and the read-only plus trust-gated MCP surface.
-- [Module integration](MODULE_INTEGRATION.md): GitPulse as host, Manvi as wrapper,
+- [Module integration](MODULE_INTEGRATION.md): Waylode as host, Manvi as wrapper,
   and DevCouncil as independently updatable components.
 - [Policy and AI](../wiki/Policy%20and%20AI.md): policy outcomes and the distinction
   between local assistance and explicitly launched agent sessions.

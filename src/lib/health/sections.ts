@@ -128,7 +128,7 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
     id: "terminal-incidents",
     label: "Terminal incidents",
     heading: "Terminal incidents",
-    summary: "Terminal sessions that were killed together from outside GitPulse, and who sent the signal.",
+    summary: "Terminal sessions that were killed together from outside Waylode, and who sent the signal.",
   },
   {
     id: "host-load",

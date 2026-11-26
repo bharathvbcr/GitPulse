@@ -1664,57 +1664,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitpulse"
-version = "0.2.0-beta.1"
-dependencies = [
- "async-channel",
- "base64 0.23.1",
- "block2",
- "dc-glob",
- "dc-redact",
- "dc-regress",
- "dc-regress-store",
- "dc-store",
- "devmap-extract",
- "devmap-query",
- "devmap-resolve",
- "devmap-store",
- "getrandom 0.4.3",
- "gix",
- "gtk",
- "libc",
- "log",
- "markdev-highlight",
- "markdev-html",
- "markdev-vault",
- "notify",
- "objc2",
- "objc2-foundation",
- "objc2-user-notifications",
- "portable-pty",
- "proptest",
- "rayon",
- "regex",
- "rfd",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tao",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-opener",
- "tauri-plugin-single-instance",
- "tempfile",
- "tokio",
- "tree-sitter",
- "tree-sitter-javascript",
- "vt100",
- "wry",
-]
-
-[[package]]
 name = "gix"
 version = "0.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6210,6 +6159,57 @@ dependencies = [
  "dlib",
  "log",
  "pkg-config",
+]
+
+[[package]]
+name = "waylode"
+version = "0.2.0-beta.1"
+dependencies = [
+ "async-channel",
+ "base64 0.23.1",
+ "block2",
+ "dc-glob",
+ "dc-redact",
+ "dc-regress",
+ "dc-regress-store",
+ "dc-store",
+ "devmap-extract",
+ "devmap-query",
+ "devmap-resolve",
+ "devmap-store",
+ "getrandom 0.4.3",
+ "gix",
+ "gtk",
+ "libc",
+ "log",
+ "markdev-highlight",
+ "markdev-html",
+ "markdev-vault",
+ "notify",
+ "objc2",
+ "objc2-foundation",
+ "objc2-user-notifications",
+ "portable-pty",
+ "proptest",
+ "rayon",
+ "regex",
+ "rfd",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tao",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "tokio",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "vt100",
+ "wry",
 ]
 
 [[package]]

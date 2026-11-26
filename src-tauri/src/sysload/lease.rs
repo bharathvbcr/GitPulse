@@ -505,12 +505,12 @@ const HOOK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 pub fn identity_serves_lease(stdout: &str) -> Result<(), String> {
     let mut lines = stdout.lines().map(str::trim);
     let first = lines.next().unwrap_or("");
-    if !first.starts_with("gitpulse-hook ") {
+    if !first.starts_with("waylode-hook ") && !first.starts_with("gitpulse-hook ") {
         let shown: String = first.chars().take(80).collect();
         return Err(if shown.is_empty() {
-            "it printed no identity for --version (a gitpulse-hook older than its --version flag answers any argument it does not know by exiting 0 and doing nothing)".into()
+            "it printed no identity for --version (a waylode-hook older than its --version flag answers any argument it does not know by exiting 0 and doing nothing)".into()
         } else {
-            format!("its --version answer is not a gitpulse-hook identity: {shown:?}")
+            format!("its --version answer is not a waylode-hook identity: {shown:?}")
         });
     }
     let served = lines
@@ -670,7 +670,7 @@ fn link_state(link: &Path, want: Option<&Path>) -> LinkState {
     }
     if want.is_some_and(|want| want != target) {
         return LinkState::Broken(format!(
-            "{} points at {}, not at this GitPulse's gitpulse-hook",
+            "{} points at {}, not at this Waylode's waylode-hook",
             link.display(),
             target.display()
         ));
@@ -736,9 +736,19 @@ pub fn launch_env(
     match (usable, bin) {
         (true, Some(bin)) => vec![
             ("PATH", Some(path_with_bin_first(&bin, existing_path))),
-            ("GITPULSE_LEASE_BIN", Some(bin.into_os_string())),
+            (
+                crate::hooks::lease_wrapper::BIN_ENV,
+                Some(bin.clone().into_os_string()),
+            ),
+            (
+                crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
+                Some(bin.into_os_string()),
+            ),
         ],
-        _ => vec![("GITPULSE_LEASE_BIN", None)],
+        _ => vec![
+            (crate::hooks::lease_wrapper::BIN_ENV, None),
+            (crate::hooks::lease_wrapper::LEGACY_BIN_ENV, None),
+        ],
     }
 }
 

@@ -266,13 +266,13 @@
         {/each}
       {/each}
       {#if knownCount === 0}
-        <p class="repo-empty">No repositories are registered yet. Open one in GitPulse, then link it here.</p>
+        <p class="repo-empty">No repositories are registered yet. Open one in Waylode, then link it here.</p>
       {:else if rows.length === 0}
         <p class="repo-empty">No repository matches this filter.</p>
       {/if}
     </div>
     {#if addable.length}
-      <small>Open in GitPulse</small>
+      <small>Open in Waylode</small>
       {#each addable as openTab (openTab.path)}
         <label class="check" title={openTab.path}>
           <Checkbox ariaLabel={`Add ${openTab.label}`} checked={false} disabled={adding} onchange={() => onAddPaths([openTab.path])} />

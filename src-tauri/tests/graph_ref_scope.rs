@@ -13,18 +13,18 @@
 //! graph width (440px, ~14 lanes) 21 of those rows drew their node off-canvas
 //! and appeared to have no node at all.
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
 
 use std::process::Command;
 
-use gitpulse_lib::analyzer::CommitFilter;
-use gitpulse_lib::commands::{assemble_commit_graph, GraphNotes};
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::graph::{
+use tempfile::TempDir;
+use waylode_lib::analyzer::CommitFilter;
+use waylode_lib::commands::{assemble_commit_graph, GraphNotes};
+use waylode_lib::engine::GitReader;
+use waylode_lib::graph::{
     hidden_ref_warning, list_ref_decorations, probe_hidden_history, RefKind, RefScope,
 };
-use tempfile::TempDir;
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     common::unmetered_spawns();
@@ -102,7 +102,7 @@ fn repo_with_harness_refs(checkpoints: usize) -> (TempDir, String) {
     (dir, repo)
 }
 
-fn solve(repo: &str, scope: RefScope) -> gitpulse_lib::commands::CommitGraphPayload {
+fn solve(repo: &str, scope: RefScope) -> waylode_lib::commands::CommitGraphPayload {
     let commits =
         GitReader::read_commit_history_paged(repo, 0, 500, None, None, scope).expect("history");
     let refs = list_ref_decorations(repo, scope).expect("refs").decorations;
@@ -118,7 +118,7 @@ fn solve(repo: &str, scope: RefScope) -> gitpulse_lib::commands::CommitGraphPayl
     )
 }
 
-fn width(payload: &gitpulse_lib::commands::CommitGraphPayload) -> u32 {
+fn width(payload: &waylode_lib::commands::CommitGraphPayload) -> u32 {
     payload.rows.iter().map(|r| r.lane).max().unwrap_or(0) + 1
 }
 
@@ -165,7 +165,7 @@ fn every_scope_labels_every_ref_it_walks() {
         // ref points at carries that ref's label.
         let tips = Command::new("git")
             .args(["rev-list", "--no-walk"])
-            .args(gitpulse_lib::graph::history_rev_args(scope))
+            .args(waylode_lib::graph::history_rev_args(scope))
             .current_dir(&repo)
             .output_locked()
             .expect("rev-list tips");

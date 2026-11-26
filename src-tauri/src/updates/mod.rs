@@ -381,7 +381,7 @@ const MAX_RELEASE_PROBES: usize = 5;
 /// draft is published, so it is public exactly when users can install the
 /// release. A test pins this format to that script.
 pub fn release_marker_asset(version: Version) -> String {
-    format!("GitPulse_{version}_SHA256SUMS.txt")
+    format!("Waylode_{version}_SHA256SUMS.txt")
 }
 
 /// Whether the release for `tag` is published: its checksum asset answers an
@@ -1177,7 +1177,7 @@ mod tests {
         )
         .expect("read check-release-assets.mjs");
         assert!(
-            script.contains("checksums: `GitPulse_${version}_SHA256SUMS.txt`"),
+            script.contains("checksums: `Waylode_${version}_SHA256SUMS.txt`"),
             "scripts/check-release-assets.mjs no longer names the checksum asset this way"
         );
         assert_eq!(
@@ -1187,7 +1187,7 @@ mod tests {
                 patch: 0,
                 beta: None,
             }),
-            "GitPulse_1.4.0_SHA256SUMS.txt"
+            "Waylode_1.4.0_SHA256SUMS.txt"
         );
     }
 
@@ -1675,7 +1675,7 @@ mod tests {
         // never be confirmed.
         assert_eq!(
             release_marker_asset(beta(0, 2, 0, 1)),
-            "GitPulse_0.2.0-beta.1_SHA256SUMS.txt"
+            "Waylode_0.2.0-beta.1_SHA256SUMS.txt"
         );
     }
 
@@ -1735,7 +1735,7 @@ mod tests {
         });
         assert!(result.update_available, "{result:?}");
         assert_eq!(result.latest_version, "0.2.0-beta.2");
-        assert_eq!(*asked.borrow(), ["GitPulse_0.2.0-beta.2_SHA256SUMS.txt"]);
+        assert_eq!(*asked.borrow(), ["Waylode_0.2.0-beta.2_SHA256SUMS.txt"]);
     }
 
     #[test]

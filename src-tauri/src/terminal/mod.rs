@@ -92,9 +92,11 @@ pub const DEFAULT_PTY_SESSIONS: usize = 32;
 pub const MAX_PTY_SESSIONS: usize = 128;
 const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
 /// Canonical terminal session identifier alias exported alongside
-/// `GITPULSE_SESSION_ID` (`crate::alerts::bridge::SESSION_ENV`) so agent skills
+/// `WAYLODE_SESSION_ID` (`crate::alerts::bridge::SESSION_ENV`) so agent skills
 /// and hooks can read either name without ambiguity.
-pub const TERMINAL_SESSION_ENV: &str = "GITPULSE_TERMINAL_SESSION";
+pub const TERMINAL_SESSION_ENV: &str = "WAYLODE_TERMINAL_SESSION";
+/// Legacy environment variable for [`TERMINAL_SESSION_ENV`].
+pub const LEGACY_TERMINAL_SESSION_ENV: &str = "GITPULSE_TERMINAL_SESSION";
 /// Writes that may wait behind the one being delivered to a session. The
 /// frontend sends one at a time and waits for each, so this is headroom for a
 /// burst of IPC calls, not a working depth; past it a write is refused at once.
@@ -1805,28 +1807,42 @@ fn build_pty_command(
         cmd.env("PATH", path);
     }
     // Strip parent Claude Code recursion markers and any inherited session
-    // capability token on every PTY session before caller `env` overrides are
-    // applied, so a GitPulse or gitpulse-ptyd started inside an existing agent
-    // shell never leaks a parent token or triggers a nested-session error.
+    // capability token, session id, notify socket, or lease marker (both
+    // `WAYLODE_*` and legacy `GITPULSE_*`) on every PTY session before caller
+    // `env` overrides are applied, so a Waylode or waylode-ptyd started
+    // inside an existing agent shell never leaks a parent token or triggers a
+    // nested-session error.
+    const SCRUB_ENV_KEYS: [&str; 18] = [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        orchestrate::SESSION_TOKEN_ENV,
+        orchestrate::LEGACY_SESSION_TOKEN_ENV,
+        crate::alerts::bridge::SESSION_ENV,
+        crate::alerts::bridge::LEGACY_SESSION_ENV,
+        TERMINAL_SESSION_ENV,
+        LEGACY_TERMINAL_SESSION_ENV,
+        crate::alerts::bridge::SOCKET_ENV,
+        crate::alerts::bridge::LEGACY_SOCKET_ENV,
+        crate::hooks::lease_wrapper::BIN_ENV,
+        crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
+        crate::hooks::lease_wrapper::HELD_ENV,
+        crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
+        crate::sysload::RUN_ID_ENV,
+        crate::sysload::LEGACY_RUN_ID_ENV,
+        crate::hooks::AGENT_KIND_ENV,
+        crate::hooks::LEGACY_AGENT_KIND_ENV,
+    ];
     let inherited_scrub_vars: Vec<String> = cmd
         .iter_full_env_as_str()
-        .filter(|(k, _)| {
-            k.eq_ignore_ascii_case("CLAUDECODE")
-                || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
-                || k.eq_ignore_ascii_case(orchestrate::SESSION_TOKEN_ENV)
-                || k.eq_ignore_ascii_case(crate::alerts::bridge::SESSION_ENV)
-                || k.eq_ignore_ascii_case(TERMINAL_SESSION_ENV)
-        })
+        .filter(|(k, _)| SCRUB_ENV_KEYS.iter().any(|s| k.eq_ignore_ascii_case(s)))
         .map(|(k, _)| k.to_owned())
         .collect();
     for key in inherited_scrub_vars {
         cmd.env_remove(key);
     }
-    cmd.env_remove("CLAUDECODE");
-    cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
-    cmd.env_remove(orchestrate::SESSION_TOKEN_ENV);
-    cmd.env_remove(crate::alerts::bridge::SESSION_ENV);
-    cmd.env_remove(TERMINAL_SESSION_ENV);
+    for key in SCRUB_ENV_KEYS {
+        cmd.env_remove(key);
+    }
     for (key, value) in env.into_iter().flatten() {
         cmd.env(key, value);
     }
@@ -3644,8 +3660,15 @@ pub(crate) fn spawn_at_with_hints(
     let token = orchestrate::mint_session_token()?;
     let token_hash_hex = orchestrate::token_hash_hex(&token)?;
     let mut env_with_token = env.unwrap_or_default();
-    env_with_token.retain(|k, _| !k.eq_ignore_ascii_case(orchestrate::SESSION_TOKEN_ENV));
+    env_with_token.retain(|k, _| {
+        !k.eq_ignore_ascii_case(orchestrate::SESSION_TOKEN_ENV)
+            && !k.eq_ignore_ascii_case(orchestrate::LEGACY_SESSION_TOKEN_ENV)
+    });
     env_with_token.insert(orchestrate::SESSION_TOKEN_ENV.to_owned(), token.clone());
+    env_with_token.insert(
+        orchestrate::LEGACY_SESSION_TOKEN_ENV.to_owned(),
+        token.clone(),
+    );
     let env = Some(env_with_token);
 
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
@@ -3903,19 +3926,33 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     // these two name *this* process's socket and *this* PTY, and an IPC caller
     // supplying its own values would be pointing hooks at neither.
     cmd.env(crate::alerts::bridge::SESSION_ENV, &session_id);
+    cmd.env(crate::alerts::bridge::LEGACY_SESSION_ENV, &session_id);
     cmd.env(TERMINAL_SESSION_ENV, &session_id);
+    cmd.env(LEGACY_TERMINAL_SESSION_ENV, &session_id);
     // Which agent this is, decided here where the launcher is known rather
     // than guessed from a hook payload that names only the host.
     match launcher_kind(&resolved) {
-        Some(kind) => cmd.env(crate::hooks::AGENT_KIND_ENV, kind),
-        None => cmd.env_remove(crate::hooks::AGENT_KIND_ENV),
+        Some(kind) => {
+            cmd.env(crate::hooks::AGENT_KIND_ENV, kind);
+            cmd.env(crate::hooks::LEGACY_AGENT_KIND_ENV, kind);
+        }
+        None => {
+            cmd.env_remove(crate::hooks::AGENT_KIND_ENV);
+            cmd.env_remove(crate::hooks::LEGACY_AGENT_KIND_ENV);
+        }
     }
     match crate::alerts::bridge::socket_path() {
-        Some(path) => cmd.env(crate::alerts::bridge::SOCKET_ENV, path),
+        Some(path) => {
+            cmd.env(crate::alerts::bridge::SOCKET_ENV, &path);
+            cmd.env(crate::alerts::bridge::LEGACY_SOCKET_ENV, path);
+        }
         // Nothing to point at. Removing it matters: a stale value inherited
-        // from a parent GitPulse would send this session's hooks to a socket
+        // from a parent Waylode would send this session's hooks to a socket
         // that is not ours.
-        None => cmd.env_remove(crate::alerts::bridge::SOCKET_ENV),
+        None => {
+            cmd.env_remove(crate::alerts::bridge::SOCKET_ENV);
+            cmd.env_remove(crate::alerts::bridge::LEGACY_SOCKET_ENV);
+        }
     }
     // The launch table's environment (the task run id), after the caller's
     // map for the same reason as the two above: it names this launch, and an
@@ -6047,7 +6084,7 @@ fn validate_venv_interpreter(
 ) -> Result<(), String> {
     check_venv_interpreter(repo, relative).map_err(|detail| {
         format!(
-            "MANVI {} action refused: virtualenv interpreter '{relative}' {detail}; GitPulse will not execute it",
+            "MANVI {} action refused: virtualenv interpreter '{relative}' {detail}; Waylode will not execute it",
             kind.label()
         )
     })
@@ -9075,7 +9112,7 @@ mod tests {
                     "--lcov".into(),
                     NATIVE_COVERAGE_LCOV.into(),
                 ],
-                "the host interpreter is never the one GitPulse runs modules in",
+                "the host interpreter is never the one Waylode runs modules in",
             ),
             (
                 vec![
@@ -11400,25 +11437,59 @@ mod tests {
     #[test]
     fn build_pty_command_prepends_helper_bin_dir_and_scrubs_inherited_session_ids() {
         let home = tempfile::tempdir().unwrap();
-        let helper_dir = home.path().join("GitPulse.app/Contents/MacOS");
+        let helper_dir = home.path().join("Waylode.app/Contents/MacOS");
         std::fs::create_dir_all(&helper_dir).unwrap();
         let mut env = gui_launch_env(home.path());
         env.helper_bin_dir = Some(helper_dir.clone());
-        env.vars.insert(
-            crate::alerts::bridge::SESSION_ENV.to_string(),
-            "term-999-stale".to_string(),
-        );
-        env.vars.insert(
-            TERMINAL_SESSION_ENV.to_string(),
-            "term-999-stale".to_string(),
-        );
+        for key in [
+            orchestrate::SESSION_TOKEN_ENV,
+            orchestrate::LEGACY_SESSION_TOKEN_ENV,
+            crate::alerts::bridge::SESSION_ENV,
+            crate::alerts::bridge::LEGACY_SESSION_ENV,
+            TERMINAL_SESSION_ENV,
+            LEGACY_TERMINAL_SESSION_ENV,
+            crate::alerts::bridge::SOCKET_ENV,
+            crate::alerts::bridge::LEGACY_SOCKET_ENV,
+            crate::hooks::lease_wrapper::BIN_ENV,
+            crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
+            crate::hooks::lease_wrapper::HELD_ENV,
+            crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
+            crate::sysload::RUN_ID_ENV,
+            crate::sysload::LEGACY_RUN_ID_ENV,
+            crate::hooks::AGENT_KIND_ENV,
+            crate::hooks::LEGACY_AGENT_KIND_ENV,
+        ] {
+            env.vars
+                .insert(key.to_string(), "stale-parent-val".to_string());
+        }
 
         let cmd = build_pty_command("/bin/zsh", true, None, None, home.path(), &env).cmd;
         let path_val = env_of(&cmd, "PATH").expect("PATH set");
         let entries: Vec<std::path::PathBuf> = std::env::split_paths(&path_val).collect();
         assert_eq!(entries.first(), Some(&helper_dir));
-        assert!(env_of(&cmd, crate::alerts::bridge::SESSION_ENV).is_none());
-        assert!(env_of(&cmd, TERMINAL_SESSION_ENV).is_none());
+        for key in [
+            orchestrate::SESSION_TOKEN_ENV,
+            orchestrate::LEGACY_SESSION_TOKEN_ENV,
+            crate::alerts::bridge::SESSION_ENV,
+            crate::alerts::bridge::LEGACY_SESSION_ENV,
+            TERMINAL_SESSION_ENV,
+            LEGACY_TERMINAL_SESSION_ENV,
+            crate::alerts::bridge::SOCKET_ENV,
+            crate::alerts::bridge::LEGACY_SOCKET_ENV,
+            crate::hooks::lease_wrapper::BIN_ENV,
+            crate::hooks::lease_wrapper::LEGACY_BIN_ENV,
+            crate::hooks::lease_wrapper::HELD_ENV,
+            crate::hooks::lease_wrapper::LEGACY_HELD_ENV,
+            crate::sysload::RUN_ID_ENV,
+            crate::sysload::LEGACY_RUN_ID_ENV,
+            crate::hooks::AGENT_KIND_ENV,
+            crate::hooks::LEGACY_AGENT_KIND_ENV,
+        ] {
+            assert!(
+                env_of(&cmd, key).is_none(),
+                "{key} leaked from inherited environment"
+            );
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

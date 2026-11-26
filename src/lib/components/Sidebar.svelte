@@ -269,7 +269,7 @@
     const base = ($repoStore.currentPath ?? "").replace(/[\\/]+$/, "");
     const sep = base.includes("\\") ? "\\" : "/";
     const fullPath = base ? `${base}${sep}${relPath}` : relPath;
-    event.dataTransfer?.setData("application/x-gitpulse-filepath", fullPath);
+    event.dataTransfer?.setData("application/x-waylode-filepath", fullPath);
     event.dataTransfer?.setData("text/plain", relPath);
     if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
     const seq = ++activeFileDragSeq;

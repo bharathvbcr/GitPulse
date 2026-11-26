@@ -489,7 +489,7 @@
           {#if panelModel.storage.available}
             <span
               class="text-micro text-faint"
-              title={`Measures immediate unallocated space available to GitPulse; ${fileManagerName($hostPlatform.os)} may report more by counting purgeable caches.`}
+              title={`Measures immediate unallocated space available to Waylode; ${fileManagerName($hostPlatform.os)} may report more by counting purgeable caches.`}
             >
               Immediate unallocated space (excludes purgeable caches).
             </span>

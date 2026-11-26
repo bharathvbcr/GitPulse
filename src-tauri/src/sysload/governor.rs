@@ -198,11 +198,11 @@ impl Binding {
             Self::MemoryPressure => "the kernel reports memory pressure",
             Self::CompressorThrash => "the memory compressor is thrashing",
             Self::CompressorSegments => "the memory compressor is nearly out of segments",
-            Self::Swap => "swap in use is above GitPulse's limit for it",
-            Self::LowDisk => "free disk space is below GitPulse's floor",
-            Self::DiskFilling => "free disk space is falling fast toward GitPulse's floor",
+            Self::Swap => "swap in use is above Waylode's limit for it",
+            Self::LowDisk => "free disk space is below Waylode's floor",
+            Self::DiskFilling => "free disk space is falling fast toward Waylode's floor",
             Self::Thermal => "the Mac is thermally throttled",
-            Self::CpuLoad => "the CPU load average is above GitPulse's limit for it",
+            Self::CpuLoad => "the CPU load average is above Waylode's limit for it",
             Self::Battery => "the Mac is running on battery",
             Self::ExecLatency => "process start-up is slow",
         }
@@ -1624,7 +1624,7 @@ pub fn admit_anyway(confirm: &dyn Fn(&str, &str) -> bool) -> Result<String, Stri
         return Ok("Nothing is refusing agent launches right now.".to_string());
     }
     let question = format!(
-        "GitPulse is refusing agent launches because {}.\n\nAdmit launches for the next {} seconds anyway? An agent started now adds to the load the machine is already struggling with.",
+        "Waylode is refusing agent launches because {}.\n\nAdmit launches for the next {} seconds anyway? An agent started now adds to the load the machine is already struggling with.",
         verdict.message,
         OVERRIDE_WINDOW.as_secs()
     );

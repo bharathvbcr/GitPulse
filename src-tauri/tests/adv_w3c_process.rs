@@ -11,8 +11,6 @@
 
 mod common;
 
-use gitpulse_lib::alerts::bridge::{SESSION_ENV, SOCKET_ENV};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -21,6 +19,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use waylode_lib::alerts::bridge::{SESSION_ENV, SOCKET_ENV};
+use waylode_lib::procguard::LockedSpawn;
 
 /// Accepts connections and holds them open without a word.
 struct SilentSocket {
@@ -62,7 +62,7 @@ impl Drop for SilentSocket {
 fn hook_path() -> PathBuf {
     std::env::var_os("GITPULSE_TEST_HOOK")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_gitpulse-hook")))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_waylode-hook")))
 }
 
 struct Ran {
@@ -83,7 +83,7 @@ fn session_ended(socket_env: Option<&Path>, home: &Path) -> Ran {
     let mut command = Command::new(hook_path());
     command
         .args(["notify", "session_ended"])
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env(SESSION_ENV, "term-4-1")
@@ -194,9 +194,9 @@ fn adv_w3c_the_default_socket_gets_its_record_beside_it_in_the_config_directory(
         home.path()
             .join("Library")
             .join("Application Support")
-            .join("GitPulse")
+            .join("Waylode")
     } else {
-        home.path().join(".config").join("gitpulse")
+        home.path().join(".config").join("waylode")
     };
     std::fs::create_dir_all(&config).unwrap();
     let socket = config.join("agent-notify.sock");

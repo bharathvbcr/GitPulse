@@ -435,13 +435,13 @@ describe("reading and resuming", () => {
         status({ last_action: { at_ms: NOW, kind: "refused", detail } });
       expect(
         endRequestOutcome(
-          refused("a request to end pid 4242 was ignored: GitPulse is not holding that process tree paused"),
+          refused("a request to end pid 4242 was ignored: Waylode is not holding that process tree paused"),
           target,
           asked,
         ),
       ).toEqual({
         state: "refused",
-        detail: "a request to end pid 4242 was ignored: GitPulse is not holding that process tree paused",
+        detail: "a request to end pid 4242 was ignored: Waylode is not holding that process tree paused",
       });
       expect(endRequestOutcome(refused("a request to end pid 999 was ignored"), target, asked).state).toBe(
         "waiting",

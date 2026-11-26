@@ -1,10 +1,10 @@
-# Running agents in GitPulse
+# Running agents in Waylode
 
-[Documentation index](README.md) · [Getting started](GETTING_STARTED.md) · [Why GitPulse](WHY_GITPULSE.md) · [Tasks and workspaces](TASKS_AND_WORKSPACES.md) · [MCP and Agents (wiki)](../wiki/MCP%20and%20Agents.md)
+[Documentation index](README.md) · [Getting started](GETTING_STARTED.md) · [Why Waylode](WHY_WAYLODE.md) · [Tasks and workspaces](TASKS_AND_WORKSPACES.md) · [MCP and Agents (wiki)](../wiki/MCP%20and%20Agents.md)
 
-GitPulse launches coding agents, watches them, guards them and lands their work. It does not replace
+Waylode launches coding agents, watches them, guards them and lands their work. It does not replace
 the agents: Claude Code, Codex, Antigravity, Grok and Manvi still run as their own CLIs, under their own
-permissions. This guide covers the parts that GitPulse adds around them. The tool-by-tool MCP reference
+permissions. This guide covers the parts that Waylode adds around them. The tool-by-tool MCP reference
 is the wiki page [MCP and Agents](../wiki/MCP%20and%20Agents.md).
 
 Contents: [Connect an agent](#connect-an-agent) · [Launch from the task board](#launch-from-the-task-board) ·
@@ -16,7 +16,7 @@ Contents: [Connect an agent](#connect-an-agent) · [Launch from the task board](
 
 Open **Settings → Agents → Connect your agent**. It shows a plan first and changes nothing until you apply
 it. On apply it links the app's bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin` and registers
-the `gitpulse` MCP server with Claude Code and Codex through their own `mcp add` commands. If the GitPulse
+the `gitpulse` MCP server with Claude Code and Codex through their own `mcp add` commands. If the Waylode
 Claude Code plugin is installed, it already provides the server and the hooks, so use the plugin or the
 direct registration, not both.
 
@@ -33,7 +33,7 @@ The board is where you start agents. In **Work → Tasks**, or the global **Task
 **Send to agent** on a card. The form asks for:
 
 - **Agent**: Claude, Codex, Grok or Antigravity, and how it runs: **Terminal** (a task-bound session in the
-  dock) or **Managed** (Manvi supervises the run and shows its requests in GitPulse; the form says which
+  dock) or **Managed** (Manvi supervises the run and shows its requests in Waylode; the form says which
   agents support it). Shell sessions are for your own use.
 - **Working checkout**: an open repository tab, or the folder beside that repository's git directory.
 - **Permission mode**: remembered for next time, except `Bypass permissions`, which you must choose again,
@@ -42,7 +42,7 @@ The board is where you start agents. In **Work → Tasks**, or the global **Task
   advisor; Antigravity takes effort. A blank field keeps the default from **Settings → Agents**. The
   values are recorded on the attempt and are not remembered for the next launch. A Manvi managed attempt
   takes none of these, because Manvi sets its model.
-- **Run in a new worktree**: GitPulse creates `.gitpulse/worktrees/<task>-<id>` on a new
+- **Run in a new worktree**: Waylode creates `.gitpulse/worktrees/<task>-<id>` on a new
   `gitpulse/<task>-<id>` branch, hidden from `git status` through `.git/info/exclude`. When the selected
   checkout already holds an agent, the form says which task holds it and selects a new worktree for you.
 
@@ -57,7 +57,7 @@ a card that is already Done.
 
 You can run several attempts at once. The limit is **Settings → Agents → Agents running at once**, from 1
 to 64 (8 until you change it); terminal sessions are capped separately, 32 across repositories by default.
-When a launch is refused or a worktree is not needed after all, GitPulse removes the worktree and branch it
+When a launch is refused or a worktree is not needed after all, Waylode removes the worktree and branch it
 created for the attempt. An attempt holds its checkout until its process is known to have ended.
 
 You can also start sessions directly from the dock, without a task: the launchers are Shell, Claude,
@@ -77,7 +77,7 @@ account. It is an execution decision, not an OS sandbox.
 
 **The Manvi command gate.** Where the plugin's hooks are registered, each agent shell command passes
 `gitpulse-hook command-gate` before it runs, and each file write passes `collision-guard`. The gate is
-Manvi's policy engine. It returns one of three actions (`allow`, `warn`, `deny`), and GitPulse renders every
+Manvi's policy engine. It returns one of three actions (`allow`, `warn`, `deny`), and Waylode renders every
 decision as one of eight statuses, defined in [`contracts/verdict.schema.json`](../contracts/verdict.schema.json):
 
 | Status | Meaning |
@@ -97,13 +97,13 @@ Soft rules (task-scope and lease rules) can be demoted by posture or cleared by 
 another checkout of the same repository are refused too. Hooks never answer `allow` on their own, so they
 cannot override your own permission rules, and a hook failure never blocks a tool call.
 
-**Other guards.** The secret gate (`dc-redact`) scans commits and pushes that GitPulse makes; it does not
+**Other guards.** The secret gate (`dc-redact`) scans commits and pushes that Waylode makes; it does not
 catch an agent's own `git commit`. Allowed agent Git mutations record pre-operation snapshots under
 `refs/gitpulse/ops/`, which you can restore with a checked undo from HEAD moves. Opt-in turn checkpoints
 under `refs/gitpulse/turns/` capture the working tree at a turn's start and end. A signal guard stops
-agents from killing GitPulse.
+agents from killing Waylode.
 
-![A commit from GitPulse's composer blocked by the secret scan: nothing was committed, and the finding names the file and line](assets/guard-secret-blocked.webp)
+![A commit from Waylode's composer blocked by the secret scan: nothing was committed, and the finding names the file and line](assets/guard-secret-blocked.webp)
 
 ## Agent-to-agent messaging
 
@@ -122,7 +122,7 @@ A session also sees unread peer messages when it starts and after tool calls, th
 hook. Separately, the `gitpulse_worktree_*` family carries lane-level handoff messages
 (`gitpulse_worktree_send_message`, `gitpulse_worktree_inbox`), for example an interface-change notice to
 every sibling lane. You can send an agent a message yourself with **Send to agent** on a live session;
-GitPulse shows a preview and waits for your confirmation before delivering it.
+Waylode shows a preview and waits for your confirmation before delivering it.
 
 The `gitpulse_agent_send` result has a `mailbox` object saying whether the recipient's mailbox took the message (`deposited`, with a `reason` of `full`, `refused`, `no_session`, `unavailable` or `hop_limit` when it did not). A peer may hold at most 7 pending messages per session; the last slot carries one notice per repository pointing the recipient at `gitpulse_agent_inbox`. A `delivery_outcome` of `bus_only` means the message is on the bus but not in the mailbox, so only an inbox or wait call will show it. A message that has reached its hop limit has `delivery_outcome` `paused_hop_limit` and is not deposited in the mailbox at all (`mailbox.reason` `hop_limit`): the bus row is the record, and the recipient or a person can read it with `gitpulse_agent_inbox`. Envelopes paused at the limit by an earlier version may still sit in a mailbox; a session waiting there (a `Stop` wait, for example) looks past such a refused message to the first deliverable one and keeps waiting while only refused ones are pending.
 
@@ -139,13 +139,13 @@ the oldest rows to bring it back under, logs a warning, and never reuses a seque
 wait response lists them in `pinned_below_dropped_before_seq`: `dropped_before_seq` still means no dropped
 row has a sequence at or above it, and those listed rows are the exceptions below it.
 
-A `messages.json` that is over 32 MiB, or that is damaged so it does not parse, is not loaded. The next write (a post, or an acknowledgement that names a message) moves it aside as `messages.json.oversized-<unix>` or `messages.json.corrupt-<unix>`, keeps the two newest such files, and starts a fresh bus whose sequence continues above the old one, so a number a reader has seen is never issued again. The unread messages in the old file are not carried over; they stay only in the aside file. A read never repairs: it refuses the file and says so. A file that parses but has a different shape was written by another GitPulse version; it is refused and left in place rather than repaired, and the remedy is to upgrade or reinstall so every GitPulse binary on the machine is the same version, or to move the file aside by hand.
+A `messages.json` that is over 32 MiB, or that is damaged so it does not parse, is not loaded. The next write (a post, or an acknowledgement that names a message) moves it aside as `messages.json.oversized-<unix>` or `messages.json.corrupt-<unix>`, keeps the two newest such files, and starts a fresh bus whose sequence continues above the old one, so a number a reader has seen is never issued again. The unread messages in the old file are not carried over; they stay only in the aside file. A read never repairs: it refuses the file and says so. A file that parses but has a different shape was written by another Waylode version; it is refused and left in place rather than repaired, and the remedy is to upgrade or reinstall so every Waylode binary on the machine is the same version, or to move the file aside by hand.
 
 ![The Agents inbox with an overlap notice from one agent session to another](assets/agent-inbox.webp)
 
 ## The collision workflow
 
-Two agents editing one file in different worktrees is the case GitPulse warns about before the merge does.
+Two agents editing one file in different worktrees is the case Waylode warns about before the merge does.
 
 1. **Look.** `gitpulse_insights` shows worktrees, live sessions and overlapping files. In the UI, Work →
    Overview and the Agents plane (`⌘⇧A`) show the worktrees, terminals and task attempts.
@@ -170,7 +170,7 @@ because there is only one worktree to compare.
 ## Agents file follow-up tasks
 
 An agent that finds work outside its task should not bury it in a transcript. It files it on your board
-with `gitpulse_add_task`, and the card appears in Backlog while GitPulse's window is on screen (and when the
+with `gitpulse_add_task`, and the card appears in Backlog while Waylode's window is on screen (and when the
 window is next shown otherwise).
 
 - The board refuses a new card that looks like open work (two shared title words, or one and a shared
@@ -186,10 +186,10 @@ window is next shown otherwise).
 
 ## Limits to know
 
-- GitPulse is tested on macOS. Windows and Linux builds exist but are not yet tested.
+- Waylode is tested on macOS. Windows and Linux builds exist but are not yet tested.
 - The hooks exist only where the plugin's hooks are registered. An agent under another profile, or one
-  started outside GitPulse, has no gate until that profile registers them.
-- Antigravity has no `PreToolUse` hooks from GitPulse, so its shell commands and file writes are not gated
+  started outside Waylode, has no gate until that profile registers them.
+- Antigravity has no `PreToolUse` hooks from Waylode, so its shell commands and file writes are not gated
   by the command gate or the collision guard. It keeps the session brief, the peer inbox and notifications.
 - A worktree is not an OS sandbox. A process that leaves the agent's process group writes with no tool call
   for a hook to judge.

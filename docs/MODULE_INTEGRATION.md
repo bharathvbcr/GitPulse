@@ -1,7 +1,7 @@
 # Reusable modules and coordinated updates
 
 **DevCouncil** is **components and modules**. **Manvi** wraps those
-components into a harness. **GitPulse** uses Manvi for policy, workbench, and
+components into a harness. **Waylode** uses Manvi for policy, workbench, and
 agent hosting, and DevCouncil components for code intelligence and related
 analysis. The stack is modular: update one module at a time, or take only the
 subset an app needs.
@@ -14,25 +14,25 @@ the configured executable and restarting it.
 
 ## Choose the integration boundary
 
-| Need | Canonical owner | Integration in GitPulse |
+| Need | Canonical owner | Integration in Waylode |
 | --- | --- | --- |
 | Parse, resolve and build a code index | DevCouncil `devmap` CLI | Bounded CLI calls in `src-tauri/src/devmap/cli.rs` |
 | Read and query a persisted index | DevCouncil `devmap-store`, `devmap-query`, `devmap-resolve` | Vendored Rust path dependencies with `default-features = false` |
 | HTML map and graph projection | DevCouncil `devmap-query` | Same upstream projection; HTML assets live inside the crate |
-| Repository execution task/lease reads and credential redaction | DevCouncil `dc-store`, `dc-redact` | Vendored Rust libraries (Manvi wraps the same modules in the harness); execution tasks and leases remain read-only in GitPulse |
+| Repository execution task/lease reads and credential redaction | DevCouncil `dc-store`, `dc-redact` | Vendored Rust libraries (Manvi wraps the same modules in the harness); execution tasks and leases remain read-only in Waylode |
 | Test-path classification (`role_of`) | DevCouncil `dc-glob` (`is_test_path`, `protocols/test-paths/v1.json`) | Vendored Rust library; commit drafting delegates test-path classification instead of keeping a private copy |
 | Profile workspaces, tasks, briefs and run records | Manvi wrap of DevCouncil `dc-store` workbench API | `cmd_workbench_request` performs typed CRUD against a separate profile database; Manvi owns the wrap's schemas, revisions and receipts |
-| Task suggestions and managed agent hosting | Profile Manvi host | GitPulse presents proposals and run controls; Manvi owns provider execution and request/decision delivery |
+| Task suggestions and managed agent hosting | Profile Manvi host | Waylode presents proposals and run controls; Manvi owns provider execution and request/decision delivery |
 | Policy, local-model discovery and chat preparation | Manvi `serve` | Protocol v1 in `src-tauri/src/harness/`; advertised `hello.ops` capabilities |
-| Code intelligence through a process boundary | Manvi `serve.DevmapModule` | Available to other hosts through `devmap.status` and `devmap.query`; GitPulse retains its in-process readers |
+| Code intelligence through a process boundary | Manvi `serve.DevmapModule` | Available to other hosts through `devmap.status` and `devmap.query`; Waylode retains its in-process readers |
 
 The module owner implements behavior once. Host adapters translate their UI or
 transport types; they do not copy policy decisions, schema migrations, parsers
-or HTML assets into independent implementations. Where a GitPulse safety check
+or HTML assets into independent implementations. Where a Waylode safety check
 intentionally diverges from a shared helper, that boundary exception is
 documented explicitly:
 [`parse_git_version`](../src-tauri/src/engine/git_cli/preflight.rs) remains
-local instead of delegating to `dc_proc::GitVersion::parse` because GitPulse
+local instead of delegating to `dc_proc::GitVersion::parse` because Waylode
 requires overflowing patch components to fail closed (not saturate to `0`),
 requires pre-release builds such as `2.45.1-rc1` to compare cleanly against
 `MIN_CLONE_GIT_VERSION`, and accepts major-only `git version 3` output.
@@ -117,8 +117,8 @@ sequenceDiagram
 
 Board CRUD never crosses the Manvi seam: `cmd_workbench_request`
 (`src-tauri/src/workbench.rs`) calls `query()`, which calls the vendored
-`dc-store` in the GitPulse process. `manvi serve` carries the policy gate and,
-for launches, the managed-run and enhancement operations; the ops GitPulse names
+`dc-store` in the Waylode process. `manvi serve` carries the policy gate and,
+for launches, the managed-run and enhancement operations; the ops Waylode names
 and the shapes it sends are pinned by `contracts/serve.ops.schema.json`, which
 Manvi generates from its Go types and `scripts/serve-ops-contract.test.ts`
 checks the Rust side against.
@@ -132,10 +132,10 @@ devmap-query = { path = "../DevCouncil/rust/devmap-query", default-features = fa
 ```
 
 That line is suitable for a local multi-repository workspace. A distributed
-host must package the dependency closure or pin its Git source. GitPulse's
+host must package the dependency closure or pin its Git source. Waylode's
 vendor command packages that closure and resolves workspace inheritance, so a
 standalone clone builds without sibling checkouts. Updating a linked crate
-still requires rebuilding GitPulse; an ABI-incompatible library cannot be
+still requires rebuilding Waylode; an ABI-incompatible library cannot be
 hot-swapped by changing a path.
 
 For a Go host, Manvi's `serve.Options.Modules` accepts modules implementing
@@ -154,7 +154,7 @@ per line, and negotiate `hello` before using advertised operations:
 {"id":"hello-1","op":"hello","params":{"protocol":1,"host":"my-app"}}
 ```
 
-GitPulse already supports executable overrides:
+Waylode already supports executable overrides:
 
 ```sh
 GITPULSE_DEVMAP_BIN=/absolute/path/devmap GITPULSE_MANVI_BIN=/absolute/path/manvi bun run tauri dev
@@ -165,13 +165,13 @@ shell's environment. Explicit broken overrides are errors; a missing optional
 tool and a malfunctioning configured tool are different states. Setup can
 install DevMap alone, the analysis suite, or the full DevCouncil host from the
 documented scripts (copy, or Run in Terminal). Disable hides a tool without
-deleting it; Uninstall removes only a binary GitPulse placed in its app bin
+deleting it; Uninstall removes only a binary Waylode placed in its app bin
 directory. There is no uv / Python install path.
 
 ## Per-repository initialization
 
 Opening a repository is the whole setup. When a repository is trusted and
-becomes an open tab, GitPulse does three things without asking, because none of
+becomes an open tab, Waylode does three things without asking, because none of
 them can appear in that repository's `git status`, its diff, or a commit:
 
 1. **Ignore hygiene.** `devmap build` leaves its state directory untracked and
@@ -253,7 +253,7 @@ flowchart TD
 ```
 
 `devmap serve` watches the tree itself, enqueues what changed, and rebuilds
-inside its own process. Where one is serving, GitPulse's poll-and-build loop is
+inside its own process. Where one is serving, Waylode's poll-and-build loop is
 not merely redundant — it is a *second writer* for the same store lock. The
 live gate therefore probes the daemon over its IPC endpoint (one JSON line in,
 one out; the endpoint path comes from `serve --print-socket-path`, never
@@ -276,7 +276,7 @@ assumed:
   store; it never writes `repo_map.json`. A missing artifact still takes
   `build --manifest`, whatever the daemon is doing.
 
-On Windows the daemon speaks a named pipe, and GitPulse has no client for it
+On Windows the daemon speaks a named pipe, and Waylode has no client for it
 yet; the probe says so rather than reporting "no daemon", because those are
 different claims.
 
@@ -303,7 +303,7 @@ left alone.
 
 ## What is installed, and whether it is what answers
 
-`devmap` and `manvi` are the two binaries GitPulse installs and manages. The
+`devmap` and `manvi` are the two binaries Waylode installs and manages. The
 setup wizard also offers `dcstore`, `dcverify`, `dcgrep` and the Go host, and
 those are probed too — by running them, not by stat-ing a path. `dcstore` is
 not cosmetic: `manvi serve --workbench-db` resolves it from `PATH`, so the
@@ -314,7 +314,7 @@ reported as separate facts and a component that ran but cannot name itself is
 not shown the same as one that is absent. `devmap doctor`'s installation
 warnings are surfaced beside the inventory: every `*_warning` field the payload
 carries, ordered by consequence — the ones that change *which binary answers*
-first — with any field GitPulse does not recognise kept at the end rather than
+first — with any field Waylode does not recognise kept at the end rather than
 dropped. That sweep is the contract, not a list of field names: a hand-written
 list is how `stray_state_warning` fired on a user's machine into a panel that
 said `devmap doctor` found nothing to report. Each warning is bounded for
@@ -327,8 +327,8 @@ list.
 Doctor is spawned with the child `PATH` the rest of the app uses — the
 inherited value plus the GUI-launch fallback dirs. It has to be: doctor
 resolves the bare `devmap` command that host MCP configs name against *its own*
-`PATH`, so a Dock-launched GitPulse handing it launchd's minimal
-`/usr/bin:/bin:/usr/sbin:/sbin` made it report the binary GitPulse had just
+`PATH`, so a Dock-launched Waylode handing it launchd's minimal
+`/usr/bin:/bin:/usr/sbin:/sbin` made it report the binary Waylode had just
 resolved as missing, under a heading that reads as the user's broken install.
 
 ## Compatibility and evidence
@@ -347,12 +347,12 @@ query can run. Consumers requiring current results must refuse a stale index.
 
 Status also carries nullable `source_freshness` and `analyzer_freshness`.
 `true` means that check passed, `false` means a mismatch was observed, and
-`null` means it was not verified. A parser-free reader such as GitPulse links
+`null` means it was not verified. A parser-free reader such as Waylode links
 no grammar, so it compares stored payload stamps against devmap-extract's
 recorded grammar identities (`PAYLOAD_GRAMMAR_IDENTITIES`, pinned upstream to
 the compiled grammars) and can certify analyzer identity. Overall `is_fresh`
 requires both checks to pass, no pending edits, and no store degradation.
-Retain `freshness_reason` in GitPulse responses (the CLI calls it
+Retain `freshness_reason` in Waylode responses (the CLI calls it
 `degraded_reason`); analyzer uncertainty must not hide a source mismatch.
 
 Repository-map marker metadata includes `inventory_complete`,
@@ -372,7 +372,7 @@ ignored; unsupported operations and incompatible protocol majors must be
 reported. An installed binary reporting the right release version alone does
 not prove it was built from the current worktree.
 
-Artifact location is also part of integration. GitPulse delegates database,
+Artifact location is also part of integration. Waylode delegates database,
 repository-map and graph paths to `devmap_extract::paths`, the CLI's canonical
 owner. Its precedence is `DEVMAP_HOME`, an existing `.devmap`, an existing
 `.devcouncil`, then the default `.devmap`. A legacy-only repository continues
@@ -386,7 +386,7 @@ No application permission or default policy is widened. A trusted embedding
 application that deliberately replaces a Manvi policy handler owns that policy
 decision; remote NDJSON requests do not configure module registration.
 
-GitPulse also bounds sidecar output while no request is running. Its canonical
+Waylode also bounds sidecar output while no request is running. Its canonical
 stdout pump retains at most eight frames (32 MiB at the per-frame ceiling),
 plus the frame currently being read. Queue overflow kills and reaps the child
 instead of leaving an unbounded buffer behind an apparently idle connection.
@@ -394,9 +394,9 @@ instead of leaving an unbounded buffer behind an apparently idle connection.
 ## Update the toolchain
 
 1. Validate and commit the canonical DevCouncil and Manvi sources first. Their
-   own workspaces run their library tests; GitPulse's vendored copies omit
+   own workspaces run their library tests; Waylode's vendored copies omit
    upstream test targets and development dependencies explicitly.
-2. From GitPulse, synchronize all crates with `bun run vendor`. Roots are
+2. From Waylode, synchronize all crates with `bun run vendor`. Roots are
    discovered from sibling checkouts, or selected with
    `GITPULSE_DEVCOUNCIL_ROOT`, `GITPULSE_MANVI_ROOT` and
    `GITPULSE_MARKDEV_ROOT`. Use
@@ -406,7 +406,7 @@ instead of leaving an unbounded buffer behind an apparently idle connection.
    manifests. `comparable: false` means an upstream comparison could not run.
 4. Refresh the installed devmap/Manvi binaries from those validated sources.
    Run `bun run check:vendor-schema`, then `bun run ci:local` against the final
-   GitPulse snapshot.
+   Waylode snapshot.
 5. Rebuild the native app and, for a source checkout, refresh MCP with `bun run mcp:install` (an app install picks up the bundled binaries it links through Connect). Verify
    `bun run mcp:doctor`, installed file hashes and a real code-intelligence
    query. Restart long-lived host processes to load the replacement binaries.

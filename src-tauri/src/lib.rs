@@ -26,6 +26,7 @@ pub mod devmap;
 pub mod diff;
 pub mod docs;
 pub mod engine;
+pub mod env_compat;
 pub mod firebase;
 mod fs_entry;
 pub mod github;
@@ -126,7 +127,7 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 }
 
 /// Makes the `cargo` and `go` links an agent's PATH starts with
-/// (`sysload::lease::bin_dir`), pointing at the `gitpulse-hook` beside this
+/// (`sysload::lease::bin_dir`), pointing at the `waylode-hook` beside this
 /// executable. A failure is logged and shown by Health ("not gated"); the
 /// builds then run unleased, never blocked.
 #[cfg(unix)]
@@ -135,11 +136,22 @@ fn install_lease_links() {
         log::warn!(target: "leases", "no per-user config directory; build leases have no links");
         return;
     };
-    let hook = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("gitpulse-hook")));
+    let hook = std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?;
+        let primary = dir.join("waylode-hook");
+        if primary.exists() {
+            Some(primary)
+        } else {
+            let legacy = dir.join("gitpulse-hook");
+            if legacy.exists() {
+                Some(legacy)
+            } else {
+                Some(primary)
+            }
+        }
+    });
     let Some(hook) = hook else {
-        log::warn!(target: "leases", "cannot locate gitpulse-hook; build leases have no links");
+        log::warn!(target: "leases", "cannot locate waylode-hook; build leases have no links");
         return;
     };
     if let Err(error) = sysload::lease::ensure_links(&config, &hook) {
@@ -161,8 +173,11 @@ pub fn run() {
     }
     #[cfg(not(test))]
     logging::install_panic_hook();
+    // Carry over legacy GitPulse/ -> Waylode/ profile data before any lock or
+    // SQLite store opens in Waylode/.
+    tool_config::migrate_profile_dir();
     // Before anything else is built. LaunchServices starts a second copy of
-    // GitPulse whenever it prefers another bundle of the same identifier —
+    // Waylode whenever it prefers another bundle of the same identifier —
     // which is what a banner click does once the running copy's bundle was
     // rebuilt or deleted. That launch hands its request to the running one and
     // leaves here, without a window, watchers or a code-intelligence build.
@@ -218,6 +233,11 @@ pub fn run() {
         .manage(workbench::WorkbenchState::default())
         .manage(mavi::MaviState::default())
         .setup(|app| {
+            // Migrate WebView origin data before `"main"` is created on all 3 OSes.
+            // On macOS `launch::establish` already ran this for bundled launches;
+            // running here too covers Windows and Linux after single-instance
+            // ownership has been established.
+            desktop::identity_migration::run_pre_webview(&app.config().identifier);
             // A signal exit stops what procguard does not own; the normal exit
             // reaches the same teardown from `RunEvent::Exit`.
             {
@@ -227,7 +247,7 @@ pub fn run() {
             }
             // Once, off this thread. Dual-read still finds a record this has
             // not renamed yet, so a failed migration does not block startup.
-            // MCP and gitpulsed do not run this path and stay read-only.
+            // MCP and wayloded do not run this path and stay read-only.
             if let Err(error) = supervisor::spawn_once(
                 "repository-trust-migrate",
                 "trust migration",
@@ -247,9 +267,8 @@ pub fn run() {
             // The cleaner and launch-at-login agents each record one fixed
             // executable path, rewritten only on a Settings save. Compare them
             // with the running app so a moved, translocated or older copy is
-            // not started every minute; off this thread, since it may run
-            // launchctl.
-            #[cfg(target_os = "macos")]
+            // not started every minute, and migrate any legacy "GitPulse"
+            // login autostart entry on all 3 OSes.
             {
                 use tauri_plugin_autostart::ManagerExt as _;
                 let handle = app.handle().clone();
@@ -258,6 +277,7 @@ pub fn run() {
                     "launch-agent-check",
                     "launch agent check",
                     move || {
+                        #[cfg(target_os = "macos")]
                         match storage::hygiene::background::refresh_if_stale() {
                             Ok(desktop::launch_agent::Registration::Stale { registered }) => {
                                 log::warn!(target: "setup", "the cleaner LaunchAgent started {registered:?}; it now starts this app");
@@ -265,7 +285,7 @@ pub fn run() {
                             Ok(_) => {}
                             Err(error) => log::warn!(target: "setup", "cleaner LaunchAgent check: {error}", error = error.message()),
                         }
-                        desktop::launch_agent::refresh_autostart(&name, || {
+                        desktop::launch_agent::migrate_and_refresh_autostart(&name, || {
                             handle.autolaunch().enable().map_err(|e| e.to_string())
                         });
                     },
@@ -857,7 +877,7 @@ pub fn run() {
             daemon_lock::cmd_daemon_status,
         ])
         .build(context())
-        .expect("error while building GitPulse")
+        .expect("error while building Waylode")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;

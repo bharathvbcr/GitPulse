@@ -400,8 +400,7 @@ fn caches_and_the_include_are_copied_as_for_an_app_created_worktree() {
 }
 
 #[cfg(unix)]
-const HOOKS: &str =
-    r#"{"worktree":{"post_create":["printf '%s' \"$GITPULSE_WORKTREE_PATH\" > hooked.txt"]}}"#;
+const HOOKS: &str = r#"{"worktree":{"post_create":["printf '%s:%s' \"$WAYLODE_WORKTREE_PATH\" \"$GITPULSE_WORKTREE_PATH\" > hooked.txt"]}}"#;
 
 #[cfg(unix)]
 fn with_hooks(hooks: &'static str) -> Fixture {
@@ -425,7 +424,7 @@ fn approved_post_create_hooks_run_with_the_gitpulse_environment() {
 
     assert_eq!(
         fs::read_to_string(path.join("hooked.txt")).unwrap(),
-        path.to_str().unwrap()
+        format!("{}:{}", path.to_str().unwrap(), path.to_str().unwrap())
     );
 }
 
@@ -873,7 +872,7 @@ fn running_out_of_time_prints_no_path_and_says_whether_git_had_started() {
 }
 
 fn manifest() -> serde_json::Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/waylode/hooks/hooks.json");
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -888,7 +887,7 @@ fn the_plugin_registers_both_events_through_the_launcher_inside_the_deadline() {
         let handler = &handlers[0];
         assert_eq!(
             handler["command"].as_str(),
-            Some(format!("{LAUNCHER_PREFIX}gitpulse-hook {subcommand}").as_str())
+            Some(format!("{LAUNCHER_PREFIX}waylode-hook {subcommand}").as_str())
         );
         assert!(handler.get("async").is_none(), "{event} must be waited for");
         let timeout = handler["timeout"].as_u64().expect("an explicit timeout");
@@ -902,7 +901,7 @@ fn the_plugin_registers_both_events_through_the_launcher_inside_the_deadline() {
         );
     }
     assert!(Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../plugins/gitpulse")
+        .join("../plugins/waylode")
         .join(LAUNCHER)
         .is_file());
 }
@@ -918,7 +917,7 @@ fn launch(
     use crate::procguard::LockedSpawn;
     use std::io::Write;
     let launcher = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../plugins/gitpulse")
+        .join("../plugins/waylode")
         .join(LAUNCHER);
     let mut child = std::process::Command::new("sh")
         .arg(launcher)
@@ -948,7 +947,7 @@ fn the_launcher_makes_a_plain_worktree_when_the_binary_cannot_serve() {
         "name": "plain-oak",
     });
 
-    let out = launch("/no/such/gitpulse-hook", CREATE, &payload, &fixture.root);
+    let out = launch("/no/such/waylode-hook", CREATE, &payload, &fixture.root);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
@@ -972,7 +971,7 @@ fn the_launcher_makes_a_plain_worktree_when_the_binary_cannot_serve() {
     fs::write(expected.join("new.txt"), "work").unwrap();
     let remove =
         serde_json::json!({"hook_event_name": "WorktreeRemove", "worktree_path": expected});
-    let out = launch("/no/such/gitpulse-hook", REMOVE, &remove, &fixture.root);
+    let out = launch("/no/such/waylode-hook", REMOVE, &remove, &fixture.root);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(!expected.exists());
@@ -987,7 +986,7 @@ fn the_launcher_makes_a_plain_worktree_when_the_binary_cannot_serve() {
     let not_a_worktree = fixture.root.join("plain-dir");
     fs::create_dir(&not_a_worktree).unwrap();
     let remove = serde_json::json!({"worktree_path": not_a_worktree});
-    let out = launch("/no/such/gitpulse-hook", REMOVE, &remove, &fixture.root);
+    let out = launch("/no/such/waylode-hook", REMOVE, &remove, &fixture.root);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -1018,7 +1017,7 @@ fn the_launchers_plain_worktree_also_goes_under_the_main_checkout() {
     let lane = lane.canonicalize().unwrap();
     let payload = serde_json::json!({"cwd": lane, "name": "from-a-lane"});
 
-    let out = launch("/no/such/gitpulse-hook", CREATE, &payload, &lane);
+    let out = launch("/no/such/waylode-hook", CREATE, &payload, &lane);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
@@ -1035,13 +1034,13 @@ fn the_launchers_plain_worktree_also_goes_under_the_main_checkout() {
 fn the_launcher_falls_back_only_on_75_and_passes_every_other_answer_through() {
     let fixture = fixture_with(|_| {});
     let dir = tempfile::tempdir().unwrap();
-    let fake = dir.path().join("gitpulse-hook");
+    let fake = dir.path().join("waylode-hook");
     let payload = serde_json::json!({"cwd": fixture.root, "name": "from-fake"});
     for (code, falls_back) in [(75, true), (1, false), (0, false)] {
         fs::write(
             &fake,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'gitpulse-hook 0\\nsubcommands: notify, worktree-create, worktree-remove\\n'; exit 0; fi\ncat >/dev/null\nexit {code}\n"
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'waylode-hook 0\\nsubcommands: notify, worktree-create, worktree-remove\\n'; exit 0; fi\ncat >/dev/null\nexit {code}\n"
             ),
         )
         .unwrap();
@@ -1071,7 +1070,7 @@ fn the_launcher_falls_back_only_on_75_and_passes_every_other_answer_through() {
     }
 
     // A binary too old to list the subcommand is not asked at all.
-    fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'gitpulse-hook 0\\nsubcommands: notify\\n'; exit 0; fi\nexit 0\n").unwrap();
+    fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'waylode-hook 0\\nsubcommands: notify\\n'; exit 0; fi\nexit 0\n").unwrap();
     let out = launch(fake.to_str().unwrap(), CREATE, &payload, &fixture.root);
     assert_eq!(
         out.status.code(),

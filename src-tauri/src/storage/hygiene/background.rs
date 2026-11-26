@@ -6,14 +6,16 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", test))]
-const LABEL: &str = "dev.vbcr.gitpulse.hygiene";
-/// The label before the VBCR Dev rename. An agent still registered under it
-/// would start the cleaner beside the new one, so it is retired when the new
-/// agent is written, and on every disable.
+const LABEL: &str = "dev.vbcr.waylode.hygiene";
+/// Labels before the Waylode rename. An agent still registered under either
+/// would start the cleaner beside the new one, so both are retired when the
+/// new agent is written, and on every disable.
 #[cfg(any(target_os = "macos", test))]
-const LEGACY_LABEL: &str = "com.gitpulse.hygiene";
+const LEGACY_LABELS: [&str; 2] = ["dev.vbcr.gitpulse.hygiene", "com.gitpulse.hygiene"];
 #[cfg(any(target_os = "macos", test))]
-const OWNER: &str = "<!-- GitPulse repository hygiene v1 -->";
+const OWNER: &str = "<!-- Waylode repository hygiene v1 -->";
+#[cfg(any(target_os = "macos", test))]
+const LEGACY_OWNER: &str = "<!-- GitPulse repository hygiene v1 -->";
 
 #[cfg(any(target_os = "macos", test))]
 fn app_executable(path: &Path) -> Result<&str, CommandError> {
@@ -72,11 +74,12 @@ fn owned_as(path: &Path, label: &str) -> Result<bool, CommandError> {
                 .take(16385)
                 .read_to_string(&mut text)
                 .map_err(|e| e.to_string())?;
+            let has_owner = text.contains(OWNER) || text.contains(LEGACY_OWNER);
             if text.len() > 16384
-                || !text.contains(OWNER)
+                || !has_owner
                 || !text.contains(&format!("<string>{label}</string>"))
             {
-                return Err("Existing LaunchAgent is not owned by GitPulse; preserved it".into());
+                return Err("Existing LaunchAgent is not owned by Waylode; preserved it".into());
             }
             Ok(true)
         }
@@ -98,25 +101,26 @@ fn location_of(label: &str) -> Result<PathBuf, CommandError> {
         .join("Library/LaunchAgents")
         .join(format!("{label}.plist")))
 }
-/// Stops and removes the agent registered under [`LEGACY_LABEL`], if GitPulse
+/// Stops and removes the agent registered under `legacy_label`, if Waylode/GitPulse
 /// wrote it. Returns whether there was one. Same rules as [`configure_at`]:
-/// a file that is not GitPulse's is preserved.
+/// a file that is not ours is preserved.
 #[cfg(any(target_os = "macos", test))]
 fn retire_legacy_at(
     path: &Path,
+    legacy_label: &str,
     domain: &str,
     mut launch: impl FnMut(&[&str]) -> Result<bool, CommandError>,
 ) -> Result<bool, CommandError> {
-    // A file at the old name that GitPulse did not write (or cannot be read)
-    // is not ours to stop or remove, and is no reason to fail the new agent.
-    if !owned_as(path, LEGACY_LABEL).unwrap_or(false) {
+    // A file at the old name that we did not write (or cannot read) is not
+    // ours to stop or remove, and is no reason to fail the new agent.
+    if !owned_as(path, legacy_label).unwrap_or(false) {
         return Ok(false);
     }
-    let target = format!("{domain}/{LEGACY_LABEL}");
+    let target = format!("{domain}/{legacy_label}");
     if launch(&["print", &target])? && !launch(&["bootout", &target])? {
         return Err("The pre-rename LaunchAgent could not be stopped".into());
     }
-    if !owned_as(path, LEGACY_LABEL)? {
+    if !owned_as(path, legacy_label)? {
         return Err("The pre-rename LaunchAgent changed during removal".into());
     }
     std::fs::remove_file(path).map_err(|e| e.to_string())?;
@@ -154,11 +158,14 @@ pub fn refresh_if_stale() -> Result<crate::desktop::launch_agent::Registration, 
     use crate::desktop::launch_agent::{inspect, is_translocated, Registration};
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
     // An agent from before the rename means the user turned closed-app
-    // cleaning on: write the new one first, then retire the old, so a failure
-    // leaves the cleaner running (once or, briefly, twice) and never off.
-    if owned_as(&location_of(LEGACY_LABEL)?, LEGACY_LABEL).unwrap_or(false) {
+    // cleaning on: write the new one first, then retire the old ones, so a
+    // failure leaves the cleaner running and never off.
+    let has_legacy = LEGACY_LABELS
+        .iter()
+        .any(|legacy| location_of(legacy).is_ok_and(|p| owned_as(&p, legacy).unwrap_or(false)));
+    if has_legacy {
         if is_translocated(&current) {
-            return Err("the pre-rename cleaner LaunchAgent is still registered, but this copy runs from a translocated path; move GitPulse to Applications and reopen it".into());
+            return Err("the pre-rename cleaner LaunchAgent is still registered, but this copy runs from a translocated path; move Waylode to Applications and reopen it".into());
         }
         configure(true)?;
         return Ok(Registration::Current);
@@ -171,7 +178,7 @@ pub fn refresh_if_stale() -> Result<crate::desktop::launch_agent::Registration, 
     if let Registration::Stale { registered } = &found {
         if is_translocated(&current) {
             return Err(format!(
-                "the cleaner LaunchAgent starts {registered:?}, but this copy runs from a translocated path; move GitPulse to Applications and reopen it"
+                "the cleaner LaunchAgent starts {registered:?}, but this copy runs from a translocated path; move Waylode to Applications and reopen it"
             ).into());
         }
         configure(true).map_err(|error| {
@@ -205,10 +212,12 @@ pub fn configure(enable: bool) -> Result<(), CommandError> {
         // SAFETY: geteuid has no pointers or side effects.
         let domain = format!("gui/{}", unsafe { libc::geteuid() });
         configure_at(&path, document.as_deref(), &domain, launchctl)?;
-        // Enabling or disabling both end with no agent under the old label:
+        // Enabling or disabling both end with no agent under old labels:
         // two agents would run the cleaner twice, and a disabled cleaner must
-        // not survive as the old one.
-        retire_legacy_at(&location_of(LEGACY_LABEL)?, &domain, launchctl)?;
+        // not survive as an old one.
+        for legacy in LEGACY_LABELS {
+            retire_legacy_at(&location_of(legacy)?, legacy, &domain, launchctl)?;
+        }
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
@@ -343,48 +352,80 @@ mod tests {
         assert!(!path.exists());
         configure_at(&path, None, "gui/1", |_| panic!("already absent")).unwrap();
     }
-    /// A plist GitPulse wrote under the pre-rename label.
-    fn legacy_plist(executable: &str) -> String {
-        plist(executable).replace(LABEL, LEGACY_LABEL)
+    /// A plist GitPulse/Waylode wrote under a pre-rename label (optionally
+    /// carrying the legacy `<!-- GitPulse repository hygiene v1 -->` header).
+    fn legacy_plist(executable: &str, legacy_label: &str, legacy_owner: bool) -> String {
+        let mut doc = plist(executable).replace(LABEL, legacy_label);
+        if legacy_owner {
+            doc = doc.replace(OWNER, LEGACY_OWNER);
+        }
+        doc
     }
     #[test]
-    fn the_label_is_in_the_vbcr_namespace_and_the_old_one_is_still_known() {
-        assert_eq!(LABEL, "dev.vbcr.gitpulse.hygiene");
-        assert_eq!(LEGACY_LABEL, "com.gitpulse.hygiene");
+    fn the_label_is_in_the_vbcr_namespace_and_both_old_ones_are_retired() {
+        assert_eq!(LABEL, "dev.vbcr.waylode.hygiene");
+        assert_eq!(
+            LEGACY_LABELS,
+            ["dev.vbcr.gitpulse.hygiene", "com.gitpulse.hygiene"]
+        );
         assert!(plist("app").contains(&format!("<string>{LABEL}</string>")));
     }
     #[test]
-    fn a_loaded_pre_rename_agent_is_stopped_and_removed() {
+    fn owned_as_accepts_both_waylode_and_legacy_gitpulse_owner_comments() {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
-        let path = root.join("old.plist");
-        std::fs::write(&path, legacy_plist("app")).unwrap();
-        let mut calls = vec![];
-        let retired = retire_legacy_at(&path, "gui/1", |args| {
-            calls.push(args.join(" "));
-            Ok(true)
-        })
-        .unwrap();
-        assert!(retired);
-        assert_eq!(
-            calls,
-            [
-                format!("print gui/1/{LEGACY_LABEL}"),
-                format!("bootout gui/1/{LEGACY_LABEL}")
-            ]
-        );
-        assert!(!path.exists());
-        // Idempotent: nothing left to retire, and launchctl is not asked.
-        assert!(!retire_legacy_at(&path, "gui/1", |_| panic!("already gone")).unwrap());
+        let p1 = root.join("v1.plist");
+        let p2 = root.join("v2.plist");
+        let p3 = root.join("v3.plist");
+        std::fs::write(&p1, legacy_plist("app", "com.gitpulse.hygiene", true)).unwrap();
+        std::fs::write(&p2, legacy_plist("app", "dev.vbcr.gitpulse.hygiene", true)).unwrap();
+        std::fs::write(&p3, plist("app")).unwrap();
+        assert!(owned_as(&p1, "com.gitpulse.hygiene").unwrap());
+        assert!(owned_as(&p2, "dev.vbcr.gitpulse.hygiene").unwrap());
+        assert!(owned_as(&p3, LABEL).unwrap());
+    }
+    #[test]
+    fn a_loaded_pre_rename_agent_is_stopped_and_removed() {
+        for (legacy_label, legacy_owner) in [
+            ("dev.vbcr.gitpulse.hygiene", true),
+            ("com.gitpulse.hygiene", true),
+            ("dev.vbcr.gitpulse.hygiene", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+            let path = root.join("old.plist");
+            std::fs::write(&path, legacy_plist("app", legacy_label, legacy_owner)).unwrap();
+            let mut calls = vec![];
+            let retired = retire_legacy_at(&path, legacy_label, "gui/1", |args| {
+                calls.push(args.join(" "));
+                Ok(true)
+            })
+            .unwrap();
+            assert!(retired);
+            assert_eq!(
+                calls,
+                [
+                    format!("print gui/1/{legacy_label}"),
+                    format!("bootout gui/1/{legacy_label}")
+                ]
+            );
+            assert!(!path.exists());
+            // Idempotent: nothing left to retire, and launchctl is not asked.
+            assert!(
+                !retire_legacy_at(&path, legacy_label, "gui/1", |_| panic!("already gone"))
+                    .unwrap()
+            );
+        }
     }
     #[test]
     fn an_unloaded_pre_rename_agent_is_just_removed() {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
         let path = root.join("old.plist");
-        std::fs::write(&path, legacy_plist("app")).unwrap();
+        let legacy_label = LEGACY_LABELS[0];
+        std::fs::write(&path, legacy_plist("app", legacy_label, true)).unwrap();
         let mut calls = vec![];
-        assert!(retire_legacy_at(&path, "gui/1", |args| {
+        assert!(retire_legacy_at(&path, legacy_label, "gui/1", |args| {
             calls.push(args[0].to_string());
             Ok(false)
         })
@@ -397,9 +438,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
         let path = root.join("old.plist");
-        std::fs::write(&path, legacy_plist("app")).unwrap();
+        let legacy_label = LEGACY_LABELS[0];
+        std::fs::write(&path, legacy_plist("app", legacy_label, true)).unwrap();
         // `launchctl bootout` failing surfaces as an error, as in `configure`.
-        assert!(retire_legacy_at(&path, "gui/1", |args| {
+        assert!(retire_legacy_at(&path, legacy_label, "gui/1", |args| {
             if args[0] == "bootout" {
                 Err("launchctl failed".into())
             } else {
@@ -414,12 +456,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
         let path = root.join("old.plist");
+        let legacy_label = LEGACY_LABELS[0];
         std::fs::write(&path, "foreign").unwrap();
-        assert!(!retire_legacy_at(&path, "gui/1", |_| panic!("foreign job")).unwrap());
+        assert!(
+            !retire_legacy_at(&path, legacy_label, "gui/1", |_| panic!("foreign job")).unwrap()
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "foreign");
         // The new agent's own label is not the old one's.
         std::fs::write(&path, plist("app")).unwrap();
-        assert!(!retire_legacy_at(&path, "gui/1", |_| panic!("not the old label")).unwrap());
+        assert!(!retire_legacy_at(&path, legacy_label, "gui/1", |_| panic!(
+            "not the old label"
+        ))
+        .unwrap());
     }
     #[test]
     fn debug_executables_and_foreign_loaded_labels_cannot_be_scheduled() {

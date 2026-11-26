@@ -1,7 +1,7 @@
 //! The ledger JSON every MCP surface serialises, pinned field for field.
 //!
-//! The ledger facet of `gitpulse_insights` and `gitpulse_status`, the honesty
-//! block of `gitpulse_ledger_events`, and the `ledger`, `insights` and `status`
+//! The ledger facet of `waylode_insights` and `waylode_status`, the honesty
+//! block of `waylode_ledger_events`, and the `ledger`, `insights` and `status`
 //! resources are a public contract. This test holds the exact names, types and
 //! values (`ledger_wire_golden.json`) for a ledger that opened read-only and for
 //! a repository with no ledger, so the representation behind them can change
@@ -64,9 +64,9 @@ fn surfaces(repo: &str) -> Value {
         |name: &str| crate::mcp::handle_tool_call(name, &json!({ "repo_path": repo })).expect(name);
     let facet = |name: &str| repo_facet(name, repo).expect(name);
     json!({
-        "tool_insights_ledger": normalised(tool("gitpulse_insights")["ledger"].clone()),
-        "tool_status_ledger": normalised(tool("gitpulse_status")["ledger"].clone()),
-        "tool_ledger_events": page_block(tool("gitpulse_ledger_events")),
+        "tool_insights_ledger": normalised(tool("waylode_insights")["ledger"].clone()),
+        "tool_status_ledger": normalised(tool("waylode_status")["ledger"].clone()),
+        "tool_ledger_events": page_block(tool("waylode_ledger_events")),
         "resource_ledger": page_block(facet("ledger")),
         "resource_insights_ledger": normalised(facet("insights")["ledger"].clone()),
         "resource_status_ledger": normalised(facet("status")["ledger"].clone()),

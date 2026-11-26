@@ -258,7 +258,7 @@ impl<'a> ExitFacts<'a> {
 
 /// `last_error` of a row [`SessionLedger::record_exit`] could not classify and
 /// the exit carried no reason for.
-const UNOBSERVED_EXIT: &str = "The session ended and GitPulse never observed how.";
+const UNOBSERVED_EXIT: &str = "The session ended and Waylode never observed how.";
 /// `last_error` of a row [`SessionLedger::repair_unobserved_exits`] rewrote.
 const REPAIRED_UNOBSERVED_EXIT: &str =
     "The session's outcome was never observed (its host ended); repaired at startup.";

@@ -41,10 +41,10 @@ use std::path::{Path, PathBuf};
 
 use common::fixture::{git, trust_repo};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::engine::git_cli::{git_text, git_with_stdin};
-use gitpulse_lib::engine::git_reader::GitReader;
-use gitpulse_lib::graph::{history_rev_args, RefScope};
-use gitpulse_lib::storage::commit_graph::{inspect, CommitGraphState};
+use waylode_lib::engine::git_cli::{git_text, git_with_stdin};
+use waylode_lib::engine::git_reader::GitReader;
+use waylode_lib::graph::{history_rev_args, RefScope};
+use waylode_lib::storage::commit_graph::{inspect, CommitGraphState};
 
 /// The cold-window arms (AC1 of the history-graph card): a 100,000-commit
 /// window read the shipped way (one walk) and the old way (one `--skip` walk
@@ -439,7 +439,7 @@ fn build_window_source(root: &Path) -> PathBuf {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("commit_graph_history");
     let temp = tempfile::tempdir().expect("temp dir");
 

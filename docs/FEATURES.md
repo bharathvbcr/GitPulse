@@ -1,13 +1,13 @@
-# GitPulse features
+# Waylode features
 
-[Documentation index](README.md) · [Getting started](GETTING_STARTED.md) · [Installation](INSTALLATION.md) · [Why GitPulse](WHY_GITPULSE.md) · [Agents guide](AGENTS_GUIDE.md) · [View reference](VIEW_REFERENCE.md)
+[Documentation index](README.md) · [Getting started](GETTING_STARTED.md) · [Installation](INSTALLATION.md) · [Why Waylode](WHY_WAYLODE.md) · [Agents guide](AGENTS_GUIDE.md) · [View reference](VIEW_REFERENCE.md)
 
-This page lists what GitPulse does, by area. Everything outside the [Coming](#coming) section is in the
+This page lists what Waylode does, by area. Everything outside the [Coming](#coming) section is in the
 code on `main` today. For controls, prerequisites and limits of each view, see the
-[view reference](VIEW_REFERENCE.md). GitPulse is tested on macOS. Windows and Linux builds are produced by
+[view reference](VIEW_REFERENCE.md). Waylode is tested on macOS. Windows and Linux builds are produced by
 release CI but have not been tested, so some features below may behave differently or be missing there.
 
-GitPulse has 5 views and 11 sections: **Work** (Overview, Remote, Tasks), **Mavi** (a single pane: agent conversations and their changes), **Code** (Explorer, Map),
+Waylode has 5 views and 11 sections: **Work** (Overview, Remote, Tasks), **Mavi** (a single pane: agent conversations and their changes), **Code** (Explorer, Map),
 **History** (Graph, Diff) and **Insights** (Pulse, Coverage, Health, Storage). Fleet, the Agents plane and
 the terminal dock sit beside them. The native layer exposes 330+ commands to the frontend.
 
@@ -36,12 +36,12 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 
 - **Launchers**: six (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab (macOS), from the dock.
   Each launcher has a default model, effort, advisor and commit model in **Settings → Agents**.
-- **Live session detection**, including sessions GitPulse did not launch (Claude, Codex, Antigravity,
+- **Live session detection**, including sessions Waylode did not launch (Claude, Codex, Antigravity,
   DevCouncil and Manvi), over MCP as `gitpulse_sessions`. The Agents plane (`⌘⇧A`) draws the checkouts,
   terminals and task attempts your repositories hold.
 - **Agent tree**: parent and child sessions nested, collapsible and filterable.
 - **A worktree per agent**, with copy-on-write `node_modules` and `target` caches, `.worktreeinclude`, and the
-  DevMap store seeded from the main checkout. The `claude --worktree` flow goes through GitPulse's hooks.
+  DevMap store seeded from the main checkout. The `claude --worktree` flow goes through Waylode's hooks.
 - **Agent-to-agent communication**: the peer inbox (`gitpulse_agent_register`, `_peers`, `_send`, `_inbox`,
   `_wait`), worktree lane messages, and **Send to agent** from the UI.
 - **Collision radar, file claims and the collision guard hook**: warnings before two agents' edits meet.
@@ -63,10 +63,10 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 - **Scope fences**: with a task scope bound, writes into another checkout (`sed -i`, `tee`, `rm`, `mv` and
   similar) are refused.
 - **Per-repository trust**: only the desktop can grant it; MCP cannot.
-- **Secret gate** on commits and pushes GitPulse makes (`dc-redact`). It does not catch an agent's own `git commit`.
+- **Secret gate** on commits and pushes Waylode makes (`dc-redact`). It does not catch an agent's own `git commit`.
 - **Pre-operation undo snapshots** (`refs/gitpulse/ops/`) with a compare-and-swap-checked restore, from HEAD moves.
-- **Signal guard**: agents cannot kill GitPulse.
-- **Limits**: Antigravity has no `PreToolUse` guards from GitPulse, and a worktree is not an OS sandbox.
+- **Signal guard**: agents cannot kill Waylode.
+- **Limits**: Antigravity has no `PreToolUse` guards from Waylode, and a worktree is not an OS sandbox.
 
 ## 4. DevCouncil and DevMap code intelligence
 

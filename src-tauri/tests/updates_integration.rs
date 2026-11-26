@@ -10,7 +10,7 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::updates::{evaluate, latest_stable_tag, parse_release_tag, parse_version};
+use waylode_lib::updates::{evaluate, latest_stable_tag, parse_release_tag, parse_version};
 
 /// Shape of one `git ls-remote --tags` line.
 fn ls_remote(tags: &[&str]) -> String {

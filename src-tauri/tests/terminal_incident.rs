@@ -5,14 +5,14 @@
 //! supplies only the event sink. Only the explicit pids this test started are
 //! signalled.
 #![cfg(unix)]
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{kill_session, spawn_session, KillOrigin};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{kill_session, spawn_session, KillOrigin};
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -55,7 +55,7 @@ fn read_pid(path: &std::path::Path) -> i32 {
 #[test]
 fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behind() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let incidents = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
@@ -82,7 +82,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exec sleep 600".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     kill_session(&state, &warm.id, KillOrigin::Unspecified).unwrap();
@@ -106,7 +106,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), script]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(app.handle()),
+            waylode_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         ids.push(spawned.id);
@@ -149,7 +149,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
     assert_eq!(exited, ids);
     // macOS's strsignal says "Terminated: 15", glibc's "Terminated".
     assert_eq!(
-        gitpulse_lib::terminal::incident::launchd_signal_name(got[0]["signal"].as_str().unwrap()),
+        waylode_lib::terminal::incident::launchd_signal_name(got[0]["signal"].as_str().unwrap()),
         Some("SIGTERM"),
         "{}",
         got[0]
@@ -178,7 +178,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
         after <= fds_before + 2,
         "descriptors leaked: {fds_before} before, {after} after"
     );
-    gitpulse_lib::terminal::shutdown_sessions(&state).expect("no session left to stop");
+    waylode_lib::terminal::shutdown_sessions(&state).expect("no session left to stop");
 }
 
 /// Closing sessions through GitPulse is not an external kill: a whole dock
@@ -186,7 +186,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
 #[test]
 fn sessions_closed_through_gitpulse_are_never_an_incident() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let dir = repo();
@@ -201,7 +201,7 @@ fn sessions_closed_through_gitpulse_are_never_an_incident() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exec sleep 600".into()]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(app.handle()),
+            waylode_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         ids.push(spawned.id);

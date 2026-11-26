@@ -1,11 +1,11 @@
 //! Consumer contracts shared by the database, map and graph adapters.
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
-use gitpulse_lib::{codeintel, devmap};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use waylode_lib::{codeintel, devmap};
 
 fn repository() -> tempfile::TempDir {
     common::unmetered_spawns();

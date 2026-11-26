@@ -1,18 +1,18 @@
-use gitpulse_lib::analyzer::CoverageScanner;
-use gitpulse_lib::diff::PatchBuilder;
-use gitpulse_lib::diff::{DiffLineType, FilePatch, UnifiedDiffHunk, UnifiedDiffLine};
-use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write, validate_repo};
-use gitpulse_lib::engine::git_reader::FirstParentChain;
-use gitpulse_lib::engine::git_writer::MergeMode;
-use gitpulse_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
-use gitpulse_lib::github::parse_github_remote_url;
-use gitpulse_lib::graph::{LaneSolver, RefScope};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::analyzer::CoverageScanner;
+use waylode_lib::diff::PatchBuilder;
+use waylode_lib::diff::{DiffLineType, FilePatch, UnifiedDiffHunk, UnifiedDiffLine};
+use waylode_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write, validate_repo};
+use waylode_lib::engine::git_reader::FirstParentChain;
+use waylode_lib::engine::git_writer::MergeMode;
+use waylode_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
+use waylode_lib::github::parse_github_remote_url;
+use waylode_lib::graph::{LaneSolver, RefScope};
+use waylode_lib::procguard::LockedSpawn;
 
 mod common;
 use common::run_git;
@@ -64,7 +64,7 @@ impl TestRepo {
         // spawn rate. Every test that reaches the gate starts here and the
         // suite shares one process gate, so a parallel run otherwise spends
         // the burst and defers git mid-operation.
-        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+        waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let dir = TempDir::new().expect("tempdir");
         let mut args = vec!["init", "-b", "main"];
         args.extend_from_slice(extra_init_args);
@@ -193,7 +193,7 @@ fn release_amend_without_message_retains_the_previous_message() {
 
 #[test]
 fn release_batch_index_roundtrip_is_bounded_and_preserves_unselected_work() {
-    use gitpulse_lib::engine::git_writer::IndexAction;
+    use waylode_lib::engine::git_writer::IndexAction;
     let repo = TestRepo::init();
     let files: Vec<String> = (0..1025)
         .map(|i| format!("changes/file {i} [日本語].txt"))
@@ -248,7 +248,7 @@ fn release_batch_index_roundtrip_is_bounded_and_preserves_unselected_work() {
 
 #[test]
 fn release_batch_checks_every_path_and_policy_before_mutating() {
-    use gitpulse_lib::engine::git_writer::IndexAction;
+    use waylode_lib::engine::git_writer::IndexAction;
     let repo = TestRepo::init();
     repo.write("valid", "preserve\n");
     for bad in [
@@ -297,7 +297,7 @@ fn release_batch_checks_every_path_and_policy_before_mutating() {
 
 #[test]
 fn release_batch_deduplicates_and_a_git_failure_leaves_the_index_untouched() {
-    use gitpulse_lib::engine::git_writer::IndexAction;
+    use waylode_lib::engine::git_writer::IndexAction;
     let repo = TestRepo::init();
     repo.write("valid", "work\n");
     let (_, count) = GitWriter::change_index_with(
@@ -352,7 +352,7 @@ fn release_batch_deduplicates_and_a_git_failure_leaves_the_index_untouched() {
 
 #[test]
 fn release_stash_options_keep_staged_work_and_leave_untracked_files() {
-    use gitpulse_lib::engine::git_writer::StashSaveOptions;
+    use waylode_lib::engine::git_writer::StashSaveOptions;
     let repo = TestRepo::init();
     repo.write("staged", "old\n");
     repo.write("unstaged", "old\n");
@@ -759,13 +759,13 @@ fn test_open_repo_history_status_and_details() {
     let details = GitReader::get_commit_details(&path, &history[0].id).expect("details");
     assert_eq!(details.summary, history[0].summary);
     let verdict =
-        gitpulse_lib::engine::commit_signature::verify_commit_signature(&path, &history[0].id)
+        waylode_lib::engine::commit_signature::verify_commit_signature(&path, &history[0].id)
             .expect("verify an unsigned commit");
     assert_eq!(
         verdict.signature,
-        gitpulse_lib::engine::CommitSignature::None
+        waylode_lib::engine::CommitSignature::None
     );
-    assert_eq!(verdict.status, gitpulse_lib::engine::SignatureStatus::None);
+    assert_eq!(verdict.status, waylode_lib::engine::SignatureStatus::None);
 
     let stats = GitReader::get_repo_language_stats(&path)
         .expect("stats")
@@ -995,7 +995,7 @@ fn test_discover_github_origin_remote() {
             "https://github.com/acme/gitpulse.git",
         ],
     );
-    let discovered = gitpulse_lib::github::discover_github_remote(&repo.path_str())
+    let discovered = waylode_lib::github::discover_github_remote(&repo.path_str())
         .expect("discover")
         .expect("remote");
     assert_eq!(discovered.slug(), "acme/gitpulse");
@@ -1041,16 +1041,16 @@ fn test_merge_conflict_parse_and_resolve() {
     );
 
     let content = GitReader::get_file_content(&path, "app.txt", None).unwrap();
-    let doc = gitpulse_lib::diff::ConflictResolver::parse("app.txt", &content);
+    let doc = waylode_lib::diff::ConflictResolver::parse("app.txt", &content);
     assert!(doc.total_conflicts >= 1);
 
     let mut resolved = doc.clone();
     for seg in &mut resolved.segments {
-        if let gitpulse_lib::diff::FileSegment::Conflict(chunk) = seg {
-            chunk.resolution = gitpulse_lib::diff::ConflictResolutionChoice::AcceptOurs;
+        if let waylode_lib::diff::FileSegment::Conflict(chunk) = seg {
+            chunk.resolution = waylode_lib::diff::ConflictResolutionChoice::AcceptOurs;
         }
     }
-    let text = gitpulse_lib::diff::ConflictResolver::render_resolved(&resolved).unwrap();
+    let text = waylode_lib::diff::ConflictResolver::render_resolved(&resolved).unwrap();
     assert!(text.contains("ours change"));
 }
 
@@ -1311,7 +1311,7 @@ fn test_get_status_copy_record_keeps_cursor_aligned() {
 /// marked with why.
 #[test]
 fn content_search_is_bounded_and_says_why() {
-    use gitpulse_lib::engine::content_search::{search, ContentSearchOptions};
+    use waylode_lib::engine::content_search::{search, ContentSearchOptions};
     let repo = TestRepo::init();
     repo.write(".gitignore", "*.log\n");
     repo.write("src/a.rs", "let needle = 1;\nother\n");
@@ -1429,7 +1429,7 @@ fn content_search_is_bounded_and_says_why() {
 }
 
 fn staged_names(repo: &TestRepo) -> String {
-    gitpulse_lib::engine::git_cli::git_text(
+    waylode_lib::engine::git_cli::git_text(
         repo.dir.path(),
         &["diff", "--cached", "--name-status", "-M"],
     )
@@ -1441,7 +1441,7 @@ fn staged_names(repo: &TestRepo) -> String {
 /// anything moves — a refusal leaves the tree untouched.
 #[test]
 fn move_path_picks_git_mv_or_a_rename_and_gates_it_first() {
-    use gitpulse_lib::engine::git_writer::MovePlan;
+    use waylode_lib::engine::git_writer::MovePlan;
     let repo = TestRepo::init();
     repo.write("src/a.txt", "a\n");
     repo.commit_all("seed");
@@ -1588,7 +1588,7 @@ fn reset_preview_names_what_a_rewind_leaves_behind() {
     let repo = TestRepo::init();
     repo.write("f.txt", "1\n");
     repo.commit_all("base");
-    let base = gitpulse_lib::engine::git_cli::git_text(repo.dir.path(), &["rev-parse", "HEAD"])
+    let base = waylode_lib::engine::git_cli::git_text(repo.dir.path(), &["rev-parse", "HEAD"])
         .unwrap()
         .trim()
         .to_string();
@@ -2095,7 +2095,7 @@ fn deleted_branch_tip_is_durable_for_restore_after_toast_death() {
     assert_eq!(returned, tip_before);
 
     // Process would have dropped the toast here. Read the durable tip.
-    let events = gitpulse_lib::ledger::tail(&path, 0, 100).expect("ledger tail");
+    let events = waylode_lib::ledger::tail(&path, 0, 100).expect("ledger tail");
     let recorded = events
         .iter()
         .rev()
@@ -3066,7 +3066,7 @@ fn release_partial_staging_exposes_both_sides_without_double_counting_files() {
     assert_eq!(value["unstaged_additions"], 2);
     assert_eq!(value["unstaged_deletions"], 1);
     assert_eq!(value["additions"], 3);
-    use gitpulse_lib::engine::git_writer::IndexAction;
+    use waylode_lib::engine::git_writer::IndexAction;
     GitWriter::change_index_with(
         &repo.path_str(),
         &["mixed.txt".into()],

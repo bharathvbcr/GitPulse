@@ -1,5 +1,5 @@
 {
-  "name": "gitpulse",
+  "name": "waylode",
   "version": "0.2.0-beta.1",
   "private": true,
   "license": "MIT OR Apache-2.0",
@@ -44,8 +44,9 @@
     "check:workflows": "node scripts/check-workflows.mjs",
     "check:vendor-schema": "node scripts/check-vendor-schema.mjs",
     "check:schema-parity": "node scripts/check-schema-parity.mjs",
+    "check:brand-assets": "node scripts/generate-brand-assets.mjs --check",
     "check:fixture-authors": "bash .githooks/lib/fixture-commits.sh",
-    "mcp:install": "cargo install --path src-tauri --bin gitpulse-mcp --bin gitpulse-hook --locked --force && node scripts/record-install.mjs",
+    "mcp:install": "cargo install --path src-tauri --bin waylode-mcp --bin waylode-hook --locked --force && node scripts/record-install.mjs",
     "mcp:doctor": "node scripts/check-mcp-install.mjs",
     "gusset:check": "node scripts/gusset-check.mjs",
     "check:ptyd-release": "node scripts/check-ptyd-release.mjs",

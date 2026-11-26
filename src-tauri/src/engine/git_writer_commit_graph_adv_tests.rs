@@ -96,7 +96,7 @@ fn adv_a_foreign_lock_taken_after_the_snapshot_is_not_swept() {
         message = message.message()
     );
     assert!(
-        message.contains("GitPulse never removes"),
+        message.contains("Waylode never removes"),
         "{message}",
         message = message.message()
     );

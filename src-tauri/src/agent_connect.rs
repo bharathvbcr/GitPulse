@@ -1,13 +1,17 @@
-//! Connect an installed agent (Claude Code, Codex) to the GitPulse MCP server.
+//! Connect an installed agent (Claude Code, Codex) to the Waylode MCP server.
 //!
-//! A DMG install ships `gitpulse-mcp` and `gitpulse-hook` inside the app bundle
-//! and puts neither on `PATH`, so an agent cannot start them. This module builds
-//! a PLAN (no side effects) and applies it only when the caller asks:
+//! A DMG / installer ships `waylode-mcp` and `waylode-hook` inside the app
+//! bundle and puts neither on `PATH`, so an agent cannot start them. This module
+//! builds a PLAN (no side effects) and applies it only when the caller asks:
 //!
-//! 1. symlink both binaries into `~/.local/bin` (never overwriting a regular
-//!    file or a link that points somewhere else; idempotent when correct);
-//! 2. register the server with each agent CLI that is installed, through the
-//!    agent's own `mcp add` — never by editing its configuration by hand.
+//! 1. symlink (or on Windows, hard-link / copy) both binaries plus legacy
+//!    `gitpulse-mcp` / `gitpulse-hook` compat links into `~/.local/bin` (never
+//!    overwriting a regular file or a link that points somewhere else;
+//!    idempotent when correct);
+//! 2. register the `waylode` server with each agent CLI that is installed,
+//!    through the agent's own `mcp add`, and clean any legacy `gitpulse` server
+//!    registration through the agent's own `mcp remove` — never by editing its
+//!    configuration by hand.
 //!
 //! The flags used come from the CLIs' own help on this machine:
 //! `claude mcp add [options] <name> <commandOrUrl> [args...]` with
@@ -24,8 +28,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// The name the server is registered under, matching what existing setups use.
-pub const SERVER_NAME: &str = "gitpulse";
+/// The name the server is registered under, matching what updated setups use.
+pub const SERVER_NAME: &str = "waylode";
+/// Legacy server name from earlier GitPulse installs, detected and cleaned on connect.
+pub const LEGACY_SERVER_NAME: &str = "gitpulse";
 
 const CLI_DEADLINE: Duration = Duration::from_secs(30);
 const CLI_OUTPUT_CAP: usize = 64 * 1024;
@@ -181,8 +187,8 @@ impl Agent {
         }
     }
     /// `claude mcp get <name>` / `codex mcp get <name> --json`.
-    fn get_args(self) -> Vec<String> {
-        let mut args = vec!["mcp".into(), "get".into(), SERVER_NAME.into()];
+    fn get_args_for(self, server_name: &str) -> Vec<String> {
+        let mut args = vec!["mcp".into(), "get".into(), server_name.into()];
         if matches!(self, Agent::Codex) {
             args.push("--json".into());
         }
@@ -198,17 +204,28 @@ impl Agent {
         args.extend([SERVER_NAME.into(), "--".into(), command.into()]);
         args
     }
+    fn remove_args_for(self, server_name: &str, scope: Option<&str>) -> Vec<String> {
+        let mut args = vec!["mcp".into(), "remove".into(), server_name.into()];
+        if let (Agent::Claude, Some(scope)) = (self, scope) {
+            args.extend(["-s".into(), scope.into()]);
+        }
+        args
+    }
 }
 
 impl Agent {
     /// The agent's own line that removes the registration, for the user to run.
-    fn remove_line(self, scope: Option<&str>) -> String {
-        let mut line = format!("{} mcp remove {SERVER_NAME}", self.key());
+    fn remove_line_for(self, server_name: &str, scope: Option<&str>) -> String {
+        let mut line = format!("{} mcp remove {server_name}", self.key());
         if let (Agent::Claude, Some(scope)) = (self, scope) {
             line.push_str(" -s ");
             line.push_str(scope);
         }
         line
+    }
+
+    fn remove_line(self, scope: Option<&str>) -> String {
+        self.remove_line_for(SERVER_NAME, scope)
     }
 }
 
@@ -251,7 +268,7 @@ fn cap(text: &str) -> String {
 /// PATH of the shell an agent starts from (a GUI app's own PATH differs), so
 /// it says what depends on it instead of guessing.
 const PATH_NOTE: &str = "The MCP registration uses the full path and works either way; \
-     Claude Code hooks call gitpulse-hook by name, so ~/.local/bin must be on your shell's PATH.";
+     Claude Code hooks call waylode-hook by name, so ~/.local/bin must be on your shell's PATH.";
 
 /// Whether `path` lies inside a macOS App Translocation mount.
 fn is_translocated(path: &Path) -> bool {
@@ -259,8 +276,16 @@ fn is_translocated(path: &Path) -> bool {
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("AppTranslocation"))
 }
 
+fn link_dest_name(name: &str) -> String {
+    if cfg!(windows) && !name.ends_with(".exe") {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
 fn link_path(home: &Path, name: &str) -> PathBuf {
-    home.join(".local").join("bin").join(name)
+    home.join(".local").join("bin").join(link_dest_name(name))
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -324,10 +349,24 @@ fn inspect_link_state(dest: &Path, source: &Path) -> (ConnectActionState, String
                 format!("could not read the link {}: {e}", dest.display()),
             ),
         },
-        Ok(_) => (
-            ConnectActionState::Blocked,
-            "Left alone: a file you put there is not a link.".into(),
-        ),
+        Ok(_meta) => {
+            #[cfg(windows)]
+            if _meta.is_file()
+                && std::fs::read(dest)
+                    .ok()
+                    .zip(std::fs::read(source).ok())
+                    .is_some_and(|(a, b)| a == b)
+            {
+                return (
+                    ConnectActionState::Done,
+                    format!("Already installed for this app. {PATH_NOTE}"),
+                );
+            }
+            (
+                ConnectActionState::Blocked,
+                "Left alone: a file you put there is not a link.".into(),
+            )
+        }
     }
 }
 
@@ -385,14 +424,20 @@ fn claude_plugin_server(program: &str, runner: &dyn CliRunner) -> PluginServer {
     let Some(serde_json::Value::Array(plugins)) = json_value(&run.output) else {
         return PluginServer::Unknown("its plugin list was not readable".into());
     };
-    let serves_gitpulse = |servers: &serde_json::Map<String, serde_json::Value>| {
+    let serves_waylode = |servers: &serde_json::Map<String, serde_json::Value>| {
         servers.iter().any(|(name, server)| {
             name == SERVER_NAME
+                || name == LEGACY_SERVER_NAME
                 || server
                     .get("command")
                     .and_then(|c| c.as_str())
                     .and_then(|c| Path::new(c).file_name())
-                    .is_some_and(|f| f == "gitpulse-mcp")
+                    .is_some_and(|f| {
+                        f == "waylode-mcp"
+                            || f == "waylode-mcp.exe"
+                            || f == "gitpulse-mcp"
+                            || f == "gitpulse-mcp.exe"
+                    })
         })
     };
     plugins
@@ -401,13 +446,13 @@ fn claude_plugin_server(program: &str, runner: &dyn CliRunner) -> PluginServer {
             p.get("enabled").and_then(|e| e.as_bool()) == Some(true)
                 && p.get("mcpServers")
                     .and_then(|m| m.as_object())
-                    .is_some_and(serves_gitpulse)
+                    .is_some_and(serves_waylode)
         })
         .map(|p| {
             PluginServer::Provided(
                 p.get("id")
                     .and_then(|i| i.as_str())
-                    .unwrap_or("a GitPulse plugin")
+                    .unwrap_or("a Waylode plugin")
                     .to_string(),
             )
         })
@@ -453,13 +498,14 @@ fn codex_command(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn registration(
+fn registration_for(
     agent: Agent,
+    server_name: &str,
     program: &str,
     runner: &dyn CliRunner,
     command: &str,
 ) -> Registration {
-    let run = match runner.run(program, &agent.get_args()) {
+    let run = match runner.run(program, &agent.get_args_for(server_name)) {
         Ok(run) => run,
         Err(e) => return Registration::Unknown(e),
     };
@@ -489,10 +535,21 @@ fn registration(
             scope,
         },
         None => Registration::Different {
-            command: "a command GitPulse could not read".into(),
+            command: "a command Waylode could not read".into(),
             scope,
         },
     }
+}
+
+fn is_legacy_mcp_command(command: &str) -> bool {
+    let name = Path::new(command)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command);
+    matches!(
+        name,
+        "gitpulse-mcp" | "gitpulse-mcp.exe" | "waylode-mcp" | "waylode-mcp.exe"
+    )
 }
 
 /// Builds the plan. Reads the filesystem and runs the agents' read-only
@@ -510,7 +567,7 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
     // Without an absolute home every link path would resolve against the
     // process's working directory, so refuse rather than write there.
     if !env.home.is_absolute() {
-        plan.reason = "GitPulse could not find your home directory (HOME is unset or not an \
+        plan.reason = "Waylode could not find your home directory (HOME is unset or not an \
                        absolute path), so it will not create links or register anything."
             .into();
         return plan;
@@ -524,50 +581,63 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
         .find(|path| is_translocated(path))
     {
         plan.reason = format!(
-            "GitPulse is running from a temporary macOS App Translocation location ({}). Move \
-             GitPulse.app into /Applications, open it from there, then connect your agent.",
+            "Waylode is running from a temporary macOS App Translocation location ({}). Move \
+             Waylode.app into /Applications, open it from there, then connect your agent.",
             moved.display()
         );
         return plan;
     }
     let mut notes: Vec<String> = Vec::new();
-    for (name, found, slot) in [
-        ("gitpulse-mcp", &env.mcp, &mut plan.mcp_path),
-        ("gitpulse-hook", &env.hook, &mut plan.hook_path),
+    for (name, found, legacy_alias) in [
+        ("waylode-mcp", &env.mcp, false),
+        ("waylode-hook", &env.hook, false),
+        ("gitpulse-mcp", &env.mcp, true),
+        ("gitpulse-hook", &env.hook, true),
     ] {
         let dest = link_path(&env.home, name);
         match found {
             Ok(source) => {
                 plan.available = true;
-                *slot = source.to_string_lossy().into_owned();
+                if name == "waylode-mcp" {
+                    plan.mcp_path = source.to_string_lossy().into_owned();
+                } else if name == "waylode-hook" {
+                    plan.hook_path = source.to_string_lossy().into_owned();
+                }
                 let (state, mut detail, mut commands) = inspect_link(&dest, source);
-                let older = env.cargo_bin.join(name);
+                let older = env.cargo_bin.join(link_dest_name(name));
                 if std::fs::symlink_metadata(&older).is_ok() && !same_file(&older, source) {
+                    let pkg = if legacy_alias { "gitpulse" } else { "waylode" };
                     detail.push_str(&format!(
                         " Also found {}, an older copy from `bun run mcp:install`; whichever \
                          directory comes first on PATH wins. If you use this app's copy, remove \
-                         it with `cargo uninstall gitpulse`.",
+                         it with `cargo uninstall {pkg}`.",
                         older.display()
                     ));
-                    commands.push("cargo uninstall gitpulse".into());
+                    commands.push(format!("cargo uninstall {pkg}"));
                 }
+                let title = if legacy_alias {
+                    format!("Link legacy compat {name} into ~/.local/bin")
+                } else {
+                    format!("Link {name} into ~/.local/bin")
+                };
                 plan.actions.push(ConnectAction {
                     id: format!("link:{name}"),
                     kind: ConnectActionKind::Link,
                     agent: None,
-                    title: format!("Link {name} into ~/.local/bin"),
+                    title,
                     target: dest.to_string_lossy().into_owned(),
                     state,
                     detail,
                     commands,
                 });
             }
-            Err(e) => notes.push(format!("{name}: {e}")),
+            Err(e) if !legacy_alias => notes.push(format!("{name}: {e}")),
+            Err(_) => {}
         }
     }
     if !plan.available {
         plan.reason = format!(
-            "GitPulse could not find its bundled agent binaries. {}",
+            "Waylode could not find its bundled agent binaries. {}",
             notes.join(" ")
         );
         return plan;
@@ -586,7 +656,7 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
             };
             plan.agents_found.push(agent.key().to_string());
             let add_line = shell_words(agent.key(), &agent.add_args(&command));
-            let registered = registration(agent, &program, env.runner, &command);
+            let registered = registration_for(agent, SERVER_NAME, &program, env.runner, &command);
             let plugin = match agent {
                 Agent::Claude => claude_plugin_server(&program, env.runner),
                 Agent::Codex => PluginServer::None,
@@ -598,12 +668,12 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
                     format!("Could not check {label}'s registry: {why}"),
                     Vec::new(),
                 ),
-                // Registering anyway could add a second gitpulse server beside
+                // Registering anyway could add a second waylode server beside
                 // the plugin's; not knowing is not "no plugin".
                 (_, PluginServer::Unknown(why)) => (
                     ConnectActionState::Blocked,
                     format!(
-                        "Could not check whether GitPulse's {label} plugin already provides the \
+                        "Could not check whether Waylode's {label} plugin already provides the \
                          server ({why}), so nothing is registered, to avoid a second {SERVER_NAME} \
                          server. If the plugin is not installed, run the line below yourself."
                     ),
@@ -612,7 +682,7 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
                 (Registration::Absent, PluginServer::Provided(id)) => (
                     ConnectActionState::Done,
                     format!(
-                        "Provided by the {id} plugin, which starts gitpulse-mcp by name, so it \
+                        "Provided by the {id} plugin, which starts waylode-mcp by name, so it \
                          needs ~/.local/bin (the link above) on your shell's PATH. Not registered \
                          a second time."
                     ),
@@ -669,6 +739,71 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
                 detail,
                 commands,
             });
+            let legacy =
+                registration_for(agent, LEGACY_SERVER_NAME, &program, env.runner, &command);
+            match legacy {
+                Registration::Current { scope } => {
+                    let remove_cmd = agent.remove_line_for(LEGACY_SERVER_NAME, scope);
+                    plan.actions.push(ConnectAction {
+                        id: format!("cleanup-legacy:{}", agent.key()),
+                        kind: ConnectActionKind::Register,
+                        agent: Some(agent.key().to_string()),
+                        title: format!(
+                            "Remove legacy '{LEGACY_SERVER_NAME}' server from {}",
+                            agent.label()
+                        ),
+                        target: remove_cmd,
+                        state: ConnectActionState::Todo,
+                        detail: format!(
+                            "Removes the legacy `{LEGACY_SERVER_NAME}` registration from {label} \
+                             now that `{SERVER_NAME}` is registered."
+                        ),
+                        commands: Vec::new(),
+                    });
+                }
+                Registration::Different {
+                    command: found,
+                    scope,
+                } => {
+                    let remove_cmd = agent.remove_line_for(LEGACY_SERVER_NAME, scope);
+                    if is_legacy_mcp_command(&found) {
+                        plan.actions.push(ConnectAction {
+                            id: format!("cleanup-legacy:{}", agent.key()),
+                            kind: ConnectActionKind::Register,
+                            agent: Some(agent.key().to_string()),
+                            title: format!(
+                                "Remove legacy '{LEGACY_SERVER_NAME}' server from {}",
+                                agent.label()
+                            ),
+                            target: remove_cmd,
+                            state: ConnectActionState::Todo,
+                            detail: format!(
+                                "Removes the legacy `{LEGACY_SERVER_NAME}` registration (`{found}`) \
+                                 from {label}."
+                            ),
+                            commands: Vec::new(),
+                        });
+                    } else {
+                        plan.actions.push(ConnectAction {
+                            id: format!("cleanup-legacy:{}", agent.key()),
+                            kind: ConnectActionKind::Register,
+                            agent: Some(agent.key().to_string()),
+                            title: format!(
+                                "Remove legacy '{LEGACY_SERVER_NAME}' server from {}",
+                                agent.label()
+                            ),
+                            target: remove_cmd.clone(),
+                            state: ConnectActionState::Blocked,
+                            detail: format!(
+                                "Left alone: {label} has a `{LEGACY_SERVER_NAME}` entry running \
+                                 `{found}`. Remove it yourself if it came from GitPulse."
+                            ),
+                            commands: vec![remove_cmd],
+                        });
+                    }
+                }
+                Registration::Absent | Registration::Unknown(_) => {}
+            }
         }
     }
     for note in notes {
@@ -677,6 +812,22 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
     }
     plan.reason = plan.reason.trim().to_string();
     plan
+}
+
+/// Windows NTFS link installer: creates a hard link, falling back to a plain
+/// file copy when cross-volume or unsupported (never writes a `.cmd` shim).
+#[allow(dead_code)]
+pub(crate) fn hard_link_or_copy(source: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
+    match std::fs::hard_link(source, dest) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::copy(source, dest)
+            .map(|_| ())
+            .map_err(|e| format!("could not copy {}: {e}", dest.display())),
+    }
 }
 
 fn apply_link(dest: &Path, source: &Path) -> Result<(), String> {
@@ -689,7 +840,11 @@ fn apply_link(dest: &Path, source: &Path) -> Result<(), String> {
         std::os::unix::fs::symlink(source, dest)
             .map_err(|e| format!("could not link {}: {e}", dest.display()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        hard_link_or_copy(source, dest)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = (dest, source);
         Err("links are not created on this platform".into())
@@ -719,7 +874,7 @@ pub fn apply(env: &ConnectEnv) -> ConnectOutcome {
                 let outcome = match action.kind {
                     ConnectActionKind::Link => {
                         let name = action.id.trim_start_matches("link:");
-                        let source = if name == "gitpulse-mcp" {
+                        let source = if name == "waylode-mcp" || name == "gitpulse-mcp" {
                             &env.mcp
                         } else {
                             &env.hook
@@ -729,7 +884,13 @@ pub fn apply(env: &ConnectEnv) -> ConnectOutcome {
                             Err(e) => Err(e.clone()),
                         }
                     }
-                    ConnectActionKind::Register => apply_register(env, action),
+                    ConnectActionKind::Register => {
+                        if action.id.starts_with("cleanup-legacy:") {
+                            apply_cleanup_legacy(env, action)
+                        } else {
+                            apply_register(env, action)
+                        }
+                    }
                 };
                 match outcome {
                     Ok(()) => ActionResult {
@@ -750,6 +911,34 @@ pub fn apply(env: &ConnectEnv) -> ConnectOutcome {
     ConnectOutcome {
         results,
         plan: build_plan(env),
+    }
+}
+
+fn apply_cleanup_legacy(env: &ConnectEnv, action: &ConnectAction) -> Result<(), String> {
+    let key = action.agent.as_deref().unwrap_or_default();
+    let agent = AGENTS
+        .into_iter()
+        .find(|a| a.key() == key)
+        .ok_or_else(|| format!("unknown agent {key}"))?;
+    let program =
+        (env.find_tool)(key).ok_or_else(|| format!("{} is no longer installed", agent.label()))?;
+    let command = env
+        .mcp
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let scope = match registration_for(agent, LEGACY_SERVER_NAME, &program, env.runner, &command) {
+        Registration::Current { scope } => scope,
+        Registration::Different { scope, command } if is_legacy_mcp_command(&command) => scope,
+        _ => return Ok(()),
+    };
+    let run = env
+        .runner
+        .run(&program, &agent.remove_args_for(LEGACY_SERVER_NAME, scope))?;
+    if run.success {
+        Ok(())
+    } else {
+        Err(format!("{} refused: {}", agent.label(), run.output.trim()))
     }
 }
 
@@ -789,8 +978,16 @@ fn with_real_env<T>(f: impl FnOnce(&ConnectEnv) -> T) -> T {
         .unwrap_or_default();
     #[cfg(unix)]
     let (mcp, hook) = (
-        crate::insights::bundled_binary("GITPULSE_MCP_PATH", "gitpulse-mcp"),
-        crate::insights::bundled_binary("GITPULSE_HOOK_PATH", "gitpulse-hook"),
+        crate::insights::bundled_binary_compat(
+            "WAYLODE_MCP_PATH",
+            "GITPULSE_MCP_PATH",
+            "waylode-mcp",
+        ),
+        crate::insights::bundled_binary_compat(
+            "WAYLODE_HOOK_PATH",
+            "GITPULSE_HOOK_PATH",
+            "waylode-hook",
+        ),
     );
     #[cfg(not(unix))]
     let (mcp, hook) = (

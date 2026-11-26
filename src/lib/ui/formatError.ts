@@ -41,7 +41,7 @@ function stableStringify(value: unknown): string | null {
  * text ("Cannot read properties of undefined (reading 'invoke')") names
  * internals and means nothing to them; it goes to Diagnostics instead.
  */
-export const INTERNAL_ERROR_COPY = "Something went wrong inside GitPulse. Details are in Diagnostics.";
+export const INTERNAL_ERROR_COPY = "Something went wrong inside Waylode. Details are in Diagnostics.";
 
 /** Where a runtime fault's raw error goes when it is replaced by `INTERNAL_ERROR_COPY`. */
 export type ProgrammingErrorSink = (source: string, err: unknown) => void;

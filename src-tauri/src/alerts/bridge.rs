@@ -133,10 +133,14 @@ use std::sync::{Mutex, OnceLock};
 pub const SOCKET_NAME: &str = "agent-notify.sock";
 
 /// The environment variable a launched agent's hooks read to find the socket.
-pub const SOCKET_ENV: &str = "GITPULSE_NOTIFY_SOCKET";
+pub const SOCKET_ENV: &str = "WAYLODE_NOTIFY_SOCKET";
+/// Legacy environment variable for [`SOCKET_ENV`].
+pub const LEGACY_SOCKET_ENV: &str = "GITPULSE_NOTIFY_SOCKET";
 
-/// The environment variable that tells a hook which GitPulse PTY it is under.
-pub const SESSION_ENV: &str = "GITPULSE_SESSION_ID";
+/// The environment variable that tells a hook which Waylode PTY it is under.
+pub const SESSION_ENV: &str = "WAYLODE_SESSION_ID";
+/// Legacy environment variable for [`SESSION_ENV`].
+pub const LEGACY_SESSION_ENV: &str = "GITPULSE_SESSION_ID";
 
 /// Largest report accepted from one connection.
 pub const MAX_REPORT_BYTES: usize = 8 * 1024;

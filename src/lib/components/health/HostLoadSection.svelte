@@ -246,11 +246,11 @@
     const writer = status.writer;
     switch (status.role) {
       case "writer":
-        return `This GitPulse samples (pid ${writer?.pid ?? "?"}, ${writer?.path ?? "unknown path"})`;
+        return `This Waylode samples (pid ${writer?.pid ?? "?"}, ${writer?.path ?? "unknown path"})`;
       case "reader":
         return writer
-          ? `Another GitPulse samples: pid ${writer.pid}, ${writer.path} (version ${writer.version})`
-          : "Another GitPulse holds the sampler; it has not written yet";
+          ? `Another Waylode samples: pid ${writer.pid}, ${writer.path} (version ${writer.version})`
+          : "Another Waylode holds the sampler; it has not written yet";
       case "not_sampling":
         return "No sampler runs in this process";
       case "unsupported":
@@ -329,10 +329,10 @@
         <div><dt class="text-textMuted">Load (1 / 5 / 15 min)</dt><dd class="text-textPrimary font-mono">{describeReading(host.load, (l) => l.map((v) => v.toFixed(2)).join(" / "))}</dd></div>
         <div><dt class="text-textMuted">CPUs</dt><dd class="text-textPrimary">{describeReading(host.cores, (c) => c.levels > 0 ? `${c.logical} (${c.perf0} + ${c.perf1} by level)` : `${c.logical}`)}</dd></div>
         <div><dt class="text-textMuted">Open files</dt><dd class="text-textPrimary">{describeReading(host.open_files, String)} of {describeReading(host.max_files, String)}</dd></div>
-        <div title={`Measures immediate unallocated space available to GitPulse; ${fileManagerName($hostPlatform.os)} may report more by counting purgeable caches.`}><dt class="text-textMuted">Free disk</dt><dd class="text-textPrimary" data-testid="host-load-free-disk">{host.free_disk.status === "value" && host.total_disk?.status === "value" ? `${bytes(host.free_disk.value)} of ${bytes(host.total_disk.value)}` : describeReading(host.free_disk, bytes)}</dd></div>
+        <div title={`Measures immediate unallocated space available to Waylode; ${fileManagerName($hostPlatform.os)} may report more by counting purgeable caches.`}><dt class="text-textMuted">Free disk</dt><dd class="text-textPrimary" data-testid="host-load-free-disk">{host.free_disk.status === "value" && host.total_disk?.status === "value" ? `${bytes(host.free_disk.value)} of ${bytes(host.total_disk.value)}` : describeReading(host.free_disk, bytes)}</dd></div>
         <div><dt class="text-textMuted">Thermal · power</dt><dd class="text-textPrimary">{describeReading(host.thermal, String)}{host.thermal_temp_c?.status === "value" ? ` (${host.thermal_temp_c.value.toFixed(1)} °C)` : ""} · {describeReading(host.power, (p) => p === "ac" ? "on power" : "on battery")}</dd></div>
         <div><dt class="text-textMuted">Processes</dt><dd class="text-textPrimary">{describeReading(snap.processes, String)}{snap.unreadable_processes > 0 ? ` (${snap.unreadable_processes} unreadable)` : ""}</dd></div>
-        <div><dt class="text-textMuted">Started by GitPulse</dt><dd class="text-textPrimary">{describeReading(snap.launched_footprint, bytes)} · writing {describeReading(snap.launched_write_rate, bytesPerSecond)}</dd></div>
+        <div><dt class="text-textMuted">Started by Waylode</dt><dd class="text-textPrimary">{describeReading(snap.launched_footprint, bytes)} · writing {describeReading(snap.launched_write_rate, bytesPerSecond)}</dd></div>
         <div><dt class="text-textMuted">Other agent sessions</dt><dd class="text-textPrimary">{describeReading(snap.observed_footprint, bytes)}</dd></div>
         <div><dt class="text-textMuted">Claude sessions</dt><dd class="text-textPrimary">{describeReading(snap.claude, (c) => `${c.launched} started here · ${c.observed} other`)}</dd></div>
         <div><dt class="text-textMuted">Codex sessions</dt><dd class="text-textPrimary">{describeReading(snap.codex, (c) => `${c.launched} started here · ${c.observed} other`)}</dd></div>
@@ -371,7 +371,7 @@
               <td class="px-3 py-1.5 text-textPrimary">{session.kind}</td>
               <td class="px-3 py-1.5 font-mono text-textMuted">{session.pid}</td>
               <td class="px-3 py-1.5 font-mono text-textMuted break-all">{session.cwd ?? "unknown"}</td>
-              <td class="px-3 py-1.5 text-textMuted">{session.tree ? (session.run_id ? `task ${session.run_id}` : "GitPulse terminal") : "elsewhere"}</td>
+              <td class="px-3 py-1.5 text-textMuted">{session.tree ? (session.run_id ? `task ${session.run_id}` : "Waylode terminal") : "elsewhere"}</td>
               <td class="px-3 py-1.5 text-textMuted">{describeReading(session.footprint, bytes)}{session.unreadable_members > 0 ? ` (+${session.unreadable_members} unreadable)` : ""}</td>
               <td class="px-3 py-1.5 text-textMuted">{describeReading(session.write_rate, (rate) => `at least ${bytesPerSecond(rate)}`)}</td>
             </tr>
@@ -384,7 +384,7 @@
       {/if}
 
       {#if procs.trees.length > 0}
-        <HealthTable caption="Process trees GitPulse started" columns={TREE_COLUMNS}>
+        <HealthTable caption="Process trees Waylode started" columns={TREE_COLUMNS}>
           {#each keyedList(previewSlice(procs.trees, expanded.trees, LIST_PREVIEW_ROWS), (t) => t.tree) as { item: tree, key } (key)}
             <tr>
               <td class="px-3 py-1.5 font-mono text-textPrimary">{tree.run_id ? `task ${tree.run_id}` : (tree.session_id ?? tree.tree)}</td>
@@ -398,7 +398,7 @@
       {/if}
 
       {#if procs.foreign_top.length > 0}
-        <HealthTable caption="The heaviest processes GitPulse did not start" columns={FOREIGN_COLUMNS}>
+        <HealthTable caption="The heaviest processes Waylode did not start" columns={FOREIGN_COLUMNS}>
           {#each keyedList(previewSlice(procs.foreign_top, expanded.foreign, LIST_PREVIEW_ROWS), (p) => String(p.pid)) as { item: proc, key } (key)}
             <tr>
               <td class="px-3 py-1.5 text-textPrimary">{proc.name}{proc.session ? ` (${proc.session} session)` : ""}</td>
@@ -442,8 +442,8 @@
         </HealthTable>
         <ListPreviewToggle total={procs.orphans.length} noun="processes" bind:expanded={expanded.orphans} />
         <p class="text-textMuted">
-          Each has no parent left, works in a git worktree, belongs to no agent session or GitPulse run, and has
-          kept a CPU busy for most of its life. GitPulse only lists them; Terminate asks you to confirm in a system
+          Each has no parent left, works in a git worktree, belongs to no agent session or Waylode run, and has
+          kept a CPU busy for most of its life. Waylode only lists them; Terminate asks you to confirm in a system
           dialog, then sends SIGTERM after checking again that it is still the same process.
         </p>
       {/if}

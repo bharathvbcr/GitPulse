@@ -187,7 +187,7 @@ impl From<&str> for Refusal {
 /// `scopes_complete` flag, which approves no reclaim scope at all.
 fn read_failure(what: impl std::fmt::Display, error: &std::io::Error) -> Refusal {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
-        Refusal::Denied(format!("{what}: GitPulse may not read it ({error})"))
+        Refusal::Denied(format!("{what}: Waylode may not read it ({error})"))
     } else {
         Refusal::Unexamined(format!("{what}: {error}"))
     }
@@ -726,7 +726,7 @@ fn judge(
     }
     tree::no_symlinks_checked(target).map_err(|e| match e {
         tree::WalkError::CouldNotRead(why) => Refusal::Unexamined(why),
-        tree::WalkError::Denied(why) => Refusal::Denied(format!("GitPulse may not read it: {why}")),
+        tree::WalkError::Denied(why) => Refusal::Denied(format!("Waylode may not read it: {why}")),
         other => Refusal::Kept(other.message()),
     })?;
     let real = crate::engine::process::canonicalize_plain(target)
@@ -810,7 +810,7 @@ fn judge(
             )),
             tree::WalkError::CouldNotRead(why) => Refusal::Unexamined(why),
             tree::WalkError::Denied(why) => {
-                Refusal::Denied(format!("GitPulse may not read it: {why}"))
+                Refusal::Denied(format!("Waylode may not read it: {why}"))
             }
             tree::WalkError::Cancelled => Refusal::Unexamined("the walk was cancelled".into()),
         },

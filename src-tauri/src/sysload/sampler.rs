@@ -334,7 +334,7 @@ impl SamplerOptions {
             thresholds: Box::new(super::Thresholds::default),
             on_tick: None,
             begin_activity: Box::new(|| {
-                super::probe::Activity::begin("GitPulse host-load sampler")
+                super::probe::Activity::begin("Waylode host-load sampler")
                     .map(|activity| Box::new(activity) as Box<dyn Send>)
             }),
             trace_opener: trace::file_opener(),
@@ -2243,7 +2243,7 @@ mod tests {
         observed_only.claude.observed = 2;
         assert!(
             !active_work_present(dir.path(), Some(&observed_only)),
-            "external observed agents should not block GitPulse hibernation"
+            "external observed agents should not block Waylode hibernation"
         );
 
         let mut launched_agent = empty.clone();

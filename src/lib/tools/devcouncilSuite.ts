@@ -16,7 +16,7 @@ import type {
 export const NEED_LABEL: Record<ComponentNeed, string> = {
   required: "Required",
   host_resolved: "Used by the Manvi host",
-  optional: "Not used by GitPulse",
+  optional: "Not used by Waylode",
 };
 
 export function needLabel(need: ComponentNeed): string {
@@ -53,7 +53,7 @@ export function missingNeeded(components: readonly ComponentStatus[]): Component
 export function missingSummary(components: readonly ComponentStatus[]): string {
   const missing = missingNeeded(components);
   if (missing.length === 0) {
-    return "Every component GitPulse or its Manvi host uses is installed.";
+    return "Every component Waylode or its Manvi host uses is installed.";
   }
   const ids = missing.map((component) => component.id).join(", ");
   return missing.length === 1

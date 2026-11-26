@@ -34,8 +34,10 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Capability token environment variable injected into every GitPulse PTY.
-pub const SESSION_TOKEN_ENV: &str = "GITPULSE_SESSION_TOKEN";
+/// Capability token environment variable injected into every Waylode PTY.
+pub const SESSION_TOKEN_ENV: &str = "WAYLODE_SESSION_TOKEN";
+/// Legacy environment variable for [`SESSION_TOKEN_ENV`].
+pub const LEGACY_SESSION_TOKEN_ENV: &str = "GITPULSE_SESSION_TOKEN";
 /// Prefix on every minted [`SESSION_TOKEN_ENV`] value so capability tokens can
 /// be recognized and scrubbed unconditionally from terminal screen reads.
 pub const SESSION_TOKEN_PREFIX: &str = "gpst_";
@@ -96,9 +98,11 @@ pub(crate) fn is_valid_external_caller_id(id: &str) -> bool {
 pub(crate) const MAVI_OWNER_PREFIX: &str = "ext-mavi-";
 
 /// Environment variable a host sets on an agent process so that agent's
-/// `gitpulse-mcp` / `gitpulse-hook` orchestrate as a stable external caller
+/// `waylode-mcp` / `waylode-hook` orchestrate as a stable external caller
 /// (today only `ext-mavi-<uuid>`) instead of the per-process `mcp-<pid>`.
-pub const ORCHESTRATE_CALLER_ENV: &str = "GITPULSE_ORCHESTRATE_CALLER";
+pub const ORCHESTRATE_CALLER_ENV: &str = "WAYLODE_ORCHESTRATE_CALLER";
+/// Legacy `GITPULSE_*` alias for [`ORCHESTRATE_CALLER_ENV`].
+pub const LEGACY_ORCHESTRATE_CALLER_ENV: &str = "GITPULSE_ORCHESTRATE_CALLER";
 
 /// A canonical (lowercase, hyphenated, 36-byte) UUID, as `crypto.randomUUID`
 /// writes it. Anything else is not a Mavi thread key.
@@ -140,7 +144,7 @@ pub(crate) fn mavi_thread_of_owner(owner_key: &str) -> Option<&str> {
 /// repository; that is no wider than the `ext-*` / `mcp-*` keys any same-user
 /// process can already claim, and repository trust still gates every call.
 pub fn standalone_caller_id(fallback: impl FnOnce() -> String) -> Result<String, String> {
-    let raw = std::env::var(ORCHESTRATE_CALLER_ENV).ok();
+    let raw = crate::env_compat::var_compat(ORCHESTRATE_CALLER_ENV, LEGACY_ORCHESTRATE_CALLER_ENV);
     standalone_caller_id_from(raw.as_deref(), fallback)
 }
 

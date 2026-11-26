@@ -17,13 +17,13 @@
 
 mod common;
 
-use gitpulse_lib::desktop::instance::{claim, Claim};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use waylode_lib::desktop::instance::{claim, Claim};
+use waylode_lib::procguard::LockedSpawn;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -104,7 +104,7 @@ fn run_session_brief_sample(
     let started = Instant::now();
     let mut child = Command::new(hook)
         .arg("session-brief")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs)
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs)
         .env("HOME", home)
         .env("PATH", child_path)
         .env_remove("GITPULSE_SESSION_ID")
@@ -191,7 +191,7 @@ fn session_brief_cost_before_and_after() {
     );
     let after_bin = std::env::var_os("GITPULSE_BENCH_HOOK_AFTER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_gitpulse-hook")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_waylode-hook")));
     let pairs = env_usize("GITPULSE_BENCH_PAIRS", 15);
     let siblings = env_usize("GITPULSE_BENCH_SIBLINGS", 16);
 
@@ -252,16 +252,16 @@ fn session_brief_cost_before_and_after() {
     let repo = repo_dir.canonicalize().unwrap();
     let repo_str = repo.to_string_lossy().into_owned();
 
-    let preview = gitpulse_lib::repository_trust::inspect(&repo_str).expect("inspect trust");
-    gitpulse_lib::repository_trust::grant(&repo_str, &preview.identity, true)
+    let preview = waylode_lib::repository_trust::inspect(&repo_str).expect("inspect trust");
+    waylode_lib::repository_trust::grant(&repo_str, &preview.identity, true)
         .expect("grant persistent trust");
 
-    let profile = app_home_path.join("Library/Application Support/GitPulse");
+    let profile = app_home_path.join("Library/Application Support/Waylode");
     let owner = match claim(&profile, Duration::from_millis(300)) {
         Claim::Primary(owner) => owner,
         _ => panic!("expected to own the profile"),
     };
-    owner.attach_insights(Arc::new(gitpulse_lib::hooks::serve_insights));
+    owner.attach_insights(Arc::new(waylode_lib::hooks::serve_insights));
 
     let expected_worktrees_line = format!(
         "worktrees: {} total, {} of {} scanned, {} with uncommitted work",
@@ -274,18 +274,18 @@ fn session_brief_cost_before_and_after() {
     let expected_count = (siblings + 1) as u64;
     let refresh_statuses = |repo_str: &str| {
         let mut list =
-            gitpulse_lib::engine::worktree::list_worktrees_lite(repo_str).expect("list worktrees");
-        let clock = gitpulse_lib::engine::worktree::ScanDeadline::after(
+            waylode_lib::engine::worktree::list_worktrees_lite(repo_str).expect("list worktrees");
+        let clock = waylode_lib::engine::worktree::ScanDeadline::after(
             Instant::now(),
             Duration::from_secs(10),
         );
-        let cut = gitpulse_lib::engine::worktree::read_dirty(&mut list, &clock);
+        let cut = waylode_lib::engine::worktree::read_dirty(&mut list, &clock);
         assert_eq!(cut, 0, "warm status scan cut {cut} worktrees");
     };
     let warm_app = |repo_str: &str| {
         for attempt in 0..8 {
             refresh_statuses(repo_str);
-            match gitpulse_lib::hooks::serve_insights(repo_str) {
+            match waylode_lib::hooks::serve_insights(repo_str) {
                 Ok(reply) => {
                     let complete = reply["not_scanned"]
                         .as_array()

@@ -9,7 +9,7 @@
 
 mod common;
 
-use gitpulse_lib::codeintel;
+use waylode_lib::codeintel;
 
 /// DevCouncil's own repository, which carries a built map.
 const REAL_REPO: &str = "/Users/bharath/Code/devtools/DevCouncil";

@@ -16,7 +16,7 @@ import { appVersion } from "./app-version.mjs";
  * silently drops it or invalidates the package.
  */
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN = path.join(ROOT, "plugins", "gitpulse");
+const PLUGIN = path.join(ROOT, "plugins", "waylode");
 
 function readJson(file: string): Record<string, unknown> {
   return JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
@@ -36,7 +36,7 @@ describe("native Cursor plugin package", () => {
   });
 
   it("names the app rather than the package slug", () => {
-    expect(readJson(manifestPath).displayName).toBe("GitPulse");
+    expect(readJson(manifestPath).displayName).toBe("Waylode");
   });
 
   it("points at a logo that is really there", () => {
@@ -72,7 +72,7 @@ describe("logo placement across the per-client manifests", () => {
 
   it("gives Claude the display name it renders and no logo field it does not", () => {
     const claude = readJson(path.join(PLUGIN, ".claude-plugin", "plugin.json"));
-    expect(claude.displayName).toBe("GitPulse");
+    expect(claude.displayName).toBe("Waylode");
     expect(claude.logo).toBeUndefined();
   });
 });

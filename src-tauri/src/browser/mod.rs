@@ -121,7 +121,7 @@ pub fn ask_app_to_browse(dir: &std::path::Path, repo: &str, url: &str) -> Result
     {
         use crate::desktop::instance::{reach_owner, Request};
         let owner = reach_owner(dir, BROWSE_HELLO)
-            .ok_or("GitPulse is not running, so there is no window to open a browser session in")?;
+            .ok_or("Waylode is not running, so there is no window to open a browser session in")?;
         owner
             .forward(&Request::Browse {
                 repo: repo.to_owned(),
@@ -129,7 +129,7 @@ pub fn ask_app_to_browse(dir: &std::path::Path, repo: &str, url: &str) -> Result
             })
             .map_err(|why| {
                 format!(
-                    "GitPulse did not take the request ({why}). A GitPulse built before browser \
+                    "Waylode did not take the request ({why}). A Waylode built before browser \
                      sessions refuses it: rebuild and reinstall the app."
                 )
             })

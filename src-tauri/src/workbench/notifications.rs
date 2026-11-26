@@ -205,7 +205,7 @@ pub(super) const SNOOZE_SECONDS: u32 = 3600;
 
 /// The heading of every activity banner. The same words go to Graft, so the
 /// phone shows what the Mac showed.
-pub(super) const ACTIVITY_HEADING: &str = "GitPulse activity";
+pub(super) const ACTIVITY_HEADING: &str = "Waylode activity";
 
 /// At most this many delivered banners are checked for withdrawal in one pass.
 /// Notification Center keeps a history of its own; the cap keeps a pass to a
@@ -1885,8 +1885,12 @@ mod tests {
         use std::fmt::Write as _;
 
         const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        const LEGACY_PLUGIN_LOGO_SHA256: &str =
-            "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
+        const RETIRED_PLUGIN_LOGO_SHA256S: [&str; 2] = [
+            // Legacy Sep-14 pulse-only PNG
+            "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1",
+            // Legacy GitPulse G-ring PNG
+            "1cf0341b1cc7b556701b5bfb17c3ed02b2eba2e87863928b4de8e1cc7225fd3b",
+        ];
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let tauri_conf_raw = std::fs::read_to_string(manifest_dir.join("tauri.conf.json"))
@@ -1911,7 +1915,7 @@ mod tests {
             );
         }
         assert_eq!(
-            tauri_conf["bundle"]["resources"]["../plugins/gitpulse/"],
+            tauri_conf["bundle"]["resources"]["../plugins/waylode/"],
             json!("plugin/")
         );
 
@@ -1961,7 +1965,7 @@ mod tests {
         }
 
         let (logo_w, logo_h, bit_depth, color_type, logo_bytes) =
-            read_png_ihdr(&manifest_dir.join("../plugins/gitpulse/assets/logo.png"));
+            read_png_ihdr(&manifest_dir.join("../plugins/waylode/assets/logo.png"));
         assert_eq!((logo_w, logo_h), (256, 256));
         assert_eq!(bit_depth, 8, "plugin logo must be 8-bit");
         assert_eq!(color_type, 6, "plugin logo must be RGBA");
@@ -1970,15 +1974,15 @@ mod tests {
         for byte in Sha256::digest(&logo_bytes) {
             let _ = write!(digest, "{byte:02x}");
         }
-        assert_ne!(
-            digest, LEGACY_PLUGIN_LOGO_SHA256,
-            "plugins/gitpulse/assets/logo.png still matches legacy Sep-14 pulse-only PNG"
+        assert!(
+            !RETIRED_PLUGIN_LOGO_SHA256S.contains(&digest.as_str()),
+            "plugins/waylode/assets/logo.png still matches a retired legacy PNG ({digest})"
         );
     }
 
     #[test]
     fn session_host_routes_through_session_category_and_preserves_activity_heading() {
-        assert_eq!(ACTIVITY_HEADING, "GitPulse activity");
+        assert_eq!(ACTIVITY_HEADING, "Waylode activity");
         assert_eq!(platform::SESSION_CATEGORY, "gitpulse-session");
         assert_eq!(crate::alerts::NATIVE_PREFIX, "gitpulse.session.");
     }

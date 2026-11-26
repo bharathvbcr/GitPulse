@@ -341,29 +341,29 @@ describe("documentation does not cite files that will not exist", () => {
 });
 
 describe("the MCP server's documented surface matches its code", () => {
-  const SKILL = "plugins/gitpulse/skills/insights/SKILL.md";
+  const SKILL = "plugins/waylode/skills/insights/SKILL.md";
   const MANIFESTS = [
     ".claude-plugin/marketplace.json",
-    "plugins/gitpulse/plugin.json",
-    "plugins/gitpulse/.codex-plugin/plugin.json",
-    "plugins/gitpulse/.cursor-plugin/plugin.json",
-    "plugins/gitpulse/.claude-plugin/plugin.json",
+    "plugins/waylode/plugin.json",
+    "plugins/waylode/.codex-plugin/plugin.json",
+    "plugins/waylode/.cursor-plugin/plugin.json",
+    "plugins/waylode/.claude-plugin/plugin.json",
   ] as const;
   const WRITE_TOOLS = [
-    "gitpulse_add_task",
-    "gitpulse_import_tasks",
-    "gitpulse_complete_task",
-    "gitpulse_merge_tasks",
-    "gitpulse_delete_task",
-    "gitpulse_worktree_create",
-    "gitpulse_worktree_switch",
-    "gitpulse_worktree_isolate",
-    "gitpulse_worktree_overlay_sync",
-    "gitpulse_worktree_claim",
-    "gitpulse_worktree_release",
-    "gitpulse_worktree_send_message",
-    "gitpulse_worktree_merge",
-    "gitpulse_worktree_prune",
+    "waylode_add_task",
+    "waylode_import_tasks",
+    "waylode_complete_task",
+    "waylode_merge_tasks",
+    "waylode_delete_task",
+    "waylode_worktree_create",
+    "waylode_worktree_switch",
+    "waylode_worktree_isolate",
+    "waylode_worktree_overlay_sync",
+    "waylode_worktree_claim",
+    "waylode_worktree_release",
+    "waylode_worktree_send_message",
+    "waylode_worktree_merge",
+    "waylode_worktree_prune",
   ] as const;
 
   it("states the real number of devmap_* tools", () => {

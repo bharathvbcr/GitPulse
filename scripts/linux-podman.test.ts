@@ -70,7 +70,7 @@ describe("linux-podman harness", () => {
     expect(webviewAll).toContain("--native --all");
 
     const e2e = buildContainerScript(parseArgs(["e2e"]), "wayland");
-    expect(e2e).toContain("--features tauri/custom-protocol --bin gitpulse --bin gitpulse-ptyd --example e2e_seed_trust");
+    expect(e2e).toContain("--features tauri/custom-protocol --bin waylode --bin waylode-ptyd --example e2e_seed_trust");
     expect(e2e).toContain("with-display wayland node scripts/e2e-driver-smoke.mjs --artifacts /e2e-artifacts/linux-wayland");
 
     const test = buildContainerScript(parseArgs(["rust-test", "--lib", "--test", "git_environment_pins", "--shard", "2/3", "--filter", "test(foo)"]), "x11");

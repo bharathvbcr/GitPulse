@@ -589,7 +589,7 @@ fn a_repository_asked_for_through_a_link_is_read_at_its_canonical_path() {
 }
 
 /// The app runs an agent's read in the class the agent's own scan runs in
-/// (`gitpulse-mcp` is a background process), not at the UI's priority.
+/// (`waylode-mcp` is a background process), not at the UI's priority.
 #[test]
 fn the_apps_reads_for_an_mcp_process_run_in_the_background_class() {
     use crate::engine::process::spawn_log::classed_spawns_in;

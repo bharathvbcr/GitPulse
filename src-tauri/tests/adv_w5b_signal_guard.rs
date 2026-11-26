@@ -18,9 +18,6 @@
 
 mod common;
 
-use gitpulse_lib::hooks::signal_guard::{check_command, live_match_pids};
-use gitpulse_lib::hooks::{HookOutput, PermissionDecision};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -30,6 +27,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use waylode_lib::hooks::signal_guard::{check_command, live_match_pids};
+use waylode_lib::hooks::{HookOutput, PermissionDecision};
+use waylode_lib::procguard::LockedSpawn;
 
 const SINK_SOURCE: &str = include_str!("fixtures/adv_w4a_sink.c");
 const LINES: &str = include_str!("fixtures/adv_w5b_lines.txt");

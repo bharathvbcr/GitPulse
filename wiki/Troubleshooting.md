@@ -12,14 +12,14 @@ See [[Installation]].
 
 ## GitHub PRs, Actions, or Dependabot are empty
 
-Those features use the **local `gh` CLI**, not a GitPulse token.
+Those features use the **local `gh` CLI**, not a Waylode token.
 
 ```sh
 gh auth status
 gh auth login
 ```
 
-GitPulse never stores GitHub credentials. If `gh` is missing, the rest of the app still works.
+Waylode never stores GitHub credentials. If `gh` is missing, the rest of the app still works.
 
 ## Policy shows Unchecked
 
@@ -39,11 +39,11 @@ Same honesty rule. Click the cell to scan that repository for that column. A tot
 
 ## Code map / Map panel says unavailable
 
-DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **29**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). When DevMap is missing, Health, Suspects, the diff impact panel, palette symbol search and the Map show **Set up code map** (or **Build index** when it is installed but unindexed); use that button, or Settings → Agents. For now the install builds `devmap` from source, so it needs a Rust toolchain (cargo); no published DevMap release is pinned yet (devmap v0.2.3 writes store schema 22, GitPulse reads 29 or newer). A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
+DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **29**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). When DevMap is missing, Health, Suspects, the diff impact panel, palette symbol search and the Map show **Set up code map** (or **Build index** when it is installed but unindexed); use that button, or Settings → Agents. For now the install builds `devmap` from source, so it needs a Rust toolchain (cargo); no published DevMap release is pinned yet (devmap v0.2.3 writes store schema 22, Waylode reads 29 or newer). A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
 
 Use **Code → Map → Copy DevMap logs** to copy the current Map status, binary
 lookup, build/background-refresh state, visible errors, and recent DevMap entries
-from GitPulse's session and durable logs. Copy remains available during a build
+from Waylode's session and durable logs. Copy remains available during a build
 and when DevMap is missing. Log-read failures and timeouts are included in the
 report, and clipboard failures are shown in the panel.
 
@@ -62,11 +62,11 @@ The dock is toggled with `Ctrl+\``. Hiding it or switching views or **repositori
 
 ## Terminal shows non-GPU rendering or text glitching
 
-If WebGL acceleration experiences repeated context losses (surpassing the 3-recovery budget) or a GPU reset occurs, GitPulse falls back to DOM rendering (`data-renderer="dom"`) to prevent pane blanking or driver crashes. A footer indicator informs you when drawing without WebGL. If hardware text distortion occurs, disable GPU rendering globally in **Settings → Appearance → GPU terminal rendering**.
+If WebGL acceleration experiences repeated context losses (surpassing the 3-recovery budget) or a GPU reset occurs, Waylode falls back to DOM rendering (`data-renderer="dom"`) to prevent pane blanking or driver crashes. A footer indicator informs you when drawing without WebGL. If hardware text distortion occurs, disable GPU rendering globally in **Settings → Appearance → GPU terminal rendering**.
 
-## Settings shows "N hook reports in the last 7 days got no reply from GitPulse in time"
+## Settings shows "N hook reports in the last 7 days got no reply from Waylode in time"
 
-This notice indicates agent hook notifications were sent when GitPulse was busy, shutting down, or temporarily unreachable. The hook waited out its timeout budget (300 ms for `SessionEnd`, 1.5 s for others), recorded a timed drop in `.drops`, and exited without waiting further. This does not mean the event was lost (the app may have applied it as the hook gave up). Records rotate to `.prev` at 32 KiB and expire automatically after 7 days.
+This notice indicates agent hook notifications were sent when Waylode was busy, shutting down, or temporarily unreachable. The hook waited out its timeout budget (300 ms for `SessionEnd`, 1.5 s for others), recorded a timed drop in `.drops`, and exited without waiting further. This does not mean the event was lost (the app may have applied it as the hook gave up). Records rotate to `.prev` at 32 KiB and expire automatically after 7 days.
 
 ## `gitpulse-mcp` is missing or stale
 
@@ -83,7 +83,7 @@ bun run mcp:install
 bun run mcp:doctor
 ```
 
-Doctor reports absent / unresponsive / stale / matching for **both** `gitpulse-mcp` and `gitpulse-hook`. Agents spawn the bare names out of `.mcp.json` and `hooks/hooks.json`, so both must be on `PATH`; `GITPULSE_MCP_PATH` only moves the binary GitPulse's own Settings panel reports and is not read by any MCP client. See [[MCP and Agents]].
+Doctor reports absent / unresponsive / stale / matching for **both** `gitpulse-mcp` and `gitpulse-hook`. Agents spawn the bare names out of `.mcp.json` and `hooks/hooks.json`, so both must be on `PATH`; `GITPULSE_MCP_PATH` only moves the binary Waylode's own Settings panel reports and is not read by any MCP client. See [[MCP and Agents]].
 
 ## Manvi is not installed
 
@@ -93,7 +93,7 @@ Settings shows "Manvi is not installed" with **Set up Manvi**, which builds Manv
 
 - Node 22+ and stable Rust with clippy/rustfmt.
 - `bun install` then `bun run tauri dev`.
-- Port 5173 busy: GitPulse walks 5174–5193, or set `GITPULSE_DEV_PORT`.
+- Port 5173 busy: Waylode walks 5174–5193, or set `GITPULSE_DEV_PORT`.
 - Linux: WebKitGTK 4.1 and GTK 3 dev packages (see [[Development]]).
 
 ## `bun run ci:local` fails on coverage
@@ -106,5 +106,5 @@ Floors: frontend 90% lines / 85% branches, Rust 80% lines. `ci:local` regenerate
 
 ## Still stuck
 
-- [Open an issue](https://github.com/bharathvbcr/GitPulse/issues) with OS, GitPulse version, and what the UI actually said (including *could not read* / *unchecked* wording).
+- [Open an issue](https://github.com/bharathvbcr/GitPulse/issues) with OS, Waylode version, and what the UI actually said (including *could not read* / *unchecked* wording).
 - Security: [[Security]] — advisory, not a public issue.

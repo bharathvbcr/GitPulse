@@ -428,7 +428,7 @@
   {#if rendered.omittedBytes > 0}
     <div class="gp-md-notice" role="status">
       <span>
-        This note is longer than GitPulse renders at once ({kib(MAX_RENDER_BYTES)}): its last
+        This note is longer than Waylode renders at once ({kib(MAX_RENDER_BYTES)}): its last
         {kib(rendered.omittedBytes)} is not shown here. The Raw view shows all of it.
       </span>
     </div>

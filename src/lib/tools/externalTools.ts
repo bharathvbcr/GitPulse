@@ -224,7 +224,7 @@ export function refreshToolCapability(): Promise<void> {
 /** One-line status for a tool row. */
 export function toolStatusSummary(status: ToolStatus): string {
   if (status.disabled && status.lookup !== "explicit_env") {
-    return status.reason ?? "Disabled in GitPulse settings";
+    return status.reason ?? "Disabled in Waylode settings";
   }
   if (status.lookup === "explicit_missing") {
     return status.reason ?? "Configured path is missing";

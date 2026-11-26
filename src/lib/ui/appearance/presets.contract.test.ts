@@ -26,7 +26,9 @@ describe("the preset list", () => {
   it("has unique ids and labels and covers the requested looks", () => {
     expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(THEME_PRESETS.length);
     expect(new Set(THEME_PRESETS.map((preset) => preset.label)).size).toBe(THEME_PRESETS.length);
-    for (const id of ["neural-hud", "reactor", "pure-black", "crimson"]) expect(presetById(id)).toBeDefined();
+    for (const id of ["cobalt", "lodestar", "oxblood", "gilded", "neural-hud", "reactor", "pure-black", "crimson"]) {
+      expect(presetById(id)).toBeDefined();
+    }
     // At least one light preset, so the gallery is not dark-only.
     expect(THEME_PRESETS.some((preset) => preset.theme.appearance === "light")).toBe(true);
   });

@@ -1,8 +1,8 @@
 # Architecture
 
-GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 owns rendering**, and they meet at one machine-checked seam: `invoke("cmd_*")`.
+Waylode is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 owns rendering**, and they meet at one machine-checked seam: `invoke("cmd_*")`.
 
-**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi (`manvi serve`) for policy, workbench, and agent hosting, and selected DevCouncil crates plus the `devmap` CLI for code intelligence. See [Module integration](https://github.com/bharathvbcr/GitPulse/blob/main/docs/MODULE_INTEGRATION.md).
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. Waylode uses Manvi (`manvi serve`) for policy, workbench, and agent hosting, and selected DevCouncil crates plus the `devmap` CLI for code intelligence. See [Module integration](https://github.com/bharathvbcr/GitPulse/blob/main/docs/MODULE_INTEGRATION.md).
 
 ```mermaid
 flowchart TB
@@ -67,7 +67,7 @@ GitPulse/
 │   ├── lib/canvas/       commit-graph renderer
 │   ├── lib/views/        routerless view registry (5 views)
 │   └── lib/<domain>/     pure logic: files, diff, coverage, health, …
-├── crates/gitpulse-worktree/ standalone worktree CLI & gitpulse-rustc cache wrapper
+├── crates/waylode-worktree/ standalone worktree CLI & waylode-rustc cache wrapper
 └── src-tauri/src/        Rust core
     ├── commands/         the only IPC entry points
     ├── engine/           git sandbox, sparse worktrees, agent bus, routes, hooks, CoW sync
@@ -79,7 +79,7 @@ GitPulse/
     ├── harness/          MANVI policy gate
     ├── mcp/              MCP surface (reads, plus trust-gated task-board & worktree tools)
     ├── ledger/           durable WAL
-    └── bin/              gitpulsed, gitpulse-mcp, gitpulse-hook, gitpulse-ptyd
+    └── bin/              wayloded, waylode-mcp, waylode-hook, waylode-ptyd
 ```
 
 There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/repos/persist.ts`, registered in `src/lib/views/viewRegistry.ts`, rendered from `App.svelte`. Adding a view means changing all three.
@@ -94,7 +94,7 @@ Fleet is swapped by **hiding, never unmounting**. Open state is a UI preference,
 
 ## DevCouncil, Manvi, and DevMap integration
 
-DevCouncil supplies components and modules, Manvi wraps them, and GitPulse integrates them through in-process readers, the CLI, and a background sidecar.
+DevCouncil supplies components and modules, Manvi wraps them, and Waylode integrates them through in-process readers, the CLI, and a background sidecar.
 
 ```mermaid
 flowchart LR
@@ -132,8 +132,8 @@ flowchart LR
 | `gitpulsed` | NDJSON, interval loop | **Write** attribution catch-up into the ledger when the GUI is closed. Serves no requests and never takes a lease. |
 | `gitpulse-hook` | Host hook JSON on stdin/stdout | Agent hook dispatcher; failures report no decision and leave host permissions in control, except a bare invocation with no subcommand, which exits 2 (blocks) so a host that drops the hook's arguments cannot read it as allow. |
 | `gitpulse-ptyd` | Unix socket to the app | Unix terminal host: holds PTY terminal sessions on Unix (`#[cfg(unix)]`) so shells and TUI agents survive app restarts or crashes. See [Terminal host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL_HOST.md). |
-| `gitpulse-worktree` | CLI (`--json` or text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` compiler, and `<git-common-dir>/gitpulse/lanes/` multi-agent coordination CLI. See [Zero-copy agentic worktrees](https://github.com/bharathvbcr/GitPulse/blob/main/docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
-| `gitpulse-rustc` | `RUSTC_WRAPPER` | Two-stage Blake3 + `.d` dep-info / `# env-dep:` Rust compiler cache materializing artifacts via APFS `clonefile` / Linux `FICLONE` from `<git-common-dir>/gitpulse/build-cache/`. |
+| `waylode-worktree` | CLI (`--json` or text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` compiler, and `<git-common-dir>/gitpulse/lanes/` multi-agent coordination CLI. See [Zero-copy agentic worktrees](https://github.com/bharathvbcr/GitPulse/blob/main/docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
+| `waylode-rustc` | `RUSTC_WRAPPER` | Two-stage Blake3 + `.d` dep-info / `# env-dep:` Rust compiler cache materializing artifacts via APFS `clonefile` / Linux `FICLONE` from `<git-common-dir>/gitpulse/build-cache/`. |
 
 ```sh
 gitpulsed --interval 300 /path/to/repo
@@ -157,7 +157,7 @@ contracts. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/bl
 
 ## Vendored crates
 
-DevCouncil (`dc-*`, `devmap-*`) and MarkDev (`markdev`) crates are copied into `src-tauri/vendored/` so a lone GitPulse checkout builds. Manvi is the wrap around those components at runtime (`manvi serve`), not a vendor origin. Do not edit those copies. Fix upstream, then `bun run vendor`. `bun run vendor:check` reports an upstream that is not checked out as **unavailable**, never **matches**. `bun run check:vendor-schema` pins the vendored store schema against the installed `devmap` CLI when present.
+DevCouncil (`dc-*`, `devmap-*`) and MarkDev (`markdev`) crates are copied into `src-tauri/vendored/` so a lone Waylode checkout builds. Manvi is the wrap around those components at runtime (`manvi serve`), not a vendor origin. Do not edit those copies. Fix upstream, then `bun run vendor`. `bun run vendor:check` reports an upstream that is not checked out as **unavailable**, never **matches**. `bun run check:vendor-schema` pins the vendored store schema against the installed `devmap` CLI when present.
 
 ## Contracts
 

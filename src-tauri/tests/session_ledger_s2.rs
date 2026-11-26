@@ -11,15 +11,15 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use gitpulse_lib::alerts::bridge::{parse_report_stamped, Reason};
-use gitpulse_lib::terminal::session_ledger::{
+use tempfile::TempDir;
+use waylode_lib::alerts::bridge::{parse_report_stamped, Reason};
+use waylode_lib::terminal::session_ledger::{
     ExitFacts, NewSessionRow, SessionEndState, SessionLedger, MAX_LEDGER_ROWS,
 };
-use gitpulse_lib::workbench::conversation::{check_session_resumability, has_transcript_locator};
-use gitpulse_lib::workbench::terminal_command::{
+use waylode_lib::workbench::conversation::{check_session_resumability, has_transcript_locator};
+use waylode_lib::workbench::terminal_command::{
     interactive_args, refuse_raw_session_args, resume, LaunchOptions, AGY_CONTINUE_SENTINEL,
 };
-use tempfile::TempDir;
 
 fn write_claude_transcript(session_id: &str) -> PathBuf {
     let home = std::env::var_os("HOME").expect("hermetic_env must set HOME");

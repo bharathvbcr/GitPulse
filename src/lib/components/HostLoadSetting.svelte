@@ -96,14 +96,14 @@
   <h3 class="gp-label mb-1.5">Host load</h3>
   <SettingToggle
     label="Measure memory pressure and agent sessions"
-    description="On by default. Every 2 seconds GitPulse reads this computer's memory pressure, swap and compressor, and finds the agent sessions running on it, for Health and for the agents GitPulse launches. Off stops the readings; nothing is ever sent anywhere."
+    description="On by default. Every 2 seconds Waylode reads this computer's memory pressure, swap and compressor, and finds the agent sessions running on it, for Health and for the agents Waylode launches. Off stops the readings; nothing is ever sent anywhere."
     checked={settings.enabled}
     disabled={busy || !readOk}
     onchange={(next) => void save({ enabled: next })}
   />
   <SettingToggle
     label="Refuse agent launches when the machine is overloaded"
-    description="On by default. When the kernel reports critical memory pressure, the memory compressor is thrashing, or an input below is set to refuse launches and reaches its limit, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still slows GitPulse's own background and refresh work under load, but never refuses a launch. Needs the measurement above."
+    description="On by default. When the kernel reports critical memory pressure, the memory compressor is thrashing, or an input below is set to refuse launches and reaches its limit, Waylode refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still slows Waylode's own background and refresh work under load, but never refuses a launch. Needs the measurement above."
     checked={settings.govern_launches}
     disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
@@ -124,7 +124,7 @@
       {/each}
     </select>
     <p class="text-textMuted text-micro leading-snug" data-testid="host-load-profile-note">
-      Sizes how much GitPulse keeps ready in memory. Every terminal you can see always keeps its GPU drawing
+      Sizes how much Waylode keeps ready in memory. Every terminal you can see always keeps its GPU drawing
       (up to 8, about 49 MB each), whatever you pick here. Only terminals that are out of sight are limited:
       the number allowed to keep theirs is
       {#if $resourceProfile}{$resourceProfile.budgets.gpu_contexts}{:else}this setting's limit{/if}
@@ -139,7 +139,7 @@
   <div class="space-y-1 pt-1" data-testid="host-load-hook-mode">
     <p class="text-text">Command gate: heavy commands in agent sessions</p>
     <p class="text-textMuted text-micro leading-snug">
-      Refuse (the default): when the machine is overloaded, GitPulse's hook refuses a build or test command (cargo, go, npm test, vitest) in any Claude session with a reason telling the agent to wait, even a session GitPulse did not launch. Advise: the same message, but the command runs. Off: the hook says nothing about load. A command it couldn't check (GitPulse not running, or too old) is never refused; the agent is told it was not checked.
+      Refuse (the default): when the machine is overloaded, Waylode's hook refuses a build or test command (cargo, go, npm test, vitest) in any Claude session with a reason telling the agent to wait, even a session Waylode did not launch. Advise: the same message, but the command runs. Off: the hook says nothing about load. A command it couldn't check (Waylode not running, or too old) is never refused; the agent is told it was not checked.
     </p>
     <SettingSegment
       ariaLabel="What the command gate does with a heavy command under load"
@@ -155,13 +155,13 @@
   <div class="space-y-1 pt-1" data-testid="host-load-supervisor">
     <p class="text-text">When memory runs out</p>
     <p class="text-textMuted text-micro leading-snug">
-      Act (the default): pause the heaviest build or test under an agent GitPulse launched, never the agent
+      Act (the default): pause the heaviest build or test under an agent Waylode launched, never the agent
       itself, until the pressure eases or 10 minutes pass; first, agent processes are slowed to background
-      priority. A build under an agent GitPulse did not start is only offered for pausing, and you decide.
+      priority. A build under an agent Waylode did not start is only offered for pausing, and you decide.
       Advise: only tell me what it would pause. Off: do nothing.
     </p>
     <SettingSegment
-      ariaLabel="What GitPulse does when memory runs out"
+      ariaLabel="What Waylode does when memory runs out"
       options={SUPERVISOR_MODES}
       value={supervisor}
       onselect={(next) => {
@@ -170,7 +170,7 @@
     />
     <SettingToggle
       label="When a paused build is still paused after 10 minutes, end it instead of resuming it"
-      description="Off by default. Ending stops the build for good (SIGTERM, then SIGKILL after 10 seconds) and the agent sees it fail. A build you end yourself from the banner or Health never needs this. Only a build GitPulse paused is ever ended."
+      description="Off by default. Ending stops the build for good (SIGTERM, then SIGKILL after 10 seconds) and the agent sees it fail. A build you end yourself from the banner or Health never needs this. Only a build Waylode paused is ever ended."
       checked={settings.supervisor_terminate}
       disabled={busy || !readOk || supervisor !== "act"}
       onchange={(next) => void save({ supervisor_terminate: next })}
@@ -210,7 +210,7 @@
   />
   <div class="flex items-center gap-2 pt-1">
     <p class="text-textMuted text-micro leading-snug flex-1">
-      Each input below can slow GitPulse's background work, also refuse agent launches, or be ignored. The starting values come from one crash and are a protective guess, not a measured optimum.
+      Each input below can slow Waylode's background work, also refuse agent launches, or be ignored. The starting values come from one crash and are a protective guess, not a measured optimum.
     </p>
     <button
       type="button"

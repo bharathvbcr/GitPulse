@@ -35,7 +35,7 @@ const STACK_BRANCHES: usize = 20;
 const DEFAULT_PAGE: usize = 5_000;
 
 fn graph_page(path: &str) -> (u64, bool) {
-    let payload = tauri::async_runtime::block_on(gitpulse_lib::commands::cmd_get_commit_graph(
+    let payload = tauri::async_runtime::block_on(waylode_lib::commands::cmd_get_commit_graph(
         path.to_string(),
         DEFAULT_PAGE,
         None,
@@ -56,7 +56,7 @@ fn graph_page(path: &str) -> (u64, bool) {
 }
 
 fn stack_refresh(path: &str) -> (u64, u64) {
-    let payload = tauri::async_runtime::block_on(gitpulse_lib::commands::cmd_get_stack_hierarchy(
+    let payload = tauri::async_runtime::block_on(waylode_lib::commands::cmd_get_stack_hierarchy(
         path.to_string(),
     ))
     .unwrap_or_else(|error| panic!("cmd_get_stack_hierarchy failed: {error}"));
@@ -75,7 +75,7 @@ fn stack_refresh(path: &str) -> (u64, u64) {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("graph_spawns");
     let temp = tempfile::tempdir().expect("temp dir");
     let graph = build_chain(&temp.path().join("graph"), GRAPH_COMMITS, 0);

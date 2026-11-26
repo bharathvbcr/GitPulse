@@ -100,7 +100,7 @@
           ? `Manvi uses cloud: ${cloudChoice.model}, billed to Anthropic account ${cloudAccount.name}${
             cloudAccount.workspace ? ` (workspace ${cloudAccount.workspace})` : ""}.`
           : cloudCredential?.keySaved
-            ? `Manvi uses cloud: ${cloudChoice.model}, billed to the key saved in GitPulse.`
+            ? `Manvi uses cloud: ${cloudChoice.model}, billed to the key saved in Waylode.`
             : `Manvi uses cloud: ${cloudChoice.model}. Checking its credential…`,
   );
 
@@ -362,7 +362,7 @@
                 {:else if cloudAccount}
                   Account {cloudAccount.name}{cloudAccount.workspace ? ` · ${cloudAccount.workspace}` : ""}
                 {:else if cloudCredential?.keySaved}
-                  Key saved in GitPulse
+                  Key saved in Waylode
                 {:else}
                   Checking the credential…
                 {/if}

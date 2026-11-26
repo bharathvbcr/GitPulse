@@ -223,7 +223,7 @@ describe("handleMarkdownClick", () => {
     handleMarkdownClick(event(element({ href: "../api.md#x" }, ["a[href]"])), ctx);
     expect(ctx.openFile).toHaveBeenCalledWith("docs/api.md", "x");
     handleMarkdownClick(event(element({ href: "javascript:x" }, ["a[href]"])), ctx);
-    expect(ctx.report).toHaveBeenCalledWith(expect.stringContaining("GitPulse opens"));
+    expect(ctx.report).toHaveBeenCalledWith(expect.stringContaining("Waylode opens"));
     expect(ctx.openExternal).not.toHaveBeenCalled();
   });
 

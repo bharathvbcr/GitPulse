@@ -1301,8 +1301,8 @@ fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
     read_json_bounded_hint(
         path,
         MESSAGES_FILE_CAP,
-        "; the next write repairs it (a post, or an acknowledgement that names a message): it moves it aside as messages.json.oversized-<unix> or messages.json.corrupt-<unix> (the two newest are kept, so up to twice the old file's size stays on disk) and starts a fresh bus whose seq continues above the old one, but the unread messages in the old file are not carried over. A read is not a write: send one gitpulse_agent_send without thread_key or in_reply_to to a registered peer in this repository",
-        "; it was written by a different GitPulse version and no write will repair it. Upgrade or reinstall the GitPulse binaries so every one on this machine is the same version, or move messages.json aside by hand (its unread messages are lost)",
+        "; the next write repairs it (a post, or an acknowledgement that names a message): it moves it aside as messages.json.oversized-<unix> or messages.json.corrupt-<unix> (the two newest are kept, so up to twice the old file's size stays on disk) and starts a fresh bus whose seq continues above the old one, but the unread messages in the old file are not carried over. A read is not a write: send one waylode_agent_send without thread_key or in_reply_to to a registered peer in this repository",
+        "; it was written by a different Waylode version and no write will repair it. Upgrade or reinstall the Waylode binaries so every one on this machine is the same version, or move messages.json aside by hand (its unread messages are lost)",
     )
 }
 
@@ -5707,7 +5707,7 @@ mod tests {
         .unwrap();
         let err = read_messages(anchor, None, 0).unwrap_err().into_message();
         assert!(!err.contains("next write repairs"), "{err}");
-        assert!(err.contains("different GitPulse version"), "{err}");
+        assert!(err.contains("different Waylode version"), "{err}");
         fs::write(&path, "{\"next_seq\": 4, \"dropp").unwrap();
         let err = read_messages(anchor, None, 0).unwrap_err().into_message();
         assert!(err.contains("next write repairs"), "{err}");

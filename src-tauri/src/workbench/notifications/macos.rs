@@ -159,7 +159,7 @@ fn center() -> Result<Retained<UNUserNotificationCenter>, WorkbenchError> {
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
         return Err(WorkbenchError::new(
             "unsupported",
-            "Native notifications require a bundled GitPulse application.",
+            "Native notifications require a bundled Waylode application.",
         ));
     }
     Ok(UNUserNotificationCenter::currentNotificationCenter())

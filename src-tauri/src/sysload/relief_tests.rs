@@ -1130,8 +1130,10 @@ fn a_build_lease_holder_is_selected_only_while_the_board_is_refusing() {
 #[test]
 fn a_held_marker_in_a_subtree_is_eligible_only_while_the_board_is_refusing() {
     for marker in [
+        "WAYLODE_LEASE_HELD=2",
         "GITPULSE_LEASE_HELD=2",
         "CARGO_SLOT_HELD=1",
+        "WAYLODE_LEASE_HELD=anything",
         "GITPULSE_LEASE_HELD=anything",
     ] {
         let (probe, _w) = fresh_probe();

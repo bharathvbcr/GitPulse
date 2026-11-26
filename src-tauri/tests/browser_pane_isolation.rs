@@ -75,7 +75,6 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use gitpulse_lib::browser::{self, Bounds, EventSink, PageEvent, PaneEvent};
     use objc2::msg_send;
     use objc2::rc::Weak;
     use objc2::runtime::AnyObject;
@@ -87,6 +86,7 @@ mod mac {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tauri::{AppHandle, Manager, RunEvent};
+    use waylode_lib::browser::{self, Bounds, EventSink, PageEvent, PaneEvent};
     use wry::WebViewExtMacOS;
 
     const DEADLINE: Duration = Duration::from_secs(120);
@@ -895,9 +895,9 @@ mod mac {
         match listening {
             Ok(_) => {
                 on_main(app, |app| {
-                    gitpulse_lib::desktop::answer_forwarded(
+                    waylode_lib::desktop::answer_forwarded(
                         app,
-                        gitpulse_lib::desktop::instance::Request::Browse {
+                        waylode_lib::desktop::instance::Request::Browse {
                             repo: "/fixture/repo".into(),
                             url: "http://localhost:5173/app".into(),
                         },
@@ -940,7 +940,7 @@ mod mac {
         let (other_port, other_reports) = serve();
         let dev_origin = format!("http://127.0.0.1:{dev_port}/");
 
-        let mut context = gitpulse_lib::context();
+        let mut context = waylode_lib::context();
         context.config_mut().identifier = "com.gitpulse.tests.browser-pane".into();
         context.config_mut().build.dev_url = Some(dev_origin.parse().expect("dev url"));
         let mut main_window = context
@@ -956,20 +956,20 @@ mod mac {
 
         let mut app = tauri::Builder::default()
             // What GitPulse's page-load handler reads (step 9).
-            .manage(gitpulse_lib::desktop::DesktopState::default())
-            .manage(gitpulse_lib::terminal::TerminalSessions::from_settings())
-            .on_page_load(gitpulse_lib::desktop::handle_page_load)
+            .manage(waylode_lib::desktop::DesktopState::default())
+            .manage(waylode_lib::terminal::TerminalSessions::from_settings())
+            .on_page_load(waylode_lib::desktop::handle_page_load)
             // The browser commands as `lib.rs` registers them (step 10).
             .invoke_handler(tauri::generate_handler![
-                gitpulse_lib::browser::commands::cmd_browser_open,
-                gitpulse_lib::browser::commands::cmd_browser_set_bounds,
-                gitpulse_lib::browser::commands::cmd_browser_set_visible,
-                gitpulse_lib::browser::commands::cmd_browser_navigate,
-                gitpulse_lib::browser::commands::cmd_browser_go,
-                gitpulse_lib::browser::commands::cmd_browser_close,
-                gitpulse_lib::browser::commands::cmd_browser_snapshot,
+                waylode_lib::browser::commands::cmd_browser_open,
+                waylode_lib::browser::commands::cmd_browser_set_bounds,
+                waylode_lib::browser::commands::cmd_browser_set_visible,
+                waylode_lib::browser::commands::cmd_browser_navigate,
+                waylode_lib::browser::commands::cmd_browser_go,
+                waylode_lib::browser::commands::cmd_browser_close,
+                waylode_lib::browser::commands::cmd_browser_snapshot,
                 // What the app's page calls on mount (step 11).
-                gitpulse_lib::desktop::hibernate::cmd_main_ready,
+                waylode_lib::desktop::hibernate::cmd_main_ready,
             ])
             .setup(move |app| {
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?.build()?;

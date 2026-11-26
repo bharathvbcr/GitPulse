@@ -4,11 +4,11 @@
 
 #![cfg(unix)]
 
-use gitpulse_lib::engine::git_cli::{
+use std::path::{Path, PathBuf};
+use waylode_lib::engine::git_cli::{
     sandbox_create, sandbox_save_edited_text, sandbox_write, FileWriteError,
 };
-use gitpulse_lib::engine::git_writer::GitWriter;
-use std::path::{Path, PathBuf};
+use waylode_lib::engine::git_writer::GitWriter;
 
 mod common;
 
@@ -234,7 +234,7 @@ fn a_save_after_the_file_was_renamed_is_a_conflict_and_recreates_nothing() {
     let f = fixture();
     std::fs::write(f.repo.join("a.txt"), "one\n").unwrap();
     let base =
-        gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
+        waylode_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
             .unwrap()
             .disk_base
             .unwrap();
@@ -255,7 +255,7 @@ fn overwrite_with_the_conflict_token_rechecks_the_disk() {
     let f = fixture();
     std::fs::write(f.repo.join("a.txt"), "one\n").unwrap();
     let base =
-        gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
+        waylode_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
             .unwrap()
             .disk_base
             .unwrap();
@@ -301,7 +301,7 @@ fn saving_an_executable_keeps_plus_x_through_the_sandbox() {
     std::fs::write(&p, "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     let base =
-        gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "run.sh", None)
+        waylode_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "run.sh", None)
             .unwrap()
             .disk_base;
     sandbox_save_edited_text(&f.repo_str, "run.sh", "#!/bin/sh\necho\n", base.as_deref()).unwrap();

@@ -18,14 +18,14 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use waylode_lib::procguard;
+use waylode_lib::procguard::LockedSpawn;
 
 /// A world-writable holder is what puts admission on its strict path: the
 /// holder's mode is what decides whether another principal could substitute

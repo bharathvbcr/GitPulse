@@ -15,21 +15,21 @@
 //! no `logging/setLevel` in the modern era — neither exists in 2026-07-28.
 //!
 //! Read tools (`readOnlyHint: true`) never write git or task state. Writes are
-//! restricted to the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`,
-//! `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and
-//! the worktree engine & coordination tools (`gitpulse_worktree_create`,
-//! `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`,
-//! `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`,
-//! `gitpulse_worktree_release`, `gitpulse_worktree_send_message`,
-//! `gitpulse_worktree_prune`, `gitpulse_worktree_merge`),
+//! restricted to the task-board tools (`waylode_add_task`, `waylode_import_tasks`,
+//! `waylode_complete_task`, `waylode_delete_task`, `waylode_merge_tasks`) and
+//! the worktree engine & coordination tools (`waylode_worktree_create`,
+//! `waylode_worktree_switch`, `waylode_worktree_isolate`,
+//! `waylode_worktree_overlay_sync`, `waylode_worktree_claim`,
+//! `waylode_worktree_release`, `waylode_worktree_send_message`,
+//! `waylode_worktree_prune`, `waylode_worktree_merge`),
 //! all behind the repository trust gate (`repository_trust::require`) and
 //! `harness::guard_command` (for git mutations). Four tools act on the running
-//! app over its single-instance mailbox: `gitpulse_browser_open` opens a
+//! app over its single-instance mailbox: `waylode_browser_open` opens a
 //! Browser session on a loopback URL in a trusted repository's dock, and
-//! `gitpulse_terminal_spawn`, `gitpulse_terminal_open_file`, and
-//! `gitpulse_terminal_send` drive Option A parent->child terminal sessions and
-//! split file panes authenticated by `GITPULSE_SESSION_TOKEN`. Destructive tools (`gitpulse_delete_task`,
-//! `gitpulse_merge_tasks`, `gitpulse_worktree_prune`, `gitpulse_worktree_merge`)
+//! `waylode_terminal_spawn`, `waylode_terminal_open_file`, and
+//! `waylode_terminal_send` drive Option A parent->child terminal sessions and
+//! split file panes authenticated by `GITPULSE_SESSION_TOKEN`. Destructive tools (`waylode_delete_task`,
+//! `waylode_merge_tasks`, `waylode_worktree_prune`, `waylode_worktree_merge`)
 //! carry `destructiveHint: true`, and every writing tool is held to the explicit
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
@@ -55,6 +55,8 @@ pub mod page;
 pub mod prompts;
 pub mod resources;
 #[cfg(test)]
+mod tool_alias_tests;
+#[cfg(test)]
 mod turn_checkpoints_tool_tests;
 pub mod uri;
 pub mod validate;
@@ -70,14 +72,24 @@ use crate::insights::{self, McpToolInfo};
 use crate::tasks::file_tasks as ft;
 use crate::workbench::intake;
 pub use a2a::{
-    effective_call_budget_ms, CALL_BUDGET_ENV, DEFAULT_CALL_BUDGET_MS, MAX_WAIT_CALLS,
-    MAX_WAIT_TIMEOUT_MS,
+    effective_call_budget_ms, CALL_BUDGET_ENV, DEFAULT_CALL_BUDGET_MS, LEGACY_CALL_BUDGET_ENV,
+    MAX_WAIT_CALLS, MAX_WAIT_TIMEOUT_MS,
 };
 use validate::{tool_args, Spec, ToolArgs};
 
 /// MCP 2.0 / 2026-07-28. The only modern version this build speaks.
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
-pub const SERVER_NAME: &str = "gitpulse-mcp";
+pub const SERVER_NAME: &str = "waylode-mcp";
+
+/// Opt-in environment flag to advertise deprecated `gitpulse_*` tool aliases
+/// and `gitpulse_*` prompt aliases in `tools/list` / `prompts/list`.
+pub const EXPOSE_LEGACY_ENV: &str = "WAYLODE_MCP_EXPOSE_LEGACY";
+/// Legacy spelling for [`EXPOSE_LEGACY_ENV`].
+pub const LEGACY_EXPOSE_LEGACY_ENV: &str = "GITPULSE_MCP_EXPOSE_LEGACY";
+
+pub(crate) fn expose_legacy_aliases() -> bool {
+    crate::env_compat::is_truthy_compat(EXPOSE_LEGACY_ENV, LEGACY_EXPOSE_LEGACY_ENV)
+}
 
 /// Legacy handshake-based revisions this binary still answers, newest first.
 /// The first is what an `initialize` for any version not listed here is answered
@@ -102,14 +114,14 @@ const LIST_TTL_MS: u64 = 3_600_000;
 /// Ledger events returned when a caller does not say. Also the number the
 /// `ledger` resource facet reads, so the tool and the document agree.
 pub const LEDGER_DEFAULT_LIMIT: u32 = 50;
-/// Ceiling on `gitpulse_ledger_events`. Without one, `limit: 4294967295`
+/// Ceiling on `waylode_ledger_events`. Without one, `limit: 4294967295`
 /// materialises the entire ledger into a single stdio write.
 pub const LEDGER_MAX_LIMIT: u32 = 1_000;
-/// Longest value accepted for a `gitpulse_ledger_events` filter. The widest
+/// Longest value accepted for a `waylode_ledger_events` filter. The widest
 /// column a filter compares is the object, which the ledger caps well below
 /// this, so a longer value could never match a stored row.
 pub const LEDGER_FILTER_MAX_BYTES: usize = 4_096;
-/// Ceiling on `gitpulse_active_changes`, matching what the backend enforces.
+/// Ceiling on `waylode_active_changes`, matching what the backend enforces.
 pub const CHANGES_MAX_LIMIT: u32 = 500;
 /// Ceiling on the code-intelligence token budget.
 pub const BUDGET_MAX: u32 = 200_000;
@@ -309,7 +321,7 @@ impl PruneOutcome {
     }
 }
 
-/// What one `gitpulse_worktree_prune` call reads once for every worktree it
+/// What one `waylode_worktree_prune` call reads once for every worktree it
 /// judges: the repository's anchor, its default branch, and its locked-in
 /// branches (or why they could not be read).
 #[derive(Clone, Copy)]
@@ -752,7 +764,7 @@ tool_args! {
             "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours.",
         ),
         expected_revision: Option<i64> = revision_spec(
-            "With overwrite: true, only replace the task if it is still at this revision (from gitpulse_get_task or gitpulse_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
+            "With overwrite: true, only replace the task if it is still at this revision (from waylode_get_task or waylode_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
         ),
         reviewed_related: Option<Vec<String>> = Spec::chars_array(
             "item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work",
@@ -760,7 +772,7 @@ tool_args! {
             128,
         ),
         parent_task_id: Option<String> = task_ref_spec(
-            "File this task as a subtask of an existing task in this repository: its task_id, or an item_id from gitpulse_list_tasks. A task has at most one parent, the parent must be live, a cycle is refused, and the chain may be only so deep. The parent you name is not held back as 'related work'",
+            "File this task as a subtask of an existing task in this repository: its task_id, or an item_id from waylode_list_tasks. A task has at most one parent, the parent must be live, a cycle is refused, and the chain may be only so deep. The parent you name is not held back as 'related work'",
         ),
         subtasks: Option<Vec<String>> = Spec::bytes_array(
             "Subtask titles to decompose this task into; each will be created with parent set to this task",
@@ -818,7 +830,7 @@ tool_args! {
             intake::MAX_SUMMARY_CHARS,
         ),
         expected_revision: Option<i64> = revision_spec(
-            "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
+            "Only move it if the task is still at this revision (from your brief or waylode_get_task); otherwise it is refused so you can re-read it",
         ),
         request_id: Option<String> = request_id_spec(),
     }
@@ -828,7 +840,7 @@ tool_args! {
     struct DeleteTaskArgs {
         repo_path: String = repo_spec(),
         task_id: String = task_ref_spec(
-            "The task_id it was filed with, or its board item_id from gitpulse_list_tasks",
+            "The task_id it was filed with, or its board item_id from waylode_list_tasks",
         ),
         reason: String = Spec::chars(
             "Why the task is being deleted, in a line or two; recorded in its history",
@@ -836,7 +848,7 @@ tool_args! {
             intake::MAX_REASON_CHARS,
         ),
         expected_revision: Option<i64> = revision_spec(
-            "Only delete it if the task is still at this revision (from gitpulse_list_tasks or gitpulse_get_task); otherwise it is refused so you can re-read it",
+            "Only delete it if the task is still at this revision (from waylode_list_tasks or waylode_get_task); otherwise it is refused so you can re-read it",
         ),
         even_if_running: Option<bool> = Spec::flag(
             "Delete it even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false",
@@ -1745,7 +1757,7 @@ fn retry_after_property() -> Value {
     json!({ "type": "integer", "minimum": 0, "description": "With deferred: the soonest worth asking again, one refill interval of the spawn rate budget." })
 }
 
-/// An evidence or gap row of `gitpulse_task_view`: open, declaring only the
+/// An evidence or gap row of `waylode_task_view`: open, declaring only the
 /// optional record of a cut `data_json` / `evidence_json`.
 fn task_view_row_schema() -> Value {
     json!({
@@ -1813,7 +1825,7 @@ fn freshness_field(name: &str) -> Value {
     freshness_properties()[name].clone()
 }
 
-/// The `ledger` facet of `gitpulse_status` and `gitpulse_insights`
+/// The `ledger` facet of `waylode_status` and `waylode_insights`
 /// ([`crate::ledger::LedgerStatus`]): deferral fields, the fields it always
 /// had, and the additive honesty fields.
 fn ledger_facet_output() -> Value {
@@ -1876,8 +1888,8 @@ fn ok_error_output(extra: Value, required: &[&str]) -> Value {
 }
 
 /// The collision facet ([`insights::CollisionRisk`]): the answer of
-/// `gitpulse_collision_risk`, and the `collisions` field of
-/// `gitpulse_change_context`, which carries the whole facet so its rows keep
+/// `waylode_collision_risk`, and the `collisions` field of
+/// `waylode_change_context`, which carries the whole facet so its rows keep
 /// the `ok` and coverage counts that say whether anything was looked at.
 fn collision_risk_output() -> Value {
     ok_error_output(
@@ -1920,7 +1932,24 @@ fn collision_risk_output() -> Value {
 /// — measured at 68 µs per call, which is most of the cost of rejecting a bad
 /// argument. It is immutable and compiled in, so there is nothing to invalidate.
 pub fn tools() -> Vec<Value> {
-    catalog().to_vec()
+    let base = catalog();
+    if !expose_legacy_aliases() {
+        return base.to_vec();
+    }
+    let mut expanded = Vec::with_capacity(base.len() * 2);
+    expanded.extend(base.iter().cloned());
+    for entry in base {
+        if let Some(name) = entry["name"].as_str() {
+            if let Some(rest) = name.strip_prefix(TOOL_PREFIX) {
+                let mut alias = entry.clone();
+                alias["name"] = json!(format!("{TOOL_ALIAS_PREFIX}{rest}"));
+                let desc = alias["description"].as_str().unwrap_or("");
+                alias["description"] = json!(format!("[DEPRECATED alias for {name}] {desc}"));
+                expanded.push(alias);
+            }
+        }
+    }
+    expanded
 }
 
 /// The catalog itself, borrowed. Callers that only read it should use this and
@@ -1933,7 +1962,7 @@ fn catalog() -> &'static [Value] {
 fn build_tools() -> Vec<Value> {
     let mut tools = vec![
         tool(
-            "gitpulse_insights",
+            "waylode_insights",
             "Repository insights",
             "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean. When the GitPulse app is running its worktrees, changes, collisions and agent counts may come from the app's shared reads instead of a scan made at call time; such a document carries served_by {source: \"app\", age_ms}. age_ms is the age, when the answer was assembled, of the oldest read it stands on: the worktree listing, the status of this checkout (changes) and the status of each worktree. It is at most about 4 seconds (an older answer is not used). A collision reported absent may therefore have begun up to age_ms ago, and so may dirty files in a worktree shared by two sessions that was clean when last read; a collision between worktrees, and a shared worktree that was dirty, were read again for this call. No served_by means this call scanned for itself, and app_unserved then says why the app's answer was not used. stages_ms gives the milliseconds each stage took (app_ask, observe, listing, main_status, worktree_status, derive, ledger, codeintel); a stage that did not run in this process is absent.",
             RepoArgs::properties(),
@@ -1966,7 +1995,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_sessions",
+            "waylode_sessions",
             "Live agent sessions",
             "List live agent sessions (Claude Code and Codex) running inside this repository's worktrees, without spawning git. Reads the OS process table, Claude Code session registries, CARD 11 file claims / worktree locks, ledger run bindings, and the running GitPulse desktop app's hook-report hub snapshot (`agent-session-state.json`). Marks `is_caller: true` on the nearest agent ancestor of this MCP server (`pid` + `start_us`), carries `run_id`, `tree`, and `task_id` when known, and reports `state` (`working` | `blocked` | `done` | `idle` | `unknown`), `state_source` (`hub` | `registry` | `none` | `unknown`), and `state_age_s`. Codex sessions with no hub entry report `state: \"unknown\"` (never `\"idle\"`); sessions with no registry or hub entry report `state_source: \"none\"`. When the desktop app is not running, `app_state.ok` is `false` with a reason and the tool still answers from the process table and registry. Results are sorted caller-first and bounded by `limit` (`cap`, `total`, `returned`, `truncated`).",
             SessionsArgs::properties(),
@@ -2028,7 +2057,7 @@ fn build_tools() -> Vec<Value> {
             ),
         ),
         tool(
-            "gitpulse_status",
+            "waylode_status",
             "Repository status",
             "Inspect repository status, worktrees, ledger, and code graph availability",
             RepoArgs::properties(),
@@ -2045,7 +2074,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_active_changes",
+            "waylode_active_changes",
             "Active changes",
             "Working-tree file list for a worktree (path, staged, conflicted, churn), capped. A failed read is reported rather than an empty list.",
             ActiveChangesArgs::properties(),
@@ -2065,7 +2094,7 @@ fn build_tools() -> Vec<Value> {
             ),
         ),
         tool(
-            "gitpulse_collision_risk",
+            "waylode_collision_risk",
             "Collision risk",
             "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed or the hook claims that attribute a session to its worktree could not be read in full; sessions_error says which. file_claims lists declared claims (a card's planned files, recorded when its run starts) and observed claims (the edit hook). A claim is not itself a collision: an observed claim names the holding session, a declared claim names the run, and a dirty file in a shared worktree with no claim is owner unknown. claims_error is set when that store could not be read in full (it failed, unreadable lines were skipped, or older live claims past the store cap were not kept; the next claim write repairs the store, a read never writes), so an empty file_claims is 'none' only when claims_error is empty. The repo-wide list is capped at its newest 256 rows, one per holder and path: claims_truncated is true and claims_total is how many matched when it was cut. There is no gitpulse_claim_files write. With the optional path (a repo-relative file you are about to edit) it instead answers whether any other worktree holds exactly that file dirty, a single one included, and returns only that row plus the scan coverage counts and the claims on that path; ok is false and truncated is true when a worktree could not be read, so an empty list is absence only when ok is true.",
             CollisionRiskArgs::properties(),
@@ -2073,9 +2102,9 @@ fn build_tools() -> Vec<Value> {
             collision_risk_output(),
         ),
         tool(
-            "gitpulse_merge_conflicts",
+            "waylode_merge_conflicts",
             "Merge conflicts between worktrees",
-            "Would the checkouts' committed work merge? For each pair of worktrees whose HEAD commits differ (detached ones included), `git merge-tree --write-tree` computes the merge, which survives a commit where `gitpulse_collision_risk` (uncommitted files only) does not. Each pair's `verdict.state` is `clean`, `conflict` with `paths` (the first 200 of `paths_total`; a path is UTF-8 text as it is, a byte that is not UTF-8 is a three-digit octal escape such as `\\377`, and a backslash is doubled, so two different paths are never the same string), or `unknown` with a `reason` (a git failure, unrelated histories, a deadline, a git older than 2.38, a partial clone): an unknown pair is never clean. At most 64 pairs are merged: above that `ok` is false, `truncated` is true, `pairs_total` is how many there were and `pairs_checked` how many were merged, so the counts are a floor. `ok` is true only when every checked pair was `clean` or `conflict`: any `unknown` pair makes it false, with `error` naming how many (and `deferred` with `retry_after_ms` when each was the spawn gate deferring under load). Worktrees on the very same commit need no merge and are counted in `same_head_pairs`. Read-only: the merge writes its trees and blobs to a scratch object directory that is deleted afterwards (the repository reads through it as an alternate), so no ref, index, working-tree file or repository object is written.",
+            "Would the checkouts' committed work merge? For each pair of worktrees whose HEAD commits differ (detached ones included), `git merge-tree --write-tree` computes the merge, which survives a commit where `waylode_collision_risk` (uncommitted files only) does not. Each pair's `verdict.state` is `clean`, `conflict` with `paths` (the first 200 of `paths_total`; a path is UTF-8 text as it is, a byte that is not UTF-8 is a three-digit octal escape such as `\\377`, and a backslash is doubled, so two different paths are never the same string), or `unknown` with a `reason` (a git failure, unrelated histories, a deadline, a git older than 2.38, a partial clone): an unknown pair is never clean. At most 64 pairs are merged: above that `ok` is false, `truncated` is true, `pairs_total` is how many there were and `pairs_checked` how many were merged, so the counts are a floor. `ok` is true only when every checked pair was `clean` or `conflict`: any `unknown` pair makes it false, with `error` naming how many (and `deferred` with `retry_after_ms` when each was the spawn gate deferring under load). Worktrees on the very same commit need no merge and are counted in `same_head_pairs`. Read-only: the merge writes its trees and blobs to a scratch object directory that is deleted afterwards (the repository reads through it as an alternate), so no ref, index, working-tree file or repository object is written.",
             RepoArgs::properties(),
             &RepoArgs::required(),
             ok_error_output(
@@ -2129,7 +2158,7 @@ fn build_tools() -> Vec<Value> {
             ),
         ),
         tool(
-            "gitpulse_change_context",
+            "waylode_change_context",
             "Change context",
             "In-flight context for one worktree: branch, dirty files, parked merge/rebase, bound task, and collisions that involve it.",
             ChangeContextArgs::properties(),
@@ -2161,7 +2190,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             "Ledger events",
             "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor` by default. `order: \"desc\"` returns the newest first (`{order: \"desc\", limit: 5}` is the five newest, read by index without paging older rows); `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and `after_ref` filter by exact value and combine with AND; `since_ts`, `action`, `task_id` and `session_id` are index-backed, while `object`, `worktree_path` and `after_ref` are not: they walk the ledger newest-first or oldest-first and stop at `limit` matches, so one that matches nothing reads the whole ledger (an event time filter is not offered: event time rides in `detail_json`, not in a column). Page by passing the last `id` you saw back as `cursor` (an upper bound when `order` is `desc`); `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix). A `verdict_json` has no room for a marker, so a cut one (long strings shortened, array tails and trailing object members dropped, never a new member or a changed kind) is recorded in the row's `verdict_truncated` (`{elements_dropped, members_dropped, strings_cut, bytes}`, null when whole); `detail_json` is returned as stored apart from its own length cut. Every answer says how current it is: `as_of` (when the newest row was appended), `last_catch_up` (with its `last_catch_up_basis`), `stale` with `stale_reason` (true when no recorder has been seen within `stale_after_secs`; nothing launches gitpulsed by itself, so a stale ledger may simply be un-ingested), and `catch_up` (what the last passes covered, including `skipped_lines` and `transcripts_unlisted`). `caveat` is non-empty when rows exist that this read cannot include (`legacy_ledger_unconsolidated`).",
             LedgerEventsArgs::properties(),
@@ -2219,7 +2248,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_turn_checkpoints",
+            "waylode_turn_checkpoints",
             "Turn checkpoints",
             "Read this worktree's turn checkpoints: commits under `refs/gitpulse/turns/<key>/<stamp>` holding the worktree's files at an agent turn boundary, when the person turned `turn_checkpoints.enabled` on. Without `id`, lists them newest first (`id`, `created_at`, `label`, `event` `turn_start` or `turn_end`, `session_id`, `branch`, and `files`, `additions`, `deletions` against the previous checkpoint, the oldest against its parent commit; `stats_complete` false when a count was cut), bounded by `limit` with `truncated` true when older ones are not shown. With `id`, returns that checkpoint's patch against its parent commit, or against `against` (another checkpoint of this worktree): at most 256 KiB, `truncated` says when it was cut, and a credential shape in the patch is redacted (`redacted`). A checkpoint can be PARTIAL: `omissions` says how many untracked files it left out and why (files whose name starts with `.env`, files the leak scanner flagged, unreadable or special files, nested repositories, GitPulse's own state), and `wholesale` names the reason when no untracked file was taken at all (`cap_exceeded` with the cap and the found counts, `scan_failed`, `scan_timeout`, `listing_failed`); never read a checkpoint with `untracked_omitted` above 0 as the whole worktree. Ignored files are never captured. Checkpoints are visible only to the worktree that took them: ids from another worktree of the same repository do not resolve. Read-only: nothing is restored, and no ref, index or working file is written. An empty list means no checkpoint was recorded (the setting is off, the app was not running, or none was taken yet), not that nothing changed.",
             TurnCheckpointsArgs::properties(),
@@ -2239,7 +2268,7 @@ fn build_tools() -> Vec<Value> {
             ),
         ),
         tool(
-            "gitpulse_task_view",
+            "waylode_task_view",
             "Task view",
             "Read task leases plus evidence, gaps, and verification runs from dc-store. Never acquires a lease. An evidence row's `data_json` and a gap's `evidence_json` over 16 KiB are cut without changing what kind of JSON they hold (an array loses its tail, with no marker element; a string is shortened; an object loses members): the row's `data_json_truncated` (`{kept, total, bytes}`: elements or members kept of how many, and the length before the cut) says so, and is null when the text is whole.",
             TaskViewArgs::properties(),
@@ -2254,9 +2283,9 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         mutating_tool(
-            "gitpulse_add_task",
+            "waylode_add_task",
             "Add task",
-            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. When you overwrite a task you read earlier, pass expected_revision (its revision from gitpulse_get_task or gitpulse_list_tasks): if the task changed since, nothing is written and revision_conflict names the current revision, so you re-read and merge instead of replacing someone else's edit. parent_task_id files the task as a subtask of one already on this repository's board, so work you split off stays under the task it came from. Planned files are kept as a section of the description. Recorded in the board's event history.",
+            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call waylode_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. When you overwrite a task you read earlier, pass expected_revision (its revision from waylode_get_task or waylode_list_tasks): if the task changed since, nothing is written and revision_conflict names the current revision, so you re-read and merge instead of replacing someone else's edit. parent_task_id files the task as a subtask of one already on this repository's board, so work you split off stays under the task it came from. Planned files are kept as a section of the description. Recorded in the board's event history.",
             AddTaskArgs::properties(),
             &AddTaskArgs::required(),
             json!({
@@ -2280,7 +2309,7 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         mutating_tool(
-            "gitpulse_import_tasks",
+            "waylode_import_tasks",
             "Import task briefs",
             "Put the Markdown task briefs in the repository's tasks folder onto the GitPulse task board. Requires the repository to be trusted. Idempotent: a brief already on the board is left alone unless replace is true, and a task deleted on the board stays deleted. Every file is accounted for: a brief that cannot be read is reported by name with the reason, and ok is true only when every file was placed.",
             ImportTasksArgs::properties(),
@@ -2309,7 +2338,7 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         tool(
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             "List tasks",
             "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done. A page is never cut to fit the result budget (that would skip rows or leave `has_more` with no `next_cursor`): a page too large to return is a tool error telling you to retry with a smaller `limit`.",
             ListTasksArgs::properties(),
@@ -2329,9 +2358,9 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_get_task",
+            "waylode_get_task",
             "Get task",
-            "Read one task from the GitPulse task board with its canonical agent brief — the same Markdown GitPulse hands an agent it launches. Accepts the task_id it was added with, or an item_id from gitpulse_list_tasks.",
+            "Read one task from the GitPulse task board with its canonical agent brief — the same Markdown GitPulse hands an agent it launches. Accepts the task_id it was added with, or an item_id from waylode_list_tasks.",
             GetTaskArgs::properties(),
             &GetTaskArgs::required(),
             json!({
@@ -2347,7 +2376,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         mutating_tool(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             "Complete task",
             "Move your GitPulse board task to done when the work is finished. Done is evidence-gated: it lands only if Manvi's verification passed for your worktree's current head, otherwise the task goes to review with the reason (held_for_review: true) for a person to judge, and no argument changes that (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
             CompleteTaskArgs::properties(),
@@ -2370,9 +2399,9 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         destructive_tool(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             "Delete task",
-            "Delete a task card from the GitPulse task board — the same delete as the board's own Delete. Pass the task_id it was filed with or its board item_id, and a reason: the reason is appended to the task's logs first, so it stays in the task's history. The delete is soft (the row and its history stay in the GitPulse profile and the id is never reused), but there is no undelete over MCP; only the person can bring it back. Use it only for a task that should not exist — a duplicate, or one merged into another — never to finish work (use gitpulse_complete_task). A task linked to other repositories as well is refused (shared_task). Idempotent: a task already deleted is reported as unchanged. With expected_revision, a task that changed since you read it is refused so you can re-read it. Requires the repository to be trusted in GitPulse.",
+            "Delete a task card from the GitPulse task board — the same delete as the board's own Delete. Pass the task_id it was filed with or its board item_id, and a reason: the reason is appended to the task's logs first, so it stays in the task's history. The delete is soft (the row and its history stay in the GitPulse profile and the id is never reused), but there is no undelete over MCP; only the person can bring it back. Use it only for a task that should not exist — a duplicate, or one merged into another — never to finish work (use waylode_complete_task). A task linked to other repositories as well is refused (shared_task). Idempotent: a task already deleted is reported as unchanged. With expected_revision, a task that changed since you read it is refused so you can re-read it. Requires the repository to be trusted in GitPulse.",
             DeleteTaskArgs::properties(),
             &DeleteTaskArgs::required(),
             json!({
@@ -2393,9 +2422,9 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         destructive_tool(
-            "gitpulse_merge_tasks",
+            "waylode_merge_tasks",
             "Merge tasks",
-            "Merge duplicate or overlapping tasks on the GitPulse task board into one that stays. Each source becomes a '## Merged from <item_id>' section of the target's description, with its status, priority and description; the target also gets every source's acceptance criteria and labels, the most urgent priority, highest severity and earliest due date among them, and a log block with your reason. Its title, status and owner stay. Then each source is deleted — the same soft delete as gitpulse_delete_task, with your reason in its history and the target named, so an agent launched on it is pointed at the target — and only at the revision that was copied, so no edit is ever lost with it. Source logs stay in each source's history. There is no unmerge over MCP; only the person can bring a source back. Refused, with nothing written: a source linked to another repository too (shared_task), one an agent may still be working on (task_in_use, unless even_if_running), a done target with an open source (target_done), a target whose description the person locked (field_locked), a merge too large for one task (merge_too_large). If it is interrupted or the board changes under it, it reports ok: false with outcome partial and every source's outcome; run the same call again to finish — nothing is copied twice. Idempotent: an already-merged source is reported as already_merged. Requires the repository to be trusted in GitPulse.",
+            "Merge duplicate or overlapping tasks on the GitPulse task board into one that stays. Each source becomes a '## Merged from <item_id>' section of the target's description, with its status, priority and description; the target also gets every source's acceptance criteria and labels, the most urgent priority, highest severity and earliest due date among them, and a log block with your reason. Its title, status and owner stay. Then each source is deleted — the same soft delete as waylode_delete_task, with your reason in its history and the target named, so an agent launched on it is pointed at the target — and only at the revision that was copied, so no edit is ever lost with it. Source logs stay in each source's history. There is no unmerge over MCP; only the person can bring a source back. Refused, with nothing written: a source linked to another repository too (shared_task), one an agent may still be working on (task_in_use, unless even_if_running), a done target with an open source (target_done), a target whose description the person locked (field_locked), a merge too large for one task (merge_too_large). If it is interrupted or the board changes under it, it reports ok: false with outcome partial and every source's outcome; run the same call again to finish — nothing is copied twice. Idempotent: an already-merged source is reported as already_merged. Requires the repository to be trusted in GitPulse.",
             MergeTasksArgs::properties(),
             &MergeTasksArgs::required(),
             json!({
@@ -2421,7 +2450,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         open_world(mutating_tool(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             "Create worktree",
             "Create a new git branch and linked worktree under <repo>/.gitpulse/worktrees/<slug> by default (or ../<Repo>.<slug> with `layout: \"sibling\"`), with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution. The result reports what happened, not what was asked: `cache_shared`, `devmap_outcome` and `problems` name every part that failed, and a failing `execute_command` still returns the worktree it ran in (`ok: false`, `command_exit_code`)",
             WorktreeCreateArgs::properties(),
@@ -2449,7 +2478,7 @@ fn build_tools() -> Vec<Value> {
             false,
         )),
         mutating_tool(
-            "gitpulse_worktree_switch",
+            "waylode_worktree_switch",
             "Switch worktree",
             "Switch to an existing worktree by branch name, or with create_if_missing create a new branch and worktree with parallel CoW cache + DevMap seeding. Creating fails when the branch already exists without a worktree; not idempotent because it can create",
             WorktreeSwitchArgs::properties(),
@@ -2472,7 +2501,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         mutating_tool(
-            "gitpulse_worktree_isolate",
+            "waylode_worktree_isolate",
             "Isolate worktree",
             "Establish parallel Copy-on-Write build-cache cloning, DevMap store/CSR provisioning, and ephemeral WorktreeOverlay sync for an existing worktree",
             WorktreeIsolateArgs::properties(),
@@ -2494,9 +2523,9 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         destructive_tool(
-            "gitpulse_worktree_prune",
+            "waylode_worktree_prune",
             "Prune worktrees",
-            "Safely prune worktrees and delete branches verified as integrated via 6-point check. A worktree with a live process working inside it is skipped with the reason unless reap_processes is true (opt-in: it terminates those processes), and even then a process the reaper spares (an agent session, an interactive shell, a supervisor-owned launch) keeps the worktree and its branch: it is skipped and named in `spared_pids`. `force` skips only the uncommitted-changes and integration checks: it never removes a worktree that has a lane claim (gitpulse_worktree_claim) or an attributed live agent session. There is no confirmation channel over MCP, so the person removes such a worktree in the app, or the agent calls gitpulse_worktree_release first. Every worktree gets its own outcome in `outcomes` (removed, would_remove, removed_branch_kept, skipped or failed, with why); one failing never aborts the rest. In a dry run `pruned_worktrees` lists what would be removed",
+            "Safely prune worktrees and delete branches verified as integrated via 6-point check. A worktree with a live process working inside it is skipped with the reason unless reap_processes is true (opt-in: it terminates those processes), and even then a process the reaper spares (an agent session, an interactive shell, a supervisor-owned launch) keeps the worktree and its branch: it is skipped and named in `spared_pids`. `force` skips only the uncommitted-changes and integration checks: it never removes a worktree that has a lane claim (waylode_worktree_claim) or an attributed live agent session. There is no confirmation channel over MCP, so the person removes such a worktree in the app, or the agent calls waylode_worktree_release first. Every worktree gets its own outcome in `outcomes` (removed, would_remove, removed_branch_kept, skipped or failed, with why); one failing never aborts the rest. In a dry run `pruned_worktrees` lists what would be removed",
             WorktreePruneArgs::properties(),
             &WorktreePruneArgs::required(),
             json!({
@@ -2528,7 +2557,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         destructive_tool(
-            "gitpulse_worktree_merge",
+            "waylode_worktree_merge",
             "Merge worktree",
             "Automated merge pipeline: 6-point check, quarantined 3-way conflict detection, squash or merge commit, process reaping, and worktree/branch teardown. The teardown keeps the worktree and its branch (the merge still succeeds; `worktree_kept_reason` says why) while an attributed live agent session or any process the reaper spares (an agent session, an interactive shell, a supervisor-owned launch) works in it",
             WorktreeMergeArgs::properties(),
@@ -2549,7 +2578,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         mutating_tool(
-            "gitpulse_worktree_claim",
+            "waylode_worktree_claim",
             "Claim agent worktree lane",
             "Register or update an agent lane's worktree, sparse cone, and pre-edit file/symbol claims on the shared <git-common-dir>/gitpulse/lanes coordination bus, returning the lane record and any immediate claim overlaps with sibling agents",
             WorktreeClaimArgs::properties(),
@@ -2598,7 +2627,7 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         mutating_tool(
-            "gitpulse_worktree_release",
+            "waylode_worktree_release",
             "Release agent worktree lane",
             "Release an agent lane's claim record from <git-common-dir>/gitpulse/lanes/claims.json when its task finishes or switches focus",
             WorktreeReleaseArgs::properties(),
@@ -2615,7 +2644,7 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         mutating_tool(
-            "gitpulse_worktree_send_message",
+            "waylode_worktree_send_message",
             "Send agent coordination message",
             "Post a bounded agent-to-agent message (direct to to_agent, or broadcast when omitted) onto <git-common-dir>/gitpulse/lanes/messages.json across sibling worktrees",
             WorktreeSendMessageArgs::properties(),
@@ -2646,7 +2675,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         mutating_tool(
-            "gitpulse_browser_open",
+            "waylode_browser_open",
             "Open a browser session on a local dev server",
             "Ask the running GitPulse (macOS) to open a Browser session on a loopback URL (localhost, 127.0.0.0/8, [::1]) in this repository's terminal dock, for the person to see the page; a session already on that URL is brought forward instead of opened again. GitPulse and the repository come to the front. Opens only: it cannot read, drive or close the page. Refused when GitPulse is not running, the repository is not trusted, or the URL is not loopback",
             BrowserOpenArgs::properties(),
@@ -2664,9 +2693,9 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         open_world(mutating_tool(
-            "gitpulse_terminal_spawn",
+            "waylode_terminal_spawn",
             "Spawn a scoped child terminal session",
-            "Ask the running GitPulse (macOS) to spawn a scoped child terminal session (shell or coding agent) inside a trusted repository. Inside a GitPulse PTY it authenticates via GITPULSE_SESSION_TOKEN; standalone MCP callers spawn under a caller-scoped mcp-<pid> identity (never touching user shells or another caller's children). To run another agent, prefer an agent launcher with prompt, mode, model and settings over launcher 'shell' with a hand-typed command line, then call gitpulse_terminal_wait: matched_reason 'needs_input' means that child is waiting on the user (tell them which tab). Allow rules in a settings file must match the exact command shapes your brief mandates ('git -C <path> log' is not matched by 'git log')",
+            "Ask the running Waylode (macOS) to spawn a scoped child terminal session (shell or coding agent) inside a trusted repository. Inside a Waylode PTY it authenticates via WAYLODE_SESSION_TOKEN (or legacy GITPULSE_SESSION_TOKEN); standalone MCP callers spawn under a caller-scoped mcp-<pid> identity (never touching user shells or another caller's children). To run another agent, prefer an agent launcher with prompt, mode, model and settings over launcher 'shell' with a hand-typed command line, then call waylode_terminal_wait: matched_reason 'needs_input' means that child is waiting on the user (tell them which tab). Allow rules in a settings file must match the exact command shapes your brief mandates ('git -C <path> log' is not matched by 'git log')",
             TerminalSpawnArgs::properties(),
             &TerminalSpawnArgs::required(),
             json!({
@@ -2690,7 +2719,7 @@ fn build_tools() -> Vec<Value> {
             false,
         )),
         open_world(mutating_tool(
-            "gitpulse_terminal_exec",
+            "waylode_terminal_exec",
             "Run a gated shell command and wait for its output",
             "Run a policy-gated command in a scoped child shell session (reusing an owned 'shell' session or spawning a fresh one), wait for OSC 133 completion or exit, and return secret-redacted command output and exit code",
             TerminalExecArgs::properties(),
@@ -2728,7 +2757,7 @@ fn build_tools() -> Vec<Value> {
             false,
         )),
         mutating_tool(
-            "gitpulse_terminal_open_file",
+            "waylode_terminal_open_file",
             "Open a repository file in a terminal split pane",
             "Ask the running GitPulse (macOS) to open an existing repository-relative file in a right-hand split Code/Markdown viewer pane beside the caller's terminal session, optionally scrolled to a 1-based line and column",
             TerminalOpenFileArgs::properties(),
@@ -2747,7 +2776,7 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         tool(
-            "gitpulse_terminal_list",
+            "waylode_terminal_list",
             "List child terminal sessions spawned by this parent",
             "List terminal sessions owned by this caller inside the repository (and read-only repository user shells with owned=false when include_repo_shells=true and Settings -> Agents allow_agent_shell_reads is enabled), including OSC 133 command state, OSC 7501 agent status, active working directory, and loopback dev-server URL",
             TerminalListArgs::properties(),
@@ -2788,7 +2817,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_terminal_wait",
+            "waylode_terminal_wait",
             "Wait for a child terminal session event or screen pattern",
             "Wait without busy-polling until a child session spawned by this parent matches a plain-text substring on its rendered screen, finishes an OSC 133 shell command, reports OSC 7501 idle/done/blocked/error, exposes a loopback dev server, exits, or reaches timeout_ms. A child blocked on an agent dialog (agy asking permission to run a command) ends the wait as matched_reason 'needs_input' with agent_prompt {kind, detail, since_ms}: it cannot continue until someone answers it, so tell the user rather than waiting again",
             TerminalWaitArgs::properties(),
@@ -2818,7 +2847,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_terminal_read",
+            "waylode_terminal_read",
             "Read a child terminal session's rendered vt100 screen",
             "Read the clean 2D vt100 screen or latest OSC 133 command block of an owned child session (agent_prompt names the dialog the agent is blocked on, or is null) (or a repository user shell when allow_agent_shell_reads is enabled), supporting scrollback paging (max_lines up to 1000, offset_lines) and plain-text grep while redacting secrets and capability tokens before filtering",
             TerminalReadArgs::properties(),
@@ -2853,7 +2882,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         open_world(mutating_tool(
-            "gitpulse_terminal_send",
+            "waylode_terminal_send",
             "Send gated input to a child terminal session",
             "Write a plain-text command, prompt, or Ctrl-C/Ctrl-D interrupt to a child terminal session spawned by this parent. ANSI escape injection is refused and commands pass through the safety gate before reaching the PTY",
             TerminalSendArgs::properties(),
@@ -2875,7 +2904,7 @@ fn build_tools() -> Vec<Value> {
             false,
         )),
         open_world(mutating_tool(
-            "gitpulse_terminal_close",
+            "waylode_terminal_close",
             "Close an owned child terminal session",
             "Terminate a child terminal session spawned by this parent, release its per-parent concurrency slot immediately, and close its split pane in the GitPulse window",
             TerminalCloseArgs::properties(),
@@ -2892,7 +2921,7 @@ fn build_tools() -> Vec<Value> {
             false,
         )),
         tool(
-            "gitpulse_worktree_inbox",
+            "waylode_worktree_inbox",
             "Read agent coordination inbox",
             "Read direct and broadcast coordination messages from <git-common-dir>/gitpulse/lanes/messages.json strictly after since_seq",
             WorktreeInboxArgs::properties(),
@@ -2942,7 +2971,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         mutating_tool(
-            "gitpulse_inbox_post",
+            "waylode_inbox_post",
             "Post message or ask to agent inbox thread",
             "Post a structured ask (decide, do, answer, review) or update message to a persistent inbox thread",
             InboxPostArgs::properties(),
@@ -2959,7 +2988,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         tool(
-            "gitpulse_inbox_read",
+            "waylode_inbox_read",
             "Read agent inbox threads and asks",
             "Read persistent inbox threads, open asks, and message timelines across agents and developers",
             InboxReadArgs::properties(),
@@ -2976,7 +3005,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         mutating_tool(
-            "gitpulse_inbox_withdraw",
+            "waylode_inbox_withdraw",
             "Withdraw open agent ask",
             "Cancel or withdraw an outstanding structured ask when resolved independently",
             InboxWithdrawArgs::properties(),
@@ -2993,7 +3022,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         mutating_tool(
-            "gitpulse_kickoff_agent",
+            "waylode_kickoff_agent",
             "Kick off or delegate a task to another agent lane",
             "Delegate a task or decomposed subtask to another agent (claude, agy, or codex), moving the board task to in_progress if present, registering pre-edit lane claims, and posting a structured handoff thread on the coordination bus",
             KickoffAgentArgs::properties(),
@@ -3069,7 +3098,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         mutating_tool(
-            "gitpulse_agent_register",
+            "waylode_agent_register",
             "Register live peer agent identity and wake mode",
             "Register or update a live coding agent session (claude, agy, or codex) in peers.json with role, wake_mode ('boundary' or 'auto'), and optional pre-edit lane claims",
             AgentRegisterArgs::properties(),
@@ -3087,7 +3116,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         tool(
-            "gitpulse_agent_peers",
+            "waylode_agent_peers",
             "List live and resumable peer agents across worktrees",
             "Discover live and resumable Claude Code, Antigravity (agy CLI and IDE), and Manvi Managed sessions across all worktrees of a trusted repository with reconciled liveness states",
             AgentPeersArgs::properties(),
@@ -3104,7 +3133,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         mutating_tool(
-            "gitpulse_agent_send",
+            "waylode_agent_send",
             "Send peer-to-peer message across Claude and Antigravity sessions",
             "Send an A2A message to a peer session (fail-closed on ambiguous targets), persisting up to 16 KiB in agent_bus, depositing a cross-process mailbox envelope, and waking live GUI/waiter targets within hop limits",
             AgentSendArgs::properties(),
@@ -3142,7 +3171,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         mutating_tool(
-            "gitpulse_agent_inbox",
+            "waylode_agent_inbox",
             "Read and cross-ack deduplicated peer inbox messages",
             "Read unread peer messages deduplicated by msg_id across agent_bus and agent_mailbox, hydrating > 6 KiB bodies. Peeks by default; cross-acknowledges both stores only when ack is true",
             AgentInboxArgs::properties(),
@@ -3183,7 +3212,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         mutating_tool(
-            "gitpulse_agent_wait",
+            "waylode_agent_wait",
             "Wait for incoming peer message with bounded kqueue notify",
             "Block up to 45s (MAX_WAIT_CALLS = 4 concurrent slots) watching lanes/messages.json and agent_mailbox for an incoming peer reply, cross-acknowledging both stores on wake",
             AgentWaitArgs::properties(),
@@ -3228,7 +3257,7 @@ fn build_tools() -> Vec<Value> {
             false,
         ),
         tool(
-            "gitpulse_worktree_radar",
+            "waylode_worktree_radar",
             "Parallel agent 3-layer collision radar",
             "Run the 3-layer parallel agent collision radar across all worktrees and registered lanes: (1) pre-edit file/symbol claim overlaps, (2) zero-copy WorktreeOverlay RoaringBitmap + 1-hop CsrGraphReader caller/callee semantic collisions, and (3) quarantined ODB 3-way git merge-tree committed conflicts",
             RepoArgs::properties(),
@@ -3322,7 +3351,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_campaign_audit",
+            "waylode_campaign_audit",
             "Verified multi-agent campaign invariant audit",
             "Audit <git-common-dir>/gitpulse/campaign.json in read-only mode against the formal campaign safety invariants and cryptographic/ODB seals: (1) pairwise hierarchical single-writer file/directory lease disjointness across lanes, (2) genesis-to-head FIPS 180-4 SHA-256 BULLETIN hash-chain integrity, (3) sole-committer Integrator target-branch authority with acyclic parent->child lineage, (4) strict 0600 non-symlink owner-UID campaign.key hygiene and constant-time domain-separated HMAC-SHA256 authentication over the envelope, BULLETIN entries, and target commits, and (5) Git ODB state-anchor parity under refs/gitpulse/campaign/state. Creates nothing on disk; an uninitialized repository reports initialized: false and invariants_verified: false rather than claiming verification passed.",
             CampaignAuditArgs::properties(),
@@ -3436,7 +3465,7 @@ fn build_tools() -> Vec<Value> {
             },
         ),
         mutating_tool(
-            "gitpulse_worktree_overlay_sync",
+            "waylode_worktree_overlay_sync",
             "Synchronize ephemeral worktree DevMap overlay",
             "Synchronize <state_dir>/codeintel/delta.sqlite for a stacked DevMap worktree via real Tree-sitter extraction (or compute an in-memory delta summary for standalone checkouts), updating Blake3 file hashes, tombstones, and RoaringBitmap dirty CSR nodes",
             WorktreeOverlaySyncArgs::properties(),
@@ -3468,7 +3497,7 @@ fn build_tools() -> Vec<Value> {
             true,
         ),
         tool(
-            "gitpulse_codeintel_search",
+            "waylode_codeintel_search",
             "Symbol search",
             "Search symbols across indexed code files via in-process devmap",
             SearchArgs::properties(),
@@ -3476,7 +3505,7 @@ fn build_tools() -> Vec<Value> {
             codeintel_output(),
         ),
         tool(
-            "gitpulse_codeintel_impact",
+            "waylode_codeintel_impact",
             "Impact / blast radius",
             "Compute downstream blast radius / affected callers for a symbol or file",
             CodeintelImpactArgs::properties(),
@@ -3484,7 +3513,7 @@ fn build_tools() -> Vec<Value> {
             codeintel_output(),
         ),
         tool(
-            "gitpulse_codeintel_dependencies",
+            "waylode_codeintel_dependencies",
             "File dependencies",
             "What a file depends on — the mirror of impact. Answers outgoing edges from the devmap code graph",
             CodeintelDependenciesArgs::properties(),
@@ -3492,7 +3521,7 @@ fn build_tools() -> Vec<Value> {
             codeintel_output(),
         ),
         tool(
-            "gitpulse_codeintel_trace",
+            "waylode_codeintel_trace",
             "Trace between symbols",
             "Shortest edge path between two symbols in the devmap code graph",
             CodeintelTraceArgs::properties(),
@@ -3500,7 +3529,7 @@ fn build_tools() -> Vec<Value> {
             codeintel_output(),
         ),
         tool(
-            "gitpulse_codeintel_dead_symbols",
+            "waylode_codeintel_dead_symbols",
             "Dead symbols",
             "Unreferenced symbols in the indexed code graph. Unavailable is reported, never an empty list that reads as none found.",
             BudgetArgs::properties(),
@@ -3508,7 +3537,7 @@ fn build_tools() -> Vec<Value> {
             codeintel_output(),
         ),
         tool(
-            "gitpulse_codeintel_suspects",
+            "waylode_codeintel_suspects",
             "Regression suspects",
             "Which commits since `since` could have caused a symptom. Blames only the lines belonging to symbols the symptom depends on, so the answer is the dependency cone rather than the file's recent history. The window ends at the commit the index was built at, never HEAD. An empty list with available=true means nothing in the window touched the cone; refusals are reported in walk_incomplete and make the list a lower bound.",
             SuspectsArgs::properties(),
@@ -3537,9 +3566,9 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_provenance",
+            "waylode_provenance",
             "Commit provenance",
-            "Read Git-native verification notes and confidence decay for a commit. `distance` is how many commits the base has that the commit lacks (`rev-list --count <commit>..<base>`), so it is 0 for a commit AHEAD of the base as well as for the base tip: it says how far the base moved, not whether the commit is on it. Read `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`, `merge_base` and `base_oid` for that; each is null with `base_relation_reason` when it could not be measured (unresolvable base, shallow clone), never false. `verified` is true only when a verification note is attached AND records a pass of the whole suite: a note recording a failure, a pass of the affected tests only (`passed-affected`) or an unrecognised verdict is `verified: false`, with the note still in `verification` (read `verification.verdict` for what it found). `confidence` is how much a recorded pass still counts (it decays with `distance`) and is null whenever `verified` is false, so a failed or unverified commit is never confident however fresh. A verification is keyed to the commit's sha and does not survive a rewrite: a rebased, amended or squashed commit is a new commit with no verification, even when `gitpulse_landed` finds its work on the base.",
+            "Read Git-native verification notes and confidence decay for a commit. `distance` is how many commits the base has that the commit lacks (`rev-list --count <commit>..<base>`), so it is 0 for a commit AHEAD of the base as well as for the base tip: it says how far the base moved, not whether the commit is on it. Read `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`, `merge_base` and `base_oid` for that; each is null with `base_relation_reason` when it could not be measured (unresolvable base, shallow clone), never false. `verified` is true only when a verification note is attached AND records a pass of the whole suite: a note recording a failure, a pass of the affected tests only (`passed-affected`) or an unrecognised verdict is `verified: false`, with the note still in `verification` (read `verification.verdict` for what it found). `confidence` is how much a recorded pass still counts (it decays with `distance`) and is null whenever `verified` is false, so a failed or unverified commit is never confident however fresh. A verification is keyed to the commit's sha and does not survive a rewrite: a rebased, amended or squashed commit is a new commit with no verification, even when `waylode_landed` finds its work on the base.",
             ProvenanceArgs::properties(),
             &ProvenanceArgs::required(),
             json!({
@@ -3573,7 +3602,7 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
-            "gitpulse_landed",
+            "waylode_landed",
             "Has a commit landed",
             "Has a commit's work reached a base, and how. `landed: true` with `via`: `merge` when a merge commit joined it to the base (checked before `ff`, so a non-tip commit of a `--no-ff` branch is `merge`), `ff` when the base's own line runs through it, `squash` when one base commit carries the patch of its whole branch (checked before `rebase`, so a one-commit squash names its commit), `rebase` when every patch is on the base under new ids, `tree` when none of those match but merging it into the base changes nothing (its content is already there; no single commit is named). `merge_commit` is the base commit that brought it in (merge or squash). `landed: false` only when absence is provable: no route found, the base was searched in full, and merging the work in would add something. Everything else is null with `reason` (a code) and `error` (words): `partial_clone_fetch_required` (a partial clone: nothing is run, because git would fetch a missing blob), `search_depth_exceeded` (the base is longer than the 1000-commit squash search, so absence in the part searched proves nothing), `content_not_provable` (the work conflicts with the base, or merging it adds content but the base changed the same paths since the fork, so it may have landed edited and been changed since), `unrelated_history` (no common history, no matching patch or tree), `shallow_clone`, `unresolvable`, `not_measured`, `comparison_failed`. `reverted: true` only when a revert commit naming the landing is found after it in the base's history (`reverted_by`); a reland reads false, a revert chain longer than four is null with `reverted_reason` starting `revert_chain_exceeded`; no content inference, so `merge -s ours` reads landed and not reverted. `landed_at` is the Unix time the base first contained the landing, from the base branch's own reflog (never HEAD's; `HEAD` means the branch it is on) with `landed_at_source: reflog`, or the landing commit's date for a base with no reflog (`commit_date`); null with `landed_at_reason` when the reflog is absent, expired or older than its 1000 newest entries. Read-only: the content comparison runs in a quarantined object directory that is deleted afterwards, so no ref, index, working-tree file or repository object is written.",
             LandedArgs::properties(),
@@ -3639,7 +3668,7 @@ fn discover_result(modern: bool) -> Value {
             json!({
                 "supportedVersions": [PROTOCOL_VERSION],
                 "capabilities": capabilities(),
-                "instructions": "GitPulse control plane. Read tools (readOnlyHint: true) never mutate git or task state. Writes are restricted to the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task, gitpulse_delete_task and gitpulse_merge_tasks — and the policy-gated worktree engine and lane coordination tools — gitpulse_worktree_create, gitpulse_worktree_switch, gitpulse_worktree_isolate, gitpulse_worktree_prune, gitpulse_worktree_merge, gitpulse_worktree_claim, gitpulse_worktree_release, gitpulse_worktree_send_message and gitpulse_worktree_overlay_sync (each gated by repository trust and harness::guard_command). gitpulse_browser_open asks the running GitPulse to open a Browser session on a loopback URL in a trusted repository's terminal dock, for the person to see; it changes no git or task state and cannot read or drive the page. gitpulse_delete_task removes a card and gitpulse_merge_tasks folds duplicate cards into one and removes the rest (both soft, with a required reason kept in history, and no undelete over MCP); use them only for tasks that should not exist separately, never to finish one, and not on a task another agent is running. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. When the board already holds duplicates, merge them with gitpulse_merge_tasks rather than deleting all but one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk, gitpulse_worktree_claim, gitpulse_worktree_inbox, and gitpulse_worktree_radar before and during parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
+                "instructions": "GitPulse control plane. Read tools (readOnlyHint: true) never mutate git or task state. Writes are restricted to the task-board tools — waylode_add_task, waylode_import_tasks, waylode_complete_task, waylode_delete_task and waylode_merge_tasks — and the policy-gated worktree engine and lane coordination tools — waylode_worktree_create, waylode_worktree_switch, waylode_worktree_isolate, waylode_worktree_prune, waylode_worktree_merge, waylode_worktree_claim, waylode_worktree_release, waylode_worktree_send_message and waylode_worktree_overlay_sync (each gated by repository trust and harness::guard_command). waylode_browser_open asks the running GitPulse to open a Browser session on a loopback URL in a trusted repository's terminal dock, for the person to see; it changes no git or task state and cannot read or drive the page. waylode_delete_task removes a card and waylode_merge_tasks folds duplicate cards into one and removes the rest (both soft, with a required reason kept in history, and no undelete over MCP); use them only for tasks that should not exist separately, never to finish one, and not on a task another agent is running. Keep the board small: before waylode_add_task, read waylode_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; waylode_add_task refuses a new task that looks like open work until you have reviewed it. When the board already holds duplicates, merge them with waylode_merge_tasks rather than deleting all but one. Start with waylode_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use waylode_change_context before editing, and waylode_collision_risk, waylode_worktree_claim, waylode_worktree_inbox, and waylode_worktree_radar before and during parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call waylode_complete_task with that id and a short summary.",
             }),
         ),
         DISCOVER_TTL_MS,
@@ -3715,7 +3744,9 @@ fn tool_exec_error(modern: bool, message: impl Into<String>) -> Value {
 /// This is the spec's *"Servers **MUST**: Validate all tool inputs"*. Before it
 /// existed the schema was decoration and a wrong-typed argument silently became
 /// a default.
-fn validate_arguments(name: &str, arguments: &Value) -> Result<(), String> {
+fn validate_arguments(requested: &str, arguments: &Value) -> Result<(), String> {
+    let canonical = canonical_tool_name(requested);
+    let name = canonical.as_ref();
     let Some(tool) = catalog().iter().find(|t| t["name"] == name) else {
         return Ok(());
     };
@@ -3768,7 +3799,7 @@ fn open_shared_profile(
 
 /// Fail-soft read-only lookup from `run_id` to board `task_id`.
 ///
-/// Opens the shared profile store at most once per `gitpulse_sessions` call
+/// Opens the shared profile store at most once per `waylode_sessions` call
 /// with `SQLITE_OPEN_READ_ONLY` and `refuse_workbench_upgrades`, returning
 /// `None` if the store is absent or requires a schema upgrade rather than
 /// failing a read-only session listing.
@@ -3989,25 +4020,31 @@ fn resolve_orchestrate_context(
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            std::env::var(crate::terminal::TERMINAL_SESSION_ENV)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
+            crate::env_compat::var_compat(
+                crate::terminal::TERMINAL_SESSION_ENV,
+                crate::terminal::LEGACY_TERMINAL_SESSION_ENV,
+            )
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
         })
         .or_else(|| {
-            std::env::var(crate::alerts::bridge::SESSION_ENV)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
+            crate::env_compat::var_compat(
+                crate::alerts::bridge::SESSION_ENV,
+                crate::alerts::bridge::LEGACY_SESSION_ENV,
+            )
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
         });
     let tok = caller_token
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            std::env::var(crate::terminal::orchestrate::SESSION_TOKEN_ENV)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
+            crate::env_compat::var_compat(
+                crate::terminal::orchestrate::SESSION_TOKEN_ENV,
+                crate::terminal::orchestrate::LEGACY_SESSION_TOKEN_ENV,
+            )
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
         });
 
     match (sid, tok) {
@@ -4055,9 +4092,28 @@ fn ask_app_to_orchestrate(
     }
 }
 
+/// The prefix this server lists its own tools under.
+pub const TOOL_PREFIX: &str = "waylode_";
+
+/// Legacy tool prefix accepted as an alias of [`TOOL_PREFIX`] during the
+/// GitPulse -> Waylode transition. By default nothing is listed under it
+/// (set `WAYLODE_MCP_EXPOSE_LEGACY=1` to include deprecated aliases in
+/// `tools/list`), and any call under it runs through the same schema,
+/// read/write classification and gates as the canonical `waylode_*` tool.
+pub const TOOL_ALIAS_PREFIX: &str = "gitpulse_";
+
+/// `name` as the catalog lists it: `gitpulse_<x>` reads as `waylode_<x>`.
+/// Every other name, including `devmap_*`, is returned unchanged.
+pub fn canonical_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.strip_prefix(TOOL_ALIAS_PREFIX) {
+        Some(rest) if !rest.is_empty() => std::borrow::Cow::Owned(format!("{TOOL_PREFIX}{rest}")),
+        _ => std::borrow::Cow::Borrowed(name),
+    }
+}
+
 /// The tools whose `status` argument names a board column. An agent written
 /// before `inbox` was merged into `backlog` may still send the old name.
-const BOARD_STATUS_TOOLS: [&str; 2] = ["gitpulse_add_task", "gitpulse_list_tasks"];
+const BOARD_STATUS_TOOLS: [&str; 2] = ["waylode_add_task", "waylode_list_tasks"];
 
 /// `arguments` with a retired board status read as the column it became.
 ///
@@ -4065,7 +4121,8 @@ const BOARD_STATUS_TOOLS: [&str; 2] = ["gitpulse_add_task", "gitpulse_list_tasks
 /// canonicalised before the schema looks at it, not loosened to accept it:
 /// nothing is advertised under the old name, and the handler never sees it.
 fn with_current_board_status<'a>(name: &str, arguments: &'a Value) -> std::borrow::Cow<'a, Value> {
-    if BOARD_STATUS_TOOLS.contains(&name) {
+    let canonical = canonical_tool_name(name);
+    if BOARD_STATUS_TOOLS.contains(&canonical.as_ref()) {
         if let Some(status) = arguments.get("status").and_then(Value::as_str) {
             let current = ft::current_status(status);
             if current != status {
@@ -4078,7 +4135,12 @@ fn with_current_board_status<'a>(name: &str, arguments: &'a Value) -> std::borro
     std::borrow::Cow::Borrowed(arguments)
 }
 
-fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
+fn handle_tool_call(requested: &str, arguments: &Value) -> Result<Value, String> {
+    // Read an alias as the listed name before anything keys on it: schema
+    // validation is skipped for a name the catalog does not list, so mapping
+    // later would let an aliased call past it.
+    let canonical = canonical_tool_name(requested);
+    let name = canonical.as_ref();
     let arguments = &*with_current_board_status(name, arguments);
     // The schema refuses what it can say (bounds, enums, unknown keys); `parse`
     // then reads the accepted call into the tool's struct, and refuses what the
@@ -4086,24 +4148,24 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
     // ever substitutes a default for an argument that was sent.
     validate_arguments(name, arguments)?;
     match name {
-        "gitpulse_insights" => {
+        "waylode_insights" => {
             let a: RepoArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
                 read_insights(|| resources::insights_document(&a.repo_path), retry)
             }))
         }
-        "gitpulse_sessions" => {
+        "waylode_sessions" => {
             let a: SessionsArgs = parse(name, arguments)?;
             let report = with_sessions_run_lookup(|lookup| {
                 insights::sessions(&a.repo_path, a.limit, lookup)
             })?;
             serde_json::to_value(report).map_err(|e| format!("serialize sessions report: {e}"))
         }
-        "gitpulse_status" => {
+        "waylode_status" => {
             let a: RepoArgs = parse(name, arguments)?;
             resources::status_document(&a.repo_path)
         }
-        "gitpulse_active_changes" => {
+        "waylode_active_changes" => {
             let a: ActiveChangesArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
                 read_insights(
@@ -4118,7 +4180,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 )
             }))
         }
-        "gitpulse_collision_risk" => {
+        "waylode_collision_risk" => {
             let a: CollisionRiskArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
                 read_insights(
@@ -4130,7 +4192,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 )
             }))
         }
-        "gitpulse_merge_conflicts" => {
+        "waylode_merge_conflicts" => {
             let a: RepoArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
                 read_insights(
@@ -4139,7 +4201,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 )
             }))
         }
-        "gitpulse_change_context" => {
+        "waylode_change_context" => {
             let a: ChangeContextArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
                 read_insights(
@@ -4153,10 +4215,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 )
             }))
         }
-        "gitpulse_ledger_events" => ledger_events(parse(name, arguments)?),
-        "gitpulse_turn_checkpoints" => Ok(turn_checkpoints(parse(name, arguments)?)),
-        "gitpulse_task_view" => task_view(parse(name, arguments)?),
-        "gitpulse_add_task" => {
+        "waylode_ledger_events" => ledger_events(parse(name, arguments)?),
+        "waylode_turn_checkpoints" => Ok(turn_checkpoints(parse(name, arguments)?)),
+        "waylode_task_view" => task_view(parse(name, arguments)?),
+        "waylode_add_task" => {
             let a: AddTaskArgs = parse(name, arguments)?;
             let key = match a.task_id {
                 Some(key) => key,
@@ -4237,7 +4299,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             }
             Ok(result)
         }
-        "gitpulse_import_tasks" => {
+        "waylode_import_tasks" => {
             let a: ImportTasksArgs = parse(name, arguments)?;
             let store =
                 open_task_profile(true)?.ok_or("the GitPulse task profile could not be created")?;
@@ -4250,7 +4312,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             .map(|report| json!(report))
             .map_err(workbench_message)
         }
-        "gitpulse_list_tasks" => {
+        "waylode_list_tasks" => {
             let a: ListTasksArgs = parse(name, arguments)?;
             let Some(store) = open_task_profile_readonly()? else {
                 return Ok(json!({
@@ -4269,12 +4331,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             )
             .map_err(workbench_message)
         }
-        "gitpulse_get_task" => {
+        "waylode_get_task" => {
             let a: GetTaskArgs = parse(name, arguments)?;
             let store = open_task_profile_readonly()?.ok_or(NO_BOARD)?;
             intake::get_task(&store, &a.repo_path, &a.task_id).map_err(workbench_message)
         }
-        "gitpulse_complete_task" => {
+        "waylode_complete_task" => {
             let a: CompleteTaskArgs = parse(name, arguments)?;
             // Reading, not creating: a task to complete has to exist already.
             let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
@@ -4289,7 +4351,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             )
             .map_err(workbench_message)
         }
-        "gitpulse_delete_task" => {
+        "waylode_delete_task" => {
             let a: DeleteTaskArgs = parse(name, arguments)?;
             // Reading, not creating: a task to delete has to exist already.
             let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
@@ -4304,7 +4366,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             )
             .map_err(workbench_message)
         }
-        "gitpulse_merge_tasks" => {
+        "waylode_merge_tasks" => {
             let a: MergeTasksArgs = parse(name, arguments)?;
             let into = intake::MergeTask {
                 task: a.into_task_id,
@@ -4330,7 +4392,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             )
             .map_err(workbench_message)
         }
-        "gitpulse_worktree_create" => {
+        "waylode_worktree_create" => {
             let a: WorktreeCreateArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4538,7 +4600,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "problems": problems
             }))
         }
-        "gitpulse_worktree_switch" => {
+        "waylode_worktree_switch" => {
             let a: WorktreeSwitchArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4635,7 +4697,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             }
             Err(format!("worktree for branch {:?} does not exist", a.branch))
         }
-        "gitpulse_worktree_isolate" => {
+        "waylode_worktree_isolate" => {
             let a: WorktreeIsolateArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4728,7 +4790,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "overlay_error": overlay_error
             }))
         }
-        "gitpulse_worktree_prune" => {
+        "waylode_worktree_prune" => {
             let a: WorktreePruneArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4807,7 +4869,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "outcomes": outcomes
             }))
         }
-        "gitpulse_worktree_merge" => {
+        "waylode_worktree_merge" => {
             let a: WorktreeMergeArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4831,7 +4893,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "error": res.error
             }))
         }
-        "gitpulse_worktree_claim" => {
+        "waylode_worktree_claim" => {
             let a: WorktreeClaimArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4857,7 +4919,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "claim_conflicts": claim_conflicts
             }))
         }
-        "gitpulse_worktree_release" => {
+        "waylode_worktree_release" => {
             let a: WorktreeReleaseArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4870,7 +4932,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "released": released
             }))
         }
-        "gitpulse_worktree_send_message" => {
+        "waylode_worktree_send_message" => {
             let a: WorktreeSendMessageArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -4892,7 +4954,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "message": message
             }))
         }
-        "gitpulse_browser_open" => {
+        "waylode_browser_open" => {
             let a: BrowserOpenArgs = parse(name, arguments)?;
             // Trust first, as every repository-scoped tool does: an untrusted
             // repository is refused as untrusted on every platform, never
@@ -4916,7 +4978,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "url": url
             }))
         }
-        "gitpulse_terminal_spawn" => {
+        "waylode_terminal_spawn" => {
             let a: TerminalSpawnArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -4942,7 +5004,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 ),
             })
         }
-        "gitpulse_terminal_exec" => {
+        "waylode_terminal_exec" => {
             let a: TerminalExecArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -4962,7 +5024,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 max_lines: a.max_lines,
             })
         }
-        "gitpulse_terminal_open_file" => {
+        "waylode_terminal_open_file" => {
             let a: TerminalOpenFileArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -4976,7 +5038,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 column: a.column,
             })
         }
-        "gitpulse_terminal_list" => {
+        "waylode_terminal_list" => {
             let a: TerminalListArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -4988,7 +5050,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 include_repo_shells: a.include_repo_shells,
             })
         }
-        "gitpulse_terminal_wait" => {
+        "waylode_terminal_wait" => {
             let a: TerminalWaitArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -5004,7 +5066,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 since_seq: a.since_seq,
             })
         }
-        "gitpulse_terminal_read" => {
+        "waylode_terminal_read" => {
             let a: TerminalReadArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -5020,7 +5082,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 last_command_only: a.last_command_only,
             })
         }
-        "gitpulse_terminal_send" => {
+        "waylode_terminal_send" => {
             let a: TerminalSendArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -5034,7 +5096,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 append_newline: a.append_newline,
             })
         }
-        "gitpulse_terminal_close" => {
+        "waylode_terminal_close" => {
             let a: TerminalCloseArgs = parse(name, arguments)?;
             let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
@@ -5046,7 +5108,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 child_session_id: a.child_session_id,
             })
         }
-        "gitpulse_worktree_inbox" => {
+        "waylode_worktree_inbox" => {
             let a: WorktreeInboxArgs = parse(name, arguments)?;
             let mut page = crate::engine::agent_bus::read_thread_messages(
                 &a.repo_path,
@@ -5069,7 +5131,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "has_more": has_more
             }))
         }
-        "gitpulse_inbox_post" => {
+        "waylode_inbox_post" => {
             let a: InboxPostArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -5113,7 +5175,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "message": message
             }))
         }
-        "gitpulse_inbox_read" => {
+        "waylode_inbox_read" => {
             let a: InboxReadArgs = parse(name, arguments)?;
             let mut threads = crate::engine::agent_bus::list_inbox_threads(
                 &a.repo_path,
@@ -5136,7 +5198,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "total": total
             }))
         }
-        "gitpulse_inbox_withdraw" => {
+        "waylode_inbox_withdraw" => {
             let a: InboxWithdrawArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -5155,7 +5217,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "message": message
             }))
         }
-        "gitpulse_kickoff_agent" => {
+        "waylode_kickoff_agent" => {
             let a: KickoffAgentArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -5274,12 +5336,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "spawn_outcome": spawn_outcome,
             }))
         }
-        "gitpulse_agent_register" => a2a::handle_agent_register(parse(name, arguments)?),
-        "gitpulse_agent_peers" => a2a::handle_agent_peers(parse(name, arguments)?),
-        "gitpulse_agent_send" => a2a::handle_agent_send(parse(name, arguments)?),
-        "gitpulse_agent_inbox" => a2a::handle_agent_inbox(parse(name, arguments)?),
-        "gitpulse_agent_wait" => a2a::handle_agent_wait(parse(name, arguments)?),
-        "gitpulse_worktree_radar" => {
+        "waylode_agent_register" => a2a::handle_agent_register(parse(name, arguments)?),
+        "waylode_agent_peers" => a2a::handle_agent_peers(parse(name, arguments)?),
+        "waylode_agent_send" => a2a::handle_agent_send(parse(name, arguments)?),
+        "waylode_agent_inbox" => a2a::handle_agent_inbox(parse(name, arguments)?),
+        "waylode_agent_wait" => a2a::handle_agent_wait(parse(name, arguments)?),
+        "waylode_worktree_radar" => {
             let a: RepoArgs = parse(name, arguments)?;
             let report = crate::engine::agent_bus::scan_parallel_agent_radar(&a.repo_path)
                 .map_err(CommandError::into_message)?;
@@ -5299,7 +5361,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "scan_errors": report.scan_errors
             }))
         }
-        "gitpulse_campaign_audit" => {
+        "waylode_campaign_audit" => {
             let a: CampaignAuditArgs = parse(name, arguments)?;
             let report = crate::engine::campaign_formal::audit_repo_campaign(
                 &a.repo_path,
@@ -5309,7 +5371,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             .map_err(CommandError::into_message)?;
             Ok(json!(report))
         }
-        "gitpulse_worktree_overlay_sync" => {
+        "waylode_worktree_overlay_sync" => {
             let a: WorktreeOverlaySyncArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
@@ -5342,7 +5404,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         name if name.starts_with("devmap_") => {
             devmap_parity::handle(name, arguments).map_err(CommandError::into_message)
         }
-        "gitpulse_codeintel_search" => {
+        "waylode_codeintel_search" => {
             let a: SearchArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::search(
                 &a.repo_path,
@@ -5350,7 +5412,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.budget
             )))
         }
-        "gitpulse_codeintel_impact" => {
+        "waylode_codeintel_impact" => {
             let a: CodeintelImpactArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::impact(
                 &a.repo_path,
@@ -5358,7 +5420,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.budget
             )))
         }
-        "gitpulse_codeintel_dependencies" => {
+        "waylode_codeintel_dependencies" => {
             let a: CodeintelDependenciesArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::dependencies(
                 &a.repo_path,
@@ -5366,7 +5428,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.budget
             )))
         }
-        "gitpulse_codeintel_trace" => {
+        "waylode_codeintel_trace" => {
             let a: CodeintelTraceArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::trace_between(
                 &a.repo_path,
@@ -5375,14 +5437,14 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.budget
             )))
         }
-        "gitpulse_codeintel_dead_symbols" => {
+        "waylode_codeintel_dead_symbols" => {
             let a: BudgetArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::dead_symbols(
                 &a.repo_path,
                 a.budget
             )))
         }
-        "gitpulse_codeintel_suspects" => {
+        "waylode_codeintel_suspects" => {
             let a: SuspectsArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::suspects(
                 &a.repo_path,
@@ -5391,7 +5453,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.depth
             )))
         }
-        "gitpulse_provenance" => {
+        "waylode_provenance" => {
             let a: ProvenanceArgs = parse(name, arguments)?;
             // A repository that cannot be examined (untrusted, not a Git
             // repository) is a tool error. `compute_freshness` would answer it
@@ -5405,7 +5467,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.base_branch.as_deref()
             )))
         }
-        "gitpulse_landed" => {
+        "waylode_landed" => {
             let a: LandedArgs = parse(name, arguments)?;
             // Same refusal as provenance: an unexaminable repository is a
             // tool error, not an answer whose only sign of it is `error`.
@@ -5417,7 +5479,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.base.as_deref()
             )))
         }
-        _ => Err(format!("Unknown tool: {name}")),
+        _ => Err(format!("Unknown tool: {requested}")),
     }
 }
 
@@ -5425,7 +5487,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
 /// machine has no board.
 const NO_BOARD: &str = "GitPulse has no task board on this machine yet: nothing has been filed.";
 
-/// `gitpulse_turn_checkpoints`: the worktree's checkpoint list, or one
+/// `waylode_turn_checkpoints`: the worktree's checkpoint list, or one
 /// checkpoint's bounded patch. A read that could not run says `ok: false` and
 /// why; it is never an empty list.
 fn turn_checkpoints(a: TurnCheckpointsArgs) -> Value {
@@ -5957,22 +6019,22 @@ mod tests {
             ("prompts/list", json!({})),
             (
                 "resources/read",
-                json!({ "uri": "gitpulse://server/manifest" }),
+                json!({ "uri": "waylode://server/manifest" }),
             ),
             (
                 "prompts/get",
-                json!({ "name": "gitpulse_preflight", "arguments": { "repo_path": "/tmp" } }),
+                json!({ "name": "waylode_preflight", "arguments": { "repo_path": "/tmp" } }),
             ),
             (
                 "completion/complete",
                 json!({
-                    "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" },
+                    "ref": { "type": "ref/prompt", "name": "waylode_preflight" },
                     "argument": { "name": "repo_path", "value": "" }
                 }),
             ),
             (
                 "tools/call",
-                json!({ "name": "gitpulse_insights", "arguments": { "repo_path": "/tmp" } }),
+                json!({ "name": "waylode_insights", "arguments": { "repo_path": "/tmp" } }),
             ),
         ]
     }
@@ -6001,7 +6063,7 @@ mod tests {
         assert!(result["instructions"]
             .as_str()
             .unwrap()
-            .contains("gitpulse_insights"));
+            .contains("waylode_insights"));
     }
 
     #[test]
@@ -6050,8 +6112,8 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names[0], "gitpulse_insights");
-        assert!(names.contains(&"gitpulse_collision_risk"));
+        assert_eq!(names[0], "waylode_insights");
+        assert!(names.contains(&"waylode_collision_risk"));
         let listed = tools();
         let again: Vec<&str> = listed.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, again);
@@ -6060,8 +6122,8 @@ mod tests {
     #[test]
     fn every_advertised_tool_has_a_dispatch_arm_and_the_reverse() {
         let source = include_str!("mod.rs");
-        let advertised: std::collections::BTreeSet<String> = tools()
-            .into_iter()
+        let advertised: std::collections::BTreeSet<String> = catalog()
+            .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         let mut dispatched: std::collections::BTreeSet<String> = source
@@ -6071,7 +6133,7 @@ mod tests {
                 let rest = t.strip_prefix('"')?;
                 let (name, tail) = rest.split_once('"')?;
                 if !tail.trim_start().starts_with("=>")
-                    || !(name.starts_with("gitpulse_") || name.starts_with("devmap_"))
+                    || !(name.starts_with("waylode_") || name.starts_with("devmap_"))
                 {
                     return None;
                 }
@@ -6330,7 +6392,7 @@ mod tests {
         let resp = call(
             "tools/call",
             json!({
-                "name": "gitpulse_not_a_tool",
+                "name": "waylode_not_a_tool",
                 "arguments": {},
                 "_meta": modern_meta()
             }),
@@ -6343,7 +6405,7 @@ mod tests {
     fn missing_tool_argument_is_an_execution_error_not_a_silent_success() {
         let result = modern_call(
             "tools/call",
-            json!({ "name": "gitpulse_insights", "arguments": {} }),
+            json!({ "name": "waylode_insights", "arguments": {} }),
         );
         assert_eq!(result["isError"], true);
         assert_eq!(result["resultType"], "complete");
@@ -6359,7 +6421,7 @@ mod tests {
         let result = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_active_changes",
+                "name": "waylode_active_changes",
                 "arguments": { "repo_path": "/tmp", "limit": "500" }
             }),
         );
@@ -6373,17 +6435,17 @@ mod tests {
     fn an_out_of_range_argument_is_refused_at_the_boundary() {
         for (tool, arguments, needle) in [
             (
-                "gitpulse_active_changes",
+                "waylode_active_changes",
                 json!({ "repo_path": "/tmp", "limit": 100_000 }),
                 "500",
             ),
             (
-                "gitpulse_ledger_events",
+                "waylode_ledger_events",
                 json!({ "repo_path": "/tmp", "limit": 0 }),
                 "1",
             ),
             (
-                "gitpulse_codeintel_search",
+                "waylode_codeintel_search",
                 json!({ "repo_path": "/tmp", "query": "x", "budget": -5 }),
                 "1",
             ),
@@ -6403,7 +6465,7 @@ mod tests {
         let result = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_insights",
+                "name": "waylode_insights",
                 "arguments": { "repo_path": "/tmp", "repo": "/tmp" }
             }),
         );
@@ -6420,7 +6482,7 @@ mod tests {
             let resp = call(
                 "tools/call",
                 json!({
-                    "name": "gitpulse_insights",
+                    "name": "waylode_insights",
                     "arguments": arguments,
                     "_meta": modern_meta()
                 }),
@@ -6431,7 +6493,7 @@ mod tests {
 
     #[test]
     fn gitpulse_status_refuses_an_invalid_repository_instead_of_creating_state() {
-        let error = handle_tool_call("gitpulse_status", &json!({ "repo_path": "/no/such/repo" }))
+        let error = handle_tool_call("waylode_status", &json!({ "repo_path": "/no/such/repo" }))
             .expect_err("an MCP read must validate its repository boundary");
         // Named as the absence it is, not as a malformed checkout.
         assert!(error.contains("missing_worktree"), "{error}");
@@ -6445,7 +6507,7 @@ mod tests {
     fn gitpulse_task_view_required_args_match_the_handler() {
         let tool = tools()
             .into_iter()
-            .find(|t| t["name"] == "gitpulse_task_view")
+            .find(|t| t["name"] == "waylode_task_view")
             .unwrap();
         let required: Vec<&str> = tool["inputSchema"]["required"]
             .as_array()
@@ -6469,33 +6531,33 @@ mod tests {
                 assert!(
                     matches!(
                         name,
-                        "gitpulse_add_task"
-                            | "gitpulse_import_tasks"
-                            | "gitpulse_complete_task"
-                            | "gitpulse_delete_task"
-                            | "gitpulse_merge_tasks"
-                            | "gitpulse_worktree_create"
-                            | "gitpulse_worktree_switch"
-                            | "gitpulse_worktree_isolate"
-                            | "gitpulse_worktree_prune"
-                            | "gitpulse_worktree_merge"
-                            | "gitpulse_worktree_claim"
-                            | "gitpulse_worktree_release"
-                            | "gitpulse_worktree_send_message"
-                            | "gitpulse_browser_open"
-                            | "gitpulse_terminal_spawn"
-                            | "gitpulse_terminal_exec"
-                            | "gitpulse_terminal_open_file"
-                            | "gitpulse_terminal_send"
-                            | "gitpulse_terminal_close"
-                            | "gitpulse_worktree_overlay_sync"
-                            | "gitpulse_inbox_post"
-                            | "gitpulse_inbox_withdraw"
-                            | "gitpulse_kickoff_agent"
-                            | "gitpulse_agent_register"
-                            | "gitpulse_agent_send"
-                            | "gitpulse_agent_inbox"
-                            | "gitpulse_agent_wait"
+                        "waylode_add_task"
+                            | "waylode_import_tasks"
+                            | "waylode_complete_task"
+                            | "waylode_delete_task"
+                            | "waylode_merge_tasks"
+                            | "waylode_worktree_create"
+                            | "waylode_worktree_switch"
+                            | "waylode_worktree_isolate"
+                            | "waylode_worktree_prune"
+                            | "waylode_worktree_merge"
+                            | "waylode_worktree_claim"
+                            | "waylode_worktree_release"
+                            | "waylode_worktree_send_message"
+                            | "waylode_browser_open"
+                            | "waylode_terminal_spawn"
+                            | "waylode_terminal_exec"
+                            | "waylode_terminal_open_file"
+                            | "waylode_terminal_send"
+                            | "waylode_terminal_close"
+                            | "waylode_worktree_overlay_sync"
+                            | "waylode_inbox_post"
+                            | "waylode_inbox_withdraw"
+                            | "waylode_kickoff_agent"
+                            | "waylode_agent_register"
+                            | "waylode_agent_send"
+                            | "waylode_agent_inbox"
+                            | "waylode_agent_wait"
                     ),
                     "unexpected mutating tool {name}"
                 );
@@ -6507,10 +6569,10 @@ mod tests {
                     tool["annotations"]["destructiveHint"],
                     matches!(
                         name,
-                        "gitpulse_delete_task"
-                            | "gitpulse_merge_tasks"
-                            | "gitpulse_worktree_prune"
-                            | "gitpulse_worktree_merge"
+                        "waylode_delete_task"
+                            | "waylode_merge_tasks"
+                            | "waylode_worktree_prune"
+                            | "waylode_worktree_merge"
                     ),
                     "{name} has the wrong destructiveHint"
                 );
@@ -6623,9 +6685,9 @@ mod tests {
     #[test]
     fn no_tool_annotated_read_only_writes_anything_into_the_repository() {
         // `readOnlyHint: true, destructiveHint: false` is a claim MCP clients
-        // gate user approval on. It was false: `gitpulse_insights`,
-        // `gitpulse_status`, `gitpulse_ledger_events` and
-        // `gitpulse_change_context` each created `.devcouncil/ledger.sqlite`
+        // gate user approval on. It was false: `waylode_insights`,
+        // `waylode_status`, `waylode_ledger_events` and
+        // `waylode_change_context` each created `.devcouncil/ledger.sqlite`
         // (plus its `-wal` and `-shm`) in a fresh checkout, because the ledger
         // is probed by opening it and opening creates it — and
         // `repository_status` additionally ran a legacy row migration.
@@ -6693,7 +6755,7 @@ mod tests {
         // new top-level field, so the tool is where a reader learns of it.
         let tool = tools()
             .into_iter()
-            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .find(|t| t["name"] == "waylode_ledger_events")
             .expect("tool");
         let description = tool["description"].as_str().expect("a description");
         assert!(
@@ -6712,7 +6774,7 @@ mod tests {
         // history — with no way to reach recent ones.
         let tool = tools()
             .into_iter()
-            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .find(|t| t["name"] == "waylode_ledger_events")
             .expect("tool");
         let cursor = &tool["inputSchema"]["properties"]["cursor"];
         assert_eq!(cursor["type"], "integer", "no cursor argument");
@@ -6745,7 +6807,7 @@ mod tests {
     fn ledger_events_newest_first_returns_the_newest_and_continues_older() {
         let (_dir, repo) = repository_with_ledger_rows(12, 8);
         let newest = handle_tool_call(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             &json!({ "repo_path": repo, "order": "desc", "limit": 5 }),
         )
         .expect("newest");
@@ -6755,14 +6817,14 @@ mod tests {
         // `cursor` is an upper bound newest first: the next page is older, with
         // nothing repeated and nothing skipped.
         let older = handle_tool_call(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             &json!({ "repo_path": repo, "order": "desc", "limit": 5, "cursor": 8 }),
         )
         .expect("older");
         assert_eq!(ledger_ids(&older), vec![7, 6, 5, 4, 3]);
         // Oldest first stays the default, unchanged.
         let oldest = handle_tool_call(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             &json!({ "repo_path": repo, "limit": 3 }),
         )
         .expect("oldest");
@@ -6773,14 +6835,14 @@ mod tests {
     fn ledger_events_filters_combine_and_a_bad_since_ts_is_refused() {
         let (_dir, repo) = repository_with_ledger_rows(12, 8);
         let one = handle_tool_call(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             &json!({ "repo_path": repo, "object": "echo 3", "action": "session.command" }),
         )
         .expect("filtered");
         assert_eq!(one["returned"], 1);
         assert_eq!(one["events"][0]["object"], "echo 3");
         let none = handle_tool_call(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             &json!({ "repo_path": repo, "action": "git.push" }),
         )
         .expect("filtered");
@@ -6790,12 +6852,12 @@ mod tests {
             "no match is an answer, not a missing ledger"
         );
         let refused = handle_tool_call(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             &json!({ "repo_path": repo, "since_ts": "2026-01-01" }),
         );
         assert!(refused.is_err(), "{refused:?}");
         let refused = validate_arguments(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             &json!({ "repo_path": repo, "order": "sideways" }),
         );
         assert!(refused.is_err(), "{refused:?}");
@@ -6809,9 +6871,9 @@ mod tests {
             for (key, value) in extra.as_object().unwrap() {
                 arguments[key] = value.clone();
             }
-            validate_arguments("gitpulse_ledger_events", &arguments)
+            validate_arguments("waylode_ledger_events", &arguments)
                 .map_err(|e| format!("refused: {e}"))
-                .and_then(|()| handle_tool_call("gitpulse_ledger_events", &arguments))
+                .and_then(|()| handle_tool_call("waylode_ledger_events", &arguments))
         };
         // Refused at the boundary, never reaching SQL.
         for refused in [
@@ -6889,7 +6951,7 @@ mod tests {
     /// the boundary, by size, without echoing it.
     #[test]
     fn an_over_long_resource_uri_is_refused_at_the_request_boundary() {
-        let long = format!("gitpulse://insights/{}", "a".repeat(MAX_URI_BYTES));
+        let long = format!("waylode://insights/{}", "a".repeat(MAX_URI_BYTES));
         let response = call(
             "resources/read",
             json!({ "uri": long, "_meta": modern_meta() }),
@@ -6904,8 +6966,8 @@ mod tests {
 
         // A uri at the limit still reaches the reader, which answers about it.
         let at_limit = format!(
-            "gitpulse://insights/{}",
-            "a".repeat(MAX_URI_BYTES - "gitpulse://insights/".len())
+            "waylode://insights/{}",
+            "a".repeat(MAX_URI_BYTES - "waylode://insights/".len())
         );
         assert_eq!(at_limit.len(), MAX_URI_BYTES);
         let response = call(
@@ -6932,7 +6994,7 @@ mod tests {
         let (_dir, repo) = repository_with_ledger_rows(1000, 6_500);
         let schema = tools()
             .into_iter()
-            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .find(|t| t["name"] == "waylode_ledger_events")
             .expect("tool")["outputSchema"]
             .clone();
         let mut cursor = 0_i64;
@@ -6942,7 +7004,7 @@ mod tests {
             let response = call(
                 "tools/call",
                 json!({
-                    "name": "gitpulse_ledger_events",
+                    "name": "waylode_ledger_events",
                     "arguments": { "repo_path": repo, "limit": 1000, "cursor": cursor },
                     "_meta": modern_meta(),
                 }),
@@ -7000,7 +7062,7 @@ mod tests {
     fn the_budget_step_alone_on_a_real_insights_payload() {
         let (dir, repo) = repository_with_ledger_rows(1, 10);
         let _keep = dir;
-        let payload = handle_tool_call("gitpulse_insights", &json!({ "repo_path": repo }))
+        let payload = handle_tool_call("waylode_insights", &json!({ "repo_path": repo }))
             .expect("insights answers");
         let bytes = serde_json::to_string(&payload).unwrap().len();
         let room = budget::tool_budget(&json!(1));
@@ -7036,7 +7098,7 @@ mod tests {
 
         let modern = modern_call(
             "tools/call",
-            json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+            json!({ "name": "waylode_ledger_events", "arguments": arguments }),
         );
         let text = modern["content"][0]["text"].as_str().expect("text");
         assert!(
@@ -7066,7 +7128,7 @@ mod tests {
             request(
                 "tools/call",
                 Some(json!(1)),
-                json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+                json!({ "name": "waylode_ledger_events", "arguments": arguments }),
             ),
             &mut era,
         )
@@ -7286,7 +7348,7 @@ mod tests {
     /// both for a tool missing from this list and for one that no longer
     /// belongs on it.
     ///
-    /// Empty now: `gitpulse_task_view` declares the optional cut record of its
+    /// Empty now: `waylode_task_view` declares the optional cut record of its
     /// evidence and gap rows, so no tool is object-only.
     const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[];
 
@@ -7312,63 +7374,63 @@ mod tests {
     /// budget has nothing to do beyond the long-string probe, which every one
     /// of them passes. The test checks the claim against the schema.
     const NO_ARRAY_IN_SCHEMA: &[(&str, &str)] = &[
-        ("gitpulse_add_task", "one task record back, no list"),
-        ("gitpulse_complete_task", "one task record back, no list"),
-        ("gitpulse_delete_task", "one deletion receipt, no list"),
-        ("gitpulse_browser_open", "one request receipt, no list"),
+        ("waylode_add_task", "one task record back, no list"),
+        ("waylode_complete_task", "one task record back, no list"),
+        ("waylode_delete_task", "one deletion receipt, no list"),
+        ("waylode_browser_open", "one request receipt, no list"),
         (
-            "gitpulse_terminal_spawn",
+            "waylode_terminal_spawn",
             "one child session spawn receipt, no list",
         ),
         (
-            "gitpulse_terminal_exec",
+            "waylode_terminal_exec",
             "one shell command execution outcome, no list",
         ),
         (
-            "gitpulse_terminal_open_file",
+            "waylode_terminal_open_file",
             "one open-file split receipt, no list",
         ),
-        ("gitpulse_terminal_wait", "one child wait outcome, no list"),
+        ("waylode_terminal_wait", "one child wait outcome, no list"),
         (
-            "gitpulse_terminal_read",
+            "waylode_terminal_read",
             "one rendered screen snapshot, no list",
         ),
-        ("gitpulse_terminal_send", "one gated input receipt, no list"),
+        ("waylode_terminal_send", "one gated input receipt, no list"),
         (
-            "gitpulse_terminal_close",
+            "waylode_terminal_close",
             "one child session close receipt, no list",
         ),
         (
-            "gitpulse_worktree_switch",
+            "waylode_worktree_switch",
             "one worktree switch receipt, no list",
         ),
         (
-            "gitpulse_worktree_merge",
+            "waylode_worktree_merge",
             "one merge pipeline receipt, no list",
         ),
         (
-            "gitpulse_worktree_release",
+            "waylode_worktree_release",
             "one lane release receipt, no list",
         ),
         (
-            "gitpulse_worktree_send_message",
+            "waylode_worktree_send_message",
             "one coordination message receipt, no list",
         ),
-        ("gitpulse_inbox_post", "one inbox post receipt, no list"),
+        ("waylode_inbox_post", "one inbox post receipt, no list"),
         (
-            "gitpulse_inbox_withdraw",
+            "waylode_inbox_withdraw",
             "one inbox ask withdrawal receipt, no list",
         ),
         (
-            "gitpulse_agent_send",
+            "waylode_agent_send",
             "one peer message delivery receipt, no list",
         ),
         (
-            "gitpulse_worktree_overlay_sync",
+            "waylode_worktree_overlay_sync",
             "one worktree overlay sync report, no list",
         ),
-        ("gitpulse_provenance", "one provenance record, no list"),
-        ("gitpulse_landed", "one landing record, no list"),
+        ("waylode_provenance", "one provenance record, no list"),
+        ("waylode_landed", "one landing record, no list"),
         ("devmap_status", "one status envelope, no list"),
         ("devmap_preview", "one preview verdict, no list"),
     ];
@@ -7378,7 +7440,7 @@ mod tests {
     /// macOS only for now", so there is no list to probe. On macOS they are
     /// probed like any other, and off it the test checks that they do refuse.
     const PROBED_ON_MACOS_ONLY: &[(&str, &str)] = &[(
-        "gitpulse_terminal_list",
+        "waylode_terminal_list",
         "terminal orchestration is macOS only for now, so off macOS there is no children list",
     )];
 
@@ -7392,33 +7454,33 @@ mod tests {
     fn answered_on_macos_only(repo: &str) -> [(&'static str, Value); 9] {
         [
             (
-                "gitpulse_browser_open",
+                "waylode_browser_open",
                 json!({ "repo_path": repo, "url": "http://localhost:5173/" }),
             ),
-            ("gitpulse_terminal_spawn", json!({ "repo_path": repo })),
+            ("waylode_terminal_spawn", json!({ "repo_path": repo })),
             (
-                "gitpulse_terminal_exec",
+                "waylode_terminal_exec",
                 json!({ "repo_path": repo, "command": "true" }),
             ),
             (
-                "gitpulse_terminal_open_file",
+                "waylode_terminal_open_file",
                 json!({ "repo_path": repo, "path": "README.md" }),
             ),
-            ("gitpulse_terminal_list", json!({ "repo_path": repo })),
+            ("waylode_terminal_list", json!({ "repo_path": repo })),
             (
-                "gitpulse_terminal_wait",
+                "waylode_terminal_wait",
                 json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
             ),
             (
-                "gitpulse_terminal_read",
+                "waylode_terminal_read",
                 json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
             ),
             (
-                "gitpulse_terminal_send",
+                "waylode_terminal_send",
                 json!({ "repo_path": repo, "child_session_id": "term-1-1", "input": "x" }),
             ),
             (
-                "gitpulse_terminal_close",
+                "waylode_terminal_close",
                 json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
             ),
         ]
@@ -7433,47 +7495,47 @@ mod tests {
     /// tool that simply has none.
     const EMPTY_ON_FIXTURES: &[(&str, &str)] = &[
         (
-            "gitpulse_task_view",
+            "waylode_task_view",
             "no evidence or gap rows on the fixture board; the row cut is held by the ledger cap tests",
         ),
         (
-            "gitpulse_collision_risk",
+            "waylode_collision_risk",
             "no overlapping dirty files on the fixture repositories",
         ),
         (
-            "gitpulse_merge_conflicts",
+            "waylode_merge_conflicts",
             "no two fixture worktrees sit on different commits, so there are no pairs",
         ),
         (
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             "the fixture ledger holds no events; page budgets are held by the ledger page tests",
         ),
         (
-            "gitpulse_turn_checkpoints",
+            "waylode_turn_checkpoints",
             "no fixture worktree holds a checkpoint; the list and patch bounds are held by the turn_checkpoint engine tests",
         ),
         (
-            "gitpulse_import_tasks",
+            "waylode_import_tasks",
             "no briefs to import, so no imported list",
         ),
         (
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             "no list in any payload this test reaches",
         ),
         (
-            "gitpulse_codeintel_impact",
+            "waylode_codeintel_impact",
             "the one-generation fixture has no callers",
         ),
         (
-            "gitpulse_codeintel_dependencies",
+            "waylode_codeintel_dependencies",
             "the one-generation fixture has no edges",
         ),
         (
-            "gitpulse_codeintel_trace",
+            "waylode_codeintel_trace",
             "the one-generation fixture has no path",
         ),
         (
-            "gitpulse_codeintel_dead_symbols",
+            "waylode_codeintel_dead_symbols",
             "the one-generation fixture reports none",
         ),
         (
@@ -7496,7 +7558,7 @@ mod tests {
     }
 
     /// A tool's result is checked by the client against its `outputSchema`,
-    /// and a mismatch fails the whole call. `gitpulse_change_context` declared
+    /// and a mismatch fails the whole call. `waylode_change_context` declared
     /// `collisions` an array while it has always returned the collision facet
     /// object, so every call was refused as "data/collisions must be array".
     /// Checked on a healthy repository, on one whose registered worktree has
@@ -7563,7 +7625,7 @@ mod tests {
         crate::test_support::trust_repo(&doomed);
         std::fs::remove_dir_all(&doomed).expect("remove worktree");
 
-        // A ledger that exists and holds no events: `gitpulse_ledger_events`
+        // A ledger that exists and holds no events: `waylode_ledger_events`
         // answers an empty page, whose `next_cursor` has nothing to point at.
         let ledgered_dir = tempfile::tempdir().expect("tempdir");
         let ledgered = ledgered_dir.path().to_string_lossy().into_owned();
@@ -7703,23 +7765,23 @@ mod tests {
             ("gp-schema-third", "Compress the ledger archives"),
         ] {
             call_writer(
-                "gitpulse_add_task",
+                "waylode_add_task",
                 json!({ "repo_path": healthy, "task_id": task, "title": title, "status": "ready", "priority": 2 }),
                 &mut validated,
             );
         }
         call_writer(
-            "gitpulse_import_tasks",
+            "waylode_import_tasks",
             json!({ "repo_path": healthy }),
             &mut validated,
         );
         call_writer(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({ "repo_path": healthy, "task_id": "gp-schema-first", "status": "review", "summary": "schema probe" }),
             &mut validated,
         );
         call_writer(
-            "gitpulse_merge_tasks",
+            "waylode_merge_tasks",
             json!({
                 "repo_path": healthy,
                 "into_task_id": "gp-schema-first",
@@ -7729,7 +7791,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": healthy, "task_id": "gp-schema-third", "reason": "schema probe cleanup" }),
             &mut validated,
         );
@@ -7777,7 +7839,7 @@ mod tests {
         crate::test_support::trust_repo(&wt_repo_dir);
 
         let created_merge = call_writer(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": wt_repo,
                 "branch": "feat/schema-merge",
@@ -7785,18 +7847,18 @@ mod tests {
             }),
             &mut validated,
         )
-        .expect("gitpulse_worktree_create succeeds");
+        .expect("waylode_worktree_create succeeds");
         let wt_merge_path = created_merge["worktree_path"]
             .as_str()
             .expect("worktree_path string")
             .to_string();
         call_writer(
-            "gitpulse_worktree_switch",
+            "waylode_worktree_switch",
             json!({ "repo_path": wt_repo, "branch": "feat/schema-merge" }),
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_isolate",
+            "waylode_worktree_isolate",
             json!({ "repo_path": wt_repo, "worktree_path": wt_merge_path }),
             &mut validated,
         );
@@ -7806,12 +7868,12 @@ mod tests {
         )
         .expect("write feature");
         call_writer(
-            "gitpulse_worktree_overlay_sync",
+            "waylode_worktree_overlay_sync",
             json!({ "repo_path": wt_repo, "worktree_path": wt_merge_path }),
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_claim",
+            "waylode_worktree_claim",
             json!({
                 "repo_path": wt_repo,
                 "agent_id": "agent-alpha",
@@ -7822,7 +7884,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_claim",
+            "waylode_worktree_claim",
             json!({
                 "repo_path": wt_repo,
                 "agent_id": "agent-beta",
@@ -7832,7 +7894,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_claim",
+            "waylode_worktree_claim",
             json!({
                 "repo_path": wt_repo,
                 "agent_id": "agent-ephemeral",
@@ -7842,7 +7904,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_release",
+            "waylode_worktree_release",
             json!({
                 "repo_path": wt_repo,
                 "agent_id": "agent-ephemeral"
@@ -7850,7 +7912,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_send_message",
+            "waylode_worktree_send_message",
             json!({
                 "repo_path": wt_repo,
                 "from_agent": "agent-alpha",
@@ -7861,7 +7923,7 @@ mod tests {
             }),
             &mut validated,
         );
-        // The app `gitpulse_browser_open` asks is a mailbox this test claims in
+        // The app `waylode_browser_open` asks is a mailbox this test claims in
         // its hermetic profile (HOME is rewritten per process, never the
         // developer's), so the tool's success result is validated too, and
         // what the app receives is checked.
@@ -7887,12 +7949,12 @@ mod tests {
                 let _ = sent.lock().unwrap().send(request);
             });
             let arguments = json!({ "repo_path": wt_repo, "url": " http://localhost:5173/app " });
-            if let Err(error) = handle_tool_call("gitpulse_browser_open", &arguments) {
-                panic!("gitpulse_browser_open failed against the test's own mailbox: {error}");
+            if let Err(error) = handle_tool_call("waylode_browser_open", &arguments) {
+                panic!("waylode_browser_open failed against the test's own mailbox: {error}");
             }
             // Drain the probe call's delivery before the validated one.
             let _ = received.recv_timeout(std::time::Duration::from_secs(5));
-            let receipt = call_writer("gitpulse_browser_open", arguments, &mut validated);
+            let receipt = call_writer("waylode_browser_open", arguments, &mut validated);
             assert_eq!(
                 receipt.as_ref().map(|r| r["url"].clone()),
                 Some(json!("http://localhost:5173/app")),
@@ -7909,7 +7971,7 @@ mod tests {
                 other => panic!("the app received {other:?}"),
             }
             let remote = handle_tool_call(
-                "gitpulse_browser_open",
+                "waylode_browser_open",
                 &json!({ "repo_path": wt_repo, "url": "https://example.com/" }),
             );
             assert!(
@@ -7919,7 +7981,7 @@ mod tests {
 
             // Attach an in-process terminal orchestrator to the same hermetic
             // mailbox so all 6 `gitpulse_terminal_*` tools (3 writers + 3 readers,
-            // including `gitpulse_terminal_list`'s `children` array budget probe)
+            // including `waylode_terminal_list`'s `children` array budget probe)
             // are validated end-to-end over the real Unix socket.
             let term_state = std::sync::Arc::new(crate::terminal::TerminalSessions::default());
             let term_ui =
@@ -7936,7 +7998,7 @@ mod tests {
                 }));
             }
             let spawned_child = call_writer(
-                "gitpulse_terminal_spawn",
+                "waylode_terminal_spawn",
                 json!({
                     "repo_path": wt_repo,
                     "launcher": "shell",
@@ -7947,14 +8009,14 @@ mod tests {
                 }),
                 &mut validated,
             )
-            .expect("gitpulse_terminal_spawn succeeds");
+            .expect("waylode_terminal_spawn succeeds");
             let child_id = spawned_child["child_session_id"]
                 .as_str()
                 .expect("child_session_id")
                 .to_string();
 
             call_writer(
-                "gitpulse_terminal_open_file",
+                "waylode_terminal_open_file",
                 json!({
                     "repo_path": wt_repo,
                     "path": "src/lib.rs",
@@ -7966,7 +8028,7 @@ mod tests {
                 &mut validated,
             );
             call_writer(
-                "gitpulse_terminal_send",
+                "waylode_terminal_send",
                 json!({
                     "repo_path": wt_repo,
                     "child_session_id": child_id,
@@ -7979,7 +8041,7 @@ mod tests {
             );
 
             call_writer(
-                "gitpulse_terminal_wait",
+                "waylode_terminal_wait",
                 json!({
                     "repo_path": wt_repo,
                     "child_session_id": child_id,
@@ -7991,7 +8053,7 @@ mod tests {
                 &mut validated,
             );
             call_writer(
-                "gitpulse_terminal_read",
+                "waylode_terminal_read",
                 json!({
                     "repo_path": wt_repo,
                     "child_session_id": child_id,
@@ -8002,7 +8064,7 @@ mod tests {
                 &mut validated,
             );
             call_writer(
-                "gitpulse_terminal_list",
+                "waylode_terminal_list",
                 json!({
                     "repo_path": wt_repo,
                     "caller_session_id": parent_id,
@@ -8011,7 +8073,7 @@ mod tests {
                 &mut validated,
             );
             let exec_out = call_writer(
-                "gitpulse_terminal_exec",
+                "waylode_terminal_exec",
                 json!({
                     "repo_path": wt_repo,
                     "command": "printf 'MCP_EXEC_READY_88\\n'",
@@ -8023,7 +8085,7 @@ mod tests {
                 }),
                 &mut validated,
             )
-            .expect("gitpulse_terminal_exec succeeds");
+            .expect("waylode_terminal_exec succeeds");
             assert_eq!(exec_out["exit_code"], 0, "{exec_out}");
             assert!(
                 exec_out["text"]
@@ -8033,7 +8095,7 @@ mod tests {
                 "{exec_out}"
             );
             call_writer(
-                "gitpulse_terminal_close",
+                "waylode_terminal_close",
                 json!({
                     "repo_path": wt_repo,
                     "child_session_id": child_id,
@@ -8052,7 +8114,7 @@ mod tests {
             crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
         }
         call_writer(
-            "gitpulse_inbox_post",
+            "waylode_inbox_post",
             json!({
                 "repo_path": wt_repo,
                 "from_agent": "agent-alpha",
@@ -8063,7 +8125,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_inbox_withdraw",
+            "waylode_inbox_withdraw",
             json!({
                 "repo_path": wt_repo,
                 "from_agent": "agent-alpha",
@@ -8073,7 +8135,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_kickoff_agent",
+            "waylode_kickoff_agent",
             json!({
                 "repo_path": wt_repo,
                 "from_agent": "agent-alpha",
@@ -8087,7 +8149,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_agent_register",
+            "waylode_agent_register",
             json!({
                 "repo_path": wt_repo,
                 "provider": "agy",
@@ -8101,7 +8163,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_agent_send",
+            "waylode_agent_send",
             json!({
                 "repo_path": wt_repo,
                 "from_peer": "claude:schema-lead",
@@ -8112,7 +8174,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_agent_inbox",
+            "waylode_agent_inbox",
             json!({
                 "repo_path": wt_repo,
                 "for_peer": "schema-worker",
@@ -8121,7 +8183,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_agent_wait",
+            "waylode_agent_wait",
             json!({
                 "repo_path": wt_repo,
                 "for_peer": "schema-worker",
@@ -8144,7 +8206,7 @@ mod tests {
             "feat: schema merge lane",
         ]);
         call_writer(
-            "gitpulse_worktree_merge",
+            "waylode_worktree_merge",
             json!({
                 "repo_path": wt_repo,
                 "source_branch": "feat/schema-merge",
@@ -8155,7 +8217,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": wt_repo,
                 "branch": "feat/schema-prune",
@@ -8165,7 +8227,7 @@ mod tests {
             &mut validated,
         );
         call_writer(
-            "gitpulse_worktree_prune",
+            "waylode_worktree_prune",
             json!({
                 "repo_path": wt_repo,
                 "dry_run": false,
@@ -8175,7 +8237,7 @@ mod tests {
         );
 
         // And the readers that depend on those tasks or agent lanes existing.
-        for name in ["gitpulse_list_tasks", "gitpulse_get_task"] {
+        for name in ["waylode_list_tasks", "waylode_get_task"] {
             let tool = tools()
                 .into_iter()
                 .find(|tool| tool["name"] == name)
@@ -8234,11 +8296,11 @@ mod tests {
                 .expect("save campaign");
         }
         for name in [
-            "gitpulse_worktree_inbox",
-            "gitpulse_worktree_radar",
-            "gitpulse_campaign_audit",
-            "gitpulse_inbox_read",
-            "gitpulse_agent_peers",
+            "waylode_worktree_inbox",
+            "waylode_worktree_radar",
+            "waylode_campaign_audit",
+            "waylode_inbox_read",
+            "waylode_agent_peers",
         ] {
             let tool = tools()
                 .into_iter()
@@ -8258,9 +8320,9 @@ mod tests {
         // test invented: a tool with no list in its payload cannot be probed,
         // so the ones that must be are named.
         for name in [
-            "gitpulse_insights",
-            "gitpulse_change_context",
-            "gitpulse_get_task",
+            "waylode_insights",
+            "waylode_change_context",
+            "waylode_get_task",
         ] {
             assert!(
                 probed.contains(name),
@@ -8382,11 +8444,11 @@ mod tests {
         // A tool that only ever errored here was never checked; these are the
         // ones whose declared shapes this test was written against.
         for name in [
-            "gitpulse_insights",
-            "gitpulse_change_context",
-            "gitpulse_collision_risk",
-            "gitpulse_ledger_events",
-            "gitpulse_codeintel_suspects",
+            "waylode_insights",
+            "waylode_change_context",
+            "waylode_collision_risk",
+            "waylode_ledger_events",
+            "waylode_codeintel_suspects",
         ] {
             assert!(
                 validated.contains(name),
@@ -8396,7 +8458,7 @@ mod tests {
 
         // Type-correct is not enough: the scan that could not read the deleted
         // worktree must say so, not render as a clean empty list.
-        for name in ["gitpulse_change_context", "gitpulse_insights"] {
+        for name in ["waylode_change_context", "waylode_insights"] {
             let payload = handle_tool_call(name, &json!({ "repo_path": broken })).expect(name);
             assert_eq!(payload["collisions"]["ok"], false, "{name}: {payload}");
             // The scan ran and failed on the deleted worktree, rather than
@@ -8467,13 +8529,13 @@ mod tests {
         // -32602 tells the client to fix its URI; -32603 tells it not to bother.
         let bad = call(
             "resources/read",
-            json!({ "uri": "gitpulse://nope/tmp", "_meta": modern_meta() }),
+            json!({ "uri": "waylode://nope/tmp", "_meta": modern_meta() }),
         );
         assert_eq!(bad.error.expect("error")["code"], -32602);
 
         let broken = call(
             "resources/read",
-            json!({ "uri": "gitpulse://status/no/such/repo", "_meta": modern_meta() }),
+            json!({ "uri": "waylode://status/no/such/repo", "_meta": modern_meta() }),
         );
         assert_eq!(broken.error.expect("error")["code"], -32603);
     }
@@ -8482,7 +8544,7 @@ mod tests {
     fn resources_read_never_answers_a_missing_resource_with_empty_contents() {
         let resp = call(
             "resources/read",
-            json!({ "uri": "gitpulse://server/nope", "_meta": modern_meta() }),
+            json!({ "uri": "waylode://server/nope", "_meta": modern_meta() }),
         );
         assert!(
             resp.result.is_none(),
@@ -8523,7 +8585,7 @@ mod tests {
         let absent = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_campaign_audit",
+                "name": "waylode_campaign_audit",
                 "arguments": { "repo_path": repo_path }
             }),
         );
@@ -8588,7 +8650,7 @@ mod tests {
         let verified = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_campaign_audit",
+                "name": "waylode_campaign_audit",
                 "arguments": { "repo_path": repo_path }
             }),
         );
@@ -8608,8 +8670,8 @@ mod tests {
             "{sc}"
         );
 
-        // Resource template `gitpulse://campaign{+repo_path}` serves the identical verified document.
-        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        // Resource template `waylode://campaign{+repo_path}` serves the identical verified document.
+        let uri = format!("waylode://campaign{}", uri::encode_path(repo_path));
         let res = modern_call("resources/read", json!({ "uri": uri }));
         let res_doc: Value =
             serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");
@@ -8628,7 +8690,7 @@ mod tests {
         let corrupted = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_campaign_audit",
+                "name": "waylode_campaign_audit",
                 "arguments": { "repo_path": repo_path }
             }),
         );
@@ -8694,7 +8756,7 @@ mod tests {
         let clean = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_campaign_audit",
+                "name": "waylode_campaign_audit",
                 "arguments": { "repo_path": repo_path }
             }),
         );
@@ -8722,7 +8784,7 @@ mod tests {
         let from_worker = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_campaign_audit",
+                "name": "waylode_campaign_audit",
                 "arguments": { "repo_path": wt_path }
             }),
         );
@@ -8750,7 +8812,7 @@ mod tests {
             let rogue = modern_call(
                 "tools/call",
                 json!({
-                    "name": "gitpulse_campaign_audit",
+                    "name": "waylode_campaign_audit",
                     "arguments": { "repo_path": probe_repo }
                 }),
             );
@@ -8772,7 +8834,7 @@ mod tests {
             );
         }
 
-        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        let uri = format!("waylode://campaign{}", uri::encode_path(repo_path));
         let res = modern_call("resources/read", json!({ "uri": uri }));
         let res_doc: Value =
             serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");
@@ -8790,7 +8852,7 @@ mod tests {
         let forged = modern_call(
             "tools/call",
             json!({
-                "name": "gitpulse_campaign_audit",
+                "name": "waylode_campaign_audit",
                 "arguments": { "repo_path": repo_path }
             }),
         );
@@ -8804,13 +8866,13 @@ mod tests {
     fn a_prompt_resolves_over_the_wire_with_its_arguments_enforced() {
         let resolved = modern_call(
             "prompts/get",
-            json!({ "name": "gitpulse_preflight", "arguments": { "repo_path": "/tmp" } }),
+            json!({ "name": "waylode_preflight", "arguments": { "repo_path": "/tmp" } }),
         );
         assert!(!resolved["messages"].as_array().unwrap().is_empty());
 
         let missing = call(
             "prompts/get",
-            json!({ "name": "gitpulse_preflight", "_meta": modern_meta() }),
+            json!({ "name": "waylode_preflight", "_meta": modern_meta() }),
         );
         assert_eq!(missing.error.expect("error")["code"], -32602);
     }
@@ -8894,14 +8956,14 @@ mod tests {
             .success());
         for (tool, arguments) in [
             (
-                "gitpulse_provenance",
+                "waylode_provenance",
                 json!({
                     "repo_path": repo.path().to_str().unwrap(),
                     "commit_sha": "0000000000000000000000000000000000000000",
                 }),
             ),
             (
-                "gitpulse_landed",
+                "waylode_landed",
                 json!({ "repo_path": repo.path().to_str().unwrap(), "commit": "HEAD" }),
             ),
         ] {
@@ -8939,7 +9001,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let database = profile.path().join("workbench.sqlite");
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({"repo_path": repo, "title": "Filed before the profile aged"}),
         );
         assert!(!error, "{added}");
@@ -8953,10 +9015,10 @@ mod tests {
 
         for (tool, arguments) in [
             (
-                "gitpulse_add_task",
+                "waylode_add_task",
                 json!({"repo_path": repo, "title": "Needs the upgrade"}),
             ),
-            ("gitpulse_list_tasks", json!({"repo_path": repo})),
+            ("waylode_list_tasks", json!({"repo_path": repo})),
         ] {
             let (error, refused) = tool_json(tool, arguments);
             assert!(error, "{tool}: {refused}");
@@ -8992,7 +9054,7 @@ mod tests {
         );
     }
 
-    /// A reader tool (`gitpulse_list_tasks` or `gitpulse_get_task`) opens the task
+    /// A reader tool (`waylode_list_tasks` or `waylode_get_task`) opens the task
     /// profile strictly read-only: it does not create missing databases, does not
     /// run DDL or schema migrations, does not switch to WAL, and succeeds even if
     /// the database file is marked read-only on disk. Mutating tools, in contrast,
@@ -9005,17 +9067,17 @@ mod tests {
 
         // 1. Reading when no board exists answers empty/none and does NOT create the database file.
         assert!(!database.exists(), "database must not exist initially");
-        let (error, listed_empty) = tool_json("gitpulse_list_tasks", json!({"repo_path": repo}));
+        let (error, listed_empty) = tool_json("waylode_list_tasks", json!({"repo_path": repo}));
         assert!(!error, "{listed_empty}");
         assert_eq!(listed_empty["returned"], 0, "{listed_empty}");
         assert_eq!(listed_empty["tasks"], json!([]), "{listed_empty}");
         assert!(
             !database.exists(),
-            "gitpulse_list_tasks must not create workbench.sqlite on a machine with no board"
+            "waylode_list_tasks must not create workbench.sqlite on a machine with no board"
         );
 
         let (error, get_empty) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({"repo_path": repo, "task_id": "nonexistent"}),
         );
         assert!(
@@ -9025,12 +9087,12 @@ mod tests {
         assert_eq!(get_empty, json!(NO_BOARD));
         assert!(
             !database.exists(),
-            "gitpulse_get_task must not create workbench.sqlite on a machine with no board"
+            "waylode_get_task must not create workbench.sqlite on a machine with no board"
         );
 
         // 2. Create tasks via add_task to populate the database.
         let (error, added1) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({
                 "repo_path": repo,
                 "task_id": "gp-ro-test-task",
@@ -9039,7 +9101,7 @@ mod tests {
         );
         assert!(!error, "{added1}");
         let (error, added2) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({
                 "repo_path": repo,
                 "task_id": "gp-ro-source-task",
@@ -9079,10 +9141,10 @@ mod tests {
         std::fs::set_permissions(&database, perms).unwrap();
 
         // 4. Verify reader tools succeed on the read-only database.
-        let (error, listed) = tool_json("gitpulse_list_tasks", json!({"repo_path": repo}));
+        let (error, listed) = tool_json("waylode_list_tasks", json!({"repo_path": repo}));
         assert!(
             !error,
-            "gitpulse_list_tasks must succeed on read-only store: {listed}"
+            "waylode_list_tasks must succeed on read-only store: {listed}"
         );
         assert_eq!(listed["returned"], 2, "{listed}");
         let titles: Vec<&str> = listed["tasks"]
@@ -9095,36 +9157,36 @@ mod tests {
         assert!(titles.contains(&"Source task for merge"));
 
         let (error, fetched) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({"repo_path": repo, "task_id": "gp-ro-test-task"}),
         );
         assert!(
             !error,
-            "gitpulse_get_task must succeed on read-only store: {fetched}"
+            "waylode_get_task must succeed on read-only store: {fetched}"
         );
         assert_eq!(fetched["task"]["title"], "Task for read-only store test");
 
         // 5. Verify mutating tools fail when the store cannot be opened writeable.
         let (error, complete_res) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": repo, "task_id": "gp-ro-test-task", "status": "review"}),
         );
         assert!(
             error,
-            "gitpulse_complete_task must fail when database is read-only: {complete_res}"
+            "waylode_complete_task must fail when database is read-only: {complete_res}"
         );
 
         let (error, delete_res) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({"repo_path": repo, "task_id": "gp-ro-test-task", "reason": "test"}),
         );
         assert!(
             error,
-            "gitpulse_delete_task must fail when database is read-only: {delete_res}"
+            "waylode_delete_task must fail when database is read-only: {delete_res}"
         );
 
         let (error, merge_res) = tool_json(
-            "gitpulse_merge_tasks",
+            "waylode_merge_tasks",
             json!({
                 "repo_path": repo,
                 "into_task_id": "gp-ro-test-task",
@@ -9134,7 +9196,7 @@ mod tests {
         );
         assert!(
             error,
-            "gitpulse_merge_tasks must fail when database is read-only: {merge_res}"
+            "waylode_merge_tasks must fail when database is read-only: {merge_res}"
         );
     }
 
@@ -9147,7 +9209,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
 
         let catalog = tools();
-        for tool in ["gitpulse_add_task", "gitpulse_list_tasks"] {
+        for tool in ["waylode_add_task", "waylode_list_tasks"] {
             let schema = catalog.iter().find(|t| t["name"] == tool).unwrap();
             assert_eq!(
                 schema["inputSchema"]["properties"]["status"]["enum"],
@@ -9164,13 +9226,13 @@ mod tests {
         }
 
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({"repo_path": repo, "task_id": "gp-old-agent", "title": "Filed by an old agent", "status": "inbox"}),
         );
         assert!(!error, "{added}");
         assert_eq!(added["status"], "backlog", "{added}");
         let (error, defaulted) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({"repo_path": repo, "task_id": "gp-no-status", "title": "No column named"}),
         );
         assert!(!error, "{defaulted}");
@@ -9178,7 +9240,7 @@ mod tests {
 
         for status in ["inbox", "backlog"] {
             let (error, listed) = tool_json(
-                "gitpulse_list_tasks",
+                "waylode_list_tasks",
                 json!({"repo_path": repo, "status": status}),
             );
             assert!(!error, "{status}: {listed}");
@@ -9188,7 +9250,7 @@ mod tests {
             }
         }
         let (error, fetched) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({"repo_path": repo, "task_id": "gp-old-agent"}),
         );
         assert!(!error, "{fetched}");
@@ -9196,13 +9258,13 @@ mod tests {
 
         // The alias reads a name an agent once used; it does not loosen the enum.
         let (error, refused) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({"repo_path": repo, "title": "Nope", "status": "outbox"}),
         );
         assert!(error, "{refused}");
     }
 
-    /// The defect this replaced: `gitpulse_add_task` reported success and the
+    /// The defect this replaced: `waylode_add_task` reported success and the
     /// task appeared on no board. So the assertion is made through the exact
     /// calls the board makes — `registerRepository`, then a repository-scoped
     /// `items.list` — on the same profile, not through the tool's own echo.
@@ -9212,7 +9274,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
 
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({
                 "repo_path": repo,
                 "title": "Build authentication flow",
@@ -9235,7 +9297,7 @@ mod tests {
         assert_eq!(added["task_id"], "gp-build-authentication-flow");
         assert_eq!(added["folded_into_description"]["planned_files"], 1);
         let (error, _) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-fix-critical-leak", "title": "Fix critical memory leak", "status": "ready", "priority": 0 }),
         );
         assert!(!error);
@@ -9293,14 +9355,14 @@ mod tests {
 
         // An agent reads the board back, by its own key.
         let (error, listed) = tool_json(
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             json!({ "repo_path": repo, "status": "ready" }),
         );
         assert!(!error, "{listed}");
         assert_eq!(listed["returned"], 1);
         assert_eq!(listed["tasks"][0]["title"], "Fix critical memory leak");
         let (error, fetched) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({ "repo_path": repo, "task_id": "gp-build-authentication-flow" }),
         );
         assert!(!error, "{fetched}");
@@ -9309,14 +9371,14 @@ mod tests {
             .unwrap()
             .starts_with("# Task brief v1"));
         let (error, by_item) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({ "repo_path": repo, "task_id": added["item_id"] }),
         );
         assert!(!error && by_item["item_id"] == added["item_id"]);
 
         // A retry is refused, not duplicated; overwrite replaces content only.
         let (error, duplicate) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-fix-critical-leak", "title": "Duplicate" }),
         );
         assert!(
@@ -9324,13 +9386,13 @@ mod tests {
             "{duplicate}"
         );
         let (error, replaced) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-fix-critical-leak", "title": "Updated title", "status": "ready", "priority": 0, "overwrite": true }),
         );
         assert!(!error, "{replaced}");
         assert_eq!(replaced["outcome"], "updated");
         let (_, again) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-fix-critical-leak", "title": "Updated title", "status": "ready", "priority": 0, "overwrite": true }),
         );
         assert_eq!(again["outcome"], "unchanged", "{again}");
@@ -9351,7 +9413,7 @@ mod tests {
         use crate::tasks::file_tasks as ft;
         let skill = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../plugins/gitpulse/skills/tasks/SKILL.md"),
+                .join("../plugins/waylode/skills/tasks/SKILL.md"),
         )
         .unwrap();
         let grouped = |n: usize| {
@@ -9411,9 +9473,7 @@ mod tests {
         let task_tools: Vec<String> = tools()
             .into_iter()
             .filter_map(|t| t["name"].as_str().map(str::to_string))
-            .filter(|n| {
-                (n.ends_with("_task") || n.ends_with("_tasks")) && n != "gitpulse_task_view"
-            })
+            .filter(|n| (n.ends_with("_task") || n.ends_with("_tasks")) && n != "waylode_task_view")
             .collect();
         assert_eq!(task_tools.len(), 7, "{task_tools:?}");
         for name in &task_tools {
@@ -9475,7 +9535,7 @@ mod tests {
             )
             .unwrap();
 
-        let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        let (error, listed) = tool_json("waylode_list_tasks", json!({ "repo_path": repo }));
         assert!(!error, "{listed}");
         assert_eq!(listed["total"], 1, "{listed}");
         assert_eq!(listed["tasks"][0]["item_id"], "on-the-board");
@@ -9483,7 +9543,7 @@ mod tests {
         assert_eq!(listed["tasks"][0]["completed_at"], Value::Null);
 
         let (error, archive) = tool_json(
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             json!({ "repo_path": repo, "archived": true }),
         );
         assert!(!error, "{archive}");
@@ -9493,7 +9553,7 @@ mod tests {
 
         // Not a boolean: refused by the schema, never read as "the board".
         let (error, refused) = tool_json(
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             json!({ "repo_path": repo, "archived": "yes" }),
         );
         assert!(error, "{refused}");
@@ -9519,7 +9579,7 @@ mod tests {
 
         // The id a launched agent reads off its brief's `Task:` line.
         let (error, brief) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({"repo_path": repo, "task_id": id}),
         );
         assert!(!error, "{brief}");
@@ -9530,7 +9590,7 @@ mod tests {
 
         let summary = "Checkpointed every 500 rows; resumed import passes the crash test.";
         let (error, done) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": repo, "task_id": id, "summary": summary, "expected_revision": 1}),
         );
         assert!(!error, "{done}");
@@ -9574,7 +9634,7 @@ mod tests {
 
         // A retry changes nothing and records nothing twice.
         let (error, again) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": repo, "task_id": id, "summary": summary}),
         );
         assert!(!error, "{again}");
@@ -9591,7 +9651,7 @@ mod tests {
 
         // Done is the person's to undo, not the agent's.
         let (error, reopened) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": repo, "task_id": id, "status": "review"}),
         );
         assert!(
@@ -9629,7 +9689,7 @@ mod tests {
         );
 
         let (error, done) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": lane.to_str().unwrap(), "task_id": id, "summary": "Done in the lane."}),
         );
         assert!(!error, "{done}");
@@ -9668,7 +9728,7 @@ mod tests {
         board.board_request("items.put", &edit.to_string()).unwrap();
 
         let (error, stale) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": repo, "task_id": id, "expected_revision": 1}),
         );
         assert!(
@@ -9683,7 +9743,7 @@ mod tests {
 
         // Without a pinned revision the move goes ahead on top of their edit.
         let (error, moved) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": repo, "task_id": id, "status": "review"}),
         );
         assert!(!error, "{moved}");
@@ -9712,7 +9772,7 @@ mod tests {
                 "4000",
             ),
         ] {
-            let (error, message) = tool_json("gitpulse_complete_task", arguments);
+            let (error, message) = tool_json("waylode_complete_task", arguments);
             assert!(error, "{message}");
             assert!(
                 message.to_string().contains(expected),
@@ -9720,7 +9780,7 @@ mod tests {
             );
         }
         let (_, final_state) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({"repo_path": repo, "task_id": id}),
         );
         assert_eq!(final_state["task"]["status"], "review");
@@ -9742,7 +9802,7 @@ mod tests {
         // This repository needs a board record to be judged at all.
         board.board_register(&repo, "mine", "mine-request").unwrap();
         let (error, message) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({"repo_path": repo, "task_id": "other-task"}),
         );
         assert!(
@@ -9776,7 +9836,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let (board, _) = board_task(profile.path(), &repo, "board-keep");
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-import", "title": "Importer survives a crash",
                     "description": "token-dup", "acceptance_criteria": ["Keeps its cursor"],
                     "reviewed_related": ["board-keep"] }),
@@ -9809,7 +9869,7 @@ mod tests {
                 "string revision",
             ),
         ] {
-            let (error, message) = tool_json("gitpulse_merge_tasks", arguments);
+            let (error, message) = tool_json("waylode_merge_tasks", arguments);
             assert!(
                 error && message.as_str().unwrap().starts_with("invalid arguments"),
                 "{why}: {message}"
@@ -9823,7 +9883,7 @@ mod tests {
         let call = json!({ "repo_path": repo, "into_task_id": "board-keep",
                            "sources": [{"task_id": "gp-dup-import", "expected_revision": 1}],
                            "reason": "Same importer work as the person's card." });
-        let (error, merged) = tool_json("gitpulse_merge_tasks", call.clone());
+        let (error, merged) = tool_json("waylode_merge_tasks", call.clone());
         assert!(!error, "{merged}");
         assert_eq!(
             (merged["ok"].clone(), merged["outcome"].clone()),
@@ -9848,7 +9908,7 @@ mod tests {
         );
 
         let (error, gone) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-import" }),
         );
         let gone = gone.as_str().unwrap();
@@ -9857,7 +9917,7 @@ mod tests {
             "{gone}"
         );
 
-        let (error, again) = tool_json("gitpulse_merge_tasks", call);
+        let (error, again) = tool_json("waylode_merge_tasks", call);
         assert!(!error, "{again}");
         assert_eq!(again["outcome"], "unchanged", "{again:#}");
         assert_eq!(again["sources"][0]["outcome"], "already_merged");
@@ -9868,20 +9928,20 @@ mod tests {
         let (dir, profile, repo) = task_fixture();
         crate::test_support::trust_repo(dir.path());
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-login", "title": "Fix login (duplicate)", "status": "done" }),
         );
         assert!(!error, "{added}");
         let item_id = added["item_id"].as_str().unwrap().to_owned();
         let (error, _) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-keep", "title": "Keep me" }),
         );
         assert!(!error);
 
         let reason = "MERGED, NOT COMPLETED: folded into gp-login-overhaul.";
         let (error, deleted) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-login", "reason": reason }),
         );
         assert!(!error, "{deleted}");
@@ -9895,7 +9955,7 @@ mod tests {
         assert!(deleted["sequence"].as_u64().is_some(), "{deleted}");
 
         // The board no longer lists it; its sibling is untouched.
-        let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        let (error, listed) = tool_json("waylode_list_tasks", json!({ "repo_path": repo }));
         assert!(!error, "{listed}");
         let titles: Vec<&str> = listed["tasks"]
             .as_array()
@@ -9906,7 +9966,7 @@ mod tests {
         assert_eq!(titles, vec!["Keep me"]);
         assert_eq!(listed["total"], 1);
         let (error, gone) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-login" }),
         );
         // Not "no such task": an agent asking after it is told it was
@@ -9935,7 +9995,7 @@ mod tests {
 
         // A second delete changes nothing and records nothing twice.
         let (error, again) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": item_id, "reason": reason }),
         );
         assert!(!error, "{again}");
@@ -9946,7 +10006,7 @@ mod tests {
 
         // The id is never handed out again.
         let (error, refiled) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-login", "title": "Fix login again" }),
         );
         assert!(
@@ -9954,7 +10014,7 @@ mod tests {
             "{refiled}"
         );
         let (error, overwritten) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-login", "title": "Fix login again", "overwrite": true }),
         );
         assert!(
@@ -9992,7 +10052,7 @@ mod tests {
         board.board_request("items.put", &edit.to_string()).unwrap();
 
         let (error, stale) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": id, "reason": "Duplicate.", "expected_revision": 1 }),
         );
         assert!(
@@ -10010,7 +10070,7 @@ mod tests {
 
         // Re-read at revision 2, the delete goes through.
         let (error, deleted) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": id, "reason": "Duplicate of board-1.", "expected_revision": 2 }),
         );
         assert!(!error, "{deleted}");
@@ -10062,7 +10122,7 @@ mod tests {
         board.board_request("items.put", &edit.to_string()).unwrap();
 
         let (error, deleted) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": id, "reason": reason, "expected_revision": 2 }),
         );
         assert!(!error, "{deleted}");
@@ -10090,7 +10150,7 @@ mod tests {
         let mine_id = mine["repository"]["id"].as_str().unwrap().to_owned();
 
         let (error, message) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({"repo_path": repo, "task_id": "other-task", "reason": "Not mine."}),
         );
         assert!(
@@ -10117,7 +10177,7 @@ mod tests {
             )
             .unwrap();
         let (error, message) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({"repo_path": repo, "task_id": "shared-task", "reason": "Duplicate."}),
         );
         assert!(
@@ -10145,7 +10205,7 @@ mod tests {
                 "not_found",
             ),
         ] {
-            let (error, message) = tool_json("gitpulse_delete_task", arguments);
+            let (error, message) = tool_json("waylode_delete_task", arguments);
             assert!(error, "{message}");
             assert!(
                 message.to_string().contains(expected),
@@ -10163,7 +10223,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         // A finished task never gates; an unrelated one is listed nowhere.
         let (error, done) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "dm-old", "title": "DevMap receiver attribution for method calls, first pass", "status": "done" }),
         );
         assert!(!error, "{done}");
@@ -10173,7 +10233,7 @@ mod tests {
             "the repository's first task has nothing to be checked against"
         );
         let (error, first) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "dm-crate-calls", "title": "DevMap: Rust calls into another crate get no caller edge", "labels": ["devmap", "resolver"] }),
         );
         assert!(!error, "{first}");
@@ -10183,7 +10243,7 @@ mod tests {
         );
         let first_id = first["item_id"].as_str().unwrap().to_owned();
         let (error, unrelated) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "ci-windows", "title": "No Windows CI job runs the Go host tests" }),
         );
         assert!(!error, "{unrelated}");
@@ -10196,7 +10256,7 @@ mod tests {
         // A shared subsystem prefix that is also the shared label is one
         // coincidence, not two: every DevMap card would otherwise gate.
         let (error, corpus) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "dm-corpus", "title": "DevMap: precision corpus is too thin", "labels": ["devmap"] }),
         );
         assert!(!error, "{corpus}");
@@ -10204,20 +10264,20 @@ mod tests {
 
         // The same kind of finding again: refused, and told where it belongs.
         let second = json!({ "repo_path": repo, "task_id": "dm-receiver", "title": "DevMap: method calls on a typed receiver get no caller edge", "labels": ["devmap"] });
-        let (error, refused) = tool_json("gitpulse_add_task", second.clone());
+        let (error, refused) = tool_json("waylode_add_task", second.clone());
         assert!(error, "{refused}");
         let message = refused.as_str().unwrap();
         assert!(message.starts_with("related_tasks_exist"), "{message}");
         assert!(message.contains(&first_id), "{message}");
         assert!(!message.contains("Windows"), "{message}");
         assert!(message.contains("overwrite: true"), "{message}");
-        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        let (_, listed) = tool_json("waylode_list_tasks", json!({ "repo_path": repo }));
         assert_eq!(listed["total"], 4, "a refusal files nothing");
 
         // Reviewing something else does not count.
         let mut wrong = second.clone();
         wrong["reviewed_related"] = json!(["ft-0000"]);
-        let (error, still) = tool_json("gitpulse_add_task", wrong);
+        let (error, still) = tool_json("waylode_add_task", wrong);
         assert!(
             error && still.as_str().unwrap().starts_with("related_tasks_exist"),
             "{still}"
@@ -10225,7 +10285,7 @@ mod tests {
 
         // Folding it in: the existing task, by its item_id, takes both.
         let (error, folded) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({
                 "repo_path": repo, "task_id": first_id, "overwrite": true,
                 "title": "DevMap: cross-crate and typed-receiver calls get no caller edge",
@@ -10241,13 +10301,13 @@ mod tests {
             Value::Null,
             "an overwrite is never gated"
         );
-        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        let (_, listed) = tool_json("waylode_list_tasks", json!({ "repo_path": repo }));
         assert_eq!(listed["total"], 4, "folded, not added");
 
         // Or, having read it and judged it separate, filed with the review named.
         let mut reviewed = second;
         reviewed["reviewed_related"] = json!([first_id]);
-        let (error, filed) = tool_json("gitpulse_add_task", reviewed);
+        let (error, filed) = tool_json("waylode_add_task", reviewed);
         assert!(!error, "{filed}");
         assert_eq!(filed["outcome"], "created");
         assert_eq!(filed["related_check"]["related_open_tasks"], 1);
@@ -10274,7 +10334,7 @@ mod tests {
         let (dir, profile, repo) = task_fixture();
         crate::test_support::trust_repo(dir.path());
         let (error, parent) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-exporter", "title": "Ship the exporter pipeline", "labels": ["exporter"] }),
         );
         assert!(!error, "{parent}");
@@ -10283,7 +10343,7 @@ mod tests {
 
         // Same words and label as the parent: unfiled without the parent named.
         let sibling = json!({ "repo_path": repo, "task_id": "gp-exporter-retries", "title": "Ship the exporter pipeline retries", "labels": ["exporter"] });
-        let (error, held) = tool_json("gitpulse_add_task", sibling.clone());
+        let (error, held) = tool_json("waylode_add_task", sibling.clone());
         assert!(
             error && held.as_str().unwrap().starts_with("related_tasks_exist"),
             "{held}"
@@ -10291,7 +10351,7 @@ mod tests {
 
         let mut by_key = sibling.clone();
         by_key["parent_task_id"] = json!("gp-exporter");
-        let (error, child) = tool_json("gitpulse_add_task", by_key);
+        let (error, child) = tool_json("waylode_add_task", by_key);
         assert!(!error, "{child}");
         assert_eq!(child["outcome"], "created");
         assert_eq!(child["parent_item_id"], parent_id.as_str());
@@ -10301,7 +10361,7 @@ mod tests {
         );
 
         let (error, by_id) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-exporter-docs", "title": "Document the exporter pipeline", "labels": ["exporter"],
                     "parent_task_id": parent_id, "reviewed_related": [child["item_id"]] }),
         );
@@ -10311,7 +10371,7 @@ mod tests {
         // Folding more into the child keeps it under the parent and does not
         // duplicate the link.
         let (error, again) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-exporter-retries", "overwrite": true,
                     "title": "Ship the exporter pipeline retries and backoff", "parent_task_id": "gp-exporter" }),
         );
@@ -10329,19 +10389,19 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         // No board yet: there is nothing to be a parent of, and no trace is left.
         let (error, none) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "title": "Orphaned subtask", "parent_task_id": "gp-nowhere" }),
         );
         assert!(error, "{none}");
         assert!(none.as_str().unwrap().contains("gp-nowhere"), "{none}");
 
         let (error, base) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-base", "title": "Rework the cache layer" }),
         );
         assert!(!error, "{base}");
         let (error, missing) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "title": "Prune stale shards", "parent_task_id": "gp-nowhere" }),
         );
         assert!(error, "{missing}");
@@ -10351,18 +10411,18 @@ mod tests {
         );
 
         let (error, deleted) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": "gp-base", "reason": "Superseded by another plan." }),
         );
         assert!(!error, "{deleted}");
         let (error, gone) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "title": "Prune stale shards", "parent_task_id": "gp-base" }),
         );
         assert!(error, "{gone}");
         assert!(gone.as_str().unwrap().contains("deleted"), "{gone}");
 
-        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        let (_, listed) = tool_json("waylode_list_tasks", json!({ "repo_path": repo }));
         assert_eq!(listed["total"], 0, "a refused subtask files nothing");
     }
 
@@ -10382,13 +10442,13 @@ mod tests {
             if let Some(parent) = parent {
                 args["parent_task_id"] = json!(parent);
             }
-            let (error, filed) = tool_json("gitpulse_add_task", args);
+            let (error, filed) = tool_json("waylode_add_task", args);
             assert!(!error, "{key}: {filed}");
             ids.insert(key, filed["item_id"].as_str().unwrap().to_owned());
         }
         // The top of the chain cannot be hung under its own grandchild.
         let (error, cycle) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-a", "overwrite": true,
                     "title": "Quarterly roadmap alpha", "parent_task_id": "gp-c" }),
         );
@@ -10398,7 +10458,7 @@ mod tests {
 
         // A task has one parent: naming another replaces it, never adds a second.
         let (error, moved) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-c", "overwrite": true,
                     "title": "Telemetry rollout charlie", "parent_task_id": "gp-a" }),
         );
@@ -10425,18 +10485,18 @@ mod tests {
             if let Some(parent) = &previous {
                 args["parent_task_id"] = json!(parent);
             }
-            let (error, filed) = tool_json("gitpulse_add_task", args);
+            let (error, filed) = tool_json("waylode_add_task", args);
             assert!(!error, "link {n} of the chain: {filed}");
             previous = Some(key);
         }
         let (error, deeper) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-chain-too-deep", "title": "Zzyzx quux", "parent_task_id": previous }),
         );
         assert!(error, "{deeper}");
         assert!(deeper.as_str().unwrap().contains("deeper"), "{deeper}");
         let (_, listed) = tool_json(
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             json!({ "repo_path": repo, "limit": 1 }),
         );
         assert_eq!(listed["total"], DEPTH);
@@ -10469,7 +10529,7 @@ mod tests {
         let mut ids: Vec<String> = Vec::new();
         for n in 0..30 {
             let (error, filed) = tool_json(
-                "gitpulse_add_task",
+                "waylode_add_task",
                 json!({
                     "repo_path": repo, "task_id": format!("imp-{n}"),
                     "title": format!("Importer crash handling case{n}x"), "labels": ["import"],
@@ -10485,7 +10545,7 @@ mod tests {
         }
         // A refusal names one page and says the rest follow.
         let (error, refused) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "imp-last", "title": "Importer crash handling again", "labels": ["import"] }),
         );
         assert!(error, "{refused}");
@@ -10506,12 +10566,12 @@ mod tests {
         let (board, _) = board_task(profile.path(), &repo, id);
         // Every related task must be named; naming one of two is not enough.
         let (error, _) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "imp-crash", "title": "Importer loses rows after a crash", "labels": ["import"], "reviewed_related": [id] }),
         );
         assert!(!error);
         let (error, refused) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "imp-resume", "title": "Importer should be resumable after a crash", "labels": ["import"], "reviewed_related": [id] }),
         );
         assert!(error, "{refused}");
@@ -10520,7 +10580,7 @@ mod tests {
         assert!(!message.contains(id), "{message}");
 
         let (error, folded) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({
                 "repo_path": repo, "task_id": id, "overwrite": true,
                 "title": "Make the importer resumable", "description": "Background\n\nAlso: resume must not re-import committed rows.",
@@ -10553,20 +10613,20 @@ mod tests {
     fn task_writes_are_refused_for_an_untrusted_repository() {
         let (_dir, profile, repo) = task_fixture();
         let (error, message) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "title": "Injected" }),
         );
         assert!(
             error && message.as_str().unwrap().contains("untrusted_repository"),
             "{message}"
         );
-        let (error, message) = tool_json("gitpulse_import_tasks", json!({ "repo_path": repo }));
+        let (error, message) = tool_json("waylode_import_tasks", json!({ "repo_path": repo }));
         assert!(
             error && message.as_str().unwrap().contains("untrusted_repository"),
             "{message}"
         );
         let (error, message) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({ "repo_path": repo, "task_id": "anything" }),
         );
         assert!(
@@ -10574,7 +10634,7 @@ mod tests {
             "{message}"
         );
         let (error, message) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": "anything", "reason": "Duplicate." }),
         );
         assert!(
@@ -10594,92 +10654,92 @@ mod tests {
         let (_dir, _profile, repo) = task_fixture();
         for (name, args) in [
             (
-                "gitpulse_worktree_create",
+                "waylode_worktree_create",
                 json!({ "repo_path": repo, "branch": "feat/untrusted" }),
             ),
             (
-                "gitpulse_worktree_switch",
+                "waylode_worktree_switch",
                 json!({ "repo_path": repo, "branch": "feat/untrusted", "create_if_missing": true }),
             ),
             (
-                "gitpulse_worktree_isolate",
+                "waylode_worktree_isolate",
                 json!({ "repo_path": repo, "worktree_path": repo }),
             ),
             (
-                "gitpulse_worktree_prune",
+                "waylode_worktree_prune",
                 json!({ "repo_path": repo, "dry_run": false }),
             ),
             (
-                "gitpulse_worktree_merge",
+                "waylode_worktree_merge",
                 json!({ "repo_path": repo, "source_branch": "feat/untrusted" }),
             ),
             (
-                "gitpulse_worktree_claim",
+                "waylode_worktree_claim",
                 json!({ "repo_path": repo, "agent_id": "agent-untrusted", "branch": "feat/untrusted" }),
             ),
             (
-                "gitpulse_worktree_release",
+                "waylode_worktree_release",
                 json!({ "repo_path": repo, "agent_id": "agent-untrusted" }),
             ),
             (
-                "gitpulse_worktree_send_message",
+                "waylode_worktree_send_message",
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "body": "probe" }),
             ),
             (
-                "gitpulse_browser_open",
+                "waylode_browser_open",
                 json!({ "repo_path": repo, "url": "http://localhost:5173/" }),
             ),
             (
-                "gitpulse_terminal_spawn",
+                "waylode_terminal_spawn",
                 json!({ "repo_path": repo, "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
             ),
             (
-                "gitpulse_terminal_exec",
+                "waylode_terminal_exec",
                 json!({ "repo_path": repo, "command": "pwd", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
             ),
             (
-                "gitpulse_terminal_open_file",
+                "waylode_terminal_open_file",
                 json!({ "repo_path": repo, "path": "README.md", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
             ),
             (
-                "gitpulse_terminal_send",
+                "waylode_terminal_send",
                 json!({ "repo_path": repo, "child_session_id": "term-1-2", "input": "pwd", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
             ),
             (
-                "gitpulse_terminal_close",
+                "waylode_terminal_close",
                 json!({ "repo_path": repo, "child_session_id": "term-1-2", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
             ),
             (
-                "gitpulse_inbox_post",
+                "waylode_inbox_post",
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "thread_key": "t-untrusted", "body": "probe" }),
             ),
             (
-                "gitpulse_inbox_withdraw",
+                "waylode_inbox_withdraw",
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "thread_key": "t-untrusted", "reason": "probe" }),
             ),
             (
-                "gitpulse_kickoff_agent",
+                "waylode_kickoff_agent",
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "to_agent": "worker-1", "task_id": "gp-probe" }),
             ),
             (
-                "gitpulse_agent_register",
+                "waylode_agent_register",
                 json!({ "repo_path": repo, "provider": "agy", "role": "probe" }),
             ),
-            ("gitpulse_agent_peers", json!({ "repo_path": repo })),
+            ("waylode_agent_peers", json!({ "repo_path": repo })),
             (
-                "gitpulse_agent_send",
+                "waylode_agent_send",
                 json!({ "repo_path": repo, "from_peer": "claude:a", "to_peer": "agy:b", "body": "probe" }),
             ),
             (
-                "gitpulse_agent_inbox",
+                "waylode_agent_inbox",
                 json!({ "repo_path": repo, "for_peer": "agy:b" }),
             ),
             (
-                "gitpulse_agent_wait",
+                "waylode_agent_wait",
                 json!({ "repo_path": repo, "for_peer": "agy:b", "timeout_ms": 10 }),
             ),
             (
-                "gitpulse_worktree_overlay_sync",
+                "waylode_worktree_overlay_sync",
                 json!({ "repo_path": repo }),
             ),
         ] {
@@ -10698,12 +10758,12 @@ mod tests {
     #[test]
     fn reads_of_a_machine_with_no_board_create_nothing() {
         let (_dir, profile, repo) = task_fixture();
-        let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        let (error, listed) = tool_json("waylode_list_tasks", json!({ "repo_path": repo }));
         assert!(!error);
         assert_eq!(listed["repository"], Value::Null);
         assert!(listed["note"].as_str().unwrap().contains("not the same as"));
         let (error, _) = tool_json(
-            "gitpulse_get_task",
+            "waylode_get_task",
             json!({ "repo_path": repo, "task_id": "gp-x" }),
         );
         assert!(error);
@@ -10732,7 +10792,7 @@ mod tests {
         )
         .unwrap();
 
-        let (error, report) = tool_json("gitpulse_import_tasks", json!({ "repo_path": repo }));
+        let (error, report) = tool_json("waylode_import_tasks", json!({ "repo_path": repo }));
         assert!(!error, "{report}");
         assert_eq!(
             report["ok"], false,
@@ -10757,7 +10817,7 @@ mod tests {
             .unwrap()
             .contains("unknown status"));
 
-        let (_, again) = tool_json("gitpulse_import_tasks", json!({ "repo_path": repo }));
+        let (_, again) = tool_json("waylode_import_tasks", json!({ "repo_path": repo }));
         assert_eq!(
             (again["created"].as_u64(), again["already_present"].as_u64()),
             (Some(0), Some(2)),
@@ -10820,7 +10880,7 @@ mod tests {
         person_edits(&board, id);
 
         let (error, stale) = tool_json(
-            "gitpulse_complete_task",
+            "waylode_complete_task",
             json!({ "repo_path": repo, "task_id": id, "expected_revision": 1.0 }),
         );
         assert!(
@@ -10839,7 +10899,7 @@ mod tests {
         person_edits(&board, id);
 
         let (error, stale) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": id, "reason": "Duplicate.", "expected_revision": 1.0 }),
         );
         assert!(
@@ -10859,7 +10919,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let (board, _) = board_task(profile.path(), &repo, "board-keep");
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-import", "title": "Importer survives a crash",
                     "reviewed_related": ["board-keep"] }),
         );
@@ -10867,7 +10927,7 @@ mod tests {
         person_edits(&board, "board-keep");
 
         let (error, stale) = tool_json(
-            "gitpulse_merge_tasks",
+            "waylode_merge_tasks",
             json!({ "repo_path": repo, "into_task_id": "board-keep", "into_expected_revision": 1.0,
                     "sources": [{ "task_id": "gp-dup-import" }], "reason": "Same work." }),
         );
@@ -10888,7 +10948,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let (_board, _) = board_task(profile.path(), &repo, "board-keep");
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-import", "title": "Importer survives a crash",
                     "reviewed_related": ["board-keep"] }),
         );
@@ -10898,7 +10958,7 @@ mod tests {
         person_edits(&board, added["item_id"].as_str().unwrap());
 
         let (error, stale) = tool_json(
-            "gitpulse_merge_tasks",
+            "waylode_merge_tasks",
             json!({ "repo_path": repo, "into_task_id": "board-keep",
                     "sources": [{ "task_id": "gp-dup-import", "expected_revision": 1.0 }],
                     "reason": "Same work." }),
@@ -10918,7 +10978,7 @@ mod tests {
     ) -> (crate::workbench::WorkbenchState, String) {
         crate::test_support::trust_repo(dir.path());
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-held", "title": "Held card" }),
         );
         assert!(!error, "{added}");
@@ -10941,7 +11001,7 @@ mod tests {
         let (board, id) = filed_then_edited(&dir, &profile, &repo);
 
         let (error, replaced) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite", "overwrite": true }),
         );
         assert!(!error, "{replaced}");
@@ -10956,7 +11016,7 @@ mod tests {
         let (board, id) = filed_then_edited(&dir, &profile, &repo);
 
         let (error, stale) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
                     "overwrite": true, "expected_revision": 1 }),
         );
@@ -10976,7 +11036,7 @@ mod tests {
         let (board, id) = filed_then_edited(&dir, &profile, &repo);
 
         let (error, saved) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
                     "overwrite": true, "expected_revision": 2.0 }),
         );
@@ -10995,7 +11055,7 @@ mod tests {
         let (board, id) = filed_then_edited(&dir, &profile, &repo);
 
         let (error, refused) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
                     "expected_revision": 2 }),
         );
@@ -11004,13 +11064,13 @@ mod tests {
         assert_eq!(board_item(&board, &id)["title"], "Edited by the person");
 
         let (error, refused) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-never-filed", "title": "Brand new card",
                     "overwrite": true, "expected_revision": 1 }),
         );
         let message = refused.as_str().unwrap_or_default();
         assert!(error && message.contains("not_found"), "{refused}");
-        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        let (_, listed) = tool_json("waylode_list_tasks", json!({ "repo_path": repo }));
         assert_eq!(listed["total"], 1, "no card was created: {listed}");
     }
 
@@ -11025,7 +11085,7 @@ mod tests {
         person_edits(&board, "board-keep");
 
         let (error, stale) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "board-keep", "title": "Agent rewrite",
                     "overwrite": true, "expected_revision": 1 }),
         );
@@ -11039,7 +11099,7 @@ mod tests {
         );
 
         let (error, saved) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "board-keep", "title": "Agent rewrite",
                     "overwrite": true, "expected_revision": 2 }),
         );
@@ -11056,13 +11116,13 @@ mod tests {
         let (dir, profile, repo) = task_fixture();
         let (_board, _id) = filed_then_edited(&dir, &profile, &repo);
         let (error, deleted) = tool_json(
-            "gitpulse_delete_task",
+            "waylode_delete_task",
             json!({ "repo_path": repo, "task_id": "gp-held", "reason": "Obsolete work." }),
         );
         assert!(!error, "{deleted}");
 
         let (error, refused) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
                     "overwrite": true, "expected_revision": 2 }),
         );
@@ -11084,13 +11144,13 @@ mod tests {
         let (_board, _id) = filed_then_edited(&dir, &profile, &repo);
         let identical = json!({ "repo_path": repo, "task_id": "gp-held",
                                 "title": "Edited by the person", "overwrite": true });
-        let (error, same) = tool_json("gitpulse_add_task", identical.clone());
+        let (error, same) = tool_json("waylode_add_task", identical.clone());
         assert!(!error, "{same}");
         assert_eq!(same["outcome"], "unchanged", "{same}");
 
         let mut held = identical;
         held["expected_revision"] = json!(1);
-        let (error, stale) = tool_json("gitpulse_add_task", held);
+        let (error, stale) = tool_json("waylode_add_task", held);
         assert!(
             error && stale.as_str().unwrap().contains("revision_conflict"),
             "{stale}"
@@ -11103,8 +11163,8 @@ mod tests {
         let (board, id) = filed_then_edited(&dir, &profile, &repo);
         let schema = tools()
             .into_iter()
-            .find(|t| t["name"] == "gitpulse_add_task")
-            .expect("gitpulse_add_task is advertised")["inputSchema"]
+            .find(|t| t["name"] == "waylode_add_task")
+            .expect("waylode_add_task is advertised")["inputSchema"]
             .clone();
         let property = &schema["properties"]["expected_revision"];
         assert_eq!(property["type"], "integer", "{property}");
@@ -11129,7 +11189,7 @@ mod tests {
         ] {
             let arguments = json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
                                     "overwrite": true, "expected_revision": bad });
-            let (error, refused) = tool_json("gitpulse_add_task", arguments);
+            let (error, refused) = tool_json("waylode_add_task", arguments);
             assert!(
                 error
                     && refused
@@ -11169,7 +11229,7 @@ mod tests {
     fn ledger_events_cursor_3_0_continues_after_event_3() {
         let (_dir, repo) = ledger_repo_with_events(6);
         let (error, page) = tool_json(
-            "gitpulse_ledger_events",
+            "waylode_ledger_events",
             json!({ "repo_path": repo, "cursor": 3.0 }),
         );
         assert!(!error, "{page}");
@@ -11182,7 +11242,7 @@ mod tests {
         let (_dir, repo) = ledger_repo_with_events(2);
         for cursor in [json!(9_223_372_036_854_775_808_u64), json!(u64::MAX)] {
             let (error, refused) = tool_json(
-                "gitpulse_ledger_events",
+                "waylode_ledger_events",
                 json!({ "repo_path": repo, "cursor": cursor }),
             );
             assert!(error, "{cursor}: {refused}");
@@ -11201,7 +11261,7 @@ mod tests {
         let mut filed: Vec<String> = Vec::new();
         for (index, word) in words.iter().enumerate() {
             let (error, added) = tool_json(
-                "gitpulse_add_task",
+                "waylode_add_task",
                 json!({ "repo_path": repo, "task_id": format!("gp-limit-{index}"),
                         "title": format!("{word} {}", word.len() * 7919),
                         "reviewed_related": filed }),
@@ -11210,13 +11270,13 @@ mod tests {
             filed.push(added["item_id"].as_str().unwrap().to_string());
         }
         let (error, ten) = tool_json(
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             json!({ "repo_path": repo, "limit": 10 }),
         );
         assert!(!error, "{ten}");
         assert_eq!(ten["returned"], 10, "{ten}");
         let (error, float_ten) = tool_json(
-            "gitpulse_list_tasks",
+            "waylode_list_tasks",
             json!({ "repo_path": repo, "limit": 10.0 }),
         );
         assert!(!error, "{float_ten}");
@@ -11228,7 +11288,7 @@ mod tests {
         let (dir, _profile, repo) = task_fixture();
         crate::test_support::trust_repo(dir.path());
         let (error, added) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({ "repo_path": repo, "title": "Prioritised work", "priority": 1.0 }),
         );
         assert!(!error, "{added}");
@@ -11490,7 +11550,7 @@ mod tests {
         use crate::tasks::file_tasks as ft;
         let tool = tools()
             .into_iter()
-            .find(|t| t["name"] == "gitpulse_add_task")
+            .find(|t| t["name"] == "waylode_add_task")
             .unwrap();
         let title = &tool["inputSchema"]["properties"]["title"];
         assert_eq!(title["maxLength"], ft::MAX_TASK_TITLE);
@@ -11503,7 +11563,7 @@ mod tests {
         );
         let call = |text: String| {
             validate_arguments(
-                "gitpulse_add_task",
+                "waylode_add_task",
                 &json!({ "repo_path": "/r", "title": text }),
             )
         };
@@ -11536,22 +11596,22 @@ mod tests {
     fn deliberate_bound_changes() -> [(&'static str, &'static str, usize); 4] {
         [
             (
-                "gitpulse_add_task",
+                "waylode_add_task",
                 "/properties/title/maxLength",
                 ft::MAX_TASK_TITLE,
             ),
             (
-                "gitpulse_complete_task",
+                "waylode_complete_task",
                 "/properties/summary/maxLength",
                 intake::MAX_SUMMARY_CHARS,
             ),
             (
-                "gitpulse_delete_task",
+                "waylode_delete_task",
                 "/properties/reason/maxLength",
                 intake::MAX_REASON_CHARS,
             ),
             (
-                "gitpulse_merge_tasks",
+                "waylode_merge_tasks",
                 "/properties/reason/maxLength",
                 intake::MAX_REASON_CHARS,
             ),
@@ -11573,7 +11633,7 @@ mod tests {
                 .pointer_mut(pointer)
                 .unwrap_or_else(|| panic!("{tool} has no {pointer}")) = json!(value);
         }
-        let current = tools();
+        let current = catalog();
         let names: Vec<&str> = current
             .iter()
             .map(|t| t["name"].as_str().unwrap())
@@ -11589,7 +11649,7 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             "the set of tools changed"
         );
-        for tool in &current {
+        for tool in current {
             let name = tool["name"].as_str().unwrap();
             assert_eq!(
                 without_descriptions(&tool["inputSchema"]),
@@ -11756,61 +11816,61 @@ mod tests {
         }
         use devmap_parity as dm;
         rows![
-            ("gitpulse_insights", RepoArgs),
-            ("gitpulse_sessions", SessionsArgs),
-            ("gitpulse_status", RepoArgs),
-            ("gitpulse_active_changes", ActiveChangesArgs),
-            ("gitpulse_collision_risk", CollisionRiskArgs),
-            ("gitpulse_merge_conflicts", RepoArgs),
-            ("gitpulse_change_context", ChangeContextArgs),
-            ("gitpulse_ledger_events", LedgerEventsArgs),
-            ("gitpulse_turn_checkpoints", TurnCheckpointsArgs),
-            ("gitpulse_task_view", TaskViewArgs),
-            ("gitpulse_add_task", AddTaskArgs),
-            ("gitpulse_import_tasks", ImportTasksArgs),
-            ("gitpulse_list_tasks", ListTasksArgs),
-            ("gitpulse_get_task", GetTaskArgs),
-            ("gitpulse_complete_task", CompleteTaskArgs),
-            ("gitpulse_delete_task", DeleteTaskArgs),
-            ("gitpulse_merge_tasks", MergeTasksArgs),
-            ("gitpulse_worktree_create", WorktreeCreateArgs),
-            ("gitpulse_worktree_switch", WorktreeSwitchArgs),
-            ("gitpulse_worktree_isolate", WorktreeIsolateArgs),
-            ("gitpulse_worktree_prune", WorktreePruneArgs),
-            ("gitpulse_worktree_merge", WorktreeMergeArgs),
-            ("gitpulse_worktree_claim", WorktreeClaimArgs),
-            ("gitpulse_worktree_release", WorktreeReleaseArgs),
-            ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
-            ("gitpulse_browser_open", BrowserOpenArgs),
-            ("gitpulse_terminal_spawn", TerminalSpawnArgs),
-            ("gitpulse_terminal_exec", TerminalExecArgs),
-            ("gitpulse_terminal_open_file", TerminalOpenFileArgs),
-            ("gitpulse_terminal_list", TerminalListArgs),
-            ("gitpulse_terminal_wait", TerminalWaitArgs),
-            ("gitpulse_terminal_read", TerminalReadArgs),
-            ("gitpulse_terminal_send", TerminalSendArgs),
-            ("gitpulse_terminal_close", TerminalCloseArgs),
-            ("gitpulse_worktree_inbox", WorktreeInboxArgs),
-            ("gitpulse_inbox_post", InboxPostArgs),
-            ("gitpulse_inbox_read", InboxReadArgs),
-            ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
-            ("gitpulse_kickoff_agent", KickoffAgentArgs),
-            ("gitpulse_agent_register", AgentRegisterArgs),
-            ("gitpulse_agent_peers", AgentPeersArgs),
-            ("gitpulse_agent_send", AgentSendArgs),
-            ("gitpulse_agent_inbox", AgentInboxArgs),
-            ("gitpulse_agent_wait", AgentWaitArgs),
-            ("gitpulse_worktree_radar", RepoArgs),
-            ("gitpulse_campaign_audit", CampaignAuditArgs),
-            ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
-            ("gitpulse_codeintel_search", SearchArgs),
-            ("gitpulse_codeintel_impact", CodeintelImpactArgs),
-            ("gitpulse_codeintel_dependencies", CodeintelDependenciesArgs),
-            ("gitpulse_codeintel_trace", CodeintelTraceArgs),
-            ("gitpulse_codeintel_dead_symbols", BudgetArgs),
-            ("gitpulse_codeintel_suspects", SuspectsArgs),
-            ("gitpulse_provenance", ProvenanceArgs),
-            ("gitpulse_landed", LandedArgs),
+            ("waylode_insights", RepoArgs),
+            ("waylode_sessions", SessionsArgs),
+            ("waylode_status", RepoArgs),
+            ("waylode_active_changes", ActiveChangesArgs),
+            ("waylode_collision_risk", CollisionRiskArgs),
+            ("waylode_merge_conflicts", RepoArgs),
+            ("waylode_change_context", ChangeContextArgs),
+            ("waylode_ledger_events", LedgerEventsArgs),
+            ("waylode_turn_checkpoints", TurnCheckpointsArgs),
+            ("waylode_task_view", TaskViewArgs),
+            ("waylode_add_task", AddTaskArgs),
+            ("waylode_import_tasks", ImportTasksArgs),
+            ("waylode_list_tasks", ListTasksArgs),
+            ("waylode_get_task", GetTaskArgs),
+            ("waylode_complete_task", CompleteTaskArgs),
+            ("waylode_delete_task", DeleteTaskArgs),
+            ("waylode_merge_tasks", MergeTasksArgs),
+            ("waylode_worktree_create", WorktreeCreateArgs),
+            ("waylode_worktree_switch", WorktreeSwitchArgs),
+            ("waylode_worktree_isolate", WorktreeIsolateArgs),
+            ("waylode_worktree_prune", WorktreePruneArgs),
+            ("waylode_worktree_merge", WorktreeMergeArgs),
+            ("waylode_worktree_claim", WorktreeClaimArgs),
+            ("waylode_worktree_release", WorktreeReleaseArgs),
+            ("waylode_worktree_send_message", WorktreeSendMessageArgs),
+            ("waylode_browser_open", BrowserOpenArgs),
+            ("waylode_terminal_spawn", TerminalSpawnArgs),
+            ("waylode_terminal_exec", TerminalExecArgs),
+            ("waylode_terminal_open_file", TerminalOpenFileArgs),
+            ("waylode_terminal_list", TerminalListArgs),
+            ("waylode_terminal_wait", TerminalWaitArgs),
+            ("waylode_terminal_read", TerminalReadArgs),
+            ("waylode_terminal_send", TerminalSendArgs),
+            ("waylode_terminal_close", TerminalCloseArgs),
+            ("waylode_worktree_inbox", WorktreeInboxArgs),
+            ("waylode_inbox_post", InboxPostArgs),
+            ("waylode_inbox_read", InboxReadArgs),
+            ("waylode_inbox_withdraw", InboxWithdrawArgs),
+            ("waylode_kickoff_agent", KickoffAgentArgs),
+            ("waylode_agent_register", AgentRegisterArgs),
+            ("waylode_agent_peers", AgentPeersArgs),
+            ("waylode_agent_send", AgentSendArgs),
+            ("waylode_agent_inbox", AgentInboxArgs),
+            ("waylode_agent_wait", AgentWaitArgs),
+            ("waylode_worktree_radar", RepoArgs),
+            ("waylode_campaign_audit", CampaignAuditArgs),
+            ("waylode_worktree_overlay_sync", WorktreeOverlaySyncArgs),
+            ("waylode_codeintel_search", SearchArgs),
+            ("waylode_codeintel_impact", CodeintelImpactArgs),
+            ("waylode_codeintel_dependencies", CodeintelDependenciesArgs),
+            ("waylode_codeintel_trace", CodeintelTraceArgs),
+            ("waylode_codeintel_dead_symbols", BudgetArgs),
+            ("waylode_codeintel_suspects", SuspectsArgs),
+            ("waylode_provenance", ProvenanceArgs),
+            ("waylode_landed", LandedArgs),
             ("devmap_status", RepoArgs),
             ("devmap_search", dm::SearchArgs),
             ("devmap_dependencies", dm::DependenciesArgs),
@@ -11890,61 +11950,61 @@ mod tests {
             }
             use devmap_parity as dm;
             rows![
-                ("gitpulse_insights", RepoArgs),
-                ("gitpulse_sessions", SessionsArgs),
-                ("gitpulse_status", RepoArgs),
-                ("gitpulse_active_changes", ActiveChangesArgs),
-                ("gitpulse_collision_risk", CollisionRiskArgs),
-                ("gitpulse_merge_conflicts", RepoArgs),
-                ("gitpulse_change_context", ChangeContextArgs),
-                ("gitpulse_ledger_events", LedgerEventsArgs),
-                ("gitpulse_turn_checkpoints", TurnCheckpointsArgs),
-                ("gitpulse_task_view", TaskViewArgs),
-                ("gitpulse_add_task", AddTaskArgs),
-                ("gitpulse_import_tasks", ImportTasksArgs),
-                ("gitpulse_list_tasks", ListTasksArgs),
-                ("gitpulse_get_task", GetTaskArgs),
-                ("gitpulse_complete_task", CompleteTaskArgs),
-                ("gitpulse_delete_task", DeleteTaskArgs),
-                ("gitpulse_merge_tasks", MergeTasksArgs),
-                ("gitpulse_worktree_create", WorktreeCreateArgs),
-                ("gitpulse_worktree_switch", WorktreeSwitchArgs),
-                ("gitpulse_worktree_isolate", WorktreeIsolateArgs),
-                ("gitpulse_worktree_prune", WorktreePruneArgs),
-                ("gitpulse_worktree_merge", WorktreeMergeArgs),
-                ("gitpulse_worktree_claim", WorktreeClaimArgs),
-                ("gitpulse_worktree_release", WorktreeReleaseArgs),
-                ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
-                ("gitpulse_browser_open", BrowserOpenArgs),
-                ("gitpulse_terminal_spawn", TerminalSpawnArgs),
-                ("gitpulse_terminal_exec", TerminalExecArgs),
-                ("gitpulse_terminal_open_file", TerminalOpenFileArgs),
-                ("gitpulse_terminal_list", TerminalListArgs),
-                ("gitpulse_terminal_wait", TerminalWaitArgs),
-                ("gitpulse_terminal_read", TerminalReadArgs),
-                ("gitpulse_terminal_send", TerminalSendArgs),
-                ("gitpulse_terminal_close", TerminalCloseArgs),
-                ("gitpulse_worktree_inbox", WorktreeInboxArgs),
-                ("gitpulse_inbox_post", InboxPostArgs),
-                ("gitpulse_inbox_read", InboxReadArgs),
-                ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
-                ("gitpulse_kickoff_agent", KickoffAgentArgs),
-                ("gitpulse_agent_register", AgentRegisterArgs),
-                ("gitpulse_agent_peers", AgentPeersArgs),
-                ("gitpulse_agent_send", AgentSendArgs),
-                ("gitpulse_agent_inbox", AgentInboxArgs),
-                ("gitpulse_agent_wait", AgentWaitArgs),
-                ("gitpulse_worktree_radar", RepoArgs),
-                ("gitpulse_campaign_audit", CampaignAuditArgs),
-                ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
-                ("gitpulse_codeintel_search", SearchArgs),
-                ("gitpulse_codeintel_impact", CodeintelImpactArgs),
-                ("gitpulse_codeintel_dependencies", CodeintelDependenciesArgs),
-                ("gitpulse_codeintel_trace", CodeintelTraceArgs),
-                ("gitpulse_codeintel_dead_symbols", BudgetArgs),
-                ("gitpulse_codeintel_suspects", SuspectsArgs),
-                ("gitpulse_provenance", ProvenanceArgs),
-                ("gitpulse_landed", LandedArgs),
+                ("waylode_insights", RepoArgs),
+                ("waylode_sessions", SessionsArgs),
+                ("waylode_status", RepoArgs),
+                ("waylode_active_changes", ActiveChangesArgs),
+                ("waylode_collision_risk", CollisionRiskArgs),
+                ("waylode_merge_conflicts", RepoArgs),
+                ("waylode_change_context", ChangeContextArgs),
+                ("waylode_ledger_events", LedgerEventsArgs),
+                ("waylode_turn_checkpoints", TurnCheckpointsArgs),
+                ("waylode_task_view", TaskViewArgs),
+                ("waylode_add_task", AddTaskArgs),
+                ("waylode_import_tasks", ImportTasksArgs),
+                ("waylode_list_tasks", ListTasksArgs),
+                ("waylode_get_task", GetTaskArgs),
+                ("waylode_complete_task", CompleteTaskArgs),
+                ("waylode_delete_task", DeleteTaskArgs),
+                ("waylode_merge_tasks", MergeTasksArgs),
+                ("waylode_worktree_create", WorktreeCreateArgs),
+                ("waylode_worktree_switch", WorktreeSwitchArgs),
+                ("waylode_worktree_isolate", WorktreeIsolateArgs),
+                ("waylode_worktree_prune", WorktreePruneArgs),
+                ("waylode_worktree_merge", WorktreeMergeArgs),
+                ("waylode_worktree_claim", WorktreeClaimArgs),
+                ("waylode_worktree_release", WorktreeReleaseArgs),
+                ("waylode_worktree_send_message", WorktreeSendMessageArgs),
+                ("waylode_browser_open", BrowserOpenArgs),
+                ("waylode_terminal_spawn", TerminalSpawnArgs),
+                ("waylode_terminal_exec", TerminalExecArgs),
+                ("waylode_terminal_open_file", TerminalOpenFileArgs),
+                ("waylode_terminal_list", TerminalListArgs),
+                ("waylode_terminal_wait", TerminalWaitArgs),
+                ("waylode_terminal_read", TerminalReadArgs),
+                ("waylode_terminal_send", TerminalSendArgs),
+                ("waylode_terminal_close", TerminalCloseArgs),
+                ("waylode_worktree_inbox", WorktreeInboxArgs),
+                ("waylode_inbox_post", InboxPostArgs),
+                ("waylode_inbox_read", InboxReadArgs),
+                ("waylode_inbox_withdraw", InboxWithdrawArgs),
+                ("waylode_kickoff_agent", KickoffAgentArgs),
+                ("waylode_agent_register", AgentRegisterArgs),
+                ("waylode_agent_peers", AgentPeersArgs),
+                ("waylode_agent_send", AgentSendArgs),
+                ("waylode_agent_inbox", AgentInboxArgs),
+                ("waylode_agent_wait", AgentWaitArgs),
+                ("waylode_worktree_radar", RepoArgs),
+                ("waylode_campaign_audit", CampaignAuditArgs),
+                ("waylode_worktree_overlay_sync", WorktreeOverlaySyncArgs),
+                ("waylode_codeintel_search", SearchArgs),
+                ("waylode_codeintel_impact", CodeintelImpactArgs),
+                ("waylode_codeintel_dependencies", CodeintelDependenciesArgs),
+                ("waylode_codeintel_trace", CodeintelTraceArgs),
+                ("waylode_codeintel_dead_symbols", BudgetArgs),
+                ("waylode_codeintel_suspects", SuspectsArgs),
+                ("waylode_provenance", ProvenanceArgs),
+                ("waylode_landed", LandedArgs),
                 ("devmap_status", RepoArgs),
                 ("devmap_search", dm::SearchArgs),
                 ("devmap_dependencies", dm::DependenciesArgs),
@@ -12278,7 +12338,7 @@ mod tests {
 
         #[test]
         fn merge_sources_revisions_are_held_to_the_same_bounds() {
-            let schema = schema_of("gitpulse_merge_tasks");
+            let schema = schema_of("waylode_merge_tasks");
             let item = &schema["properties"]["sources"]["items"]["properties"]["expected_revision"];
             let max = item["maximum"].as_u64().expect("maximum") as i128;
             let min = item["minimum"].as_i64().expect("minimum") as i128;
@@ -12293,7 +12353,7 @@ mod tests {
             for (value, ok) in [(min - 1, false), (min, true), (max, true), (max + 1, false)] {
                 for sent in [int_json(value), json!(value as f64)] {
                     let arguments = base(sent.clone());
-                    let validated = validate_arguments("gitpulse_merge_tasks", &arguments);
+                    let validated = validate_arguments("waylode_merge_tasks", &arguments);
                     let float_beyond_exact = sent.is_f64() && value.abs() > 999_999_999_999_999;
                     if ok && !float_beyond_exact {
                         validated.unwrap_or_else(|e| panic!("{sent}: {e}"));
@@ -12558,13 +12618,13 @@ mod tests {
             let last_wins: Value =
                 serde_json::from_str(r#"{"repo_path":5,"repo_path":"/no/such/repo"}"#).unwrap();
             assert_eq!(last_wins["repo_path"], "/no/such/repo");
-            validate_arguments("gitpulse_status", &last_wins).expect("the last key is valid");
+            validate_arguments("waylode_status", &last_wins).expect("the last key is valid");
             assert!(extract::<RepoArgs>(&last_wins).is_ok());
 
             let bad_last: Value =
                 serde_json::from_str(r#"{"repo_path":"/no/such/repo","repo_path":5}"#).unwrap();
             let error =
-                validate_arguments("gitpulse_status", &bad_last).expect_err("5 is not a path");
+                validate_arguments("waylode_status", &bad_last).expect_err("5 is not a path");
             assert!(error.contains("repo_path"), "{error}");
             assert!(extract::<RepoArgs>(&bad_last).is_err());
         }
@@ -12665,7 +12725,7 @@ mod tests {
                     "the typed layer holds global state: {needle}"
                 );
             }
-            let schema = schema_of("gitpulse_ledger_events");
+            let schema = schema_of("waylode_ledger_events");
             let cases: Vec<Value> = (0..40)
                 .map(|n| {
                     let mut arguments = sample(&schema);
@@ -12683,7 +12743,7 @@ mod tests {
                     .iter()
                     .map(|arguments| {
                         (
-                            validate_arguments("gitpulse_ledger_events", arguments).is_ok(),
+                            validate_arguments("waylode_ledger_events", arguments).is_ok(),
                             extract::<LedgerEventsArgs>(arguments).ok(),
                         )
                     })
@@ -12699,7 +12759,7 @@ mod tests {
                                 .iter()
                                 .map(|arguments| {
                                     (
-                                        validate_arguments("gitpulse_ledger_events", arguments)
+                                        validate_arguments("waylode_ledger_events", arguments)
                                             .is_ok(),
                                         extract::<LedgerEventsArgs>(arguments).ok(),
                                     )
@@ -12739,10 +12799,7 @@ mod tests {
                     "devmap_parity.rs",
                     production(include_str!("devmap_parity.rs")),
                 ),
-                (
-                    "bin/gitpulse-mcp.rs",
-                    include_str!("../bin/gitpulse-mcp.rs"),
-                ),
+                ("bin/waylode-mcp.rs", include_str!("../bin/waylode-mcp.rs")),
             ] {
                 for needle in [
                     "handle_tool_call(",
@@ -12798,7 +12855,7 @@ mod tests {
 
         // Create a zero-copy sparse sibling worktree via MCP.
         let (err, wt_created) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": anchor,
                 "branch": "feat/auth-lane",
@@ -12812,7 +12869,7 @@ mod tests {
 
         // Claim lane A on the sibling worktree, then claim overlapping path on lane B.
         let (err, claim_a) = tool_json(
-            "gitpulse_worktree_claim",
+            "waylode_worktree_claim",
             json!({
                 "repo_path": anchor,
                 "agent_id": "lane-a",
@@ -12827,7 +12884,7 @@ mod tests {
         assert_eq!(claim_a["claim_conflicts"].as_array().unwrap().len(), 0);
 
         let (err, claim_b) = tool_json(
-            "gitpulse_worktree_claim",
+            "waylode_worktree_claim",
             json!({
                 "repo_path": anchor,
                 "agent_id": "lane-b",
@@ -12845,7 +12902,7 @@ mod tests {
         // Reject claiming or syncing an unrelated directory outside the worktree family.
         let outsider = tempfile::tempdir().expect("outsider");
         let (err, bad_sync) = tool_json(
-            "gitpulse_worktree_overlay_sync",
+            "waylode_worktree_overlay_sync",
             json!({
                 "repo_path": anchor,
                 "worktree_path": outsider.path().to_str().unwrap()
@@ -12855,7 +12912,7 @@ mod tests {
 
         // Send broadcast + direct messages and verify inbox filtering and limit/has_more pagination.
         let (err, m1) = tool_json(
-            "gitpulse_worktree_send_message",
+            "waylode_worktree_send_message",
             json!({
                 "repo_path": anchor,
                 "from_agent": "lane-a",
@@ -12866,7 +12923,7 @@ mod tests {
         );
         assert!(!err && m1["message"]["seq"] == 1, "{m1}");
         let (err, m2) = tool_json(
-            "gitpulse_worktree_send_message",
+            "waylode_worktree_send_message",
             json!({
                 "repo_path": anchor,
                 "from_agent": "lane-b",
@@ -12876,7 +12933,7 @@ mod tests {
         );
         assert!(!err && m2["message"]["seq"] == 2, "{m2}");
         let (err, m3) = tool_json(
-            "gitpulse_worktree_send_message",
+            "waylode_worktree_send_message",
             json!({
                 "repo_path": anchor,
                 "from_agent": "lane-b",
@@ -12889,7 +12946,7 @@ mod tests {
 
         // Lane A sees broadcast (seq 1) and direct message to lane-a (seq 3), NOT private message to lane-c (seq 2).
         let (err, inbox_page1) = tool_json(
-            "gitpulse_worktree_inbox",
+            "waylode_worktree_inbox",
             json!({
                 "repo_path": anchor,
                 "agent_id": "lane-a",
@@ -12903,7 +12960,7 @@ mod tests {
         assert_eq!(inbox_page1["messages"][0]["seq"], 1);
 
         let (err, inbox_page2) = tool_json(
-            "gitpulse_worktree_inbox",
+            "waylode_worktree_inbox",
             json!({
                 "repo_path": anchor,
                 "agent_id": "lane-a",
@@ -12923,7 +12980,7 @@ mod tests {
         )
         .expect("modify auth.rs");
         let (err, synced) = tool_json(
-            "gitpulse_worktree_overlay_sync",
+            "waylode_worktree_overlay_sync",
             json!({
                 "repo_path": anchor,
                 "worktree_path": wt_path
@@ -12932,7 +12989,7 @@ mod tests {
         assert!(!err, "overlay sync failed: {synced}");
         assert_eq!(synced["modified_files"], 1);
 
-        let (err, radar) = tool_json("gitpulse_worktree_radar", json!({ "repo_path": anchor }));
+        let (err, radar) = tool_json("waylode_worktree_radar", json!({ "repo_path": anchor }));
         assert!(!err, "radar failed: {radar}");
         assert_eq!(radar["lanes_registered"], 2);
         assert_eq!(radar["claim_conflicts"].as_array().unwrap().len(), 1);
@@ -12940,12 +12997,12 @@ mod tests {
 
         // Release lane-b -> conflict clears.
         let (err, rel) = tool_json(
-            "gitpulse_worktree_release",
+            "waylode_worktree_release",
             json!({ "repo_path": anchor, "agent_id": "lane-b" }),
         );
         assert!(!err && rel["released"] == true, "{rel}");
         let (err, radar_after) =
-            tool_json("gitpulse_worktree_radar", json!({ "repo_path": anchor }));
+            tool_json("waylode_worktree_radar", json!({ "repo_path": anchor }));
         assert!(!err, "{radar_after}");
         // Depends on zc/fix-engine 9b404787: a failed per-worktree scan is
         // carried to the client with its reason, never only counted.
@@ -12992,7 +13049,7 @@ mod tests {
 
     fn create_lane(repo: &str, branch: &str) -> String {
         let (err, created) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({ "repo_path": repo, "branch": branch, "share_cache": false }),
         );
         assert!(!err, "create {branch}: {created}");
@@ -13008,7 +13065,7 @@ mod tests {
             .current_dir(&wt)
             .spawn_locked()
             .expect("spawn sleep");
-        let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
+        let (err, out) = tool_json("waylode_worktree_prune", json!({ "repo_path": repo }));
         let still_running = child.try_wait().expect("try_wait").is_none();
         let _ = child.kill();
         let _ = child.wait();
@@ -13110,7 +13167,7 @@ mod tests {
             let child = spared_shell_in(&wt);
             let pid = i64::from(child.id());
             let (err, out) = tool_json(
-                "gitpulse_worktree_prune",
+                "waylode_worktree_prune",
                 json!({ "repo_path": repo, "reap_processes": true, "force": force }),
             );
             let alive = stop(child);
@@ -13147,7 +13204,7 @@ mod tests {
         let wt = create_lane(&repo, "feat/dry");
         let child = spared_shell_in(&wt);
         let (err, out) = tool_json(
-            "gitpulse_worktree_prune",
+            "waylode_worktree_prune",
             json!({ "repo_path": repo, "reap_processes": true, "dry_run": true }),
         );
         let _ = stop(child);
@@ -13175,7 +13232,7 @@ mod tests {
         .expect("claim the lane");
         for force in [false, true] {
             let (err, out) = tool_json(
-                "gitpulse_worktree_prune",
+                "waylode_worktree_prune",
                 json!({ "repo_path": repo, "force": force }),
             );
             assert!(!err, "force={force}: {out}");
@@ -13225,7 +13282,7 @@ mod tests {
         let child = spared_shell_in(&wt);
         let pid = i64::from(child.id());
         let (err, out) = tool_json(
-            "gitpulse_worktree_merge",
+            "waylode_worktree_merge",
             json!({
                 "repo_path": repo,
                 "source_branch": "feat/merge-busy",
@@ -13266,7 +13323,7 @@ mod tests {
             "",
         )
         .expect("lock the ref");
-        let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
+        let (err, out) = tool_json("waylode_worktree_prune", json!({ "repo_path": repo }));
         assert!(!err, "{out}");
         let find = |path: &str| outcome_for(&out, path);
         if cfg!(windows) {
@@ -13318,7 +13375,7 @@ mod tests {
             "labs",
         ]);
         let (err, out) = tool_json(
-            "gitpulse_worktree_prune",
+            "waylode_worktree_prune",
             json!({ "repo_path": repo, "force": true }),
         );
         assert!(!err, "{out}");
@@ -13353,7 +13410,7 @@ mod tests {
     fn create_with_a_failing_command_still_returns_the_worktree_it_made() {
         let (_sandbox, repo) = honesty_repo();
         let (err, out) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": repo,
                 "branch": "feat/cmd-fails",
@@ -13393,7 +13450,7 @@ mod tests {
             if let Some(base) = base {
                 args["base"] = json!(base);
             }
-            let (err, out) = tool_json("gitpulse_worktree_create", args);
+            let (err, out) = tool_json("waylode_worktree_create", args);
             assert!(err, "{branch}/{base:?} must be refused: {out}");
         }
     }
@@ -13407,7 +13464,7 @@ mod tests {
         // 1. Default invocation places the worktree under <repo>/.gitpulse/worktrees/<slug>,
         //    matches the shared resolver / WorktreeCreate hook plan, and stays out of git status.
         let (err, created) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": repo,
                 "branch": "feat/auth-lane",
@@ -13449,7 +13506,7 @@ mod tests {
 
         // 2. Creating from inside an existing linked lane still anchors at the main checkout.
         let (err, nested) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": actual.to_str().unwrap(),
                 "branch": "feat/from-lane",
@@ -13486,7 +13543,7 @@ mod tests {
             "add sub",
         ]);
         let (err, sparse) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": repo,
                 "branch": "feat/sparse-lane",
@@ -13507,7 +13564,7 @@ mod tests {
 
         // 4. Explicit `layout: "sibling"` places the worktree at ../<Repo>.<slug>.
         let (err, sibling) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": repo,
                 "branch": "feat/sibling-opt",
@@ -13530,7 +13587,7 @@ mod tests {
 
         // 5. Invalid layout values fail closed, and the schema change stays additive.
         let (err, invalid) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": repo,
                 "branch": "feat/invalid-layout",
@@ -13541,7 +13598,7 @@ mod tests {
         assert!(err, "invalid layout must be rejected: {invalid}");
         let schema = tools()
             .into_iter()
-            .find(|t| t["name"] == "gitpulse_worktree_create")
+            .find(|t| t["name"] == "waylode_worktree_create")
             .unwrap();
         assert_eq!(
             schema["inputSchema"]["required"],
@@ -13553,7 +13610,7 @@ mod tests {
     fn worktree_create_default_lane_is_writable_under_default_manvi_gate() {
         let (_sandbox, repo) = honesty_repo();
         let (err, created_lane) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": repo,
                 "branch": "feat/gate-lane",
@@ -13565,7 +13622,7 @@ mod tests {
             .join("gate_probe.txt");
 
         let (err, created_sibling) = tool_json(
-            "gitpulse_worktree_create",
+            "waylode_worktree_create",
             json!({
                 "repo_path": repo,
                 "branch": "feat/gate-sibling",
@@ -13615,9 +13672,9 @@ mod tests {
         let (dir, _profile, repo) = task_fixture();
         crate::test_support::trust_repo(dir.path());
 
-        // 1. Test task decomposition into subtasks via gitpulse_add_task
+        // 1. Test task decomposition into subtasks via waylode_add_task
         let (err, parent_task) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({
                 "repo_path": repo,
                 "task_id": "parent-epic",
@@ -13639,9 +13696,9 @@ mod tests {
         assert_eq!(subtasks[1]["task_id"], "parent-epic-sub-2");
         assert_eq!(subtasks[2]["task_id"], "parent-epic-sub-3");
 
-        // 2. Test posting an inbox ask via gitpulse_inbox_post
+        // 2. Test posting an inbox ask via waylode_inbox_post
         let (err, posted) = tool_json(
-            "gitpulse_inbox_post",
+            "waylode_inbox_post",
             json!({
                 "repo_path": repo,
                 "from_agent": "claude-subagent",
@@ -13658,9 +13715,9 @@ mod tests {
         assert_eq!(posted["thread_key"], "thread-spec-review");
         assert_eq!(posted["message"]["thread_key"], "thread-spec-review");
 
-        // 3. Test reading inbox threads via gitpulse_inbox_read
+        // 3. Test reading inbox threads via waylode_inbox_read
         let (err, inbox) = tool_json(
-            "gitpulse_inbox_read",
+            "waylode_inbox_read",
             json!({
                 "repo_path": repo,
                 "status": "open"
@@ -13673,9 +13730,9 @@ mod tests {
         assert_eq!(threads[0]["status"], "open");
         assert_eq!(threads[0]["ask_type"], "decide");
 
-        // 4. Test withdrawing ask via gitpulse_inbox_withdraw
+        // 4. Test withdrawing ask via waylode_inbox_withdraw
         let (err, withdrawn) = tool_json(
-            "gitpulse_inbox_withdraw",
+            "waylode_inbox_withdraw",
             json!({
                 "repo_path": repo,
                 "from_agent": "claude-subagent",
@@ -13689,7 +13746,7 @@ mod tests {
 
         // 5. Verify thread status transitioned to withdrawn
         let (err, inbox_withdrawn) = tool_json(
-            "gitpulse_inbox_read",
+            "waylode_inbox_read",
             json!({
                 "repo_path": repo,
                 "status": "withdrawn"
@@ -13709,7 +13766,7 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
 
         let (err, parent) = tool_json(
-            "gitpulse_add_task",
+            "waylode_add_task",
             json!({
                 "repo_path": repo,
                 "task_id": "agy-managed-epic",
@@ -13722,13 +13779,13 @@ mod tests {
                 ]
             }),
         );
-        assert!(!err, "gitpulse_add_task failed: {parent}");
+        assert!(!err, "waylode_add_task failed: {parent}");
         let subs = parent["subtasks"].as_array().expect("subtasks array");
         assert_eq!(subs.len(), 3);
         let sub_key = subs[0]["task_id"].as_str().expect("subtask key");
 
         let (err, kickoff) = tool_json(
-            "gitpulse_kickoff_agent",
+            "waylode_kickoff_agent",
             json!({
                 "repo_path": repo,
                 "from_agent": "claude-coordinator",
@@ -13740,7 +13797,7 @@ mod tests {
                 "claimed_files": ["manvi/codingagent/agy.go", "manvi/codingagent/executable.go"]
             }),
         );
-        assert!(!err, "gitpulse_kickoff_agent failed: {kickoff}");
+        assert!(!err, "waylode_kickoff_agent failed: {kickoff}");
         assert_eq!(kickoff["ok"], true);
         assert_eq!(kickoff["task_id"], sub_key);
         assert_eq!(kickoff["task_updated"], true);
@@ -13751,14 +13808,14 @@ mod tests {
 
         let thread_key = kickoff["thread_key"].as_str().expect("thread_key");
         let (err, inbox) = tool_json(
-            "gitpulse_inbox_read",
+            "waylode_inbox_read",
             json!({
                 "repo_path": repo,
                 "agent_id": "agy-worker-1",
                 "status": "open"
             }),
         );
-        assert!(!err, "gitpulse_inbox_read failed: {inbox}");
+        assert!(!err, "waylode_inbox_read failed: {inbox}");
         let threads = inbox["threads"].as_array().expect("threads");
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0]["thread_key"], thread_key);
@@ -13948,14 +14005,14 @@ mod deferral_retry_tests {
     fn collision_risk_and_insights_under_a_shed_gate_report_deferral_not_invalid() {
         let repo = crate::test_support::git_repo();
         let path = repo.path().to_str().unwrap();
-        for tool in ["gitpulse_collision_risk", "gitpulse_insights"] {
+        for tool in ["waylode_collision_risk", "waylode_insights"] {
             let answer = crate::engine::process::with_forced_deferral(|| {
                 handle_tool_call(tool, &json!({ "repo_path": path })).expect(tool)
             });
             assert!(!answer["ok"].as_bool().unwrap_or(false), "{tool}");
             let text = answer.to_string();
             assert!(!text.contains("invalid_worktree"), "{tool}: {text}");
-            let marked = if tool == "gitpulse_insights" {
+            let marked = if tool == "waylode_insights" {
                 &answer["worktrees"]
             } else {
                 &answer
@@ -13966,7 +14023,7 @@ mod deferral_retry_tests {
 
         let plain = tempfile::tempdir().unwrap();
         let answer = handle_tool_call(
-            "gitpulse_insights",
+            "waylode_insights",
             &json!({ "repo_path": plain.path().to_str().unwrap() }),
         )
         .unwrap();
@@ -13999,16 +14056,13 @@ mod deferral_retry_tests {
         let (repo, _holder) = repo_with_a_holder();
         let repo_path = repo.path().to_str().unwrap();
 
-        let wide = handle_tool_call(
-            "gitpulse_collision_risk",
-            &json!({ "repo_path": repo_path }),
-        )
-        .expect("repo-wide");
+        let wide = handle_tool_call("waylode_collision_risk", &json!({ "repo_path": repo_path }))
+            .expect("repo-wide");
         assert_eq!(wide, json!(insights::collision_risk(repo_path)));
         assert_eq!(wide["items"], json!([]), "no overlap: {wide}");
 
         let held = handle_tool_call(
-            "gitpulse_collision_risk",
+            "waylode_collision_risk",
             &json!({ "repo_path": repo_path, "path": "held.txt" }),
         )
         .expect("held");
@@ -14026,7 +14080,7 @@ mod deferral_retry_tests {
         assert_eq!(held["shared_worktrees"], json!([]));
 
         let free = handle_tool_call(
-            "gitpulse_collision_risk",
+            "waylode_collision_risk",
             &json!({ "repo_path": repo_path, "path": "nobody-has-this.txt" }),
         )
         .expect("free");
@@ -14038,7 +14092,7 @@ mod deferral_retry_tests {
             json!({ "repo_path": repo_path, "paths": "x" }),
         ] {
             assert!(
-                handle_tool_call("gitpulse_collision_risk", &bad).is_err(),
+                handle_tool_call("waylode_collision_risk", &bad).is_err(),
                 "{bad}"
             );
         }
@@ -14050,12 +14104,12 @@ mod deferral_retry_tests {
     fn preflight_from_a_clean_worktree_lists_what_other_worktrees_hold() {
         let (repo, _holder) = repo_with_a_holder();
         let repo_path = repo.path().to_str().unwrap();
-        let prompt = prompts::get("gitpulse_preflight", &json!({ "repo_path": repo_path }))
+        let prompt = prompts::get("waylode_preflight", &json!({ "repo_path": repo_path }))
             .expect("preflight");
         let text = prompt.to_string();
         assert!(text.contains("held.txt"), "{text}");
         assert!(text.contains("cannot know which file"), "{text}");
-        assert!(text.contains("gitpulse_collision_risk"), "{text}");
+        assert!(text.contains("waylode_collision_risk"), "{text}");
     }
 
     /// The ledger read resolves its address through the same retry: a shed

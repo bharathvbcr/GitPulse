@@ -214,7 +214,7 @@ fn resolve(program: &str) -> Result<(String, Option<std::ffi::OsString>), String
     );
     if !Path::new(&resolved).is_absolute() || !Path::new(&resolved).is_file() {
         return Err(match program {
-            "claude" => "Claude Code is not installed, or not on the PATH GitPulse sees.".into(),
+            "claude" => "Claude Code is not installed, or not on the PATH Waylode sees.".into(),
             other => format!("{other} is not installed."),
         });
     }
@@ -235,14 +235,18 @@ fn command_for(program: &str, path: Option<std::ffi::OsString>) -> Command {
     ] {
         command.env_remove(name);
     }
-    // Nor may a GitPulse started from one of its own terminals hand the agent
+    // Nor may a Waylode started from one of its own terminals hand the agent
     // that terminal's id without its token (or the reverse), or an owner key
     // of its own: the agent's identity is the one `start` sets, or none.
     for name in [
         crate::terminal::TERMINAL_SESSION_ENV,
+        crate::terminal::LEGACY_TERMINAL_SESSION_ENV,
         crate::terminal::orchestrate::SESSION_TOKEN_ENV,
+        crate::terminal::orchestrate::LEGACY_SESSION_TOKEN_ENV,
         crate::alerts::bridge::SESSION_ENV,
+        crate::alerts::bridge::LEGACY_SESSION_ENV,
         crate::terminal::orchestrate::ORCHESTRATE_CALLER_ENV,
+        crate::terminal::orchestrate::LEGACY_ORCHESTRATE_CALLER_ENV,
     ] {
         command.env_remove(name);
     }
@@ -719,9 +723,13 @@ mod tests {
             .collect();
         for name in [
             crate::terminal::TERMINAL_SESSION_ENV,
+            crate::terminal::LEGACY_TERMINAL_SESSION_ENV,
             crate::terminal::orchestrate::SESSION_TOKEN_ENV,
+            crate::terminal::orchestrate::LEGACY_SESSION_TOKEN_ENV,
             crate::alerts::bridge::SESSION_ENV,
+            crate::alerts::bridge::LEGACY_SESSION_ENV,
             crate::terminal::orchestrate::ORCHESTRATE_CALLER_ENV,
+            crate::terminal::orchestrate::LEGACY_ORCHESTRATE_CALLER_ENV,
         ] {
             assert!(
                 removed.iter().any(|r| r == name),

@@ -7,15 +7,15 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::engine::git_reader::GitReader;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::{
-    engine::{git_cli, process},
-    repository_trust,
-};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use waylode_lib::engine::git_reader::GitReader;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::{
+    engine::{git_cli, process},
+    repository_trust,
+};
 
 fn git(repo: &Path, args: &[&str]) {
     // This suite is about trust admission, which is decided before the spawn
@@ -109,7 +109,7 @@ fn global_probe_subprocess() {
     std::fs::create_dir(&source).unwrap();
     git(&source, &["init", "-q"]);
     let destination = inherited.join("relative-clone");
-    gitpulse_lib::engine::GitWriter::clone_repo("relative-source", destination.to_str().unwrap())
+    waylode_lib::engine::GitWriter::clone_repo("relative-source", destination.to_str().unwrap())
         .expect("relative local clone must retain the caller's path interpretation");
     assert!(destination.join(".git").is_dir());
 }
@@ -387,33 +387,33 @@ fn health_watchers_pty_and_mcp_are_denied_before_work_starts() {
         "[alias]\naudit = \"!touch cargo-alias-executed\"\n",
     )
     .unwrap();
-    let health = gitpulse_lib::analyzer::DepsScanner::scan(path);
+    let health = waylode_lib::analyzer::DepsScanner::scan(path);
     assert!(health.unwrap_err().contains(repository_trust::REQUIRED));
     assert!(!repo.path().join("cargo-alias-executed").exists());
-    assert!(gitpulse_lib::devmap::cli::build(path)
+    assert!(waylode_lib::devmap::cli::build(path)
         .unwrap_err()
         .contains(repository_trust::REQUIRED));
-    let changes = gitpulse_lib::insights::active_changes(path, None, None);
+    let changes = waylode_lib::insights::active_changes(path, None, None);
     assert!(!changes.ok);
     assert!(changes.error.contains(repository_trust::REQUIRED));
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let host_dir = tempfile::Builder::new()
         .prefix("ph")
         .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
         .unwrap();
-    let terminals = gitpulse_lib::terminal::TerminalSessions::with_host(
-        gitpulse_lib::terminal::host::client::HostConfig {
+    let terminals = waylode_lib::terminal::TerminalSessions::with_host(
+        waylode_lib::terminal::host::client::HostConfig {
             dir: host_dir.path().to_path_buf(),
-            binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
+            binary: Some(env!("CARGO_BIN_EXE_waylode-ptyd").into()),
             idle_exit: Some(std::time::Duration::from_secs(3)),
             // Passed to gitpulse-ptyd as GITPULSE_LOG_DIR (logging::LOG_DIR_ENV),
             // so the host logs into this temp directory, never the user's real log.
             log_dir: Some(host_dir.path().join("logs")),
         },
     );
-    let spawn = gitpulse_lib::terminal::spawn_session(
+    let spawn = waylode_lib::terminal::spawn_session(
         app.handle(),
         &terminals,
         path,
@@ -422,7 +422,7 @@ fn health_watchers_pty_and_mcp_are_denied_before_work_starts() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "touch terminal-executed".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     );
     assert!(spawn.unwrap_err().contains(repository_trust::REQUIRED));
     assert!(!repo.path().join("terminal-executed").exists());
@@ -541,7 +541,7 @@ fn worktree_removal_cannot_execute_an_unapproved_targets_configuration() {
 
     let main = fixture();
     approve(main.path());
-    let result = gitpulse_lib::engine::worktree::remove_worktree(
+    let result = waylode_lib::engine::worktree::remove_worktree(
         main.path().to_str().unwrap(),
         stranger.to_str().unwrap(),
         false,
@@ -559,7 +559,7 @@ fn worktree_removal_cannot_execute_an_unapproved_targets_configuration() {
     let parent = tempfile::tempdir().unwrap();
     let linked = parent.path().join("linked");
     linked_fixture(main.path(), &linked);
-    gitpulse_lib::engine::worktree::remove_worktree(
+    waylode_lib::engine::worktree::remove_worktree(
         main.path().to_str().unwrap(),
         linked.to_str().unwrap(),
         false,
@@ -575,7 +575,7 @@ fn trusting_a_linked_checkout_preserves_its_shared_ledger() {
     let linked = parent.path().join("linked");
     linked_fixture(main.path(), &linked);
     approve(&linked);
-    let address = gitpulse_lib::ledger::bindings::repository_address(linked.to_str().unwrap());
+    let address = waylode_lib::ledger::bindings::repository_address(linked.to_str().unwrap());
     assert!(
         address.is_ok(),
         "approved linked checkout lost its ledger: {address:?}"
@@ -644,9 +644,9 @@ fn trust_store(home: &Path) -> std::path::PathBuf {
     let base = home
         .join("Library")
         .join("Application Support")
-        .join("GitPulse");
+        .join("Waylode");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let base = home.join(".config").join("gitpulse");
+    let base = home.join(".config").join("waylode");
     base.join("repository-trust-v1")
 }
 
@@ -742,7 +742,7 @@ fn a_pre_repository_approval_subprocess() {
     let refusal = repository_trust::require(Path::new(&worktree)).unwrap_err();
     assert!(repository_trust::refused(refusal.message()));
     assert!(
-        refusal.contains("approved before GitPulse covered worktrees"),
+        refusal.contains("approved before Waylode covered worktrees"),
         "a reader who already approved this repository needs to be told why \
          that did not reach here: {refusal:?}"
     );
@@ -758,7 +758,7 @@ fn a_pre_repository_approval_subprocess() {
 
     // 3. The collision scan therefore reads one of two working trees — and the
     //    shared dirty file it cannot see is exactly what it exists to report.
-    let dark = gitpulse_lib::insights::collision_risk(&main);
+    let dark = waylode_lib::insights::collision_risk(&main);
     assert_eq!(dark.scanned_worktrees, 1, "{dark:?}");
     assert_eq!(dark.failed_worktrees, 1, "{dark:?}");
     assert!(!dark.ok, "{dark:?}");
@@ -766,11 +766,10 @@ fn a_pre_repository_approval_subprocess() {
 
     // The hook must not render that as a clean pass. This is the message the
     // reporter saw.
-    let facts =
-        gitpulse_lib::hooks::collision_facts(&dark, Path::new(&main), "shared.txt", &|_| {
-            String::new()
-        });
-    let notice = gitpulse_lib::hooks::collision_decision(&facts)
+    let facts = waylode_lib::hooks::collision_facts(&dark, Path::new(&main), "shared.txt", &|_| {
+        String::new()
+    });
+    let notice = waylode_lib::hooks::collision_decision(&facts)
         .render()
         .expect("a partial scan must never be silent");
     assert!(notice.contains("INCOMPLETE"), "{notice}");
@@ -779,7 +778,7 @@ fn a_pre_repository_approval_subprocess() {
     // same explanation the desktop does. This is the message that started the
     // investigation, and without this sentence it is a dead end.
     assert!(
-        notice.contains("approved before GitPulse covered worktrees"),
+        notice.contains("approved before Waylode covered worktrees"),
         "{notice}"
     );
 
@@ -798,19 +797,19 @@ fn a_pre_repository_approval_subprocess() {
 
     // 5. And the scan is whole: both working trees read, and the collision
     //    that was invisible is now reported.
-    let whole = gitpulse_lib::insights::collision_risk(&main);
+    let whole = waylode_lib::insights::collision_risk(&main);
     assert_eq!(whole.scanned_worktrees, 2, "{whole:?}");
     assert_eq!(whole.failed_worktrees, 0, "{whole:?}");
     assert!(whole.ok, "{whole:?}");
     assert_eq!(whole.overlapping_files, 1, "{whole:?}");
 
     let facts =
-        gitpulse_lib::hooks::collision_facts(&whole, Path::new(&main), "shared.txt", &|_| {
+        waylode_lib::hooks::collision_facts(&whole, Path::new(&main), "shared.txt", &|_| {
             String::new()
         });
     assert!(facts.ok && facts.partial.is_empty(), "{facts:?}");
     assert_eq!(facts.others.len(), 1, "{facts:?}");
-    let decision = gitpulse_lib::hooks::collision_decision(&facts)
+    let decision = waylode_lib::hooks::collision_decision(&facts)
         .render()
         .expect("a real collision must escalate");
     assert!(decision.contains("\"ask\""), "{decision}");

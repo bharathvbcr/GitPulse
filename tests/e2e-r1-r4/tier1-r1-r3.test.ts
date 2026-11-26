@@ -36,12 +36,14 @@ import {
 } from "./helpers/env";
 import { makeMenuState, makeRepoFixtures } from "./helpers/fixtures";
 
-const OLD_PULSE_LOGO_SHA256 =
-  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
-const CANONICAL_PATH_FRAGMENT = "M24.04 9.25A10.5";
+const RETIRED_LOGO_SHA256S = new Set([
+  "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1",
+  "1cf0341b1cc7b556701b5bfb17c3ed02b2eba2e87863928b4de8e1cc7225fd3b",
+]);
+const CANONICAL_PATH_FRAGMENT = "M23.8 9.0A10.5";
 const CANONICAL_PATH_FULL =
-  "M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8";
-const CANONICAL_STOPS = ["#22d3ee", "#58a6ff", "#a371f7"];
+  "M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8";
+const CANONICAL_STOPS = ["#7dd3fc", "#38bdf8", "#3b82f6"];
 
 function extractGradientStops(svgText: string): string[] {
   const match = /<linearGradient[^>]*id="[^"]*stroke"[^>]*>([\s\S]*?)<\/linearGradient>/.exec(
@@ -197,36 +199,36 @@ afterEach(() => {
 // F1 — Notification & Plugin Logo Assets (6 tests)
 // ---------------------------------------------------------------------------
 describe("[Tier 1] [R1] F1 — Notification & Plugin Logo Assets", () => {
-  it("shares the canonical G-ring path, tip circle, and 3-stop gradient across static SVGs, index.html, and Logo.svelte", () => {
+  it("shares the canonical Way-Arc path, lodestar circle, and 3-stop gradient across static SVGs, index.html, and Logo.svelte", () => {
     const sources = [
       "src/lib/components/Logo.svelte",
-      "public/gitpulse-icon.svg",
-      "public/gitpulse-mark.svg",
+      "public/waylode-icon.svg",
+      "public/waylode-mark.svg",
       "index.html",
     ];
     for (const rel of sources) {
       const content = readRepoFile(rel);
       expect(content, `${rel} path`).toContain(CANONICAL_PATH_FULL);
       expect(content, `${rel} circle`).toMatch(
-        /<circle[^>]*cx="24\.04"[^>]*cy="9\.25"[^>]*r="2\.9"/,
+        /<circle[^>]*cx="23\.8"[^>]*cy="9(?:\.0)?"[^>]*r="2\.8"/,
       );
       expect(extractGradientStops(content), `${rel} gradient`).toEqual(CANONICAL_STOPS);
     }
   });
 
-  it("ships plugins/gitpulse/assets/logo.png as current 256x256 RGBA G-ring badge matching 128x128@2x.png mark colors", () => {
-    const pluginLogo = readPngInfo("plugins/gitpulse/assets/logo.png");
+  it("ships plugins/waylode/assets/logo.png as current 256x256 RGBA Way-Arc badge matching 128x128@2x.png mark colors", () => {
+    const pluginLogo = readPngInfo("plugins/waylode/assets/logo.png");
     const appIcon2x = readPngInfo("src-tauri/icons/128x128@2x.png");
 
     expect(pluginLogo.width).toBe(256);
     expect(pluginLogo.height).toBe(256);
     expect(pluginLogo.colorType).toBe(6);
     expect(pluginLogo.bitDepth).toBe(8);
-    expect(pluginLogo.sha256).not.toBe(OLD_PULSE_LOGO_SHA256);
+    expect(RETIRED_LOGO_SHA256S.has(pluginLogo.sha256)).toBe(false);
     expect(appIcon2x.width).toBe(256);
     expect(appIcon2x.height).toBe(256);
 
-    // Verify both 256x256 PNGs render the cyan-blue G-ring at the same ring coordinates
+    // Verify both 256x256 PNGs render the Cobalt light-sky->cobalt Way-Arc at the same coordinates
     const decode = (rel: string) => {
       const bytes = readFileSync(repoPath(rel));
       const idat: Buffer[] = [];
@@ -274,32 +276,49 @@ describe("[Tier 1] [R1] F1 — Notification & Plugin Logo Assets", () => {
       };
     };
 
-    const pluginPixel = decode("plugins/gitpulse/assets/logo.png");
+    const pluginPixel = decode("plugins/waylode/assets/logo.png");
     const iconPixel = decode("src-tauri/icons/128x128@2x.png");
     expect(pluginPixel(0, 0)[3]).toBe(0);
+    // Light-sky portion (#7dd3fc)
     for (const [x, y] of [
-      [60, 128],
-      [128, 196],
+      [80, 176],
+      [73, 167],
+    ] as const) {
+      const [pr, pg, pb, pa] = pluginPixel(x, y);
+      const [ir, ig, ib, ia] = iconPixel(x, y);
+      expect(pa).toBeGreaterThan(200);
+      expect(pb).toBeGreaterThan(pr);
+      expect(pg).toBeGreaterThanOrEqual(180);
+      expect(ia).toBeGreaterThan(200);
+      expect(ib).toBeGreaterThan(ir);
+      expect(ig).toBeGreaterThanOrEqual(180);
+    }
+    // Sky/cobalt portion (#38bdf8 -> #3b82f6)
+    for (const [x, y] of [
+      [128, 60],
+      [179, 83],
     ] as const) {
       const [pr, , pb, pa] = pluginPixel(x, y);
       const [ir, , ib, ia] = iconPixel(x, y);
       expect(pa).toBeGreaterThan(200);
       expect(pb).toBeGreaterThan(pr);
+      expect(pb).toBeGreaterThanOrEqual(230);
       expect(ia).toBeGreaterThan(200);
       expect(ib).toBeGreaterThan(ir);
+      expect(ib).toBeGreaterThanOrEqual(230);
     }
   });
 
-  it("references assets/logo.png in Cursor plugin manifest and bundles ../plugins/gitpulse/ in tauri.conf.json", () => {
+  it("references assets/logo.png in Cursor plugin manifest and bundles ../plugins/waylode/ in tauri.conf.json", () => {
     const cursorManifest = JSON.parse(
-      readRepoFile("plugins/gitpulse/.cursor-plugin/plugin.json"),
+      readRepoFile("plugins/waylode/.cursor-plugin/plugin.json"),
     ) as { logo?: string };
     const tauriConf = JSON.parse(readRepoFile("src-tauri/tauri.conf.json")) as {
       bundle?: { resources?: Record<string, string> };
     };
 
     expect(cursorManifest.logo).toBe("assets/logo.png");
-    expect(tauriConf.bundle?.resources?.["../plugins/gitpulse/"]).toBe("plugin/");
+    expect(tauriConf.bundle?.resources?.["../plugins/waylode/"]).toBe("plugin/");
   });
 
   it("keeps src-tauri/icons/ PNGs and icon.icns valid and configured in tauri.conf.json", () => {
@@ -338,13 +357,13 @@ describe("[Tier 1] [R1] F1 — Notification & Plugin Logo Assets", () => {
     expect(icnsBytes.length).toBeGreaterThan(100_000);
   });
 
-  it("updates plugins/gitpulse-agy/assets/logo.svg to current GitPulse G-ring geometry (not stale 3-node SVG)", () => {
-    const agyManifest = JSON.parse(readRepoFile("plugins/gitpulse-agy/plugin.json")) as {
+  it("updates plugins/waylode-agy/assets/logo.svg to current Waylode Way-Arc geometry (not stale 3-node SVG)", () => {
+    const agyManifest = JSON.parse(readRepoFile("plugins/waylode-agy/plugin.json")) as {
       logo?: string;
     };
     expect(agyManifest.logo).toBe("assets/logo.svg");
 
-    const agyLogo = readRepoFile("plugins/gitpulse-agy/assets/logo.svg");
+    const agyLogo = readRepoFile("plugins/waylode-agy/assets/logo.svg");
     expect(agyLogo).toContain(CANONICAL_PATH_FRAGMENT);
     expect(extractGradientStops(agyLogo)).toEqual(CANONICAL_STOPS);
     expect(agyLogo).not.toContain('fill="#0F172A"');
@@ -420,20 +439,20 @@ describe("[Tier 1] [R1] F2 — macOS System Notification Logo & Bundle Delivery"
     const badgeHtml = render(Logo, { props: { variant: "badge", size: 24 } }).body;
 
     expect(markHtml).toContain('role="img"');
-    expect(markHtml).toContain('aria-label="GitPulse"');
+    expect(markHtml).toContain('aria-label="Waylode"');
     expect(markHtml).toContain(CANONICAL_PATH_FRAGMENT);
     expect(markHtml).toContain('transform="translate(-2.4 -2.4) scale(1.15)"');
     expect(markHtml).not.toContain('rx="10"');
 
     expect(badgeHtml).toContain('role="img"');
-    expect(badgeHtml).toContain('aria-label="GitPulse"');
+    expect(badgeHtml).toContain('aria-label="Waylode"');
     expect(badgeHtml).toContain(CANONICAL_PATH_FRAGMENT);
     expect(badgeHtml).toContain('transform="translate(3.04 3.04) scale(0.81)"');
     expect(badgeHtml).toContain('rx="10"');
   });
 
-  it("contains no stale pulse-only image or SVG artifacts under plugins/gitpulse/assets/", () => {
-    const assetsDir = repoPath("plugins/gitpulse/assets");
+  it("contains no stale pulse-only or retired image or SVG artifacts under plugins/waylode/assets/", () => {
+    const assetsDir = repoPath("plugins/waylode/assets");
     const files = readdirSync(assetsDir, { recursive: true, withFileTypes: true })
       .filter((d) => d.isFile())
       .map((d) => path.join(d.parentPath, d.name));
@@ -442,7 +461,7 @@ describe("[Tier 1] [R1] F2 — macOS System Notification Logo & Bundle Delivery"
     for (const file of files) {
       if (file.endsWith(".png")) {
         const info = readPngInfo(file);
-        expect(info.sha256, file).not.toBe(OLD_PULSE_LOGO_SHA256);
+        expect(RETIRED_LOGO_SHA256S.has(info.sha256), file).toBe(false);
       } else if (file.endsWith(".svg")) {
         const svg = readFileSync(file, "utf8");
         expect(svg, file).toContain(CANONICAL_PATH_FRAGMENT);
@@ -455,7 +474,7 @@ describe("[Tier 1] [R1] F2 — macOS System Notification Logo & Bundle Delivery"
 // F3 — In-App Notification Surfaces Logo (6 tests)
 // ---------------------------------------------------------------------------
 describe("[Tier 1] [R1] F3 — In-App Notification Surfaces Logo", () => {
-  it("SSR renders ToastContainer with current GitPulse Logo, exposed action/dismiss buttons, and separate live regions", () => {
+  it("SSR renders ToastContainer with current Waylode Logo, exposed action/dismiss buttons, and separate live regions", () => {
     toastStore.info("Workspace indexed cleanly", {
       label: "Open",
       onClick: () => {},
@@ -467,7 +486,7 @@ describe("[Tier 1] [R1] F3 — In-App Notification Surfaces Logo", () => {
     expect(body).toContain('aria-live="assertive"');
     expect(body).toContain('aria-live="polite"');
     expect(body).toContain(CANONICAL_PATH_FRAGMENT);
-    expect(body).toContain('aria-label="GitPulse"');
+    expect(body).toContain('aria-label="Waylode"');
     expect(body).toContain('aria-label="Open: Workspace indexed cleanly"');
     expect(body).toContain('aria-label="Dismiss: Workspace indexed cleanly"');
     expect(findButtonsInsideAriaHidden(body)).toEqual([]);
@@ -526,7 +545,7 @@ describe("[Tier 1] [R1] F3 — In-App Notification Surfaces Logo", () => {
 
     expect(body).toContain('aria-label="Inbox"');
     expect(body).toContain(CANONICAL_PATH_FRAGMENT);
-    expect(body).toContain('aria-label="GitPulse"');
+    expect(body).toContain('aria-label="Waylode"');
     expect(body).toContain('aria-label="Inbox filter"');
     expect(body).toContain(">Refresh</button>");
   });

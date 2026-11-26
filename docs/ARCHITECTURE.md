@@ -1,12 +1,12 @@
-# GitPulse Architecture
+# Waylode Architecture
 
 [Documentation index](README.md) · [Contributing](../CONTRIBUTING.md) · [Module integration](MODULE_INTEGRATION.md)
 
-GitPulse is built as a local-first native desktop client combining a **Rust backend (Tauri 2)** with a **Svelte 5 + TypeScript frontend**.
+Waylode is built as a local-first native desktop client combining a **Rust backend (Tauri 2)** with a **Svelte 5 + TypeScript frontend**.
 
 **Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is
 **components and modules**. [Manvi](https://github.com/bharathvbcr/Manvi) wraps
-them into a coding-agent harness. GitPulse uses **Manvi** for policy, workbench,
+them into a coding-agent harness. Waylode uses **Manvi** for policy, workbench,
 and agent hosting, and **DevCouncil components** (`devmap` CLI and crates,
 verification reads) for code intelligence. Modules stay independently
 updatable; this app takes only the subset it needs. See
@@ -95,7 +95,7 @@ flowchart TB
 ## 1. Frontend Architecture
 
 ### Routerless View Architecture
-GitPulse does not use a virtual DOM router. Views are members of the `ViewTab` union defined in [`src/lib/repos/persist.ts`](../src/lib/repos/persist.ts).
+Waylode does not use a virtual DOM router. Views are members of the `ViewTab` union defined in [`src/lib/repos/persist.ts`](../src/lib/repos/persist.ts).
 
 ```mermaid
 flowchart LR
@@ -194,7 +194,7 @@ Two of these are worth stating plainly, because both were live defects:
   sample as a total.
 
 ### Async Hygiene & Cancellation Guards
-When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. GitPulse guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](../src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.
+When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. Waylode guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](../src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.
 
 On the backend, a DevMap live refresh never holds its IPC command on the `devmap status` probe: `start_refresh` waits at most `PROBE_GRACE` (1 s) and otherwise answers with `probe_pending` while the probe finishes in the background. Untracked-file line counting is bounded per refresh by `UntrackedBudget` (2,000 files / 128 MiB, and no single file over 64 MiB); each file is opened `O_NONBLOCK | O_NOFOLLOW`, results are cached against a `ScanIdentity` (length, inode, mtime, ctime), and a row whose lines were not counted carries a warning so its zero is not read as "no lines".
 
@@ -358,18 +358,18 @@ for contracts, regression evidence and platform verification limits.
 - **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history. Transcripts are read through a `TranscriptSource` per agent: Claude Code (`~/.claude/projects`, `GITPULSE_TRANSCRIPT_ROOT`, rows with `actor_id` `claude-code`) and Codex (`$CODEX_HOME/sessions`, default `~/.codex/sessions`, `GITPULSE_CODEX_TRANSCRIPT_ROOT` overriding, `actor_id` `codex`; structured tool calls, plus the straight-line literal calls of code-mode `exec` programs read with tree-sitter-javascript under size, time and node bounds; every other code-mode call is counted in `skipped_lines`). Each source is walked under its own depth and file caps; `walk_complete` is true only when every walked source was whole, and a transcript's saved offset is forgotten only after such a walk. A Codex line this build cannot read is counted in `skipped_lines`, never guessed at. Other agents' transcripts are not read.
 - **`ledger/`**: WAL-backed action store with redaction, cursors, and bounded replay for history projection.
 - **`mcp/`**: MCP 2.0 + Agent Plugins 1.0 server surface, including tool caching and capability discovery. Read tools (`readOnlyHint: true`, including `gitpulse_worktree_inbox` and `gitpulse_worktree_radar`) never mutate Git or task state; writes are restricted to the repository-trust-gated task-board tools and `gitpulse_worktree_*` lifecycle/coordination tools, with Git mutations gated through `harness::guard_command` (`src-tauri/src/mcp/mod.rs`).
-- **`sysload/`**: The host-load sensor. A sampler in the app process only reads memory pressure, swap, compressor counters, load, open files, disk, thermal state and power every 2 s, scans the process table for agent sessions (by executable, launched vs observed through `GITPULSE_RUN_ID` / `GITPULSE_SESSION_ID`), launched-tree footprints and disk-write rates, memguard and foreign orphans, and publishes `host-load.v1`: a fixed-size sequence-locked record in the per-user config directory that any GitPulse process reads without asking the app. It measures and publishes only; admission, shedding and leases consume it. See [Load governor](LOAD_GOVERNOR.md).
+- **`sysload/`**: The host-load sensor. A sampler in the app process only reads memory pressure, swap, compressor counters, load, open files, disk, thermal state and power every 2 s, scans the process table for agent sessions (by executable, launched vs observed through `GITPULSE_RUN_ID` / `GITPULSE_SESSION_ID`), launched-tree footprints and disk-write rates, memguard and foreign orphans, and publishes `host-load.v1`: a fixed-size sequence-locked record in the per-user config directory that any Waylode process reads without asking the app. It measures and publishes only; admission, shedding and leases consume it. See [Load governor](LOAD_GOVERNOR.md).
 - **`logging.rs`**: Diagnostics for the backend. A 1,000-entry in-memory ring behind the `log` facade, a panic hook that records the payload, the location and a bounded backtrace, and a durable append-only mirror under the platform log directory (`~/Library/Logs/GitPulse` on macOS, `%LOCALAPPDATA%\\GitPulse\\logs` on Windows, `$XDG_STATE_HOME/gitpulse` otherwise; `GITPULSE_LOG_DIR` overrides all three). See [Diagnostics](#5-diagnostics) below.
-- **`crates/gitpulse-worktree/`**: Standalone workspace member building `gitpulse-worktree` (worktree orchestrator, DevMap delta overlay compiler, and `<git-common-dir>/gitpulse/lanes/` multi-agent coordination CLI) and `gitpulse-rustc` (two-stage Blake3 + `.d` dep-info / `# env-dep:` `RUSTC_WRAPPER` compiler cache materializing artifacts via APFS `clonefile` / Linux `FICLONE` from `<git-common-dir>/gitpulse/build-cache/`). See [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md).
+- **`crates/waylode-worktree/`**: Standalone workspace member building `waylode-worktree` (worktree orchestrator, DevMap delta overlay compiler, and `<git-common-dir>/gitpulse/lanes/` multi-agent coordination CLI) and `waylode-rustc` (two-stage Blake3 + `.d` dep-info / `# env-dep:` `RUSTC_WRAPPER` compiler cache materializing artifacts via APFS `clonefile` / Linux `FICLONE` from `<git-common-dir>/gitpulse/build-cache/`). See [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md).
 
 ### Worktree binding authority
 
 A worktree's task binding is a ledger event (`worktree.bind` / `worktree.unbind`), and the gate derives task-scope authority from it, so who may write one is a security boundary.
 
-- **Who may write.** Only the GitPulse app and the bind/unbind commands (`ledger::bindings::bind`, `unbind` and their `_with` forms), writing the **anchor** ledger (the primary checkout's `.devcouncil/ledger.sqlite`), may set a binding. A row written any other way (a process in a linked worktree writing its own ledger, a hand-edited database) is not a binding.
+- **Who may write.** Only the Waylode app and the bind/unbind commands (`ledger::bindings::bind`, `unbind` and their `_with` forms), writing the **anchor** ledger (the primary checkout's `.devcouncil/ledger.sqlite`), may set a binding. A row written any other way (a process in a linked worktree writing its own ledger, a hand-edited database) is not a binding.
 - **Precedence is insertion order, for the gate and for history alike.** Within a ledger the newest bind or unbind is the row with the highest `id`, which `write_tx` (`BEGIN IMMEDIATE`) serialises across processes. `ts_utc` is display data: a backward clock step or a future-dated row cannot make an older bind beat a later unbind or rebind. `binding_order!()` is the one definition, used by `latest_binding`, `newest_binding_readonly`, `binding_as_of` and `BindingHistory`, so ingest attribution cannot name a task the gate would not have enforced. "Held at a moment" is the row inserted last among those stamped at or before it. A bind or unbind stamped more than `FAR_FUTURE_TOLERANCE_MS` (24 h) ahead of the clock is logged as `dated in the future`.
 - **Sibling ledgers: the initial pass is grandfathered (B+).** Older builds wrote a binding into the worktree's own ledger. A sibling enumerated before the anchor's initial consolidation pass completed is legacy: the rows it held then keep setting bindings, so an upgrade never turns a bound worktree unbound. That is decided once per sibling and stored in its `ledger_family_imports` row as `legacy@<max id>|<path>`, so a pass that is cut short and resumed keeps legacy authority for the rows up to that bound however many runs it takes; rows past the bound, and every row of a sibling first seen after the pass, are history only. Rows from different legacy siblings are ranked by `(ts_utc, ulid)`, the one cross-database key (row ids mean nothing across databases); a far-future date ranks below every believable one. The pass itself is one `family-initial-pass` row in the same table (no schema change): cursor 0 while unfinished, 1 once it ended. No row means no pass has finished, whatever source rows an older build left, so an upgrade from a build that kept no marker treats every sibling still present as legacy. A fresh family closes its window when a bind or unbind creates the ledger (nothing legacy can exist), and a read-only caller never writes the marker. Everything after the pass is imported as `worktree.bind.imported` / `worktree.unbind.imported`: visible in history, matched by no binding read, however it is dated. File timestamps play no part: the same user can rewrite them. Residuals, not closed: a ledger created by a plain append (hook, ingest) rather than a bind has no marker until the first consolidation, and a sibling ledger that appears in that gap counts as legacy; deleting the marker row, or resetting it to 0, reopens the initial pass, which takes a write to the anchor itself.
-- **Demotions are never silent.** An import that demotes rows logs how many and from which sibling. The running count is its own field, `history_only_bindings`, on `LedgerStatus` (the app status and every MCP surface: the status, insights and ledger tools and resources, and their output schema), so it coexists with any `error_code`. The status also carries it as `error_code` `binding_rows_history_only`, with the count in the message, when the slot is free or holds only the legacy-unconsolidated caveat; a real failure keeps the slot there. Rebind the worktree in GitPulse if one was meant.
+- **Demotions are never silent.** An import that demotes rows logs how many and from which sibling. The running count is its own field, `history_only_bindings`, on `LedgerStatus` (the app status and every MCP surface: the status, insights and ledger tools and resources, and their output schema), so it coexists with any `error_code`. The status also carries it as `error_code` `binding_rows_history_only`, with the count in the message, when the slot is free or holds only the legacy-unconsolidated caveat; a real failure keeps the slot there. Rebind the worktree in Waylode if one was meant.
 - **What this does not claim.** The ledger is not tamper-evident against a same-user writer of the anchor itself: it is a file inside the checkout and carries no signature or hash chain, so whoever can write the anchor ledger directly can write any row, including a bind. This narrows what a sibling worktree can contribute; it does not authenticate the anchor.
 
 ---
@@ -380,7 +380,7 @@ Every allowed agent Git write triggers a pre-operation snapshot stored under
 `refs/gitpulse/ops/<n>` (`src-tauri/src/engine/git_writer.rs`), exposing a
 new ref-write surface whose authority and hygiene rules are bounded as follows:
 
-- **App-only ref authority (`hooks/` stays decide-only).** Only the GitPulse
+- **App-only ref authority (`hooks/` stays decide-only).** Only the Waylode
   desktop app process inside `GitWriter::record_op_snapshot` (serialized under
   `repo_mutation_lock`) writes or prunes `refs/gitpulse/ops/*`.
   `src-tauri/src/hooks/` never runs `update-ref`, `commit-tree`, or `GitWriter`
@@ -478,7 +478,7 @@ sequenceDiagram
 
 ## 4. Strict IPC & Type Contracts
 
-GitPulse enforces compile-time and pre-commit contract safety across the Rust/TypeScript boundary:
+Waylode enforces compile-time and pre-commit contract safety across the Rust/TypeScript boundary:
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
@@ -708,7 +708,7 @@ revision. Copying no longer depends on the frontend's paginated repository list.
 The operation omits repository identities/remotes, refuses stale or incomplete
 snapshots, and starts no model worker. The export opens with an `## Agent guidance`
 section (dc-store `AGENT_GUIDANCE`: read the repository and its code before
-writing, GitPulse / DevMap / DevCouncil, the engineering and verification rules),
+writing, Waylode / DevMap / DevCouncil, the engineering and verification rules),
 so every lane that delivers it, from a clipboard copy to a terminal launch to a
 managed run, tells the agent the same thing and the run snapshot records it.
 Lanes add only what they alone know (the completion rule for the permission mode),
@@ -833,7 +833,7 @@ the store lists a run's requests oldest first), polls only while one is live
 and in front, and wakes on `workbench-changed`. A failed read clears the
 marks. `TaskHandoffSheet.svelte` renders it
 in a modal reached from a board card's context menu. The form resolves the working checkout from
-the repository tabs GitPulse already has open (falling back to the folder beside
+the repository tabs Waylode already has open (falling back to the folder beside
 the repository's git common directory, labelled as derived), re-reads the saved
 task and refuses a revision that moved, and locks every control while a
 preparation outcome is unknown so a retry replays the request it was given.
@@ -892,7 +892,7 @@ Process reaping evidence is carried separately from exit status. An unconfirmed
 exit stays unresolved in the store. During shutdown, new work is refused while
 already-owned native observers may persist receipts into the existing store; PTY
 cleanup retains its slot until the callback returns. Private brief files are
-removed on normal cleanup, and a crashed GitPulse's are removed at the next
+removed on normal cleanup, and a crashed Waylode's are removed at the next
 startup: the brief directory's name records its writer's pid and creation
 instant, and `reconcile::sweep_briefs` removes it only when
 `process_birth::running_since` says that writer is gone — never a symlink,
@@ -913,7 +913,7 @@ releases attempts whose owner can no longer report, through the store's
 `runs.reconcile`. It releases only on a definite *gone* from
 `process_birth::{probe, running_since}`, which separate "no such process" from
 "could not check": a recorded agent process must be gone by its creation
-identity, and an attempt with no recorded process needs the launching GitPulse
+identity, and an attempt with no recorded process needs the launching Waylode
 gone (or this process, after it already wrote `unresolved`). A run whose PTY
 this process still holds is never touched. The sweep runs at startup and once
 before a `checkout_busy`/`capacity_reached` refusal is returned, and the run
@@ -950,7 +950,7 @@ stress fixtures, regression evidence and the remaining desktop resource checks.
 Text saves persist a debounced queue entry before a coalesced wake hint reaches
 the lazy profile Manvi host. A failed wake is shown separately from the successful
 save. Manvi owns provider selection, one active generation, quota, cancellation and
-restart recovery. GitPulse's profile controls select automatic settings and expose
+restart recovery. Waylode's profile controls select automatic settings and expose
 status; visible boards share one active-work timer, with none for idle, paused or
 hidden views. Activating the board resumes previously queued work. Newest-first
 proposal history exposes automatic results for explicit selected-field acceptance.

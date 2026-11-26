@@ -6606,7 +6606,7 @@ mod tests {
             assert_eq!(
                 filter.skip().epoch_now(),
                 epoch,
-                "GitPulse's own reads moved the epoch"
+                "Waylode's own reads moved the epoch"
             );
             let before = reads_of(reads);
             let skipped_before = filter.skip().counted(skip::Outcome::Skipped);

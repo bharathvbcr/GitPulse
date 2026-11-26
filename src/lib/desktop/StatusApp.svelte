@@ -34,7 +34,7 @@
     finally { pending = false; }
   }
   onMount(() => {
-    if (!isTauri()) { error = "Open this panel from the GitPulse menu bar icon."; return; }
+    if (!isTauri()) { error = "Open this panel from the Waylode menu bar icon."; return; }
     void connection.connect();
     // WKWebView lacks `prefers-reduced-transparency`; the native bridge stamps
     // `data-transparency` on <html> for StatusPopover to key off.

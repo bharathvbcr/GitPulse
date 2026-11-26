@@ -159,7 +159,7 @@ impl Link {
 
     fn send(&self, header: &HostFrame, payload: &[u8]) -> Result<(), String> {
         self.current()
-            .ok_or_else(|| "no GitPulse app is connected".to_string())?
+            .ok_or_else(|| "no Waylode app is connected".to_string())?
             .send(header, payload)
     }
 
@@ -660,7 +660,7 @@ fn introduce(host: &Arc<Host>, conn: &Arc<Conn>, reader: &mut BufReader<UnixStre
                 drop(state);
                 conn.reply(
                     id,
-                    Err("Another GitPulse window is connected to this terminal host.".into()),
+                    Err("Another Waylode window is connected to this terminal host.".into()),
                 );
                 return false;
             }
@@ -735,7 +735,7 @@ pub(in crate::terminal) fn serve_for_unit_test(config: ServeConfig, engine: Engi
 
 fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) -> i32 {
     if let Err(error) = crate::local_socket::private_dir(&config.dir) {
-        eprintln!("gitpulse-ptyd: {error}");
+        eprintln!("waylode-ptyd: {error}");
         return exit_code::FAILED;
     }
     let _lock = match crate::daemon_lock::acquire_named(
@@ -746,7 +746,7 @@ fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) 
         crate::daemon_lock::Acquire::Held(lock) => lock,
         crate::daemon_lock::Acquire::Occupied(owner) => {
             eprintln!(
-                "gitpulse-ptyd: another terminal host (pid {:?}, build {:?}) already serves protocol {PROTOCOL} in {}",
+                "waylode-ptyd: another terminal host (pid {:?}, build {:?}) already serves protocol {PROTOCOL} in {}",
                 owner.pid,
                 owner.version,
                 config.dir.display()
@@ -754,14 +754,14 @@ fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) 
             return exit_code::OCCUPIED;
         }
         crate::daemon_lock::Acquire::Unavailable(error) => {
-            eprintln!("gitpulse-ptyd: {error}");
+            eprintln!("waylode-ptyd: {error}");
             return exit_code::FAILED;
         }
     };
     let receipts = match Receipts::open(config.dir.join(super::RECEIPTS_DIR)) {
         Ok(receipts) => Arc::new(receipts),
         Err(error) => {
-            eprintln!("gitpulse-ptyd: {error}");
+            eprintln!("waylode-ptyd: {error}");
             return exit_code::FAILED;
         }
     };
@@ -770,7 +770,7 @@ fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) 
     if let Err(error) = &transcripts {
         // Terminals still run; reads say why there is nothing to read.
         log::error!(target: "terminal_host", "session output will not be saved: {error}");
-        eprintln!("gitpulse-ptyd: session output will not be saved: {error}");
+        eprintln!("waylode-ptyd: session output will not be saved: {error}");
     }
     let recovered = receipts.recover(&std::collections::HashSet::new());
     if recovered > 0 {
@@ -780,7 +780,7 @@ fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) 
     let listener = match crate::local_socket::bind_private(&socket, "terminal host socket") {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("gitpulse-ptyd: {error}");
+            eprintln!("waylode-ptyd: {error}");
             return exit_code::FAILED;
         }
     };

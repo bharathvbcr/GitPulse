@@ -55,14 +55,14 @@ describe("ToastContainer", () => {
     expect(pile).toContain("Only notice");
   });
 
-  it("renders the current GitPulse badge Logo inside aria-hidden without trapping interactive buttons", () => {
+  it("renders the current Waylode badge Logo inside aria-hidden without trapping interactive buttons", () => {
     toastStore.info("Build finished", { label: "Inspect", onClick: () => {} });
     const { body } = render(ToastContainer);
     const pile = body.slice(body.indexOf('data-testid="toast-pile"'));
-    expect(pile).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
-    expect(pile).toMatch(/<circle[^>]*cx="24\.04"[^>]*cy="9\.25"[^>]*r="2\.9"/);
-    expect(pile).toMatch(/id="gp-[a-z0-9]+-badge"/);
-    expect(pile).toMatch(/<div[^>]*aria-hidden="true"[^>]*>[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
+    expect(pile).toContain("M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8");
+    expect(pile).toMatch(/<circle[^>]*cx="23\.8"[^>]*cy="9(?:\.0)?"[^>]*r="2\.8"/);
+    expect(pile).toMatch(/id="wl-[a-z0-9]+-badge"/);
+    expect(pile).toMatch(/<div[^>]*aria-hidden="true"[^>]*>[\s\S]*?<svg[^>]*aria-label="Waylode"/);
   });
 });
 

@@ -377,7 +377,7 @@ pub fn uninstall_tool(tool: ExternalTool) -> Result<String, String> {
     Ok(match removed {
         Some(path) => format!("removed {path}"),
         None => format!(
-            "cleared the saved {} path; the binary was not in the GitPulse bin directory so it was left on disk",
+            "cleared the saved {} path; the binary was not in the Waylode bin directory so it was left on disk",
             tool.as_str()
         ),
     })
@@ -466,7 +466,7 @@ pub fn resolve_source_root(tool: ExternalTool) -> Result<PathBuf, String> {
         }
     }
     Err(format!(
-        "no {} checkout found beside GitPulse (set {} or run setup)",
+        "no {} checkout found beside Waylode (set {} or run setup)",
         tool.sibling_names()[0],
         tool.env_root()
     ))
@@ -879,10 +879,7 @@ pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
             path: None,
             lookup: ToolLookup::Missing,
             version: None,
-            reason: Some(format!(
-                "{} is disabled in GitPulse settings",
-                tool.as_str()
-            )),
+            reason: Some(format!("{} is disabled in Waylode settings", tool.as_str())),
             source_checkout: source.map(|p| p.display().to_string()),
             install_ready,
             install_block,
@@ -1887,7 +1884,7 @@ fn parse_doctor_json(v: &serde_json::Value) -> DoctorSchemas {
     }
 }
 
-/// `Some("too old for this GitPulse: writes schema N, needs ≥ M")` when a
+/// `Some("too old for this Waylode: writes schema N, needs ≥ M")` when a
 /// devmap reports a store schema below what this build's reader accepts
 /// (`MIN_READER_SCHEMA_VERSION`). An unreported schema is not "too old": that
 /// is "unverified", which [`verify_devmap`] reports as not ok on its own.
@@ -1895,7 +1892,7 @@ fn devmap_too_old(spoken: Option<i32>) -> Option<String> {
     let minimum = devmap_store::schema::MIN_READER_SCHEMA_VERSION;
     spoken
         .filter(|n| *n < minimum)
-        .map(|n| format!("too old for this GitPulse: writes schema {n}, needs ≥ {minimum}"))
+        .map(|n| format!("too old for this Waylode: writes schema {n}, needs ≥ {minimum}"))
 }
 
 fn verify_devmap() -> VerifyReport {
@@ -2745,7 +2742,7 @@ mod tests {
         let min = devmap_store::schema::MIN_READER_SCHEMA_VERSION;
         assert_eq!(
             devmap_too_old(Some(22)).as_deref(),
-            Some(format!("too old for this GitPulse: writes schema 22, needs ≥ {min}").as_str())
+            Some(format!("too old for this Waylode: writes schema 22, needs ≥ {min}").as_str())
         );
         assert!(devmap_too_old(Some(min)).is_none());
         assert!(devmap_too_old(Some(min + 1)).is_none());
@@ -2788,13 +2785,13 @@ esac"#,
         );
         let reason = outcome.reason.expect("a reason");
         assert!(
-            reason.contains("too old for this GitPulse: writes schema 22, needs ≥"),
+            reason.contains("too old for this Waylode: writes schema 22, needs ≥"),
             "{reason}"
         );
         let report = verify_devmap();
         assert!(!report.ok);
         assert!(
-            report.detail.contains("too old for this GitPulse"),
+            report.detail.contains("too old for this Waylode"),
             "{}",
             report.detail
         );

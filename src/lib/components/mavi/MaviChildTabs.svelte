@@ -41,7 +41,7 @@
 
   async function ask(card: ChildCard) {
     try {
-      await onAsk(`Read terminal tab ${card.sessionId} with gitpulse_terminal_read and tell me what it needs.`);
+      await onAsk(`Read terminal tab ${card.sessionId} with waylode_terminal_read and tell me what it needs.`);
       notes[card.sessionId] = "";
     } catch (e) {
       notes[card.sessionId] = e instanceof Error ? e.message : String(e);

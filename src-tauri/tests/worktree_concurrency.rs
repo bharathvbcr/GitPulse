@@ -1,13 +1,13 @@
 //! Concurrent worktree-tab mutations must serialize on the shared git common
 //! dir rather than colliding, and lock/unlock/prune must be live-tested.
 
-use gitpulse_lib::engine::{worktree, GitWriter};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
+use waylode_lib::engine::{worktree, GitWriter};
+use waylode_lib::procguard::LockedSpawn;
 
 fn git_in(dir: &Path, args: &[&str]) {
     let output = Command::new("git")

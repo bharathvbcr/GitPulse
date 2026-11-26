@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// What a call that lost its connection is told.
 const LOST: &str = "The connection to the terminal host was lost; the terminal kept running there.";
 /// What a connect that the app's quit overtook is told.
-const QUIT: &str = "GitPulse is quitting and has let the terminal host go.";
+const QUIT: &str = "Waylode is quitting and has let the terminal host go.";
 /// The longest an ordinary request waits for its answer.
 const CALL_DEADLINE: Duration = Duration::from_secs(10);
 /// A spawn checks the repository and its trust and forks.
@@ -1995,8 +1995,12 @@ impl Inner {
         }
         let binary = match &self.config.binary {
             Some(binary) => binary.clone(),
-            None => crate::insights::bundled_binary(super::BINARY_ENV, super::BINARY)
-                .map_err(|error| format!("The terminal host could not start: {error}"))?,
+            None => crate::insights::bundled_binary_compat(
+                super::BINARY_ENV,
+                super::LEGACY_BINARY_ENV,
+                super::BINARY,
+            )
+            .map_err(|error| format!("The terminal host could not start: {error}"))?,
         };
         crate::local_socket::private_dir(&self.config.dir)?;
         let log_path = self.config.dir.join("ptyd.log");
@@ -2172,7 +2176,7 @@ fn skew(
     listed: bool,
 ) -> String {
     let head = format!(
-        "A terminal host from another GitPulse version (protocol {protocol}, build {build}, pid {pid}) is still running {sessions} session(s). This version speaks protocol {current}"
+        "A terminal host from another Waylode version (protocol {protocol}, build {build}, pid {pid}) is still running {sessions} session(s). This version speaks protocol {current}"
     );
     if listed {
         format!(

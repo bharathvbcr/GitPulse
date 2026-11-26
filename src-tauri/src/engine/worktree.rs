@@ -1041,7 +1041,7 @@ pub fn ensure_gitpulse_lane_excluded(repo_or_worktree: &Path) -> Result<(), Comm
         crate::devmap::init::ensure_dir_excluded(&anchor, GITPULSE_LANE_DIR, LANE_EXCLUDE_MARKER);
     if !outcome.is_clean() {
         return Err(CommandError::plain(format!(
-            "GitPulse could not keep {GITPULSE_LANE_DIR}/ out of git status: {outcome:?}"
+            "Waylode could not keep {GITPULSE_LANE_DIR}/ out of git status: {outcome:?}"
         )));
     }
     Ok(())
@@ -1058,7 +1058,7 @@ pub fn ensure_gitpulse_lane_excluded(repo_or_worktree: &Path) -> Result<(), Comm
 pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), CommandError> {
     match agent_layout(target_path) {
         Some(layout) if is_gitpulse_lane(&layout.kind) => Err(format!(
-            "{target_path} is inside {GITPULSE_LANE_DIR}/, where GitPulse places the worktrees it creates for task attempts. Start the task from the task board to get one, or choose a path outside {GITPULSE_LANE_DIR}/."
+            "{target_path} is inside {GITPULSE_LANE_DIR}/, where Waylode places the worktrees it creates for task attempts. Start the task from the task board to get one, or choose a path outside {GITPULSE_LANE_DIR}/."
         ).into()),
         _ => Ok(()),
     }
@@ -4509,6 +4509,8 @@ pub fn add_worktree_configured(
                 Path::new(&created.path),
                 "post_create",
                 &[
+                    ("WAYLODE_BRANCH", branch_name),
+                    ("WAYLODE_WORKTREE_PATH", &created.path),
                     ("GITPULSE_BRANCH", branch_name),
                     ("GITPULSE_WORKTREE_PATH", &created.path),
                 ],
@@ -4666,6 +4668,8 @@ pub fn add_worktree_with_devmap(
             target,
             "post_create",
             &[
+                ("WAYLODE_BRANCH", branch_name),
+                ("WAYLODE_WORKTREE_PATH", &created.path),
                 ("GITPULSE_BRANCH", branch_name),
                 ("GITPULSE_WORKTREE_PATH", &created.path),
             ],
@@ -5517,6 +5521,8 @@ pub(crate) fn merge_and_teardown_configured(
             &worktree,
             "pre_merge",
             &[
+                ("WAYLODE_BRANCH", &branch),
+                ("WAYLODE_WORKTREE_PATH", &worktree.to_string_lossy()),
                 ("GITPULSE_BRANCH", &branch),
                 ("GITPULSE_WORKTREE_PATH", &worktree.to_string_lossy()),
             ],
@@ -5932,6 +5938,8 @@ pub(crate) fn merge_and_teardown_configured(
         &repo,
         "post_merge",
         &[
+            ("WAYLODE_BRANCH", &branch),
+            ("WAYLODE_TARGET_BRANCH", target),
             ("GITPULSE_BRANCH", &branch),
             ("GITPULSE_TARGET_BRANCH", target),
         ],
@@ -7489,7 +7497,7 @@ pub fn resolve_worktree_path(
                     Ok(meta) if meta.file_type().is_dir() => {}
                     Ok(_) => {
                         return Err(CommandError::plain(format!(
-                            "{} is not a directory (Claude Code and GitPulse refuse a worktree path through a link inside the repository)",
+                            "{} is not a directory (Claude Code and Waylode refuse a worktree path through a link inside the repository)",
                             container.display()
                         )));
                     }

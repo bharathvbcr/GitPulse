@@ -1,13 +1,13 @@
 # Terminal host (`gitpulse-ptyd`)
 
-Card: *Terminal sessions survive a GitPulse app exit or crash: move PTY
+Card: *Terminal sessions survive a Waylode app exit or crash: move PTY
 ownership into a separate PTY host process* (`ft-1c36bec1d71ba700f65fbfbb12015e71`,
 lane L6 of the 2026-10-12 terminal crash-resilience audit, wave 11 of the
 audit-2026-10-13 plan). Written against `main` at `8026dd7e`.
 
 ## The problem
 
-Every PTY master, child handle and reader thread lives in the GitPulse app
+Every PTY master, child handle and reader thread lives in the Waylode app
 process (`TerminalSessions`, `src-tauri/src/terminal/mod.rs`). When that
 process dies — OOM, SIGKILL, Cmd-Q, a panic in AppKit or tao — the masters
 close, the kernel hangs up every session leader, and every hosted agent dies
@@ -174,7 +174,7 @@ host of another protocol by accident.
 * The app also looks for sockets of *other* protocol versions in the host
   directory and sends each the frozen `hello`. A live host of another protocol
   is reported loudly — logged as a warning, and shown under Settings → Agents →
-  "Keep managed agent runs running when GitPulse quits" (`cmd_terminal_backend`'s
+  "Keep managed agent runs running when Waylode quits" (`cmd_terminal_backend`'s
   `trouble`) — with its build, pid and session count:
   * with **no sessions**, the app sends it `retire` (also frozen) and it exits;
   * with **sessions**, it is left running, untouched, and the report says how
@@ -376,7 +376,7 @@ sequence in another), and the file is reachable only by the user who owns it.
   host's user (a file with wider permissions is narrowed before anything is
   written), and named only by a well-formed session id. A read applies the same
   checks, so a link planted in place of a transcript is reported, never followed.
-* The only way to it through GitPulse is the host socket, which refuses any peer
+* The only way to it through Waylode is the host socket, which refuses any peer
   that is not the host's own user. It is never sent anywhere.
 * `redact: true` runs the tail through `ledger::redact::text` in the host, before
   the bytes leave it, and is what any surface beyond the local user (an export, a
@@ -413,9 +413,9 @@ terminal session on its own:
 ## Managed runs in a hosted Manvi
 
 Managed Codex and Claude runs are not PTY sessions: Manvi drives them, and they
-live in the memory of the `manvi serve` that GitPulse spawns, so closing that
+live in the memory of the `manvi serve` that Waylode spawns, so closing that
 child cancels every run. The `keep_terminals_running` setting (labeled *"Keep
-managed agent runs running when GitPulse quits"* in Settings → Agents,
+managed agent runs running when Waylode quits"* in Settings → Agents,
 default-on via `unwrap_or(true)`) therefore hosts that child outside the app,
 in Manvi's socket mode (`manvi serve --listen`, `docs/SERVE_HOST_PLANE.md` in
 Manvi). `KeepTerminalsSetting.svelte` toggles `keep_terminals_running` and also
@@ -428,7 +428,7 @@ to the socket exactly as to a pipe).
   on (default). With it explicitly turned off, or on an installed Manvi that
   predates `--listen`, the worker is the stdio child it has always been, and
   Settings → Agents says why on a line of its own (`cmd_terminal_backend`'s
-  `managed`): *"Managed agent runs end when GitPulse quits: the installed
+  `managed`): *"Managed agent runs end when Waylode quits: the installed
   Manvi (…) cannot serve on a socket; update Manvi."* Support is read from
   `manvi serve --help` naming `--listen` (starting nothing, once per binary
   file), and checked again from the running server's `hello` (`serve.status`
@@ -436,7 +436,7 @@ to the socket exactly as to a pipe).
   host runs and are untouched.
 * **Where.** `<config>/GitPulse/manvi-host/`: the socket (`serve.sock`), the
   server's persistent state directory, `serve.log`, and `host.json`, the record
-  GitPulse writes when it starts a server (socket, owner id, pid, the model
+  Waylode writes when it starts a server (socket, owner id, pid, the model
   selection it was started with, the profile). The server is started detached
   (`setsid`) and outside `procguard`, like `gitpulse-ptyd`, so no quit sweep
   reaches it; it exits by itself after five minutes with no client and no
@@ -480,8 +480,8 @@ to the socket exactly as to a pipe).
 * **Another controller.** A second connection to a server is answered busy until
   the first's is served out (Manvi allows five seconds), so a reconnect waits a
   bounded time. After that the server is reported as controlled by another client
-  and is **not** taken over (`serve.takeover` is never sent): GitPulse is a
-  single-instance app and a dead GitPulse's connection is closed by the kernel,
+  and is **not** taken over (`serve.takeover` is never sent): Waylode is a
+  single-instance app and a dead Waylode's connection is closed by the kernel,
   so another controller is something else, and cancelling its requests is not
   ours to do. Nothing is started beside a server that cannot be used — two
   Manvi processes on one profile would each run the background work — and
@@ -490,7 +490,7 @@ to the socket exactly as to a pipe).
   started with. A new model selection or Claude key reaches it only through a
   new server: an idle one is ended (SIGTERM to the pid it reported over the
   authenticated socket, that `host.json` names, whose start time still equals
-  the one recorded when GitPulse started it, never this process) and a fresh one
+  the one recorded when Waylode started it, never this process) and a fresh one
   started; one that holds runs is kept for them,
   `work.enhancements.generate`/`refine` answer `model_pending` meanwhile, and the
   next call after the runs end replaces it. This holds for a server adopted at
@@ -524,12 +524,12 @@ to the socket exactly as to a pipe).
   path already did (`jobs::hang_up`, `jobs::kill_stragglers`); the last
   `portable_pty` `Child::kill` on the session leader is replaced by
   `signal_process` keyed to the start time recorded at spawn.
-* `signal_guard` already counts `gitpulse-ptyd` as a GitPulse process (names
+* `signal_guard` already counts `gitpulse-ptyd` as a Waylode process (names
   starting `gitpulse`, other than `gitpulse-hook`). It now also refuses a
-  signal command that reaches a *session leader* GitPulse hosts — a process
-  whose parent is a GitPulse process and which leads its own session — not only
+  signal command that reaches a *session leader* Waylode hosts — a process
+  whose parent is a Waylode process and which leads its own session — not only
   hosted agents. Jobs running under a hosted shell are not protected: killing a
-  dev server you started in a GitPulse terminal stays your business.
+  dev server you started in a Waylode terminal stays your business.
 
 ## Platforms
 
@@ -567,7 +567,7 @@ into the rows they belong to (2, 3 and 4).
 ## Security impact statement
 
 **What this widens.** A new unix socket that can start processes, type into
-them and read their output. Before, the only way to drive a GitPulse PTY was
+them and read their output. Before, the only way to drive a Waylode PTY was
 the webview's IPC. Now any process that can `connect` to
 `ptyd-v<N>.sock` can spawn a shell or an agent CLI in a *trusted* repository,
 attach to a live session, read what it prints, and type into it.
@@ -631,9 +631,9 @@ holding managed Codex and Claude runs.
   and stop managed runs on the profile's repositories, read what they printed
   (checkpointed in the run record). Nothing it could not do by editing the
   profile database the server uses or by starting `manvi serve` itself. The
-  directory is made `0700` by GitPulse (which refuses a symlinked one) and the
-  socket is created `0600` by Manvi (GitPulse does not check the socket's mode),
-  Manvi refuses a peer of another uid, and GitPulse refuses to dial a socket that
+  directory is made `0700` by Waylode (which refuses a symlinked one) and the
+  socket is created `0600` by Manvi (Waylode does not check the socket's mode),
+  Manvi refuses a peer of another uid, and Waylode refuses to dial a socket that
   is not a socket owned by the user, answers from another uid, belongs to another
   owner than the one it recorded, or serves another profile; a platform that
   cannot report a peer's user hosts nothing.
@@ -642,7 +642,7 @@ holding managed Codex and Claude runs.
   life of the app). It is started only after Manvi's promise to withhold it from
   its children has been read, and is checked again in `hello`. A key that
   changed reaches a server only when it is replaced, which waits for its runs.
-* *Signals.* GitPulse signals the server in two cases: a replacement of an idle
+* *Signals.* Waylode signals the server in two cases: a replacement of an idle
   server whose pid it verified three ways (see above), and a server it has just
   started and cannot use, identified by the pid it started and that process's
   start time. Both go through `procguard::signal`, which refuses a pid whose
@@ -650,7 +650,7 @@ holding managed Codex and Claude runs.
   holds a run.
 * *Stopping at quit.* *Stop Them and Quit* can now dial the server from an app
   that holds no connection to it. That dial is the relaunch's: only the server
-  at GitPulse's own path, owned by the user, answering from the user's uid, of
+  at Waylode's own path, owned by the user, answering from the user's uid, of
   the recorded owner and profile, never started, never taken over. It widens
   nothing a same-user process could not already do.
 

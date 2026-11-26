@@ -5,11 +5,11 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
 const CHILD_MODE: &str = "GITPULSE_LOGGING_PROBE";
 
@@ -63,8 +63,8 @@ fn logging_child() {
             }
         }
     }
-    gitpulse_lib::logging::init();
-    gitpulse_lib::logging::install_panic_hook();
+    waylode_lib::logging::init();
+    waylode_lib::logging::install_panic_hook();
     if mode == "panic" {
         let caught = std::panic::catch_unwind(|| {
             panic!("logging-panic-probe access_token=synthetic-panic-secret-123456789")
@@ -83,7 +83,7 @@ fn logging_child() {
         });
     }
     log::info!(target: "logging-probe", "logging continued");
-    let tail = gitpulse_lib::logging::diagnostic_tail(500);
+    let tail = waylode_lib::logging::diagnostic_tail(500);
     assert!(tail.iter().any(|line| line.contains("logging continued")));
     if mode == "panic" {
         assert!(tail.iter().any(|line| line.contains("logging-panic-probe")));
@@ -94,8 +94,8 @@ fn logging_child() {
             100
         );
     }
-    let persisted = gitpulse_lib::logging::persisted_log(500);
-    let dir = std::env::var_os(gitpulse_lib::logging::LOG_DIR_ENV).unwrap();
+    let persisted = waylode_lib::logging::persisted_log(500);
+    let dir = std::env::var_os(waylode_lib::logging::LOG_DIR_ENV).unwrap();
     fs::write(
         std::path::PathBuf::from(dir).join(
             std::env::var("GITPULSE_PROBE_STATUS_FILE")
@@ -147,7 +147,7 @@ fn run_probe(mode: &str, stderr_kind: StderrKind) {
     let mut child = command
         .args(["--exact", "logging_child", "--nocapture"])
         .env(CHILD_MODE, mode)
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::piped())
         .stdout(File::create(&output_path).expect("probe output"))
         .stderr(stderr)
@@ -217,8 +217,8 @@ fn mcp_keeps_serving_after_stderr_disconnects_and_exits_cleanly() {
 
     let dir = tempfile::tempdir().expect("probe directory");
     let output = dir.path().join("wire.jsonl");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"))
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+    let mut child = Command::new(env!("CARGO_BIN_EXE_waylode-mcp"))
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::piped())
         .stdout(File::create(&output).expect("wire output"))
         .stderr(Stdio::piped())
@@ -256,7 +256,7 @@ fn mcp_keeps_serving_after_stderr_disconnects_and_exits_cleanly() {
                 .is_some_and(|tools| !tools.is_empty())),
         "{messages:?}"
     );
-    let saved = fs::read_to_string(dir.path().join("gitpulse-mcp.log")).expect("MCP log");
+    let saved = fs::read_to_string(dir.path().join("waylode-mcp.log")).expect("MCP log");
     assert!(saved.contains("stdin closed; exiting"));
     assert!(!saved.contains("[panic]"));
 }
@@ -277,7 +277,7 @@ fn simultaneous_processes_preserve_complete_shared_log_records() {
                 .args(["--exact", "logging_child", "--nocapture"])
                 .env(CHILD_MODE, "log")
                 .env("GITPULSE_PROBE_STATUS_FILE", format!("status-{index}.json"))
-                .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+                .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -364,7 +364,7 @@ fn panic_diagnostics_never_bypass_redaction_on_stderr() {
         .args(["--exact", "logging_child", "--nocapture"])
         .env(CHILD_MODE, "panic")
         .env("RUST_TEST_NOCAPTURE", "1")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -420,7 +420,7 @@ fn unsafe_log_path_probe(kind: &str) {
     let mut child = Command::new(&exe)
         .args(["--exact", "logging_child", "--nocapture"])
         .env(CHILD_MODE, "log")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, &logs)
+        .env(waylode_lib::logging::LOG_DIR_ENV, &logs)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

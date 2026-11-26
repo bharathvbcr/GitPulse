@@ -7,12 +7,12 @@
 //! point is being lightweight, and the viewer renders at most 300k rows of it
 //! anyway. These tests build that repository for real and pin the bound.
 
-use gitpulse_lib::engine::budget;
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::engine::budget;
+use waylode_lib::engine::GitReader;
+use waylode_lib::procguard::LockedSpawn;
 
 fn git(dir: &Path, args: &[&str]) {
     common::unmetered_spawns();

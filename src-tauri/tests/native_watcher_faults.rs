@@ -6,13 +6,13 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::watcher::RepoFileWatcher;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs::{self, File};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::watcher::RepoFileWatcher;
 
 /// Printed by the child immediately before its first registration.
 const READY: &str = "GITPULSE_WATCH_PROBE_READY";

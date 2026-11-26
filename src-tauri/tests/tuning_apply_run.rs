@@ -10,13 +10,13 @@
 
 mod common;
 use common::run_git;
-use gitpulse_lib::engine::tuning_apply::{tuning_apply, tuning_apply_cancel, tuning_plan};
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::storage::repo_tuning::{TuningChange, TuningStepStatus};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
+use waylode_lib::engine::tuning_apply::{tuning_apply, tuning_apply_cancel, tuning_plan};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::storage::repo_tuning::{TuningChange, TuningStepStatus};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 

@@ -16,9 +16,15 @@
   } from "../ui/appearance/apply";
   import type { Density } from "../ui/appearance/density";
   import { isFamilyInstalled, normalizeFamily } from "../ui/appearance/fonts";
+  import {
+    BRAND_LOGO_PALETTES,
+    BRAND_LOGO_STYLES,
+    brandGradientCss,
+  } from "../ui/appearance/brandLogo";
   import { liquidGlassRequirement, shortcutTextLabel } from "../ui/platformCopy";
   import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
   import type { BranchRowLayout } from "../sidebar/metrics";
+  import Logo from "./Logo.svelte";
   import SettingToggle from "./SettingToggle.svelte";
   import SettingSegment from "./SettingSegment.svelte";
   import Slider from "./Slider.svelte";
@@ -145,8 +151,8 @@
   const refreshRestart = $derived(
     $nativeRenderingBoot !== null && $nativeRenderingBoot.highRefresh !== prefs.highRefresh
       ? prefs.highRefresh
-        ? "Saved. Takes effect the next time GitPulse starts."
-        : "Saved. The interface returns to 60 Hz the next time GitPulse starts."
+        ? "Saved. Takes effect the next time Waylode starts."
+        : "Saved. The interface returns to 60 Hz the next time Waylode starts."
       : null,
   );
   const refreshAnswer = $derived(
@@ -320,6 +326,66 @@
     </div>
   </section>
 
+  <!-- Brand -->
+  <section
+    class="gp-card p-4 flex flex-col gap-3"
+    hidden={!any(["appearance.logoStyle", "appearance.logoPalette"])}
+    data-group="brand"
+  >
+    <h3 class="gp-label">Brand mark</h3>
+    <div data-setting="appearance.logoStyle" hidden={!shown("appearance.logoStyle")} class="flex flex-col gap-2">
+      <div class="text-meta font-medium text-textPrimary">Logo mark</div>
+      <div class="grid grid-cols-1 gap-2 sm:grid-cols-3" role="group" aria-label="Logo mark">
+        {#each BRAND_LOGO_STYLES as style (style.id)}
+          {@const picked = prefs.logoStyle === style.id}
+          <button
+            type="button"
+            aria-pressed={picked}
+            data-logo-style={style.id}
+            title={style.description}
+            onclick={() => interfaceStore.setLogoStyle(style.id)}
+            class="flex items-center gap-2.5 rounded-lg border p-2 text-left transition-colors {picked
+              ? 'border-accent bg-accent/10'
+              : 'border-edge hover:bg-surfaceHover'}"
+          >
+            <Logo size={24} variant="badge" logoStyle={style.id} logoPalette={prefs.logoPalette} />
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-meta font-medium text-textPrimary">{style.label}</span>
+              <span class="block truncate text-micro text-textMuted">{style.description}</span>
+            </span>
+          </button>
+        {/each}
+      </div>
+    </div>
+
+    <div data-setting="appearance.logoPalette" hidden={!shown("appearance.logoPalette")} class="flex flex-col gap-2">
+      <div class="text-meta font-medium text-textPrimary">Logo palette</div>
+      <div class="flex flex-wrap items-center gap-2" role="group" aria-label="Logo palette">
+        {#each BRAND_LOGO_PALETTES as palette (palette.id)}
+          {@const picked = prefs.logoPalette === palette.id}
+          <button
+            type="button"
+            aria-pressed={picked}
+            aria-label="{palette.label} logo palette"
+            title="{palette.label} logo palette"
+            data-logo-palette={palette.id}
+            onclick={() => interfaceStore.setLogoPalette(palette.id)}
+            class="inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-meta transition-colors {picked
+              ? 'border-accent bg-accent/10 text-textPrimary'
+              : 'border-edge text-textMuted hover:bg-surfaceHover hover:text-textPrimary'}"
+          >
+            <span
+              aria-hidden="true"
+              class="size-3.5 shrink-0 rounded-full border border-edge"
+              style="background-image: {brandGradientCss(palette.id, theme)};"
+            ></span>
+            <span>{palette.label}</span>
+          </button>
+        {/each}
+      </div>
+    </div>
+  </section>
+
   <!-- Colors -->
   <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["accent"])} data-group="colors">
     <h3 class="gp-label">Colors</h3>
@@ -473,7 +539,7 @@
     </div>
     {#if any(["font-ui", "font-mono"])}
       <p class="text-micro text-textMuted">
-        Installed fonts only. GitPulse never downloads a font; a name that isn't installed falls back to the system
+        Installed fonts only. Waylode never downloads a font; a name that isn't installed falls back to the system
         stack. The code font applies to diffs, code views and Markdown; terminals and the commit graph still draw
         their own.
       </p>
@@ -585,7 +651,7 @@
       />
       <p class="text-micro text-textMuted">
         Auto follows the system. Reduced draws solid surfaces whatever the system says. It can only add reduction: if
-        the system already asks for less transparency, GitPulse honors that.
+        the system already asks for less transparency, Waylode honors that.
       </p>
     </div>
 
@@ -614,13 +680,13 @@
       />
       <p class="text-micro text-textMuted">
         Leaving this off follows the system setting. It can only add reduction: if the operating system already asks
-        for less motion, GitPulse honors that whatever this says.
+        for less motion, Waylode honors that whatever this says.
       </p>
     </div>
     <div data-setting="high-refresh" hidden={!shown("high-refresh")} class="flex flex-col gap-1.5">
       <SettingToggle
         label="120 Hz rendering"
-        description="Lets the interface draw more than 60 frames a second on a display that supports it. Uses a private WebKit switch that a system update can remove, and it stays off unless you turn it on. A change takes effect the next time GitPulse starts."
+        description="Lets the interface draw more than 60 frames a second on a display that supports it. Uses a private WebKit switch that a system update can remove, and it stays off unless you turn it on. A change takes effect the next time Waylode starts."
         ariaLabel="Render the interface above 60 Hz"
         checked={prefs.highRefresh}
         onchange={(next) => interfaceStore.setHighRefresh(next)}
