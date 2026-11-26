@@ -2,6 +2,41 @@ use super::*;
 use crate::sysload::{CompressorSegments, Governor, Level, Reading};
 use std::sync::{Arc, Mutex};
 
+/// The relief's action lock (`ACT`) is one per process, and `cargo test`
+/// runs tests as threads of one process: a test that holds it to stand in for
+/// a hung tick made a relief test running beside it read "busy" and do
+/// nothing (three of these failed together on a local run; nextest's process
+/// per test never shared the lock). Every test that reaches the lock holds
+/// this first: `Rig` for its whole life, a test without one at its top.
+/// Reentrant per thread, so a test with two rigs does not wait on itself.
+static ACT_SERIAL: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static HOLDS_ACT_SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds [`ACT_SERIAL`] until dropped, unless this thread already does.
+struct ActSerial(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl Drop for ActSerial {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            HOLDS_ACT_SERIAL.with(|held| held.set(false));
+        }
+    }
+}
+
+fn act_serial() -> ActSerial {
+    if HOLDS_ACT_SERIAL.with(std::cell::Cell::get) {
+        return ActSerial(None);
+    }
+    let guard = ACT_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    HOLDS_ACT_SERIAL.with(|held| held.set(true));
+    ActSerial(Some(guard))
+}
+
 const STEP: Duration = Duration::from_secs(2);
 const MIB: u64 = 1 << 20;
 
@@ -334,10 +369,13 @@ struct Rig {
     now: Instant,
     /// What the lease board says to each tick.
     refuses: bool,
+    /// Last, so it is released after `relief`, whose drop takes the lock.
+    _serial: ActSerial,
 }
 
 impl Rig {
     fn new(mode: SupervisorMode) -> Self {
+        let serial = act_serial();
         let dir = tempfile::tempdir().unwrap();
         let worktree = clean_worktree();
         let fake = Fake::default();
@@ -368,6 +406,7 @@ impl Rig {
             _worktree: worktree,
             now: Instant::now(),
             refuses: false,
+            _serial: serial,
         }
     }
 
@@ -1796,6 +1835,7 @@ fn resume_all_reports_each_pid_and_records_a_refused_one_as_failed() {
 
 #[test]
 fn resume_all_leaves_another_running_gitpulses_processes_alone_and_without_a_relief_does_nothing() {
+    let _serial = act_serial();
     let dir = tempfile::tempdir().unwrap();
     let parent = parent_id();
     let journal = Journal {
@@ -2103,6 +2143,7 @@ fn a_recycled_pid_is_refused_and_recorded_as_failed() {
 
 #[test]
 fn a_journaled_freeze_is_resumed_by_a_new_relief_and_a_recycled_entry_is_a_failure() {
+    let _serial = act_serial();
     let dir = tempfile::tempdir().unwrap();
     let entries = vec![
         JournalEntry {
@@ -2739,6 +2780,7 @@ fn shutdown_does_not_wait_for_a_hung_tick_and_continues_from_memory() {
 
 #[test]
 fn recovery_leaves_a_live_writers_journal_entirely_alone_however_old_it_is() {
+    let _serial = act_serial();
     let dir = tempfile::tempdir().unwrap();
     let parent = parent_id();
     let live_start = crate::sysload::process_start_us(parent).expect("the parent is running");
