@@ -41,6 +41,8 @@ import { adoptOutput, pushOutput, emitExit } from "./tauriMocks";
         cmd_stash_list: () => ({ entries: [], truncated: false }), cmd_list_tags: () => ({ tags: [], truncated: false }), cmd_branch_stats: () => ({}),
         cmd_terminal_spawn: (args) => { plainSpawns.push(args); const id = `plain-${++sessions}`; adoptOutput(id, args); return { id, cwd: args.repoPath, shell: "/bin/sh" }; },
         cmd_terminal_kill: () => null, cmd_terminal_detach: () => true, cmd_terminal_resize: () => null, cmd_terminal_write: () => null, cmd_terminal_ack: () => null,
+        // The terminal's backend title sync fires on a debounce timer, so whether it lands inside the run is timing.
+        cmd_terminal_set_title: () => null,
         cmd_workspace_sync: () => null, cmd_repo_operation: () => null, cmd_watch_repo: () => null, cmd_set_recent_menu: () => null,
         cmd_last_fetch_at: () => null, cmd_devmap_maybe_refresh: () => null, cmd_devcouncil_init: () => null, cmd_agent_defaults: () => null,
         cmd_session_alerts_visible: () => null, cmd_note_tab_activated: () => null,
