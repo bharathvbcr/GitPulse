@@ -19,7 +19,7 @@ function makeRow(over: Partial<AgentRow> = {}): AgentRow {
     id: "row-1",
     parentId: null,
     children: [],
-    rollup: { descendants: 0, live: 0, attention: [], unobserved: 0 },
+    rollup: { descendants: 0, live: 0, attention: [], unobserved: 0, subagents: 0 },
     attentionObserved: true,
     repoPath: "/code/alpha",
     repoLabel: "alpha",
@@ -49,6 +49,7 @@ function makeRow(over: Partial<AgentRow> = {}): AgentRow {
     liveKey: null,
     taskRunId: null,
     outsideSessions: 0,
+    activeSubagents: [],
     ...over,
   };
 }
