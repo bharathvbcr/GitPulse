@@ -528,6 +528,12 @@ pub(crate) mod sys {
             read: *mut usize,
         ) -> i32;
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
+        fn GetProcessInformation(
+            process: *mut c_void,
+            class: u32,
+            information: *mut c_void,
+            size: u32,
+        ) -> i32;
     }
 
     #[link(name = "advapi32")]
@@ -653,6 +659,32 @@ pub(crate) mod sys {
             exited: exit.ticks() != 0,
             cpu_ticks: kernel.ticks().saturating_add(user.ticks()),
         })
+    }
+
+    /// `ProcessProtectionLevelInfo`: member 7 of `PROCESS_INFORMATION_CLASS`
+    /// in declaration order (processthreadsapi.h; the enum states no values).
+    const PROCESS_PROTECTION_LEVEL_INFO: u32 = 7;
+    /// `PROTECTION_LEVEL_NONE` ("The process is not protected"). Level 0 is
+    /// `PROTECTION_LEVEL_WINTCB_LIGHT`, so "unprotected" is this value, not 0.
+    const PROTECTION_LEVEL_NONE: u32 = 0xFFFF_FFFE;
+
+    /// Whether the process is a protected one (PP or PPL: Defender, LSA and
+    /// the like), whose memory no unprotected process may read by design.
+    /// `GetProcessInformation` needs only `PROCESS_QUERY_LIMITED_INFORMATION`.
+    /// `None` when the OS would not say.
+    pub(crate) fn is_protected(handle: &Handle) -> Option<bool> {
+        let mut level = 0u32;
+        // SAFETY: the handle is live and `level` is a writable DWORD, the
+        // whole of PROCESS_PROTECTION_LEVEL_INFORMATION, of the size passed.
+        let ok = unsafe {
+            GetProcessInformation(
+                handle.0,
+                PROCESS_PROTECTION_LEVEL_INFO,
+                (&mut level as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        (ok != 0).then_some(level != PROTECTION_LEVEL_NONE)
     }
 
     /// One row of the process snapshot.
