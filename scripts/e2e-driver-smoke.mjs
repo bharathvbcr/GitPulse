@@ -582,6 +582,36 @@ function windowsAppEvents() {
 }
 
 /**
+ * A `.cmd` in `dir` that starts `driver` with every argument tauri-driver
+ * gives it plus `--verbose --log-path=<log>`. Returns the wrapper's path.
+ * @param {string} driver
+ * @param {string} dir
+ * @param {string} log
+ * @returns {string}
+ */
+export function windowsLoggingDriver(driver, dir, log) {
+  const wrapper = path.join(dir, "msedgedriver-logged.cmd");
+  writeFileSync(wrapper, `@echo off\r\n"${driver}" %* --verbose "--log-path=${log}"\r\n`);
+  return wrapper;
+}
+
+/**
+ * The last `count` lines of `file`, each cut at 400 characters; a missing or
+ * unreadable file says so.
+ * @param {string} file
+ * @param {number} count
+ * @returns {string[]}
+ */
+function tailFile(file, count) {
+  try {
+    const lines = readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+    return lines.slice(-count).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l));
+  } catch (error) {
+    return [`(${file}: ${error instanceof Error ? error.message : String(error)})`];
+  }
+}
+
+/**
  * The last 40 lines of each of up to 4 files in `dir`, headed by the file
  * name. A missing or unreadable directory says so.
  * @param {string} dir
@@ -660,7 +690,16 @@ async function runSmoke(opts) {
   const nativePort = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   const driverArgs = ["--port", String(port), "--native-port", String(nativePort)];
-  if (opts.nativeDriver) driverArgs.push("--native-driver", opts.nativeDriver);
+  // Edge WebDriver logs only with --verbose --log-path, and tauri-driver passes
+  // it no flags of its own, so on Windows it is started through a wrapper that
+  // adds them. Both sit in the artifacts folder: it is uploaded, and the
+  // shutdown check reads any process naming the work folder as a leak.
+  const edgeDriverLog = path.join(opts.artifactsDir, "msedgedriver.log");
+  const driverForTauri =
+    process.platform === "win32" && opts.nativeDriver
+      ? windowsLoggingDriver(opts.nativeDriver, opts.artifactsDir, edgeDriverLog)
+      : opts.nativeDriver;
+  if (driverForTauri) driverArgs.push("--native-driver", driverForTauri);
 
   let driverStdout = "";
   let driverStderr = "";
@@ -1082,6 +1121,9 @@ async function runSmoke(opts) {
       const events = windowsAppEvents();
       console.error(`Application event log, gitpulse (${events.length}):\n${events.join("\n") || "(none)"}`);
       console.error(`App log files:\n${logTails(path.join(profileRoot, "logs")).join("\n") || "(none)"}`);
+      if (driverForTauri !== opts.nativeDriver) {
+        console.error(`Edge WebDriver log (last 60 lines):\n${tailFile(edgeDriverLog, 60).join("\n") || "(empty)"}`);
+      }
     }
     if (error instanceof Error) console.error(`E2E smoke failed: ${error.message}`);
   } finally {
