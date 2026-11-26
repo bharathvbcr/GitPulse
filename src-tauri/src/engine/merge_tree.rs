@@ -12,7 +12,8 @@
 //! has no `merge-tree` write. This module does not build that merge.
 
 use crate::engine::git_cli::{
-    git_captured, git_supports, git_text, without_lazy_fetch, HOOK_LIST, MERGE_TREE_WRITE_TREE,
+    git_captured, git_supports, git_text, resolve_git_dir, without_lazy_fetch, HOOK_LIST,
+    MERGE_TREE_WRITE_TREE,
 };
 use crate::engine::git_writer::{is_full_oid, GitWriter};
 use crate::engine::object_quarantine::{
@@ -20,6 +21,7 @@ use crate::engine::object_quarantine::{
 };
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -128,6 +130,7 @@ pub(crate) struct CheckoutTouch {
 }
 
 /// Why the object-database integration did not move the target.
+#[derive(Debug)]
 pub(crate) enum IntegrateFailure {
     Conflict {
         message: String,
@@ -209,6 +212,23 @@ pub(crate) fn prepare(
     squash: bool,
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> Result<String, IntegrateFailure> {
+    prepare_with_message(
+        repo, branch, target, target_sha, branch_sha, squash, None, gate,
+    )
+}
+
+/// Like [`prepare`], using `commit_message` when supplied and non-blank.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_with_message(
+    repo: &Path,
+    branch: &str,
+    target: &str,
+    target_sha: &str,
+    branch_sha: &str,
+    squash: bool,
+    commit_message: Option<&str>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<String, IntegrateFailure> {
     refuse_partial_clone(repo).map_err(refused)?;
     let fast_forward = is_ancestor(repo, target_sha, branch_sha)?;
     // A squash always records a commit, and a non-fast-forward records a merge
@@ -254,10 +274,10 @@ pub(crate) fn prepare(
     if !hooks.is_empty() {
         return Err(IntegrateFailure::CommitHooks { hooks });
     }
-    let message = if squash {
-        format!("Merge branch '{branch}' (squashed)")
-    } else {
-        format!("Merge branch '{branch}' into {target}")
+    let message = match commit_message.filter(|m| !m.trim().is_empty()) {
+        Some(custom) => custom.to_string(),
+        None if squash => format!("Merge branch '{branch}' (squashed)"),
+        None => format!("Merge branch '{branch}' into {target}"),
     };
     let second = if squash { None } else { Some(branch_sha) };
     commit_tree(repo, &merged_tree, target_sha, second, &message, gate)
@@ -596,34 +616,466 @@ fn no_checkout_note(target: &str) -> String {
     )
 }
 
-/// Refuses, naming the first checkout with `target` that is not safe to move.
-fn refuse_unsafe_holders(target: &str, checkout: &CheckoutTouch) -> Result<(), IntegrateFailure> {
+struct IncomingEntry {
+    old_mode: String,
+    new_mode: String,
+    path: String,
+}
+
+fn held(reason: HeldReason, target: &str, shown: &str, why: &str) -> IntegrateFailure {
+    IntegrateFailure::Held {
+        reason,
+        message: format!(
+            "{target} is checked out in {shown}, which {why}. Moving {target} would change \
+             that checkout underneath whoever is using it, so nothing was merged and nothing \
+             was moved."
+        ),
+        path: Some(shown.to_string()),
+    }
+}
+
+fn incoming_changes(
+    repo: &Path,
+    old_tree: &str,
+    new_tree: &str,
+) -> Result<(Vec<IncomingEntry>, bool), IntegrateFailure> {
+    let run = git_captured(
+        repo,
+        &[
+            "diff-tree",
+            "-r",
+            "--no-renames",
+            "--raw",
+            "-z",
+            old_tree,
+            new_tree,
+        ],
+    )
+    .map_err(refused)?
+    .require_complete("git diff-tree")
+    .map_err(refused)?;
+    if run.status_code != 0 {
+        return Err(refused_text(format!(
+            "Could not inspect incoming tree diff ({} -> {}, git exit {}): {}. Nothing was merged.",
+            old_tree,
+            new_tree,
+            run.status_code,
+            String::from_utf8_lossy(&run.stderr).trim()
+        )));
+    }
+    parse_diff_tree_raw_z(&run.stdout)
+}
+
+fn parse_diff_tree_raw_z(bytes: &[u8]) -> Result<(Vec<IncomingEntry>, bool), IntegrateFailure> {
+    if bytes.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let mut entries = Vec::new();
+    let mut touches_gitlink = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some(meta_rel_end) = bytes[i..].iter().position(|&b| b == 0) else {
+            return Err(refused_text(
+                "git diff-tree returned a truncated raw entry; refusing to advance checkouts.",
+            ));
+        };
+        let meta = std::str::from_utf8(&bytes[i..i + meta_rel_end]).map_err(|_| {
+            refused_text("git diff-tree returned non-UTF-8 metadata; refusing to advance.")
+        })?;
+        i += meta_rel_end + 1;
+
+        let Some(rest) = meta.strip_prefix(':') else {
+            return Err(refused_text(format!(
+                "Unexpected git diff-tree raw header '{meta}'; refusing to advance."
+            )));
+        };
+        let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+        if parts.len() != 5 {
+            return Err(refused_text(format!(
+                "Unexpected git diff-tree raw fields in '{meta}'; refusing to advance."
+            )));
+        }
+        let (old_mode, new_mode, status) = (parts[0], parts[1], parts[4]);
+        if !matches!(status, "A" | "M" | "D" | "T") {
+            return Err(refused_text(format!(
+                "Unexpected git diff-tree status '{status}'; refusing to advance."
+            )));
+        }
+
+        let Some(path_rel_end) = bytes[i..].iter().position(|&b| b == 0) else {
+            return Err(refused_text(
+                "git diff-tree returned a truncated path entry; refusing to advance.",
+            ));
+        };
+        let path = std::str::from_utf8(&bytes[i..i + path_rel_end]).map_err(|_| {
+            refused_text(
+                "Incoming change has a non-UTF-8 path; refusing to advance dirty checkouts.",
+            )
+        })?;
+        i += path_rel_end + 1;
+
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.ends_with('/')
+            || path
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(refused_text(format!(
+                "Incoming change path '{path}' is unsafe; refusing to advance."
+            )));
+        }
+        if old_mode == "160000" || new_mode == "160000" {
+            touches_gitlink = true;
+        }
+        entries.push(IncomingEntry {
+            old_mode: old_mode.to_string(),
+            new_mode: new_mode.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok((entries, touches_gitlink))
+}
+
+fn holder_ignores_case(holder: &Path) -> Result<bool, IntegrateFailure> {
+    let platform_ci = cfg!(any(target_os = "macos", target_os = "windows"));
+    let shown = holder.display().to_string();
+    let run =
+        git_captured(holder, &["config", "--bool", "--get", "core.ignorecase"]).map_err(|e| {
+            held(
+                HeldReason::CheckoutUnreadable,
+                "target",
+                &shown,
+                &format!("could not read core.ignorecase ({})", e.message()),
+            )
+        })?;
+    match run.status_code {
+        0 => Ok(platform_ci
+            || String::from_utf8_lossy(&run.stdout)
+                .trim()
+                .eq_ignore_ascii_case("true")),
+        1 => Ok(platform_ci),
+        code => Err(held(
+            HeldReason::CheckoutUnreadable,
+            "target",
+            &shown,
+            &format!(
+                "could not read core.ignorecase (git exit {code}: {})",
+                String::from_utf8_lossy(&run.stderr).trim()
+            ),
+        )),
+    }
+}
+
+fn normalize_rel_path(raw: &str, ignore_case: bool) -> Option<String> {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    if ignore_case {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || (a.len() > b.len() && a.as_bytes()[b.len()] == b'/' && a.starts_with(b))
+        || (b.len() > a.len() && b.as_bytes()[a.len()] == b'/' && b.starts_with(a))
+}
+
+fn mode_file_type(mode: &str) -> &str {
+    mode.get(..3).unwrap_or(mode)
+}
+
+fn has_symlink_ancestor(root: &Path, rel_path: &str) -> Result<bool, std::io::Error> {
+    let mut parts = rel_path.split('/').peekable();
+    let mut cur = root.to_path_buf();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(false)
+}
+
+/// Validates every checkout holding `target` against the 5 disjoint-dirty guards.
+/// Clean holders and strictly disjoint dirty holders pass; anything unsafe or
+/// unreadable fails closed before `refs/heads/<target>` moves.
+fn refuse_unsafe_holders(
+    repo: &Path,
+    target: &str,
+    old_tree: &str,
+    new_tree: &str,
+    checkout: &CheckoutTouch,
+) -> Result<(), IntegrateFailure> {
+    if checkout.holders.is_empty() {
+        return Ok(());
+    }
     for holder in &checkout.holders {
         let shown = holder.path.display().to_string();
-        let (reason, why) = match &holder.problem {
-            None => continue,
-            Some(HolderProblem::Dirty) => (
-                HeldReason::CheckoutDirty,
-                "has uncommitted files".to_string(),
-            ),
-            Some(HolderProblem::IndexLocked) => (
-                HeldReason::CheckoutLocked,
-                "has its index.lock held".to_string(),
-            ),
-            Some(HolderProblem::Unreadable(why)) => (
+        match &holder.problem {
+            None | Some(HolderProblem::Dirty) => {}
+            Some(HolderProblem::IndexLocked) => {
+                return Err(held(
+                    HeldReason::CheckoutLocked,
+                    target,
+                    &shown,
+                    "has its index.lock held",
+                ));
+            }
+            Some(HolderProblem::Unreadable(why)) => {
+                return Err(held(
+                    HeldReason::CheckoutUnreadable,
+                    target,
+                    &shown,
+                    &format!("could not be checked ({why})"),
+                ));
+            }
+        }
+    }
+
+    let (incoming, touches_gitlink) = incoming_changes(repo, old_tree, new_tree)?;
+
+    for holder in &checkout.holders {
+        let shown = holder.path.display().to_string();
+
+        // Guard 2: index.lock, parked operation, and unmerged entries on EVERY holder.
+        let git_dir = resolve_git_dir(&holder.path).map_err(|e| {
+            held(
                 HeldReason::CheckoutUnreadable,
-                format!("could not be checked ({why})"),
-            ),
+                target,
+                &shown,
+                &format!("could not be checked ({})", e.message()),
+            )
+        })?;
+        match std::fs::symlink_metadata(git_dir.join("index.lock")) {
+            Ok(_) => {
+                return Err(held(
+                    HeldReason::CheckoutLocked,
+                    target,
+                    &shown,
+                    "has its index.lock held",
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(held(
+                    HeldReason::CheckoutUnreadable,
+                    target,
+                    &shown,
+                    &format!("could not check index.lock ({err})"),
+                ));
+            }
+        }
+        match crate::engine::repo_op::detect_kind(&holder.path) {
+            Ok(None) => {}
+            Ok(Some(kind)) => {
+                return Err(held(
+                    HeldReason::CheckoutDirty,
+                    target,
+                    &shown,
+                    &format!("has a {} in progress", kind.label()),
+                ));
+            }
+            Err(err) => {
+                return Err(held(
+                    HeldReason::CheckoutUnreadable,
+                    target,
+                    &shown,
+                    &format!("could not check for a parked operation ({})", err.message()),
+                ));
+            }
+        }
+        match crate::engine::repo_op::conflicted_paths(&holder.path) {
+            Ok((_, 0)) => {}
+            Ok((_, total)) => {
+                return Err(held(
+                    HeldReason::CheckoutDirty,
+                    target,
+                    &shown,
+                    &format!("has {total} unmerged file(s)"),
+                ));
+            }
+            Err(err) => {
+                return Err(held(
+                    HeldReason::CheckoutUnreadable,
+                    target,
+                    &shown,
+                    &format!("could not check unmerged files ({})", err.message()),
+                ));
+            }
+        }
+
+        // Guard 3: untruncated dirty path scan on each holder.
+        let holder_str = holder.path.to_str().ok_or_else(|| {
+            held(
+                HeldReason::CheckoutUnreadable,
+                target,
+                &shown,
+                "could not be checked (its path is not UTF-8)",
+            )
+        })?;
+        let (dirty_paths, truncated) = match crate::engine::worktree::user_changed_paths(holder_str)
+        {
+            Ok(res) => res,
+            Err(err) if err.message().contains("exceeded scan cap") => {
+                return Err(held(
+                    HeldReason::CheckoutDirty,
+                    target,
+                    &shown,
+                    "has too many uncommitted files to verify disjointness",
+                ));
+            }
+            Err(err) => {
+                return Err(held(
+                    HeldReason::CheckoutUnreadable,
+                    target,
+                    &shown,
+                    &format!("could not be checked ({})", err.message()),
+                ));
+            }
         };
-        return Err(IntegrateFailure::Held {
-            reason,
-            message: format!(
-                "{target} is checked out in {shown}, which {why}. Moving {target} would change \
-                 that checkout underneath whoever is using it, so nothing was merged and nothing \
-                 was moved."
-            ),
-            path: Some(shown),
-        });
+        if truncated {
+            return Err(held(
+                HeldReason::CheckoutDirty,
+                target,
+                &shown,
+                "has too many uncommitted files to verify disjointness (scan truncated)",
+            ));
+        }
+
+        // Guards 1 & 4: when the holder has uncommitted files, enforce submodule
+        // refusal and path/prefix-ancestry disjointness (case-folded when needed).
+        if !dirty_paths.is_empty() {
+            if touches_gitlink {
+                return Err(held(
+                    HeldReason::CheckoutDirty,
+                    target,
+                    &shown,
+                    "has uncommitted files and the merge updates a submodule (160000)",
+                ));
+            }
+            let ignore_case = holder_ignores_case(&holder.path)?;
+            if ignore_case
+                && (dirty_paths.iter().any(|p| !p.is_ascii())
+                    || incoming.iter().any(|e| !e.path.is_ascii()))
+            {
+                return Err(held(
+                    HeldReason::CheckoutDirty,
+                    target,
+                    &shown,
+                    "has uncommitted files with non-ASCII paths on a case-insensitive filesystem",
+                ));
+            }
+            let mut norm_incoming = Vec::with_capacity(incoming.len());
+            for entry in &incoming {
+                let Some(norm) = normalize_rel_path(&entry.path, ignore_case) else {
+                    return Err(held(
+                        HeldReason::CheckoutDirty,
+                        target,
+                        &shown,
+                        "has uncommitted files and an incoming path cannot be normalized",
+                    ));
+                };
+                norm_incoming.push(norm);
+            }
+            for raw_dirty in &dirty_paths {
+                let Some(norm_dirty) = normalize_rel_path(raw_dirty, ignore_case) else {
+                    return Err(held(
+                        HeldReason::CheckoutDirty,
+                        target,
+                        &shown,
+                        "has uncommitted files with an unsafe path",
+                    ));
+                };
+                if let Some(clash) = norm_incoming
+                    .iter()
+                    .find(|inc| paths_overlap(inc, &norm_dirty))
+                {
+                    return Err(held(
+                        HeldReason::CheckoutDirty,
+                        target,
+                        &shown,
+                        &format!(
+                            "has uncommitted files overlapping incoming change '{clash}' ({raw_dirty})"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Guard 5: incoming added or mode-type-changed paths must not exist on disk
+        // (catches APFS case collisions with staged files and gitignored files).
+        for entry in &incoming {
+            let is_added = entry.old_mode == "000000";
+            let is_type_change = !is_added
+                && entry.new_mode != "000000"
+                && mode_file_type(&entry.old_mode) != mode_file_type(&entry.new_mode);
+            if !is_added && !(is_type_change && !dirty_paths.is_empty()) {
+                continue;
+            }
+            match has_symlink_ancestor(&holder.path, &entry.path) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(held(
+                        HeldReason::CheckoutDirty,
+                        target,
+                        &shown,
+                        &format!(
+                            "has a symlinked parent directory for incoming path '{}'",
+                            entry.path
+                        ),
+                    ));
+                }
+                Err(err) => {
+                    return Err(held(
+                        HeldReason::CheckoutDirty,
+                        target,
+                        &shown,
+                        &format!("could not inspect parent path for '{}' ({err})", entry.path),
+                    ));
+                }
+            }
+            match std::fs::symlink_metadata(holder.path.join(&entry.path)) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(held(
+                        HeldReason::CheckoutDirty,
+                        target,
+                        &shown,
+                        &format!(
+                            "already has '{}' on disk (uncommitted, staged, or gitignored)",
+                            entry.path
+                        ),
+                    ));
+                }
+                Err(err) => {
+                    return Err(held(
+                        HeldReason::CheckoutDirty,
+                        target,
+                        &shown,
+                        &format!(
+                            "could not verify path '{}' is absent on disk ({err})",
+                            entry.path
+                        ),
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -645,18 +1097,27 @@ fn advance_checkout(
     git_text(path, &read).map(|_| ())
 }
 
-/// Whether the index of the checkout at `path` matches its HEAD.
-fn index_matches_head(path: &Path) -> bool {
-    git_captured(path, &["diff-index", "--cached", "--quiet", "HEAD"])
-        .map(|run| run.status_code == 0)
-        .unwrap_or(false)
+/// SHA-256 of the raw staged index diff against `old_tree` (`git diff-index --cached --raw -z <old_tree>`).
+/// Preserves pre-existing staged edits across disjoint-dirty advance and rollback.
+fn cached_index_digest(path: &Path, old_tree: &str) -> Result<[u8; 32], CommandError> {
+    let run = git_captured(path, &["diff-index", "--cached", "--raw", "-z", old_tree])?
+        .require_complete("git diff-index")?;
+    if run.status_code != 0 {
+        return Err(CommandError::plain(format!(
+            "git diff-index --cached --raw -z {old_tree} exited {}: {}",
+            run.status_code,
+            String::from_utf8_lossy(&run.stderr).trim()
+        )));
+    }
+    Ok(Sha256::digest(&run.stdout).into())
 }
 
 /// Puts back what a failed [`advance_checkout`] left half done: the
-/// checkouts already advanced move back, then the ref returns to
-/// `target_sha` (a compare-and-swap from `candidate`, so a ref somebody else
-/// has since moved is left alone). Returns the sentence to report, which says
-/// so when something could not be restored.
+/// checkouts already advanced move back via reverse `read-tree -m -u` (never
+/// `--reset`), then the ref returns to `target_sha` (a compare-and-swap from
+/// `candidate`, so a ref somebody else has since moved is left alone), and
+/// `failed` (plus any rolled-back holder) is verified against its
+/// `pre_cached_digest` against `old_tree`.
 #[allow(clippy::too_many_arguments)]
 fn restore_after_failed_advance(
     repo: &Path,
@@ -664,20 +1125,35 @@ fn restore_after_failed_advance(
     target_sha: &str,
     candidate: &str,
     failed: &CheckoutHolder,
-    advanced: &[&CheckoutHolder],
+    failed_pre_digest: [u8; 32],
+    advanced: &[(&CheckoutHolder, [u8; 32])],
     trees: (&str, &str),
     why: &CommandError,
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> String {
     let (old_tree, new_tree) = trees;
     let mut unresolved: Vec<String> = Vec::new();
-    for holder in advanced.iter().rev() {
-        if let Err(error) = advance_checkout(&holder.path, new_tree, old_tree, gate) {
-            unresolved.push(format!(
-                "{} could not be moved back ({})",
-                holder.path.display(),
-                error.message()
-            ));
+    for (holder, pre_digest) in advanced.iter().rev() {
+        match advance_checkout(&holder.path, new_tree, old_tree, gate) {
+            Err(error) => {
+                unresolved.push(format!(
+                    "{} could not be moved back ({})",
+                    holder.path.display(),
+                    error.message()
+                ));
+            }
+            Ok(()) => match cached_index_digest(&holder.path, old_tree) {
+                Ok(digest) if digest == *pre_digest => {}
+                Ok(_) => unresolved.push(format!(
+                    "the staged index of {} changed during rollback",
+                    holder.path.display()
+                )),
+                Err(error) => unresolved.push(format!(
+                    "the staged index of {} could not be verified ({})",
+                    holder.path.display(),
+                    error.message()
+                )),
+            },
         }
     }
     let refname = format!("refs/heads/{target}");
@@ -688,11 +1164,17 @@ fn restore_after_failed_advance(
             error.message()
         ));
     }
-    if !index_matches_head(&failed.path) {
-        unresolved.push(format!(
-            "the index of {} does not match its HEAD",
+    match cached_index_digest(&failed.path, old_tree) {
+        Ok(digest) if digest == failed_pre_digest => {}
+        Ok(_) => unresolved.push(format!(
+            "the staged index of {} no longer matches its pre-merge state",
             failed.path.display()
-        ));
+        )),
+        Err(error) => unresolved.push(format!(
+            "the staged index of {} could not be verified ({})",
+            failed.path.display(),
+            error.message()
+        )),
     }
     let shown = failed.path.display();
     if unresolved.is_empty() {
@@ -714,13 +1196,14 @@ fn restore_after_failed_advance(
 
 /// Moves the target ref, then every checkout that has it.
 ///
-/// Before anything moves, each checkout with the target must be clean and
-/// readable; one that is not refuses the integration with a typed reason
-/// naming it. Nothing is detached: a live session keeps its HEAD. The ref
-/// moves by compare-and-swap, then each checkout's index and files follow with
-/// `read-tree` (not a merge: the CAS has already refused a target that moved).
-/// If one cannot follow, the others and the ref are put back and the failure
-/// says what could not be, so HEAD, index and files never silently disagree.
+/// Before anything moves, each checkout with the target must pass the
+/// disjoint-dirty and safety guards; one that does not refuses the integration
+/// with a typed reason naming it. Nothing is detached: a live session keeps its
+/// HEAD. The ref moves by compare-and-swap, then each checkout's index and
+/// files follow with `read-tree -m -u` (not a merge: the CAS has already
+/// refused a target that moved). If one cannot follow, the others and the ref
+/// are put back and the failure says what could not be, so HEAD, index and
+/// files never silently disagree.
 pub(crate) fn land(
     repo: &Path,
     branch: &str,
@@ -731,12 +1214,24 @@ pub(crate) fn land(
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> Result<ObjectLanded, IntegrateFailure> {
     let moving = candidate != target_sha;
-    if moving {
-        refuse_unsafe_holders(target, checkout)?;
-    }
     // Read before the ref moves: nothing after the CAS may fail for want of them.
     let trees = if moving {
-        Some((tree_of(repo, target_sha)?, tree_of(repo, candidate)?))
+        let old_tree = tree_of(repo, target_sha)?;
+        let new_tree = tree_of(repo, candidate)?;
+        refuse_unsafe_holders(repo, target, &old_tree, &new_tree, checkout)?;
+        let mut pre_digests = Vec::with_capacity(checkout.holders.len());
+        for holder in &checkout.holders {
+            let digest = cached_index_digest(&holder.path, &old_tree).map_err(|e| {
+                held(
+                    HeldReason::CheckoutUnreadable,
+                    target,
+                    &holder.path.display().to_string(),
+                    &format!("could not snapshot staged index ({})", e.message()),
+                )
+            })?;
+            pre_digests.push(digest);
+        }
+        Some((old_tree, new_tree, pre_digests))
     } else {
         None
     };
@@ -756,9 +1251,9 @@ pub(crate) fn land(
         )));
     }
 
-    if let Some((old_tree, new_tree)) = &trees {
-        let mut advanced: Vec<&CheckoutHolder> = Vec::new();
-        for holder in &checkout.holders {
+    if let Some((old_tree, new_tree, pre_digests)) = &trees {
+        let mut advanced: Vec<(&CheckoutHolder, [u8; 32])> = Vec::new();
+        for (holder, &pre_digest) in checkout.holders.iter().zip(pre_digests.iter()) {
             if let Err(why) = advance_checkout(&holder.path, old_tree, new_tree, gate) {
                 return Err(refused_text(restore_after_failed_advance(
                     repo,
@@ -766,13 +1261,14 @@ pub(crate) fn land(
                     target_sha,
                     candidate,
                     holder,
+                    pre_digest,
                     &advanced,
                     (old_tree, new_tree),
                     &why,
                     gate,
                 )));
             }
-            advanced.push(holder);
+            advanced.push((holder, pre_digest));
         }
     }
     let held = !checkout.holders.is_empty();

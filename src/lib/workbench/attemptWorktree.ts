@@ -383,8 +383,7 @@ export interface VerifiedMerge { head: string; message: string; beforeOid: strin
  * looked at. It refuses, and merges nothing, when the worktree's head is not
  * `expectedHead` (the commit the verdict was reached for), when the worktree
  * has uncommitted files (teardown would lose them, and no verdict saw them),
- * when the main checkout is dirty or unreadable (a person's or another
- * session's work), or when a live attempt is working in the main checkout.
+ * when the main checkout is unreadable, or when a live attempt is working in the main checkout.
  * It never pushes: the host command it calls only merges and tears down.
  */
 export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string, taskId?: string): Promise<VerifiedMerge> {
@@ -397,7 +396,9 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (own.dirty_files !== 0) throw new Error(own.dirty_files === null ? "The worktree's uncommitted changes couldn't be counted, so it is not merged." : `The worktree has ${plural(own.dirty_files, "uncommitted file")} no verdict covered, so it is not merged.`);
   const target = main?.branch ?? null;
   if (!main || !target) throw new Error("The main worktree is not on a branch, so there is nothing to merge into.");
-  if (main.dirty_files !== 0) throw new Error(main.dirty_files === null ? `The main worktree ${root} couldn't be checked for uncommitted work, so nothing is merged into it.` : `The main worktree ${root} has ${plural(main.dirty_files, "uncommitted file")}, which are not this wave's to merge over.`);
+  if (main.dirty_files === null || !Number.isInteger(main.dirty_files) || main.dirty_files < 0) {
+    throw new Error(`The main worktree ${root} couldn't be checked for uncommitted work, so nothing is merged into it.`);
+  }
   const live = await listAllLiveRuns();
   if (!live.complete) throw new Error("Live runs couldn't all be read, so the main worktree cannot be shown free of other sessions.");
   if (liveRunIn(root, live.runs)) throw new Error(`Another run is working in the main worktree ${root}, so nothing is merged into it.`);
