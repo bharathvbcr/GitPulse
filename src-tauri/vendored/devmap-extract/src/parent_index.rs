@@ -17,7 +17,20 @@ const MAX_ACTIVE_TREES: usize = 8;
 struct Frame {
     owner: Rc<()>,
     tree: *const ffi::TSTree,
-    parents: HashMap<usize, Option<ffi::TSNode>>,
+    links: HashMap<usize, Links>,
+}
+
+/// One node's parent and previous sibling, as the cursor walk saw them.
+///
+/// `Node::prev_sibling()` is rebuilt from the parent the same way `parent()`
+/// is from the root, and its cost grows with the sibling run it steps through:
+/// walking back over 12,000 consecutive `//` lines to reach an item's
+/// attributes took 2.4 s, and 6,000 lines 0.6 s. The walk already passes every
+/// sibling in order, so it records the link for free.
+#[derive(Clone, Copy)]
+struct Links {
+    parent: Option<ffi::TSNode>,
+    prev_sibling: Option<ffi::TSNode>,
 }
 
 thread_local! {
@@ -40,23 +53,32 @@ impl<'tree> ParentIndex<'tree> {
         if FRAMES.with(|frames| frames.borrow().len() >= MAX_ACTIVE_TREES) {
             return guard;
         }
-        let mut parents = HashMap::with_capacity(root.descendant_count().min(MAX_LINKS));
+        let mut links = HashMap::with_capacity(root.descendant_count().min(MAX_LINKS));
         let mut ancestors = Vec::new();
+        // The sibling the cursor left to reach the node it is on now.
+        let mut prev_sibling = None;
         let mut cursor = root.walk();
         'walk: loop {
-            if parents.len() >= MAX_LINKS
-                || (parents.len() % 256 == 0 && Instant::now() >= deadline)
-            {
+            if links.len() >= MAX_LINKS || (links.len() % 256 == 0 && Instant::now() >= deadline) {
                 break;
             }
             let node = cursor.node();
-            parents.insert(node.id(), ancestors.last().copied());
+            links.insert(
+                node.id(),
+                Links {
+                    parent: ancestors.last().copied(),
+                    prev_sibling,
+                },
+            );
             if cursor.goto_first_child() {
                 ancestors.push(node.into_raw());
+                prev_sibling = None;
                 continue;
             }
             loop {
+                let left = cursor.node();
                 if cursor.goto_next_sibling() {
+                    prev_sibling = Some(left.into_raw());
                     break;
                 }
                 if !cursor.goto_parent() {
@@ -69,7 +91,7 @@ impl<'tree> ParentIndex<'tree> {
             frames.borrow_mut().push(Frame {
                 owner: guard.owner.clone(),
                 tree: root.into_raw().tree,
-                parents,
+                links,
             })
         });
         guard
@@ -101,6 +123,38 @@ pub(crate) fn with_index<R>(
 
 /// Outer None means uncached; inner None is the cached root's real parent.
 pub(crate) fn parent(node: Node<'_>) -> Option<Option<Node<'_>>> {
+    cached_link(node, |links| links.parent)
+}
+
+/// Outer None means uncached; inner None means the node is its parent's first
+/// child (or the root).
+pub(crate) fn prev_sibling(node: Node<'_>) -> Option<Option<Node<'_>>> {
+    cached_link(node, |links| links.prev_sibling)
+}
+
+/// `node.prev_sibling()`, answered from the index when the node is in it and
+/// by tree-sitter when it is not. The same answer either way; only the cost
+/// differs.
+pub(crate) fn prev_sibling_of(node: Node<'_>) -> Option<Node<'_>> {
+    prev_sibling(node).unwrap_or_else(|| node.prev_sibling())
+}
+
+/// `node.prev_named_sibling()`, stepping back through [`prev_sibling_of`].
+pub(crate) fn prev_named_sibling_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut sibling = prev_sibling_of(node);
+    while let Some(candidate) = sibling {
+        if candidate.is_named() {
+            return Some(candidate);
+        }
+        sibling = prev_sibling_of(candidate);
+    }
+    None
+}
+
+fn cached_link(
+    node: Node<'_>,
+    pick: impl Fn(&Links) -> Option<ffi::TSNode>,
+) -> Option<Option<Node<'_>>> {
     let tree = node.into_raw().tree;
     FRAMES.with(|frames| {
         frames
@@ -108,9 +162,9 @@ pub(crate) fn parent(node: Node<'_>) -> Option<Option<Node<'_>>> {
             .iter()
             .rev()
             .find(|frame| frame.tree == tree)
-            .and_then(|frame| frame.parents.get(&node.id()))
-            .map(|parent| {
-                parent.map(|raw| {
+            .and_then(|frame| frame.links.get(&node.id()))
+            .map(|links| {
+                pick(links).map(|raw| {
                     // SAFETY: entries come only from live cursor Nodes. A guard
                     // borrows their immutable Tree and removes them before that
                     // borrow ends. The checked tree identity matches the input
@@ -165,6 +219,75 @@ mod tests {
     }
 
     #[test]
+    fn every_cached_previous_sibling_matches_the_native_tree_including_errors() {
+        for source in [
+            "fn f(a:i32) { let b = a; g(b); }",
+            "fn ((((",
+            "",
+            "fn f() { ((())) }",
+            "// comment\nstruct S { x: usize }\n",
+            "// a\n// b\n/* c */\n#[inline]\n// d\n#[cfg(test)]\npub fn f() {}\nfn g() {}\n",
+            "impl S {\n    /// doc\n    #[must_use]\n    fn a(&self) {}\n    fn b(&self) {}\n}\n",
+            "fn f() { let x = [1, 2, /* c */ 3]; x.iter().map(|y| y + 1); }",
+            "#[derive(Debug)] struct A; #[ unclosed fn h(",
+        ] {
+            let tree = tree(source);
+            let root = tree.root_node();
+            let guard = ParentIndex::new(root, Instant::now() + Duration::from_secs(5));
+            let mut nodes = vec![root];
+            let mut checked = 0;
+            while let Some(node) = nodes.pop() {
+                let cached = prev_sibling(node).expect("small tree is fully cached");
+                assert_eq!(
+                    cached,
+                    node.prev_sibling(),
+                    "{source:?} at {:?}",
+                    node.byte_range()
+                );
+                assert_eq!(prev_sibling_of(node), node.prev_sibling());
+                assert_eq!(prev_named_sibling_of(node), node.prev_named_sibling());
+                checked += 1;
+                nodes.extend(node.children(&mut node.walk()));
+            }
+            assert_eq!(checked, root.descendant_count());
+            drop(guard);
+            assert!(prev_sibling(root).is_none());
+            // Uncached: the same answer from tree-sitter.
+            let last = root.child(root.child_count().saturating_sub(1));
+            if let Some(last) = last {
+                assert_eq!(prev_sibling_of(last), last.prev_sibling());
+            }
+        }
+    }
+
+    /// The link is recorded by the walk, so stepping back over a long run of
+    /// comments is one lookup per step. Counted as lookups that missed the
+    /// index (the slow path), not timed.
+    #[test]
+    fn a_long_comment_run_is_walked_back_from_the_index() {
+        let comments: String = (0..12_000).map(|n| format!("// line {n}\n")).collect();
+        let source = format!("{comments}#[inline]\npub fn f() {{}}\n");
+        let tree = tree(&source);
+        let root = tree.root_node();
+        let guard = ParentIndex::new(root, Instant::now() + Duration::from_secs(60));
+        let item = root.child(root.child_count() - 1).unwrap();
+        assert_eq!(item.kind(), "function_item");
+        let mut steps = 0;
+        let mut sibling = Some(item);
+        while let Some(node) = sibling {
+            assert!(
+                prev_sibling(node).is_some(),
+                "step {steps} missed the index"
+            );
+            sibling = prev_sibling_of(node);
+            steps += 1;
+        }
+        // The item, its attribute, and every comment line.
+        assert_eq!(steps, 12_002);
+        drop(guard);
+    }
+
+    #[test]
     fn tree_identity_nesting_unwind_and_out_of_order_retirement_are_isolated() {
         let first = tree("fn a() {}");
         let second = tree("fn b() { c(); }");
@@ -200,7 +323,7 @@ mod tests {
         let tree = tree(&";".repeat(MAX_LINKS + 128));
         let root = tree.root_node();
         let guard = ParentIndex::new(root, Instant::now() + Duration::from_secs(5));
-        FRAMES.with(|frames| assert_eq!(frames.borrow().last().unwrap().parents.len(), MAX_LINKS));
+        FRAMES.with(|frames| assert_eq!(frames.borrow().last().unwrap().links.len(), MAX_LINKS));
         let last = root.child(root.child_count() - 1).unwrap();
         assert!(
             parent(last).is_none(),

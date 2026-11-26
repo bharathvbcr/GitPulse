@@ -939,8 +939,8 @@ mod index;
 
 mod resolve_all;
 pub use resolve_all::{
-    ResolutionBudgetUsage, ResolveReuse, ReuseBudgetReceipt, ReusedFileResolution,
-    RESOLUTION_REUSE_EPOCH,
+    resolution_reuse_dir_name, ResolutionBudgetUsage, ResolveReuse, ReuseBudgetReceipt,
+    ReusedFileResolution, RESOLUTION_REUSE_EPOCH, RESOLUTION_REUSE_FORMAT,
 };
 
 mod candidates;

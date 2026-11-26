@@ -97,7 +97,7 @@ pub(crate) fn extract_mod(node: Node, source: &str, imports: &mut Vec<ExtractedI
 /// separate children, so `#[ path  =  "x.rs" ]` and `#[path="x.rs"]` are the
 /// same tree and only one of them survives text surgery.
 fn path_attribute(node: Node, source: &str) -> Option<String> {
-    let mut sibling = node.prev_sibling();
+    let mut sibling = crate::parent_index::prev_sibling_of(node);
     while let Some(current) = sibling {
         match current.kind() {
             "attribute_item" => {
@@ -112,7 +112,7 @@ fn path_attribute(node: Node, source: &str) -> Option<String> {
             // Anything else ends the attribute run — the previous item.
             _ => return None,
         }
-        sibling = current.prev_sibling();
+        sibling = crate::parent_index::prev_sibling_of(current);
     }
     None
 }

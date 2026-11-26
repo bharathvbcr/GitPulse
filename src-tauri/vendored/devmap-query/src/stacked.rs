@@ -108,6 +108,15 @@ pub struct FileRecord {
     pub ctime_ns: u64,
     pub ino: u64,
     pub dev: u64,
+    /// The high 64 bits of a 128-bit file id (ReFS). Zero on Unix and NTFS, and
+    /// then absent from the JSON, so a lease written before this field existed
+    /// reads as it always did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ino_hi: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// What identifies a published base: generation id, donor `HEAD`, donor root,
@@ -613,6 +622,7 @@ fn file_record(file: &File, sha256: String) -> Result<FileRecord> {
             ctime_ns: nanos(meta.ctime(), meta.ctime_nsec()),
             ino: meta.ino(),
             dev: meta.dev(),
+            ino_hi: 0,
         })
     }
     #[cfg(not(unix))]
@@ -623,13 +633,21 @@ fn file_record(file: &File, sha256: String) -> Result<FileRecord> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0);
+        // No device and inode here, and no portable change clock: a copy keeps
+        // its length and (on Windows) its modification time, so without the
+        // file id a swapped-in copy of the base was indistinguishable from it.
+        // An unreadable id is an error, not a zero that two files could share.
+        let (dev, ino, ino_hi) = devmap_extract::safe_fs::FileIdentity::of_file(file)
+            .context("cannot read the file id of an admitted file")?
+            .parts();
         Ok(FileRecord {
             sha256,
             len: meta.len(),
             mtime_ns,
             ctime_ns: mtime_ns,
-            ino: 0,
-            dev: 0,
+            ino,
+            dev,
+            ino_hi,
         })
     }
 }
@@ -642,15 +660,23 @@ fn check_identity(file: &File, record: &FileRecord, what: &str, lease_path: &Pat
     if now != *record {
         bail!(
             "the lane's {what} was replaced or modified after it was admitted \
-             (recorded len/mtime_ns/ctime_ns/ino/dev {:?}, now {:?}); {}",
+             (recorded len/mtime_ns/ctime_ns/ino/dev/ino_hi {:?}, now {:?}); {}",
             (
                 record.len,
                 record.mtime_ns,
                 record.ctime_ns,
                 record.ino,
-                record.dev
+                record.dev,
+                record.ino_hi
             ),
-            (now.len, now.mtime_ns, now.ctime_ns, now.ino, now.dev),
+            (
+                now.len,
+                now.mtime_ns,
+                now.ctime_ns,
+                now.ino,
+                now.dev,
+                now.ino_hi
+            ),
             restack_hint(lease_path)
         );
     }
@@ -692,9 +718,19 @@ fn require_sealed(file: &File, what: &str, lease_path: Option<&Path>) -> Result<
     if !meta.is_file() {
         bail!("{what} is not a regular file");
     }
-    // The mode check below is Unix-only; the hint is only for its refusal.
+    // Off Unix there is no mode, only the read-only attribute, and the seal
+    // sets it (`set_file_readonly`). Without this branch a writable base passed here and
+    // was refused one layer down by the snapshot open, whose error the lane
+    // wraps as "cannot open the lane's base snapshot": still refused, but no
+    // longer saying the base had been made writable.
     #[cfg(not(unix))]
-    let _ = lease_path;
+    if !meta.permissions().readonly() {
+        bail!(
+            "{what} is writable (the read-only attribute is clear); refusing to serve it as an \
+             immutable snapshot{}",
+            lease_path.map_or_else(String::new, |p| format!("; {}", restack_hint(p)))
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1709,8 +1745,9 @@ pub struct StackedStore {
     worktree_root: PathBuf,
     lease: StackLease,
     /// The lane's own `base.sqlite`, held open: the connection, a materialize
-    /// and any re-check all go through this descriptor, never a name.
-    base_file: File,
+    /// and any re-check all go through this descriptor, never a name. `None`
+    /// only after [`Self::release_stack_handles`], once the lane is a store.
+    base_file: Option<File>,
     csr_file: Option<File>,
     base: Store,
     /// `None` until `delta.sqlite` exists. A read path (hook, MCP, status) never
@@ -1798,7 +1835,7 @@ impl StackedStore {
         Ok(Self {
             worktree_root: wt_canon,
             lease,
-            base_file,
+            base_file: Some(base_file),
             csr_file,
             base,
             delta,
@@ -2205,7 +2242,15 @@ impl StackedStore {
         }
 
         let rebased_to_standalone = if self.needs_rebase()? {
-            Some(self.materialize_seeded_store()?)
+            // Placed, then this value's handles in `stack/` closed, and only
+            // then retired: on Windows an open handle there makes the retire
+            // fail after it has already removed the lease.
+            let placed = self.place_seeded_store(Store::WRITER_LOCK_WAIT)?;
+            let retired = self
+                .release_stack_handles()
+                .and_then(|()| retire_stack(&self.worktree_root));
+            note_unretired_stack(&placed, retired);
+            Some(placed)
         } else {
             None
         };
@@ -2299,6 +2344,41 @@ impl StackedStore {
     /// the lease, the base and any store that was there untouched; only those
     /// orphaned sidecars (which describe no store) may already be gone.
     pub fn materialize_seeded_store_waiting(&self, wait: std::time::Duration) -> Result<PathBuf> {
+        let target_db = self.place_seeded_store(wait)?;
+        note_unretired_stack(&target_db, retire_stack(&self.worktree_root));
+        Ok(target_db)
+    }
+
+    /// Close every handle this value holds inside the lane's `stack/`
+    /// directory: the base connection, the base and CSR descriptors and the
+    /// delta. Called once a materialize has placed the lane's own store, when
+    /// this value has nothing left to answer from.
+    ///
+    /// Windows deletes no file that a handle holds open without
+    /// `FILE_SHARE_DELETE`, and neither SQLite's connection nor `safe_fs`'s
+    /// sealed-child descriptors grant it. A retire attempted while they were
+    /// open removed the lease and then failed on `stack/`, leaving a full copy
+    /// of the base on disk that no lease names and nothing ever collects.
+    fn release_stack_handles(&mut self) -> Result<()> {
+        self.delta = None;
+        self.delta_writable = false;
+        self.csr_file = None;
+        self.base_file = None;
+        *self
+            .merged_edges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.base = Store::open_in_memory()
+            .context("cannot release the lane's base connection after materializing")?;
+        Ok(())
+    }
+
+    /// Everything [`Self::materialize_seeded_store_waiting`] does except
+    /// retiring the stack: returns the placed store's path.
+    fn place_seeded_store(&self, wait: std::time::Duration) -> Result<PathBuf> {
+        let base_file = self.base_file.as_ref().context(
+            "this lane's base was released by an earlier materialize; reopen the worktree",
+        )?;
         let target_db = store_path(&self.worktree_root);
         if let Some(parent) = target_db.parent() {
             fs::create_dir_all(parent)
@@ -2315,12 +2395,7 @@ impl StackedStore {
             );
         }
         let lease_path = stack_lease_path(&self.worktree_root);
-        check_identity(
-            &self.base_file,
-            &self.lease.base,
-            "base snapshot",
-            &lease_path,
-        )?;
+        check_identity(base_file, &self.lease.base, "base snapshot", &lease_path)?;
         if let (Some(file), Some(record)) = (&self.csr_file, &self.lease.csr) {
             check_identity(file, record, "CSR sidecar", &lease_path)?;
             verify_csr_content(file, record)?;
@@ -2347,7 +2422,7 @@ impl StackedStore {
             for suffix in SQLITE_SIDECARS.into_iter().chain(STORE_SIDECARS) {
                 remove_file_if_present(&sidecar(&target_db, suffix))?;
             }
-            promote_immutable_base_to_store(&self.base_file, &target_db, &self.worktree_root)?;
+            promote_immutable_base_to_store(base_file, &target_db, &self.worktree_root)?;
             if let Some(csr_file) = &self.csr_file {
                 clone_or_copy_file(csr_file, &dst_csr)?;
                 set_file_writable(&dst_csr)?;
@@ -2362,14 +2437,6 @@ impl StackedStore {
                 "materialize failed: no store was placed and the lease is intact (stale sidecars at the target path may have been removed); {}",
                 restack_hint(&lease_path)
             )));
-        }
-        if let Err(err) = retire_stack(&self.worktree_root) {
-            // The lane is consistent: a store beside a stale lease, which the
-            // next `open_if_leased_for_sync` retires.
-            eprintln!(
-                "devmap: materialized {} but could not retire the stack lease: {err:#}",
-                target_db.display()
-            );
         }
         Ok(target_db)
     }
@@ -3800,6 +3867,18 @@ fn retire_stale_lease(worktree_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// A materialize placed `target_db` but `retired` failed. The lane is still
+/// consistent, a store beside a stale lease that the next
+/// `open_if_leased_for_sync` retires, so this is reported and not returned.
+fn note_unretired_stack(target_db: &Path, retired: Result<()>) {
+    if let Err(err) = retired {
+        eprintln!(
+            "devmap: materialized {} but could not retire the stack lease: {err:#}",
+            target_db.display()
+        );
+    }
+}
+
 /// Remove a lane's lease, private base and delta. The lease goes first, so an
 /// interruption never leaves a lease naming a base that is gone.
 fn retire_stack(worktree_root: &Path) -> Result<()> {
@@ -3922,6 +4001,9 @@ mod tests {
     fn run_git_ok(cwd: &Path, args: &[&str]) {
         let out = Command::new("git")
             .current_dir(cwd)
+            // Git for Windows checks a worktree out with CRLF under its default
+            // autocrlf=true, which would make every lane look edited.
+            .args(["-c", "core.autocrlf=false"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
@@ -4496,6 +4578,21 @@ mod tests {
         let _ = remove_readonly_tree(&root);
     }
 
+    #[test]
+    fn a_file_record_without_a_high_file_id_reads_and_a_zero_one_is_not_written() {
+        let old = r#"{"sha256":"ab","len":1,"mtime_ns":2,"ctime_ns":3,"ino":4,"dev":5}"#;
+        let record: FileRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(record.ino_hi, 0);
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let wide = FileRecord {
+            ino_hi: 9,
+            ..record
+        };
+        let round: FileRecord =
+            serde_json::from_str(&serde_json::to_string(&wide).unwrap()).unwrap();
+        assert_eq!(round, wide);
+    }
+
     #[cfg(feature = "parse")]
     #[test]
     fn open_refuses_swapped_base() {
@@ -4510,6 +4607,11 @@ mod tests {
         let impostor = lease.base_dir().join("impostor.sqlite");
         fs::copy(&base_sqlite, &impostor).unwrap();
         set_file_readonly(&impostor).unwrap();
+        // Windows refuses to rename over a read-only file (os error 5); Unix
+        // ignores the target's mode. Clearing the sealed original's flag is
+        // the attacker's first step there and changes nothing being tested:
+        // the file that ends up named base.sqlite is the sealed impostor.
+        set_file_writable(&base_sqlite).unwrap();
         fs::rename(&impostor, &base_sqlite).unwrap();
         let err = StackedStore::open(&lane)
             .expect_err("a swapped base.sqlite must be refused")
