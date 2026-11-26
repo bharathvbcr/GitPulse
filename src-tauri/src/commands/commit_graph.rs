@@ -918,9 +918,12 @@ pub(super) fn stack_hierarchy(
         commit_parents.insert(c.id, c.parent_ids);
     }
 
-    let persisted_meta = crate::engine::git_reader::config_snapshot(Path::new(repo_path))
+    let mut persisted_meta = crate::engine::git_reader::config_snapshot(Path::new(repo_path))
         .map(|cfg| crate::stack::parse_stack_metadata_from_config(&cfg))
         .unwrap_or_default();
+    if let Ok(json_meta) = crate::engine::GitWriter::read_stack_metadata(Path::new(repo_path)) {
+        persisted_meta.extend(json_meta);
+    }
 
     let mut nodes = StackTreeEngine::build_stack_hierarchy_with_metadata(
         &branch_tips,

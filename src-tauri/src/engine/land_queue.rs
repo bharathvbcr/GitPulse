@@ -2692,12 +2692,14 @@ fn submit_inner(registry: RegistryRef, req: LandRequest) -> Result<LandOutcome, 
         if spawn_worker {
             let worker_registry = registry.clone();
             let worker_lane = Arc::clone(&lane);
-            std::thread::Builder::new()
-                .name(format!("land-queue-{}", key.target_branch))
-                .spawn(move || LandQueueRegistry::run_lane(worker_registry, worker_lane))
-                .map_err(|e| LandError::Failed {
-                    message: format!("failed to spawn land queue worker: {e}"),
-                })?;
+            crate::supervisor::spawn_one_of_many(
+                format!("land-queue-{}", key.target_branch),
+                "land-queue",
+                move || LandQueueRegistry::run_lane(worker_registry, worker_lane),
+            )
+            .map_err(|e| LandError::Failed {
+                message: format!("failed to spawn land queue worker: {e}"),
+            })?;
         }
         (lane, entry)
     };

@@ -167,6 +167,18 @@ site | src/engine/git_writer.rs | repo_mutation_lock_hold_child | 0 | bounded-po
 site | src/engine/git_writer.rs | repo_mutation_lock_serializes_across_processes_and_respects_asker_deadline | 0 | bounded-poll
 site | src/engine/git_writer.rs | stage_retries_while_index_lock_is_held_then_released | 0 | hold
 
+# src/engine/land_queue.rs
+site | src/engine/land_queue.rs | branch_wide_and_file_level_tickets_are_mutually_exclusive_both_ways | 0 | linger
+site | src/engine/land_queue.rs | branch_wide_and_file_level_tickets_are_mutually_exclusive_both_ways | 1 | linger
+site | src/engine/land_queue.rs | cas_rebuild_recovers_after_concurrent_move_and_does_not_complete_early_when_cur_moved | 0 | race-widen
+site | src/engine/land_queue.rs | concurrent_submit_queued_cancel_and_close_is_deadlock_free | 0 | race-widen
+site | src/engine/land_queue.rs | concurrent_submit_queued_cancel_and_close_is_deadlock_free | 1 | race-widen
+site | src/engine/land_queue.rs | five_lane_batch_with_conflicting_third_lane_lands_four_in_one_quarantine_and_one_cas | 0 | spacing
+site | src/engine/land_queue.rs | hook_rejection_falls_back_to_solo_landing_and_split_dependents_isolates_failures | 0 | race-widen
+site | src/engine/land_queue.rs | opposite_order_sqlite_fifo_tickets_are_deadlock_free | 0 | hold
+site | src/engine/land_queue.rs | opposite_order_sqlite_fifo_tickets_are_deadlock_free | 1 | hold
+site | src/engine/land_queue.rs | split_dependents_isolates_failed_member_and_retries_dependent_lane | 0 | race-widen
+
 # src/engine/git_writer_commit_graph_adv_tests.rs
 site | src/engine/git_writer_commit_graph_adv_tests.rs | wait_for_flight | 0 | bounded-poll
 

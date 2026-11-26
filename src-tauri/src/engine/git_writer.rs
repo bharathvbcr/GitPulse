@@ -12,7 +12,7 @@ use crate::ipc_error::CommandError;
 use crate::leak_scan::range::{guard_push as guard_pushed_secrets, PushRefs};
 use crate::leak_scan::staged::guard_commit as guard_staged_secrets;
 pub use crate::leak_scan::staged::Policy as SecretPolicy;
-use crate::stack::{parse_stack_config_bytes, ParsedStackConfig, StackBranchMeta};
+use crate::stack::{ParsedStackConfig, StackBranchMeta};
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,6 +49,19 @@ pub(crate) struct RepoMutationGuard<'a> {
     // another thread in this process never wakes into a self-contended flock.
     _cross_proc: Option<AdvisoryFileLock>,
     _in_proc: std::sync::MutexGuard<'a, ()>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StacksFile {
+    #[serde(default)]
+    branches: HashMap<String, StackFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StackFileEntry {
+    parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_oid: Option<String>,
 }
 
 fn open_mutation_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -2174,8 +2187,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         ])
     }
 
-    const WAYLODE_PARENT_CONFIG_KEY: &'static str = "waylodeParent";
-    const WAYLODE_BASE_OID_CONFIG_KEY: &'static str = "waylodeBaseOid";
+    const STACKS_FILE_NAME: &'static str = "stacks.json";
+    const STACKS_LOCK_NAME: &'static str = "stacks.lock";
+    const STACKS_FILE_CAP: usize = 4 * 1024 * 1024;
 
     fn rev_parse_commit_oid(repo: &Path, rev: &str) -> Result<String, CommandError> {
         let spec = format!("{rev}^{{commit}}");
@@ -2191,42 +2205,182 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Ok(oid)
     }
 
-    fn set_local_config_key(repo: &Path, key: &str, value: &str) -> Result<(), CommandError> {
-        git_text(repo, &["config", "--local", key, value]).map(|_| ())
+    fn stacks_paths(repo: &Path) -> Result<(PathBuf, PathBuf), CommandError> {
+        let common = resolve_git_common_dir(repo)?;
+        let dir = common.join("gitpulse");
+        Ok((
+            dir.join(Self::STACKS_FILE_NAME),
+            dir.join(Self::STACKS_LOCK_NAME),
+        ))
     }
 
-    fn unset_local_config_key(repo: &Path, key: &str) -> Result<(), CommandError> {
-        let run = git_captured(repo, &["config", "--local", "--unset-all", key])?
-            .require_complete("git config --unset-all")?;
-        // Exit 5 means the key was not present in local config.
-        if run.success || run.status_code == 5 {
-            Ok(())
-        } else {
-            Err(format!(
-                "Failed to unset config '{key}': {}",
-                String::from_utf8_lossy(&run.stderr).trim()
+    fn read_stacks_file(path: &Path) -> Result<StacksFile, CommandError> {
+        use std::io::Read;
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(format!(
+                        "Refusing non-regular stack metadata file {}",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StacksFile::default());
+            }
+            Err(err) => {
+                return Err(
+                    format!("Failed to stat stack metadata {}: {err}", path.display()).into(),
+                );
+            }
+        }
+        let file = std::fs::File::open(path).map_err(|e| {
+            CommandError::from(format!(
+                "Failed to open stack metadata {}: {e}",
+                path.display()
+            ))
+        })?;
+        let mut buf = Vec::new();
+        file.take((Self::STACKS_FILE_CAP as u64) + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| {
+                CommandError::from(format!(
+                    "Failed to read stack metadata {}: {e}",
+                    path.display()
+                ))
+            })?;
+        if buf.len() > Self::STACKS_FILE_CAP {
+            return Err(format!(
+                "Stack metadata {} exceeds {} byte cap",
+                path.display(),
+                Self::STACKS_FILE_CAP
             )
-            .into())
+            .into());
+        }
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(StacksFile::default());
+        }
+        serde_json::from_slice(&buf).map_err(|e| {
+            CommandError::from(format!(
+                "Failed to parse stack metadata {}: {e}",
+                path.display()
+            ))
+        })
+    }
+
+    fn write_stacks_file_atomic(path: &Path, data: &StacksFile) -> Result<(), CommandError> {
+        use std::io::Write;
+        static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let bytes = serde_json::to_vec_pretty(data)
+            .map_err(|e| CommandError::from(format!("Failed to serialize stack metadata: {e}")))?;
+        if bytes.len() > Self::STACKS_FILE_CAP {
+            return Err(
+                format!("Stack metadata exceeds {} byte cap", Self::STACKS_FILE_CAP).into(),
+            );
+        }
+        let Some(parent) = path.parent() else {
+            return Err("Stack metadata path has no parent".into());
+        };
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CommandError::from(format!(
+                "Failed to create stack metadata dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+        if let Ok(meta) = std::fs::symlink_metadata(parent) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(
+                    format!("Refusing symlinked stack metadata dir {}", parent.display()).into(),
+                );
+            }
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(
+                    format!("Refusing symlinked stack metadata file {}", path.display()).into(),
+                );
+            }
+        }
+        let seq = NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = parent.join(format!("stacks.{}.{seq}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Failed to write stack metadata {}: {err}", path.display()).into());
+        }
+        Ok(())
+    }
+
+    fn mutate_stacks_file(
+        repo: &Path,
+        mutate: impl FnOnce(&mut StacksFile) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
+        let (stacks_path, lock_path) = Self::stacks_paths(repo)?;
+        let _lock =
+            acquire_mutation_file_lock(&lock_path, std::time::Duration::from_secs(10), None)?;
+        let mut data = Self::read_stacks_file(&stacks_path)?;
+        mutate(&mut data)?;
+        if data.branches.is_empty() {
+            match std::fs::remove_file(&stacks_path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(format!(
+                    "Failed to remove empty stack metadata {}: {err}",
+                    stacks_path.display()
+                )
+                .into()),
+            }
+        } else {
+            Self::write_stacks_file_atomic(&stacks_path, &data)
         }
     }
 
     fn read_stack_metadata_with_bases_local(
         repo: &Path,
     ) -> Result<ParsedStackConfig, CommandError> {
-        let run = git_captured(repo, &["config", "--local", "--list", "-z"])?
-            .require_complete("git config --local --list")?;
-        if !run.success {
-            return Err(format!(
-                "Failed to read local git config: {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )
-            .into());
+        let (stacks_path, _) = Self::stacks_paths(repo)?;
+        let data = Self::read_stacks_file(&stacks_path)?;
+        let mut parents = HashMap::new();
+        let mut base_oids = HashMap::new();
+        for (branch, entry) in data.branches {
+            if validate_short_ref_name(&branch).is_err()
+                || validate_short_ref_name(&entry.parent).is_err()
+                || branch == entry.parent
+            {
+                continue;
+            }
+            let base_oid = entry.base_oid.filter(|oid| validate_oid(oid).is_ok());
+            if let Some(ref oid) = base_oid {
+                base_oids.insert(branch.clone(), oid.clone());
+            }
+            parents.insert(
+                branch,
+                StackBranchMeta {
+                    parent_branch: entry.parent,
+                    base_oid,
+                },
+            );
         }
-        Ok(parse_stack_config_bytes(&run.stdout))
+        Ok(ParsedStackConfig { parents, base_oids })
     }
 
-    /// Persists `(parent_branch, base_oid)` for `branch` in local git config
-    /// (`branch.<name>.waylodeParent`, `branch.<name>.waylodeBaseOid`).
+    /// Persists `(parent_branch, base_oid)` for `branch` in
+    /// `<common_git_dir>/gitpulse/stacks.json`.
     pub fn set_stack_parent(
         repo: &Path,
         branch: &str,
@@ -2241,42 +2395,37 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if let Some(oid) = base_oid {
             validate_oid(oid)?;
         }
-        Self::set_local_config_key(
-            repo,
-            &format!("branch.{branch}.{}", Self::WAYLODE_PARENT_CONFIG_KEY),
-            parent,
-        )?;
-        let base_key = format!("branch.{branch}.{}", Self::WAYLODE_BASE_OID_CONFIG_KEY);
-        if let Some(oid) = base_oid {
-            Self::set_local_config_key(repo, &base_key, oid)?;
-        } else {
-            Self::unset_local_config_key(repo, &base_key)?;
-        }
-        Ok(())
+        let branch_key = branch.to_string();
+        let entry = StackFileEntry {
+            parent: parent.to_string(),
+            base_oid: base_oid.map(str::to_string),
+        };
+        Self::mutate_stacks_file(repo, |data| {
+            data.branches.insert(branch_key, entry);
+            Ok(())
+        })
     }
 
-    /// Removes persisted stack metadata (`waylodeParent`, `waylodeBaseOid`) for `branch`.
+    /// Removes persisted stack metadata for `branch` from
+    /// `<common_git_dir>/gitpulse/stacks.json`.
     pub fn clear_stack_metadata(repo: &Path, branch: &str) -> Result<(), CommandError> {
         validate_short_ref_name(branch)?;
-        Self::unset_local_config_key(
-            repo,
-            &format!("branch.{branch}.{}", Self::WAYLODE_PARENT_CONFIG_KEY),
-        )?;
-        Self::unset_local_config_key(
-            repo,
-            &format!("branch.{branch}.{}", Self::WAYLODE_BASE_OID_CONFIG_KEY),
-        )?;
-        Ok(())
+        Self::mutate_stacks_file(repo, |data| {
+            data.branches.remove(branch);
+            Ok(())
+        })
     }
 
-    /// Reads all persisted `(parent_branch, base_oid)` edges from local git config.
+    /// Reads all persisted `(parent_branch, base_oid)` edges from
+    /// `<common_git_dir>/gitpulse/stacks.json`.
     pub fn read_stack_metadata(
         repo: &Path,
     ) -> Result<HashMap<String, StackBranchMeta>, CommandError> {
         Self::read_stack_metadata_with_bases_local(repo).map(|parsed| parsed.parents)
     }
 
-    /// Reads the persisted `branch.<name>.waylodeBaseOid` for `branch`, if set.
+    /// Reads the persisted `base_oid` for `branch` from
+    /// `<common_git_dir>/gitpulse/stacks.json`, if set.
     pub fn read_branch_base_oid(repo: &Path, branch: &str) -> Result<Option<String>, CommandError> {
         validate_short_ref_name(branch)?;
         Self::read_stack_metadata_with_bases_local(repo)
@@ -2405,9 +2554,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let all_meta = Self::read_stack_metadata(&repo)?;
         git_text(&repo, &Self::argv_refs(&argv)[1..])?;
         if old_name != new_name {
-            // `git branch -m` renames the branch's own `[branch "<old>"]`
-            // section automatically, but does not update children pointing to
-            // `<old>` as their `waylodeParent`.
+            // `git branch -m` renames the ref only; move `<old>`'s persisted
+            // stack entry in `<common_git_dir>/gitpulse/stacks.json` and
+            // reparent any children pointing to `<old>`.
             for (child, child_meta) in &all_meta {
                 if child == old_name {
                     continue;
@@ -2417,8 +2566,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 }
             }
             if let Some(old_meta) = all_meta.get(old_name) {
-                let current_meta = Self::read_stack_metadata(&repo)?;
-                if !current_meta.contains_key(new_name) && old_meta.parent_branch != new_name {
+                if old_meta.parent_branch != new_name {
                     Self::set_stack_parent(
                         &repo,
                         new_name,
@@ -11887,6 +12035,10 @@ mod bound_to_checked_state {
         git_in(p, &["checkout", "-q", "main"]);
 
         let meta = GitWriter::read_stack_metadata(p).expect("read stack metadata");
+        assert!(p.join(".git/gitpulse/stacks.json").is_file());
+        let git_cfg = std::fs::read_to_string(p.join(".git/config")).unwrap();
+        assert!(!git_cfg.contains("waylodeParent"));
+        assert!(!git_cfg.contains("waylodeBaseOid"));
         assert_eq!(meta["feat-parent"].parent_branch, "main");
         assert_eq!(
             meta["feat-parent"].base_oid.as_deref(),
@@ -11925,6 +12077,7 @@ mod bound_to_checked_state {
         assert_eq!(after_delete2["feat-grandchild"].parent_branch, "main");
         GitWriter::delete_branch(path_str, "feat-grandchild", true).expect("delete grandchild");
         assert!(GitWriter::read_stack_metadata(p).unwrap().is_empty());
+        assert!(!p.join(".git/gitpulse/stacks.json").exists());
     }
 
     #[test]
