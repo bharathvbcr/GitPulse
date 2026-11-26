@@ -672,7 +672,7 @@ impl AdvisoryLock {
         let meta = file
             .metadata()
             .map_err(|e| io("could not inspect a mailbox lock", &e))?;
-        if !meta.is_file() || !owned_privately(&meta) {
+        if !meta.is_file() || !owned_privately(&meta, Subject::File(&file)) {
             return Err(MailboxError::Insecure(format!(
                 "{} is not a private lock file of this user",
                 path.display()
@@ -983,7 +983,7 @@ impl Mailbox {
         let meta = file
             .metadata()
             .map_err(|e| io("could not inspect envelope provenance", &e))?;
-        if !meta.is_file() || !owned_privately(&meta) {
+        if !meta.is_file() || !owned_privately(&meta, Subject::File(&file)) {
             return Err(MailboxError::Insecure(format!(
                 "{} is not a private provenance file of this user",
                 path.display()
@@ -1718,7 +1718,7 @@ impl Mailbox {
         let meta = file
             .metadata()
             .map_err(|e| io("could not inspect mailbox counter", &e))?;
-        if !meta.is_file() || !owned_privately(&meta) {
+        if !meta.is_file() || !owned_privately(&meta, Subject::File(&file)) {
             return Err(MailboxError::Insecure(format!(
                 "{} is not a private counter file of this user",
                 path.display()
@@ -2336,10 +2336,11 @@ fn regular_files(dir: &Path) -> Vec<(String, SystemTime)> {
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !meta.file_type().is_file() || !owned_privately(&meta) {
+        if !meta.file_type().is_file() || !owned_privately(&meta, Subject::Path(&path)) {
             continue;
         }
         out.push((name, meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
@@ -2347,15 +2348,36 @@ fn regular_files(dir: &Path) -> Vec<(String, SystemTime)> {
     out
 }
 
+/// What a privacy check reads where ownership is not in the metadata
+/// (Windows): the open file itself, or a path that is not followed.
+#[cfg_attr(not(windows), allow(dead_code))]
+enum Subject<'a> {
+    File(&'a File),
+    Path(&'a Path),
+}
+
 #[cfg(unix)]
-fn owned_privately(meta: &std::fs::Metadata) -> bool {
+fn owned_privately(meta: &std::fs::Metadata, _subject: Subject<'_>) -> bool {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions and cannot fail.
     meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0
 }
 
-#[cfg(not(unix))]
-fn owned_privately(_meta: &std::fs::Metadata) -> bool {
+/// Owned by this user (or Administrators, for an elevated run) and open to no
+/// one else, by its owner SID and DACL. This answered "yes" for anything
+/// until [`crate::win_private`] existed.
+#[cfg(windows)]
+fn owned_privately(_meta: &std::fs::Metadata, subject: Subject<'_>) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    let security = match subject {
+        Subject::File(file) => crate::win_private::sys::of_handle(file.as_raw_handle()),
+        Subject::Path(path) => crate::win_private::sys::of_path(path),
+    };
+    security.is_some_and(|security| security.private_to_me())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn owned_privately(_meta: &std::fs::Metadata, _subject: Subject<'_>) -> bool {
     true
 }
 
@@ -2382,7 +2404,41 @@ fn private_dir(dir: &Path) -> Result<(), MailboxError> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    // A directory that is ours but open to others was made by a build that
+    // set no ACL (it inherited its parent's), or was opened up since: it is
+    // made private in place, and Windows re-derives what its files inherit.
+    // One owned by anyone else is refused, as on Unix.
+    #[cfg(windows)]
+    {
+        use crate::win_private::sys;
+        std::fs::create_dir_all(dir).map_err(|e| io("could not make a mailbox directory", &e))?;
+        let insecure = || {
+            MailboxError::Insecure(format!(
+                "{} is not a private directory of this user",
+                dir.display()
+            ))
+        };
+        let meta = std::fs::symlink_metadata(dir)
+            .map_err(|e| io("could not look at a mailbox directory", &e))?;
+        if !meta.is_dir() {
+            return Err(insecure());
+        }
+        let security = sys::of_path(dir).ok_or_else(insecure)?;
+        if !security.owned_by_me() {
+            return Err(insecure());
+        }
+        if security.private_to_me() {
+            return Ok(());
+        }
+        sys::make_private(dir).map_err(|e| {
+            MailboxError::Insecure(format!("{} could not be made private: {e}", dir.display()))
+        })?;
+        match sys::of_path(dir) {
+            Some(security) if security.private_to_me() => Ok(()),
+            _ => Err(insecure()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(dir).map_err(|e| io("could not make a mailbox directory", &e))
     }
@@ -2429,7 +2485,7 @@ fn read_message(path: &Path) -> Result<String, MailboxError> {
     let meta = file
         .metadata()
         .map_err(|e| io("could not look at a message", &e))?;
-    if !meta.is_file() || !owned_privately(&meta) {
+    if !meta.is_file() || !owned_privately(&meta, Subject::File(&file)) {
         return Err(MailboxError::Insecure(format!(
             "{} is not a private file of this user",
             path.display()

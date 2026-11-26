@@ -105,6 +105,8 @@ pub trait TrustAnchorProvider: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct PlatformTrustAnchor {
     access_group: String,
+    /// Read only by the macOS Keychain lookup; elsewhere the anchor fails closed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     service: String,
 }
 

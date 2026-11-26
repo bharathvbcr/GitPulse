@@ -1023,7 +1023,7 @@ pub(crate) fn sweep_stale(base: &Path, older_than: Duration) -> usize {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !meta.is_dir() || !owned_by_this_user(&meta) {
+        if !meta.is_dir() || !owned_by_this_user(&meta, &path) {
             continue;
         }
         let old_enough = meta
@@ -1046,13 +1046,21 @@ pub(crate) fn sweep_stale(base: &Path, older_than: Duration) -> usize {
 }
 
 #[cfg(unix)]
-fn owned_by_this_user(meta: &std::fs::Metadata) -> bool {
+fn owned_by_this_user(meta: &std::fs::Metadata, _path: &Path) -> bool {
     // SAFETY: `geteuid` reads this process's own credentials and cannot fail.
     std::os::unix::fs::MetadataExt::uid(meta) == unsafe { libc::geteuid() }
 }
 
-#[cfg(not(unix))]
-fn owned_by_this_user(_meta: &std::fs::Metadata) -> bool {
+/// By the directory's owner SID: this user's, or Administrators' for an
+/// elevated run. An owner that cannot be read is not ours, so the sweep skips
+/// it. This answered "yes" for anything until [`crate::win_private`] existed.
+#[cfg(windows)]
+fn owned_by_this_user(_meta: &std::fs::Metadata, path: &Path) -> bool {
+    crate::win_private::sys::of_path(path).is_some_and(|security| security.owned_by_me())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn owned_by_this_user(_meta: &std::fs::Metadata, _path: &Path) -> bool {
     true
 }
 

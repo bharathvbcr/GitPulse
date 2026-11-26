@@ -232,8 +232,16 @@ fn forty_two_worktrees_scan_completely_without_truncation_and_fail_closed_when_b
         insights_json["codeintel"]["available"], false,
         "the farm has no DevMap store: {insights_json}"
     );
+    // A logged warning is a diagnostic, not part of the answer: under load
+    // the spawn gate may log that its shared budget was busy (Windows CI).
+    // Everything else the CLI writes to stderr is compared exactly.
+    let insights_said: String = insights_err
+        .lines()
+        .filter(|line| !line.contains("WARN ["))
+        .map(|line| format!("{line}\n"))
+        .collect();
     assert_eq!(
-        (insights_code, insights_err.as_str()),
+        (insights_code, insights_said.as_str()),
         (
             3,
             "waylode-mcp call: the answer is incomplete (codeintel.available); read its error fields before relying on it\n"

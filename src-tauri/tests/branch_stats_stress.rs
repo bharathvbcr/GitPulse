@@ -254,22 +254,43 @@ fn unique_tips_above_budget_cap_then_drain() {
     run_git(repo.path(), &["reset", "-q", "--hard", &base_oid]);
     create_refs(repo.path(), specs);
 
+    // Two limits stop a call: 96 tips started, and a 5 s budget, which a slow
+    // host reaches first (Windows CI computed 92). Either way the first call is
+    // capped, computes at most 96, and each later call returns every earlier
+    // answer from the cache and computes at least one more, until none remain.
     let first = GitReader::branch_stats(path).expect("stats 1");
     assert!(first.capped);
-    assert_eq!(first.updates.len(), 96);
-    assert_eq!(first.computed, 96);
+    assert!(
+        (1..=96).contains(&first.computed),
+        "computed {}",
+        first.computed
+    );
     assert_eq!(first.cached, 0);
+    assert_eq!(first.updates.len(), first.computed);
 
-    let second = GitReader::branch_stats(path).expect("stats 2");
-    assert!(!second.capped);
-    assert_eq!(second.updates.len(), 110);
-    assert_eq!(second.cached, 96);
-    assert_eq!(second.computed, 14);
+    let mut done = first.computed;
+    let mut calls = 1;
+    loop {
+        calls += 1;
+        assert!(calls <= 110, "draining 110 tips took more than 110 calls");
+        let next = GitReader::branch_stats(path).expect("drain");
+        assert_eq!(
+            next.cached, done,
+            "every earlier answer comes from the cache"
+        );
+        assert!(next.computed >= 1, "each call makes progress");
+        assert_eq!(next.updates.len(), next.cached + next.computed);
+        done += next.computed;
+        if !next.capped {
+            assert_eq!(done, 110, "uncapped means nothing is left");
+            break;
+        }
+    }
 
-    let third = GitReader::branch_stats(path).expect("stats 3");
-    assert_eq!(third.computed, 0);
-    assert_eq!(third.cached, 110);
-    assert!(!third.capped);
+    let last = GitReader::branch_stats(path).expect("stats after the drain");
+    assert_eq!(last.computed, 0);
+    assert_eq!(last.cached, 110);
+    assert!(!last.capped);
 }
 
 /// Unicode and slash-heavy ref names survive both commands intact.

@@ -247,13 +247,17 @@ pub(crate) fn forbidden_fields_absent(rendered: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The broker runs over a Unix socket; only the Unix tests reach it.
+    #[cfg(unix)]
     use crate::alerts::approval_broker::{
         ApprovalBroker, ApprovalBrokerServer, MockPresenceProvider, TrustedApprovalKeyStore,
         UserPresence, SOCKET_NAME,
     };
     use serde_json::json;
+    #[cfg(unix)]
     use std::sync::Arc;
 
+    #[cfg(unix)]
     fn sample_bash_input() -> HookInput {
         HookInput::from_value(&json!({
             "hook_event_name": "PermissionRequest",

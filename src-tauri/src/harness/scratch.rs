@@ -152,7 +152,11 @@ pub(super) fn pid_alive(pid: u32) -> bool {
         }
         std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::sysload::winproc::sys::process_exists(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true

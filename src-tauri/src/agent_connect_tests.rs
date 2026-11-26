@@ -511,11 +511,12 @@ fn link_details_say_what_depends_on_path() {
         .contains("must be on your shell's PATH"));
     let outcome = apply(&e);
     let done = action(&outcome.plan, "link:waylode-hook");
-    // Links are only created where a link needs no privilege; elsewhere the
-    // action stays to do and says why, and the plan keeps naming the PATH note.
-    #[cfg(unix)]
+    // Unix links and Windows hard-links (or copies) need no privilege, so the
+    // action is done; elsewhere it stays to do and says why, and the plan
+    // keeps naming the PATH note.
+    #[cfg(any(unix, windows))]
     assert_eq!(done.state, ConnectActionState::Done);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         assert_eq!(done.state, ConnectActionState::Todo);
         let refusal = outcome
@@ -686,7 +687,9 @@ fn an_older_cargo_install_copy_is_named_beside_the_link() {
     let fx = fixture();
     let cargo_bin = fx.home.join(".cargo/bin");
     std::fs::create_dir_all(&cargo_bin).unwrap();
-    std::fs::write(cargo_bin.join("waylode-hook"), b"old").unwrap();
+    // `cargo install` names it `waylode-hook.exe` on Windows.
+    let copy = cargo_bin.join(link_dest_name("waylode-hook"));
+    std::fs::write(&copy, b"old").unwrap();
     let runner = FakeRunner::new(vec![]);
     let plan = build_plan(&env(&fx, &runner, &none));
     let hook = action(&plan, "link:waylode-hook");
@@ -696,8 +699,7 @@ fn an_older_cargo_install_copy_is_named_beside_the_link() {
         "the copy does not block the link"
     );
     assert!(
-        hook.detail
-            .contains(&cargo_bin.join("waylode-hook").display().to_string()),
+        hook.detail.contains(&copy.display().to_string()),
         "{}",
         hook.detail
     );

@@ -26,7 +26,9 @@ use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// Mirrors `HANDOFF_GRACE` in `src-tauri/src/terminal/host/server.rs`.
 pub const HANDOFF_GRACE: Duration = Duration::from_millis(250);
@@ -86,6 +88,7 @@ struct DaemonPtydState {
     desktop_active: bool,
     #[cfg(unix)]
     link: Option<UnixStream>,
+    #[cfg(unix)]
     next_id: u64,
 }
 

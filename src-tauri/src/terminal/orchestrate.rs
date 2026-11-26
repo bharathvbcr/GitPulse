@@ -197,8 +197,16 @@ fn process_exists(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Windows asks `OpenProcess`: only "no process holds the pid" or an exit
+/// time proves the owner gone. Answering "alive" here unconditionally let a
+/// dead orchestrator's children fill the external cap for good.
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    pid != 0 && crate::sysload::winproc::sys::process_exists(pid)
+}
+
 /// Without a cheap probe, an owner is never declared dead.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn process_exists(_pid: u32) -> bool {
     true
 }

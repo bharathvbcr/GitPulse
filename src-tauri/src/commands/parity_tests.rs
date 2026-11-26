@@ -448,10 +448,14 @@ fn adv_edge_inputs_keep_judged_equal_to_run() {
         }
     };
 
+    // `refs/heads/pfx` used to be accepted; the ref hardening on main
+    // (559eaf930) refuses it as a DWIM decoy, so a plain name keeps six
+    // accepted inputs behind the vacuity guard below.
     for name in [
         "-x",
         "--force",
         "refs/heads/pfx",
+        "plain-edge",
         "ünï/çode",
         "a..b",
         "a~1",

@@ -34,7 +34,9 @@
 //!    `deny_and_interrupt` — never `updatedInput` or `updatedPermissions`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+#[cfg(any(unix, test))]
+use serde_json::json;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -867,7 +869,8 @@ impl ApprovalBroker {
         self
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Only the Unix-socket tests build a broker with a ledger.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     pub(crate) fn with_human_ledger(mut self, ledger: Arc<HumanIssuanceLedger>) -> Self {
         self.human_ledger = Some(ledger);
         self

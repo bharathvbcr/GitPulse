@@ -75,6 +75,7 @@ pub mod tool_config;
 pub mod tool_install;
 pub mod updates;
 pub mod watcher;
+pub(crate) mod win_private;
 pub mod workbench;
 pub mod workspace_registry;
 

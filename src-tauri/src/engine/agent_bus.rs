@@ -6211,6 +6211,7 @@ mod tests {
         )
         .unwrap();
 
+        #[cfg(unix)]
         let peers_path = lanes_dir.join(PEERS_FILE);
         #[cfg(unix)]
         let initial_ino = {
