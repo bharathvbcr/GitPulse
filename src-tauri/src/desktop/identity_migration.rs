@@ -213,11 +213,7 @@ fn migrate_ordered_stores<'a>(
             continue;
         }
         let mut total_files = 0;
-        for ((src, dst), has_data) in source_stores
-            .iter()
-            .zip(target_stores.iter())
-            .zip(active.into_iter())
-        {
+        for ((src, dst), has_data) in source_stores.iter().zip(target_stores.iter()).zip(active) {
             if has_data {
                 total_files += copy_store_atomically(&src.path, &dst.path)?;
             }
