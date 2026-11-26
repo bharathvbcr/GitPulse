@@ -1480,13 +1480,15 @@ impl ApprovalBrokerServer {
         let wake_bg = wake.clone();
         let path_bg = path.clone();
 
-        let handle = std::thread::Builder::new()
-            .name("gitpulse-approval-broker".into())
-            .spawn(move || {
+        let handle = crate::supervisor::spawn_once(
+            "gitpulse-approval-broker",
+            "approval broker accept",
+            move || {
                 accept_loop(listener, broker, stop_bg, wake_bg);
                 let _ = std::fs::remove_file(&path_bg);
-            })
-            .map_err(|e| format!("could not spawn approval broker accept thread: {e}"))?;
+            },
+        )
+        .map_err(|e| format!("could not spawn approval broker accept thread: {e}"))?;
 
         Ok(Self {
             path,
@@ -1548,9 +1550,11 @@ fn accept_loop(
                     continue;
                 }
                 let broker_conn = broker.clone();
-                let _ = std::thread::Builder::new()
-                    .name("gitpulse-approval-conn".into())
-                    .spawn(move || handle_connection(stream, broker_conn));
+                let _ = crate::supervisor::spawn_one_of_many(
+                    "gitpulse-approval-conn",
+                    "approval broker connection",
+                    move || handle_connection(stream, broker_conn),
+                );
             }
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
             Err(e) => {
