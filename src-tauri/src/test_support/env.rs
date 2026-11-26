@@ -474,6 +474,11 @@ pub(crate) mod hermetic {
              sampler asks one bench process for, `_REPO` and `_SOAK_*` size the run",
         ),
         (
+            "GITPULSE_RELAY_DIR",
+            "the gitpulse-relay checkout a developer points `remote_relay_e2e` at; \
+             read by the test itself, not state (it skips when the directory is absent)",
+        ),
+        (
             "GITPULSE_MANVI_BIN",
             "the manvi a developer points `hook_scope_fence` and the real-Manvi \
              tests at; read by the test itself, not state",

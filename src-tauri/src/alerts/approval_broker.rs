@@ -1974,7 +1974,7 @@ mod tests {
         presence.set(UserPresence::Away);
         let t0 = Instant::now();
         let reply = broker.register_and_wait_in_process(&bash_request("s1", "ls"), || false);
-        assert!(t0.elapsed() < Duration::from_millis(50));
+        assert!(t0.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(50)));
         assert_eq!(
             reply,
             HookBrokerReply::Bypass {
@@ -1987,7 +1987,7 @@ mod tests {
         presence.set(UserPresence::Present);
         let t1 = Instant::now();
         let reply = broker.register_and_wait_in_process(&bash_request("s1", "ls"), || false);
-        assert!(t1.elapsed() < Duration::from_millis(50));
+        assert!(t1.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(50)));
         assert_eq!(
             reply,
             HookBrokerReply::Bypass {
@@ -2429,7 +2429,7 @@ mod tests {
 
         let t0 = Instant::now();
         let reply = broker.register_and_wait_in_process(&req, || false);
-        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert!(t0.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(200)));
         assert_eq!(
             reply,
             HookBrokerReply::Bypass {

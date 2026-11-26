@@ -433,7 +433,7 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         assert_eq!(run_against_socket(&input, &sock, Duration::from_secs(5)), None);
-        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert!(t0.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(200)));
         assert!(broker.pending_tickets().is_empty());
     }
 
