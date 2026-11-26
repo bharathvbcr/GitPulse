@@ -2286,10 +2286,28 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     .submit_batch_static(requests);
                 for (idx, res) in queued_indices.into_iter().zip(results) {
                     outcomes[idx] = Some(match res {
+                        Ok(landed) if landed.reverted_by.is_some() => json!({
+                            "branch": landed.branch,
+                            "ok": false,
+                            "already_landed": landed.already_landed,
+                            "reverted_by": landed.reverted_by,
+                            "source_oid": landed.source_oid,
+                            "landed_oid": landed.landed_oid,
+                            "batch_tip": landed.batch_tip,
+                            "error_code": "refused",
+                            "error": format!(
+                                "{} already landed on {} as {} (AlreadyLanded), but that landing was reverted by {}",
+                                landed.branch,
+                                landed.target_branch,
+                                landed.landed_oid,
+                                landed.reverted_by.as_deref().unwrap_or("")
+                            ),
+                        }),
                         Ok(landed) => json!({
                             "branch": landed.branch,
                             "ok": true,
                             "already_landed": landed.already_landed,
+                            "reverted_by": landed.reverted_by,
                             "source_oid": landed.source_oid,
                             "landed_oid": landed.landed_oid,
                             "batch_tip": landed.batch_tip,

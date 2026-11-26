@@ -753,6 +753,21 @@ pub(crate) fn worktree_merge_batch_guarded(
         for (idx, res) in queued_indices.into_iter().zip(queue_outcomes) {
             let lane = &lanes[idx];
             outcomes[idx] = Some(match res {
+                Ok(landed) if landed.reverted_by.is_some() => failed_batch_outcome(
+                    lane,
+                    before_oid.as_deref(),
+                    Some(landed.source_oid),
+                    "refused",
+                    format!(
+                        "{} already landed on {} as {} (AlreadyLanded), but that landing was reverted by {}; worktree and branch were kept.",
+                        landed.branch,
+                        landed.target_branch,
+                        landed.landed_oid,
+                        landed.reverted_by.as_deref().unwrap_or("")
+                    ),
+                    Vec::new(),
+                    None,
+                ),
                 Ok(landed) => {
                     let mut worktree_removed = false;
                     let mut removal_error = None;
@@ -768,7 +783,7 @@ pub(crate) fn worktree_merge_batch_guarded(
                             .filter(|s| !s.is_empty())
                         {
                             let clean = crate::engine::worktree::user_changed_paths(wt_path)
-                                .map(|(dirty, _)| dirty.is_empty())
+                                .map(|(dirty, truncated)| dirty.is_empty() && !truncated)
                                 .unwrap_or(false);
                             if !clean {
                                 removal_error = Some(
@@ -1693,6 +1708,96 @@ mod tests {
                 .unwrap()
                 .trim(),
             "from-b"
+        );
+    }
+
+    #[test]
+    fn worktree_merge_batch_guarded_refuses_reverted_lane_and_keeps_branch() {
+        let dir = tempfile::tempdir().expect("temp repo");
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main", "."]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Tester"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "base.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-m", "init"]);
+        let base_oid = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        crate::test_support::git_in(repo, &["checkout", "-q", "-b", "lane/reverted", &base_oid]);
+        std::fs::write(repo.join("feat.txt"), "reverted feature\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "feat.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-q", "-m", "add feat"]);
+        let source_oid = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        crate::test_support::git_in(repo, &["checkout", "-q", "main"]);
+        crate::test_support::trust_repo(repo);
+
+        let workbench = crate::workbench::WorkbenchState::default();
+        let lane = WorktreeMergeBatchLane {
+            worktree_path: None,
+            branch: "lane/reverted".to_string(),
+            source_oid: Some(source_oid.clone()),
+            squash: Some(true),
+            commit_message: None,
+            hot_files: None,
+            verify_in_scratch: None,
+        };
+
+        // First land succeeds without removing the branch.
+        let first = worktree_merge_batch_guarded(
+            &workbench,
+            repo.to_str().unwrap(),
+            Some("main"),
+            std::slice::from_ref(&lane),
+            false,
+            &|r, argv| crate::harness::guard_command(r, argv),
+        )
+        .expect("initial land");
+        assert!(first.outcomes[0].ok);
+        let landed_oid = first.outcomes[0]
+            .landed_oid
+            .clone()
+            .expect("landed_oid recorded");
+
+        // Revert the landed commit on main.
+        crate::test_support::git_in(repo, &["revert", "--no-edit", &landed_oid]);
+        let revert_oid = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Retrying the batch with remove_worktrees = true MUST refuse and preserve the branch.
+        let retry = worktree_merge_batch_guarded(
+            &workbench,
+            repo.to_str().unwrap(),
+            Some("main"),
+            std::slice::from_ref(&lane),
+            true,
+            &|r, argv| crate::harness::guard_command(r, argv),
+        )
+        .expect("retry returns isolated outcome");
+        assert_eq!(retry.outcomes.len(), 1);
+        let out = &retry.outcomes[0];
+        assert!(!out.ok, "reverted lane must be refused: {out:?}");
+        assert_eq!(out.error_code.as_deref(), Some("refused"));
+        assert!(!out.branch_deleted);
+        let err_msg = out.error.as_deref().unwrap_or("");
+        assert!(
+            err_msg.contains("AlreadyLanded") && err_msg.contains(&revert_oid),
+            "error must name AlreadyLanded and reverted_by SHA ({revert_oid}): {err_msg}"
+        );
+        assert!(
+            crate::engine::git_cli::git_text(
+                repo,
+                &["rev-parse", "--verify", "refs/heads/lane/reverted"]
+            )
+            .is_ok(),
+            "branch lane/reverted must still exist"
         );
     }
 }
