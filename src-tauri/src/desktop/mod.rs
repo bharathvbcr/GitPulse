@@ -1178,6 +1178,31 @@ pub fn queue_and_emit_open<R: Runtime>(app: &AppHandle<R>, path: &Path) {
     }
 }
 
+/// Set by [`keep_off_screen`]; read by every path that would put the main
+/// window or a Dock icon in front of the person.
+static KEEP_OFF_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps this process off the person's screen. [`reveal_main`] and a rebuilt
+/// main window then leave the window hidden and unfocused, and the Dock policy
+/// stays as it is, while the lifecycle bookkeeping still moves as it would.
+///
+/// For native tests that run a real AppKit loop (`tests/common/quiet_app.rs`
+/// calls it). The quit guard reaches [`reveal_main`] through every quit
+/// confirmation and the browser pane suite through an agent's browse request.
+/// Without this, each run showed a window, took focus and switched Spaces on
+/// the person's display.
+///
+/// Only a Rust call sets it, and the app never does. No IPC command, setting or
+/// environment variable reaches it: an app whose quit confirmation could be
+/// hidden would wait out the acknowledgement deadline and quit.
+pub fn keep_off_screen() {
+    KEEP_OFF_SCREEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn kept_off_screen() -> bool {
+    KEEP_OFF_SCREEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     if let Some(desktop) = app.try_state::<DesktopState>() {
         desktop.hibernation.cancel_hibernating();
@@ -1206,6 +1231,10 @@ pub fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         }
     }
     crate::sysload::sampler::set_app_hibernated(false);
+    if kept_off_screen() {
+        crate::workbench::external_changes::note_main_window_on_screen(true);
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         apply_dock_policy(app, DockMode::Regular);
@@ -1252,6 +1281,9 @@ pub fn dock_policy(show_status_icon: bool, hide_dock_pref: bool, main_visible: b
 
 #[cfg(target_os = "macos")]
 fn apply_dock_policy<R: Runtime>(app: &AppHandle<R>, mode: DockMode) {
+    if kept_off_screen() {
+        return;
+    }
     let policy = match mode {
         DockMode::Accessory => tauri::ActivationPolicy::Accessory,
         DockMode::Regular => tauri::ActivationPolicy::Regular,

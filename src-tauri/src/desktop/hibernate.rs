@@ -676,8 +676,11 @@ pub fn build_main_window_with_visibility<R: Runtime>(
 
     super::webview_perf::unlock_window_high_refresh_rate(&window);
     if show_after {
-        if let Err(err) = window.show() {
-            log::warn!(target: "desktop", "Could not show built main window: {err}");
+        // `keep_off_screen`: the window stays hidden, the lifecycle still moves.
+        if !super::kept_off_screen() {
+            if let Err(err) = window.show() {
+                log::warn!(target: "desktop", "Could not show built main window: {err}");
+            }
         }
         if !wake_from_hibernation {
             if let Some(desktop) = app.try_state::<super::DesktopState>() {

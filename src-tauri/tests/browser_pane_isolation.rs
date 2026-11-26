@@ -914,6 +914,13 @@ mod mac {
                     ),
                     Err(e) => check.that(false, format!("browse: {e}")),
                 }
+                // The request revealed the main window; under test that must
+                // stay off the screen (`quiet_app::out_of_the_way`).
+                let in_the_way = on_main(app, super::quiet_app::in_the_way);
+                check.that(
+                    !in_the_way,
+                    "browse: revealing the window for the request put nothing on screen",
+                );
             }
             Err(e) => check.that(
                 false,
@@ -954,7 +961,7 @@ mod mac {
         main_window.url = tauri::WebviewUrl::App("main".into());
         context.config_mut().app.windows.clear();
 
-        let mut app = tauri::Builder::default()
+        let mut app = super::quiet_app::background_launch(tauri::Builder::default())
             // What GitPulse's page-load handler reads (step 9).
             .manage(waylode_lib::desktop::DesktopState::default())
             .manage(waylode_lib::terminal::TerminalSessions::from_settings())
