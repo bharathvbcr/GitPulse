@@ -398,9 +398,11 @@ impl CodexAppServerClient {
                 let _ = tx.send(Err(CodexError::Closed));
             }
         };
-        if let Err(e) =
-            supervisor::spawn_once("codex-app-server-reader", "codex app-server reader", reader)
-        {
+        if let Err(e) = supervisor::spawn_one_of_many(
+            "codex-app-server-reader",
+            "codex app-server reader",
+            reader,
+        ) {
             reap(&mut child, &registration);
             return Err(CodexError::SpawnFailed(format!("reader thread: {e}")));
         }

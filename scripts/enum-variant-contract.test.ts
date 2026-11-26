@@ -97,15 +97,15 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   [
     "PtyGateDenial",
-    "the refusal reason of the remote PTY gate, returned to the relay peer over the E2EE tunnel; no IPC command carries it",
+    "the refusal reason of the remote PTY gate (remote/pty_gate.rs), meant for the relay peer; no production caller yet, no IPC command carries it and no frontend reads it",
   ],
   [
     "RelayWireMessage",
-    "internally tagged enum, not a unit enum; the relay tunnel's wire message, mirrored for the mobile app in packages/gitpulse-core/src/protocol/types.ts, not for the desktop frontend",
+    "untagged enum, not a unit enum; the relay tunnel's wire message, whose parts are mirrored for the mobile app in packages/gitpulse-core/src/protocol/types.ts, not for the desktop frontend",
   ],
   [
     "RemoteApprovalState",
-    "the approval state sent to the relay peer over the tunnel; the mobile app mirrors it in packages/gitpulse-core, the desktop frontend never reads it",
+    "the remote-approval state persisted to the remote-approval.state file that gitpulse-hook and the approval broker read (remote/tunnel.rs); no IPC command carries it and no frontend reads it",
   ],
   [
     "LandedAtSource",

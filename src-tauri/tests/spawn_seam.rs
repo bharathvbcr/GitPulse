@@ -42,8 +42,9 @@ const ALLOWED: &[(&str, &str)] = &[
         "src/remote/codex_app_server.rs",
         "`codex app-server`: one long-lived JSON-RPC child per hosted thread that \
          reads requests on stdin and answers on stdout until `shutdown`. A gate \
-         permit, a timeout or an output cap would end the session it exists to \
-         serve. The file only builds the `Command`; `procguard::spawn` starts it \
+         permit held for its life would starve every git call behind it, and a \
+         timeout or output cap would end the session it exists to serve (per-call \
+         deadlines come from `rpc_timeout`). The file only builds the `Command`; `procguard::spawn` starts it \
          (trust admission, its own process group, the quit sweep) and \
          `Registration::stop_and_reap` stops it. Not git",
     ),
