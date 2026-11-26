@@ -11,19 +11,23 @@
 //! The in-checkout merge stays in `worktree` and is used only when this git
 //! has no `merge-tree` write. This module does not build that merge.
 
+use crate::engine::cow_clone::{clone_ignored_caches, CacheSelection};
 use crate::engine::git_cli::{
-    git_captured, git_supports, git_text, resolve_git_dir, without_lazy_fetch, HOOK_LIST,
-    MERGE_TREE_WRITE_TREE,
+    git_captured, git_supports, git_text, resolve_git_common_dir, resolve_git_dir,
+    without_lazy_fetch, HOOK_LIST, MERGE_TREE_WRITE_TREE,
 };
 use crate::engine::git_writer::{is_full_oid, GitWriter};
 use crate::engine::object_quarantine::{
     parse_merge_tree_output, refuse_partial_clone, MergeOutcome, QuarantineError,
 };
 use crate::ipc_error::CommandError;
+use crate::sysload::{free_bytes, FreeSpace, Reading, LOW_DISK_FLOOR};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// How this call decides whether `merge-tree` can write a tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +173,7 @@ pub(crate) struct ObjectLanded {
     pub candidate_oid: String,
     pub checkout_note: Option<String>,
     pub checkout_advanced: bool,
+    pub green_ref_note: Option<String>,
 }
 
 /// Computes the merge of `branch_sha` into `target_sha` and, when it is clean
@@ -192,10 +197,14 @@ pub(crate) fn integrate(
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> Result<ObjectLanded, IntegrateFailure> {
     let candidate = prepare(repo, branch, target, target_sha, branch_sha, squash, gate)?;
+    let mut verified = false;
     if let Some(verify) = verify {
         verify_in_scratch(repo, &candidate, verify, gate)?;
+        verified = true;
     }
-    land(repo, branch, target, target_sha, &candidate, checkout, gate)
+    land_verified(
+        repo, branch, target, target_sha, &candidate, checkout, verified, gate,
+    )
 }
 
 /// Writes the candidate commit and does not move the target ref.
@@ -318,7 +327,11 @@ fn refused_text(message: impl Into<String>) -> IntegrateFailure {
     }
 }
 
-fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, IntegrateFailure> {
+pub(crate) fn is_ancestor(
+    repo: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, IntegrateFailure> {
     let run = git_captured(repo, &["merge-base", "--is-ancestor", ancestor, descendant])
         .map_err(refused)?;
     match run.status_code {
@@ -362,7 +375,7 @@ fn merge_trees(
     })
 }
 
-fn tree_of(repo: &Path, oid: &str) -> Result<String, IntegrateFailure> {
+pub(crate) fn tree_of(repo: &Path, oid: &str) -> Result<String, IntegrateFailure> {
     let spec = format!("{oid}^{{tree}}");
     let text = git_text(repo, &["rev-parse", "--verify", spec.as_str()]).map_err(refused)?;
     let tree = text.trim();
@@ -407,12 +420,282 @@ fn commit_tree(
 }
 
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_VERIFIED_CANDIDATE_CACHE: usize = 256;
 
-/// Checks `candidate` out, detached, somewhere that is not a worktree yet, and
-/// removes that worktree before returning. A rejected candidate does not move
-/// the target. A scratch worktree that cannot be removed after a pass also
-/// does not: the candidate must not stay registered.
+fn verified_candidates() -> &'static Mutex<VecDeque<(PathBuf, String)>> {
+    static VERIFIED: OnceLock<Mutex<VecDeque<(PathBuf, String)>>> = OnceLock::new();
+    VERIFIED.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn verified_repo_key(repo: &Path) -> PathBuf {
+    resolve_git_common_dir(repo)
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .or_else(|| repo.canonicalize().ok())
+        .unwrap_or_else(|| repo.to_path_buf())
+}
+
+fn record_verified_candidate(repo: &Path, candidate: &str) {
+    let key = (verified_repo_key(repo), candidate.to_string());
+    let mut cache = verified_candidates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !cache.contains(&key) {
+        if cache.len() >= MAX_VERIFIED_CANDIDATE_CACHE {
+            cache.pop_front();
+        }
+        cache.push_back(key);
+    }
+}
+
+fn take_verified_candidate(repo: &Path, candidate: &str) -> bool {
+    let key = (verified_repo_key(repo), candidate.to_string());
+    let mut cache = verified_candidates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(pos) = cache.iter().position(|entry| entry == &key) {
+        cache.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+/// Checks `candidate` out, detached, and runs `verify` before the target moves.
+///
+/// Reuses a `flock`-guarded pooled scratch worktree under
+/// `<common>/gitpulse/verify-scratch/` seeded with CoW-cloned `node_modules`/
+/// `target` caches and reset via `git clean -fdx -e target -e node_modules` +
+/// `git read-tree --reset -u <candidate>`, falling back automatically to a
+/// clean detached `temp_dir()` checkout when busy or when free disk is below
+/// [`LOW_DISK_FLOOR`].
 pub(crate) fn verify_in_scratch(
+    repo: &Path,
+    candidate: &str,
+    verify: &mut CandidateVerifier<'_>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<(), IntegrateFailure> {
+    verify_in_scratch_with_free_space(repo, candidate, verify, gate, free_bytes)
+}
+
+pub(crate) fn verify_in_scratch_with_free_space(
+    repo: &Path,
+    candidate: &str,
+    verify: &mut CandidateVerifier<'_>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+    free_space: FreeSpace,
+) -> Result<(), IntegrateFailure> {
+    let Ok(common) = resolve_git_common_dir(repo) else {
+        return verify_in_detached_temp_dir(repo, candidate, verify, gate);
+    };
+    let pool_root = common.join("gitpulse").join("verify-scratch");
+    if let Err(err) = ensure_private_dir(&pool_root) {
+        log::warn!(
+            "Pooled verify scratch dir {} unavailable ({err}); falling back to temp_dir",
+            pool_root.display()
+        );
+        return verify_in_detached_temp_dir(repo, candidate, verify, gate);
+    }
+
+    if let Reading::Value(free) = crate::engine::cow_clone::read_free(free_space, &pool_root) {
+        if free < LOW_DISK_FLOOR {
+            log::warn!(
+                "Free disk ({free} B) is below LOW_DISK_FLOOR ({LOW_DISK_FLOOR} B); using detached temp_dir for verify_in_scratch"
+            );
+            return verify_in_detached_temp_dir(repo, candidate, verify, gate);
+        }
+    }
+
+    let lock_path = pool_root.join("pool.lock");
+    let Some(_pool_guard) = try_acquire_pool_lock(&lock_path) else {
+        return verify_in_detached_temp_dir(repo, candidate, verify, gate);
+    };
+
+    let checkout_dir = pool_root.join("worktree");
+    match prepare_pooled_worktree(repo, &common, &checkout_dir, candidate, gate, free_space) {
+        Ok(true) => {}
+        Ok(false) => {
+            drop(_pool_guard);
+            return verify_in_detached_temp_dir(repo, candidate, verify, gate);
+        }
+        Err(failure) => return Err(failure),
+    }
+
+    match verify(&checkout_dir, candidate) {
+        Ok(()) => {
+            record_verified_candidate(repo, candidate);
+            Ok(())
+        }
+        Err(why) => Err(IntegrateFailure::CandidateFailed {
+            message: format!(
+                "The candidate {candidate} for merging into the target failed verification ({why}). \
+                 Nothing was merged."
+            ),
+            candidate: candidate.to_string(),
+        }),
+    }
+}
+
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+struct PoolLockGuard {
+    file: std::fs::File,
+}
+
+impl Drop for PoolLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn try_acquire_pool_lock(lock_path: &Path) -> Option<PoolLockGuard> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path).ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(PoolLockGuard { file }),
+        Err(_) => None,
+    }
+}
+
+fn is_pooled_worktree_valid(common: &Path, checkout_dir: &Path) -> bool {
+    if !checkout_dir.is_dir() || !checkout_dir.join(".git").exists() {
+        return false;
+    }
+    let Ok(wt_common) = resolve_git_common_dir(checkout_dir) else {
+        return false;
+    };
+    let Ok(canon_wt) = wt_common.canonicalize() else {
+        return false;
+    };
+    let Ok(canon_common) = common.canonicalize() else {
+        return false;
+    };
+    if canon_wt != canon_common {
+        return false;
+    }
+    let Ok(git_dir) = resolve_git_dir(checkout_dir) else {
+        return false;
+    };
+    !git_dir.join("index.lock").exists()
+}
+
+/// Returns `Ok(true)` if the pooled worktree is ready at `candidate`, `Ok(false)`
+/// if pooled setup failed non-fatally and the caller should fall back to
+/// `temp_dir()`, or `Err` on a `gate` refusal.
+fn prepare_pooled_worktree(
+    repo: &Path,
+    common: &Path,
+    checkout_dir: &Path,
+    candidate: &str,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+    free_space: FreeSpace,
+) -> Result<bool, IntegrateFailure> {
+    let mut ready = false;
+    if is_pooled_worktree_valid(common, checkout_dir) {
+        ready = reset_pooled_worktree(checkout_dir, candidate, gate)?;
+    }
+    if !ready {
+        if checkout_dir.exists() {
+            let _ = std::fs::remove_dir_all(checkout_dir);
+        }
+        let _ = git_text(repo, &["worktree", "prune"]);
+        let Some(path_str) = checkout_dir.to_str() else {
+            return Ok(false);
+        };
+        let add = ["worktree", "add", "--detach", path_str, candidate];
+        gate(&add).map_err(refused)?;
+        if let Err(err) = git_text(repo, &add) {
+            log::warn!(
+                "Pooled verify worktree add failed at {} ({}); falling back to temp_dir",
+                checkout_dir.display(),
+                err.message()
+            );
+            let _ = std::fs::remove_dir_all(checkout_dir);
+            let _ = git_text(repo, &["worktree", "prune"]);
+            return Ok(false);
+        }
+    }
+
+    let selection = CacheSelection {
+        free_space,
+        ..CacheSelection::default()
+    };
+    match clone_ignored_caches(repo, checkout_dir, &selection) {
+        Ok(report) => {
+            if let Some(err) = report.error() {
+                log::warn!("Pooled verify cache seed partial warning: {err}");
+            }
+        }
+        Err(err) => {
+            log::warn!(
+                "Pooled verify cache seed skipped ({}); continuing without pre-seeded caches",
+                err.message()
+            );
+        }
+    }
+    Ok(true)
+}
+
+fn reset_pooled_worktree(
+    checkout_dir: &Path,
+    candidate: &str,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<bool, IntegrateFailure> {
+    let clean = ["clean", "-fdx", "-e", "target", "-e", "node_modules"];
+    gate(&clean).map_err(refused)?;
+    if let Err(err) = git_text(checkout_dir, &clean) {
+        log::warn!(
+            "Pooled verify clean failed ({}); recreating pooled worktree",
+            err.message()
+        );
+        return Ok(false);
+    }
+
+    let read_tree = ["read-tree", "--reset", "-u", candidate];
+    gate(&read_tree).map_err(refused)?;
+    if let Err(err) = git_text(checkout_dir, &read_tree) {
+        log::warn!(
+            "Pooled verify read-tree failed ({}); recreating pooled worktree",
+            err.message()
+        );
+        return Ok(false);
+    }
+
+    let update_head = ["update-ref", "--no-deref", "HEAD", candidate];
+    gate(&update_head).map_err(refused)?;
+    if let Err(err) = git_text(checkout_dir, &update_head) {
+        log::warn!(
+            "Pooled verify HEAD update failed ({}); recreating pooled worktree",
+            err.message()
+        );
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn verify_in_detached_temp_dir(
     repo: &Path,
     candidate: &str,
     verify: &mut CandidateVerifier<'_>,
@@ -459,7 +742,10 @@ pub(crate) fn verify_in_scratch(
             candidate: candidate.to_string(),
         }),
         Ok(()) => match removed {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                record_verified_candidate(repo, candidate);
+                Ok(())
+            }
             Err(_) => Err(refused_text(format!(
                 "The candidate {candidate} was verified, but its scratch worktree could not be removed.{leftover} Nothing was merged."
             ))),
@@ -1194,6 +1480,51 @@ fn restore_after_failed_advance(
     }
 }
 
+/// Lists every checkout holding `target` (main or linked worktree) with its
+/// cleanliness status, for callers inside `engine` (e.g. `land_queue`).
+pub(crate) fn checkout_holders_for_target(
+    repo: &Path,
+    target: &str,
+) -> Result<CheckoutTouch, IntegrateFailure> {
+    let entries = crate::engine::worktree::read_worktree_entries(repo).map_err(|e| {
+        refused_text(format!(
+            "The worktrees that have {target} checked out could not be listed ({}), so nothing was merged.",
+            e.message()
+        ))
+    })?;
+    let mut holders = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.branch.as_deref() == Some(target))
+    {
+        let path = PathBuf::from(&entry.path);
+        let problem = if entry.is_prunable || !path.is_dir() {
+            Some(HolderProblem::Unreadable(
+                "its directory is missing; `git worktree prune` removes the stale entry".into(),
+            ))
+        } else {
+            match resolve_git_dir(&path) {
+                Ok(git_dir) => {
+                    if std::fs::symlink_metadata(git_dir.join("index.lock")).is_ok() {
+                        Some(HolderProblem::IndexLocked)
+                    } else if let Some(text) = path.to_str() {
+                        match crate::engine::worktree::user_changed_paths(text) {
+                            Ok((paths, _)) if paths.is_empty() => None,
+                            Ok(_) => Some(HolderProblem::Dirty),
+                            Err(err) => Some(HolderProblem::Unreadable(err.into_message())),
+                        }
+                    } else {
+                        Some(HolderProblem::Unreadable("its path is not UTF-8".into()))
+                    }
+                }
+                Err(err) => Some(HolderProblem::Unreadable(err.into_message())),
+            }
+        };
+        holders.push(CheckoutHolder { path, problem });
+    }
+    Ok(CheckoutTouch { holders })
+}
+
 /// Moves the target ref, then every checkout that has it.
 ///
 /// Before anything moves, each checkout with the target must pass the
@@ -1204,6 +1535,10 @@ fn restore_after_failed_advance(
 /// refused a target that moved). If one cannot follow, the others and the ref
 /// are put back and the failure says what could not be, so HEAD, index and
 /// files never silently disagree.
+///
+/// When `candidate` recently passed [`verify_in_scratch`], best-effort
+/// advances `refs/gitpulse/green/<target>` after landing without ever failing
+/// the already-landed merge on a non-fatal green-ref error.
 pub(crate) fn land(
     repo: &Path,
     branch: &str,
@@ -1211,6 +1546,25 @@ pub(crate) fn land(
     target_sha: &str,
     candidate: &str,
     checkout: &CheckoutTouch,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<ObjectLanded, IntegrateFailure> {
+    let verified = take_verified_candidate(repo, candidate);
+    land_verified(
+        repo, branch, target, target_sha, candidate, checkout, verified, gate,
+    )
+}
+
+/// Like [`land`], with explicit `verified` flag indicating whether `candidate`
+/// passed verification and should best-effort advance `refs/gitpulse/green/<target>`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn land_verified(
+    repo: &Path,
+    branch: &str,
+    target: &str,
+    target_sha: &str,
+    candidate: &str,
+    checkout: &CheckoutTouch,
+    verified: bool,
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> Result<ObjectLanded, IntegrateFailure> {
     let moving = candidate != target_sha;
@@ -1271,6 +1625,28 @@ pub(crate) fn land(
             advanced.push((holder, pre_digest));
         }
     }
+
+    let green_ref_note = if verified {
+        match crate::engine::provenance::advance_green_ref(repo, target, candidate) {
+            Ok(moved) => {
+                if moved {
+                    log::info!("Advanced refs/gitpulse/green/{target} to {candidate}");
+                }
+                None
+            }
+            Err(err) => {
+                let msg = format!(
+                    "advisory: refs/gitpulse/green/{target} was not updated ({})",
+                    err.message()
+                );
+                log::warn!("{msg}");
+                Some(msg)
+            }
+        }
+    } else {
+        None
+    };
+
     let held = !checkout.holders.is_empty();
     Ok(ObjectLanded {
         candidate_oid: candidate.to_string(),
@@ -1280,5 +1656,6 @@ pub(crate) fn land(
         } else {
             Some(no_checkout_note(target))
         },
+        green_ref_note,
     })
 }

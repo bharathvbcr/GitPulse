@@ -470,3 +470,269 @@ fn a_hook_that_refuses_the_panels_squash_keeps_the_lane() {
     assert!(lane.path().exists() && branch_exists(repo, "feature-x"));
     assert_eq!(git(repo, &["diff", "--cached", "--name-only"]), "README.md");
 }
+
+#[test]
+fn verify_in_scratch_reuses_pooled_cow_worktree_and_preserves_target_and_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    let repo = dir.path();
+
+    std::fs::write(repo.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+    git(repo, &["add", ".gitignore"]);
+    git(repo, &["commit", "-q", "-m", "gitignore"]);
+    let c1 = git(repo, &["rev-parse", "HEAD"]);
+
+    // Seed target/ and node_modules/ in anchor repo so CoW seeding populates them.
+    std::fs::create_dir_all(repo.join("target/debug")).unwrap();
+    std::fs::write(repo.join("target/debug/seed.o"), "seed-obj").unwrap();
+    std::fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+    std::fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .unwrap();
+
+    // Create a second commit c2.
+    std::fs::write(repo.join("README.md"), "hello v2\n").unwrap();
+    std::fs::write(repo.join("new_file.txt"), "from c2\n").unwrap();
+    git(repo, &["add", "README.md", "new_file.txt"]);
+    git(repo, &["commit", "-q", "-m", "c2"]);
+    let c2 = git(repo, &["rev-parse", "HEAD"]);
+    // Move main back to c1 so c2 is an unmerged candidate commit.
+    git(repo, &["reset", "--hard", "-q", &c1]);
+
+    let mut first_scratch = None;
+    crate::engine::merge_tree::verify_in_scratch(
+        repo,
+        &c1,
+        &mut |scratch, oid| {
+            assert_eq!(oid, c1);
+            assert!(
+                scratch
+                    .to_string_lossy()
+                    .contains("gitpulse/verify-scratch/worktree"),
+                "expected pooled scratch path, got {}",
+                scratch.display()
+            );
+            assert!(scratch.join("target/debug/seed.o").exists());
+            assert!(scratch.join("node_modules/pkg/index.js").exists());
+            std::fs::write(scratch.join("target/debug/incremental.o"), "inc").unwrap();
+            std::fs::write(scratch.join("node_modules/.cache.json"), "{}").unwrap();
+            std::fs::write(scratch.join("stray_build.tmp"), "junk").unwrap();
+            first_scratch = Some(scratch.to_path_buf());
+            Ok(())
+        },
+        &mut allow_all,
+    )
+    .unwrap();
+
+    let mut second_scratch = None;
+    crate::engine::merge_tree::verify_in_scratch(
+        repo,
+        &c2,
+        &mut |scratch, oid| {
+            assert_eq!(oid, c2);
+            second_scratch = Some(scratch.to_path_buf());
+            assert!(
+                scratch.join("target/debug/incremental.o").exists(),
+                "target/ must be preserved across consecutive pooled runs"
+            );
+            assert!(
+                scratch.join("node_modules/.cache.json").exists(),
+                "node_modules/ must be preserved across consecutive pooled runs"
+            );
+            assert!(
+                !scratch.join("stray_build.tmp").exists(),
+                "stray untracked files must be cleaned"
+            );
+            assert_eq!(
+                std::fs::read_to_string(scratch.join("new_file.txt")).unwrap(),
+                "from c2\n"
+            );
+            assert_eq!(git(scratch, &["rev-parse", "HEAD"]), c2);
+            Ok(())
+        },
+        &mut allow_all,
+    )
+    .unwrap();
+
+    assert_eq!(first_scratch, second_scratch);
+}
+
+#[test]
+fn verify_in_scratch_falls_back_to_temp_dir_when_pool_busy_or_low_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    let repo = dir.path();
+    let head = git(repo, &["rev-parse", "HEAD"]);
+
+    let common = crate::engine::git_cli::resolve_git_common_dir(repo).unwrap();
+    let pool_root = common.join("gitpulse").join("verify-scratch");
+    std::fs::create_dir_all(&pool_root).unwrap();
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(pool_root.join("pool.lock"))
+        .unwrap();
+    lock_file.try_lock().unwrap();
+
+    let mut busy_path = None;
+    crate::engine::merge_tree::verify_in_scratch(
+        repo,
+        &head,
+        &mut |scratch, _| {
+            busy_path = Some(scratch.to_path_buf());
+            assert!(
+                !scratch
+                    .to_string_lossy()
+                    .contains("gitpulse/verify-scratch/worktree"),
+                "busy pool must fall back to detached temp_dir"
+            );
+            Ok(())
+        },
+        &mut allow_all,
+    )
+    .unwrap();
+    assert!(
+        !busy_path.unwrap().exists(),
+        "temp_dir scratch must be removed"
+    );
+    lock_file.unlock().unwrap();
+
+    let mut low_disk_path = None;
+    crate::engine::merge_tree::verify_in_scratch_with_free_space(
+        repo,
+        &head,
+        &mut |scratch, _| {
+            low_disk_path = Some(scratch.to_path_buf());
+            assert!(
+                !scratch
+                    .to_string_lossy()
+                    .contains("gitpulse/verify-scratch/worktree"),
+                "low disk must fall back to detached temp_dir"
+            );
+            Ok(())
+        },
+        &mut allow_all,
+        |_| crate::sysload::Reading::Value(crate::sysload::LOW_DISK_FLOOR - 1),
+    )
+    .unwrap();
+    assert!(
+        !low_disk_path.unwrap().exists(),
+        "low-disk temp_dir scratch must be removed"
+    );
+}
+
+#[test]
+fn land_advances_green_ref_after_verify_in_scratch_and_stays_nonfatal_on_rewind() {
+    let (dir, lane) = lane_fixture();
+    let repo = dir.path();
+    let target_sha = git(repo, &["rev-parse", "refs/heads/main"]);
+    let branch_sha = git(repo, &["rev-parse", "refs/heads/feature-x"]);
+
+    let candidate = crate::engine::merge_tree::prepare(
+        repo,
+        "feature-x",
+        "main",
+        &target_sha,
+        &branch_sha,
+        false,
+        &mut allow_all,
+    )
+    .unwrap();
+    crate::engine::merge_tree::verify_in_scratch(
+        repo,
+        &candidate,
+        &mut |scratch, _| {
+            assert_eq!(git(scratch, &["rev-parse", "HEAD"]), candidate);
+            Ok(())
+        },
+        &mut allow_all,
+    )
+    .unwrap();
+    let touch = crate::engine::merge_tree::checkout_holders_for_target(repo, "main").unwrap();
+    let landed = crate::engine::merge_tree::land(
+        repo,
+        "feature-x",
+        "main",
+        &target_sha,
+        &candidate,
+        &touch,
+        &mut allow_all,
+    )
+    .unwrap();
+    assert!(
+        landed.green_ref_note.is_none(),
+        "{:?}",
+        landed.green_ref_note
+    );
+    assert_eq!(
+        git(repo, &["rev-parse", "--verify", "refs/gitpulse/green/main"]),
+        landed.candidate_oid
+    );
+
+    // Create a diverged commit on refs/gitpulse/green/main so advance_green_ref refuses rewind,
+    // and verify a subsequent verified land() still succeeds with an advisory note.
+    let diverged_tree = git(repo, &["rev-parse", &format!("{target_sha}^{{tree}}")]);
+    let diverged_commit = git(
+        repo,
+        &["commit-tree", &diverged_tree, "-m", "diverged green"],
+    );
+    git(
+        repo,
+        &["update-ref", "refs/gitpulse/green/main", &diverged_commit],
+    );
+
+    std::fs::write(lane.path().join("second.txt"), "second\n").unwrap();
+    git(lane.path(), &["add", "second.txt"]);
+    git(lane.path(), &["commit", "-q", "-m", "second commit"]);
+    let target_sha2 = git(repo, &["rev-parse", "refs/heads/main"]);
+    let branch_sha2 = git(repo, &["rev-parse", "refs/heads/feature-x"]);
+    let candidate2 = crate::engine::merge_tree::prepare(
+        repo,
+        "feature-x",
+        "main",
+        &target_sha2,
+        &branch_sha2,
+        false,
+        &mut allow_all,
+    )
+    .unwrap();
+    crate::engine::merge_tree::verify_in_scratch(
+        repo,
+        &candidate2,
+        &mut |_, _| Ok(()),
+        &mut allow_all,
+    )
+    .unwrap();
+    let touch2 = crate::engine::merge_tree::checkout_holders_for_target(repo, "main").unwrap();
+    let landed2 = crate::engine::merge_tree::land(
+        repo,
+        "feature-x",
+        "main",
+        &target_sha2,
+        &candidate2,
+        &touch2,
+        &mut allow_all,
+    )
+    .unwrap();
+    assert_eq!(
+        git(repo, &["rev-parse", "refs/heads/main"]),
+        landed2.candidate_oid
+    );
+    assert!(
+        landed2
+            .green_ref_note
+            .as_deref()
+            .is_some_and(|n| n.contains("advisory:")),
+        "expected advisory green_ref_note, got {:?}",
+        landed2.green_ref_note
+    );
+    // Green ref was not rewound/clobbered.
+    assert_eq!(
+        git(repo, &["rev-parse", "--verify", "refs/gitpulse/green/main"]),
+        diverged_commit
+    );
+}
