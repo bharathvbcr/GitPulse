@@ -4412,9 +4412,12 @@ mod os {
 /// A process that refuses even a limited query outranks this one (a protected
 /// or another user's, or `System`). That is an access-control refusal with a
 /// known cause, as Linux's `withheld_by_kernel` is: it is counted, not
-/// unproven. A process that opened but whose parameter block could not then
-/// be read (a block that is not normalised, a read that failed while it is
-/// still running) is the user's own and unexplained, which leaves it
+/// unproven. So is one that opens for a limited query but refuses memory reads
+/// because it is a protected process (PP/PPL, such as Defender's
+/// `DefenderSessionHelper` running as the user): the protection level
+/// explains the refusal. A process that opened but whose parameter block could
+/// not then be read (a block that is not normalised, a read that failed while
+/// it is still running) is the user's own and unexplained, which leaves it
 /// unproven. A 32-bit (WoW64) process is not among them: its parameters are
 /// read through its 32-bit PEB (`winproc::Remote`).
 #[cfg(all(windows, target_pointer_width = "64"))]
@@ -4703,6 +4706,14 @@ mod os {
             // outranks this process, as `Refused` does.
             Owner::Unknown if !live.readable => return Some(elsewhere()),
             Owner::Ours | Owner::Unknown => {}
+        }
+        // Memory closed to it because the process is protected (PP/PPL:
+        // Defender's DefenderSessionHelper runs as the user and refuses
+        // PROCESS_VM_READ). That refusal is the access-control system's own,
+        // explained by the protection level: counted, as `Refused` is, not
+        // the user's unexplained unknown. An unanswered level stays unproven.
+        if !live.readable && sys::is_protected(&live.handle) == Some(true) {
+            return Some(elsewhere());
         }
         let exe = sys::image_path(&live.handle).map(|path| {
             canonical(PathBuf::from(path))

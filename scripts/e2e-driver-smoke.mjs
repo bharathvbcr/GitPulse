@@ -25,6 +25,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -538,17 +540,98 @@ function findOrphanProcesses(marker) {
  * @returns {string[]}
  */
 function windowsAttachProcesses() {
-  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('msedgedriver.exe','gitpulse.exe','msedgewebview2.exe') } | Select-Object -First 24 | ForEach-Object { \"$($_.ProcessId) $($_.Name) parent=$($_.ParentProcessId) $($_.CommandLine)\" }";
-  const res = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+  // PowerShell 7 (pwsh, on every GitHub Windows image) exposes CommandLine on
+  // Get-Process, which starts far faster than a CIM query: the CIM form ran
+  // past its 15 s bound on a runner and showed nothing.
+  const ps = "Get-Process -Name msedgedriver,gitpulse,msedgewebview2 -ErrorAction SilentlyContinue | Select-Object -First 24 | ForEach-Object { \"$($_.Id) $($_.ProcessName) parent=$($_.Parent.Id) $($_.CommandLine)\" }";
+  const res = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", ps], {
     encoding: "utf8",
-    timeout: 15_000,
+    timeout: 45_000,
   });
-  if (res.status !== 0) return [`(process query failed: status ${res.status}, ${String(res.stderr ?? res.error ?? "").trim().slice(0, 300)})`];
-  return String(res.stdout ?? "")
+  if (res.error) return [`(process query failed: ${res.error.message.slice(0, 300)})`];
+  const rows = String(res.stdout ?? "")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => (line.length > 700 ? `${line.slice(0, 700)}…` : line));
+  // pwsh exits 1 when any named process is absent, even with the error
+  // silenced, so a non-zero status with rows is still an answer. Only one
+  // with nothing printed is reported as the query failing.
+  if (rows.length === 0 && res.status !== 0) {
+    return [`(process query found nothing; exit ${res.status}: ${String(res.stderr ?? "").trim().slice(0, 300)})`];
+  }
+  return rows;
+}
+
+/**
+ * Application event log entries from the last 15 minutes that name gitpulse
+ * (an "Application Error" crash record carries the exception code and the
+ * faulting module), at most 6, each cut at 900 characters.
+ * @returns {string[]}
+ */
+function windowsAppEvents() {
+  const ps =
+    "Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-15)} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'gitpulse' } | Select-Object -First 6 | ForEach-Object { \"$($_.TimeCreated.ToString('s')) $($_.ProviderName) $($_.Id): $($_.Message -replace '\\s+',' ')\" }";
+  const res = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", timeout: 45_000 });
+  if (res.error) return [`(event query failed: ${res.error.message.slice(0, 300)})`];
+  return String(res.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (line.length > 900 ? `${line.slice(0, 900)}…` : line));
+}
+
+/**
+ * A `.cmd` in `dir` that starts `driver` with every argument tauri-driver
+ * gives it plus `--verbose --log-path=<log>`. Returns the wrapper's path.
+ * @param {string} driver
+ * @param {string} dir
+ * @param {string} log
+ * @returns {string}
+ */
+export function windowsLoggingDriver(driver, dir, log) {
+  const wrapper = path.join(dir, "msedgedriver-logged.cmd");
+  writeFileSync(wrapper, `@echo off\r\n"${driver}" %* --verbose "--log-path=${log}"\r\n`);
+  return wrapper;
+}
+
+/**
+ * The last `count` lines of `file`, each cut at 400 characters; a missing or
+ * unreadable file says so.
+ * @param {string} file
+ * @param {number} count
+ * @returns {string[]}
+ */
+function tailFile(file, count) {
+  try {
+    const lines = readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+    return lines.slice(-count).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l));
+  } catch (error) {
+    return [`(${file}: ${error instanceof Error ? error.message : String(error)})`];
+  }
+}
+
+/**
+ * The last 40 lines of each of up to 4 files in `dir`, headed by the file
+ * name. A missing or unreadable directory says so.
+ * @param {string} dir
+ * @returns {string[]}
+ */
+function logTails(dir) {
+  let names;
+  try {
+    names = readdirSync(dir).sort().slice(0, 4);
+  } catch (error) {
+    return [`(${dir}: ${error instanceof Error ? error.message : String(error)})`];
+  }
+  return names.flatMap((name) => {
+    try {
+      const lines = readFileSync(path.join(dir, name), "utf8").split(/\r?\n/).filter(Boolean);
+      return [`--- ${name} (${lines.length} lines, last 40)`, ...lines.slice(-40).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l))];
+    } catch (error) {
+      return [`--- ${name}: ${error instanceof Error ? error.message : String(error)}`];
+    }
+  });
 }
 
 /** @param {SmokeOptions} opts */
@@ -607,7 +690,16 @@ async function runSmoke(opts) {
   const nativePort = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   const driverArgs = ["--port", String(port), "--native-port", String(nativePort)];
-  if (opts.nativeDriver) driverArgs.push("--native-driver", opts.nativeDriver);
+  // Edge WebDriver logs only with --verbose --log-path, and tauri-driver passes
+  // it no flags of its own, so on Windows it is started through a wrapper that
+  // adds them. Both sit in the artifacts folder: it is uploaded, and the
+  // shutdown check reads any process naming the work folder as a leak.
+  const edgeDriverLog = path.join(opts.artifactsDir, "msedgedriver.log");
+  const driverForTauri =
+    process.platform === "win32" && opts.nativeDriver
+      ? windowsLoggingDriver(opts.nativeDriver, opts.artifactsDir, edgeDriverLog)
+      : opts.nativeDriver;
+  if (driverForTauri) driverArgs.push("--native-driver", driverForTauri);
 
   let driverStdout = "";
   let driverStderr = "";
@@ -1023,6 +1115,15 @@ async function runSmoke(opts) {
       // --remote-debugging-port and --user-data-dir.
       const rows = windowsAttachProcesses();
       console.error(`WebView2 attach processes (${rows.length}):\n${rows.join("\n") || "(none)"}`);
+      // The app has been seen gone with its WebView2 children orphaned and no
+      // line on stderr: say whether Windows recorded it crashing, and what
+      // the app's own log files hold.
+      const events = windowsAppEvents();
+      console.error(`Application event log, gitpulse (${events.length}):\n${events.join("\n") || "(none)"}`);
+      console.error(`App log files:\n${logTails(path.join(profileRoot, "logs")).join("\n") || "(none)"}`);
+      if (driverForTauri !== opts.nativeDriver) {
+        console.error(`Edge WebDriver log (last 60 lines):\n${tailFile(edgeDriverLog, 60).join("\n") || "(empty)"}`);
+      }
     }
     if (error instanceof Error) console.error(`E2E smoke failed: ${error.message}`);
   } finally {

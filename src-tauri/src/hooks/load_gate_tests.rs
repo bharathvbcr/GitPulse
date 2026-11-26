@@ -1549,7 +1549,7 @@ fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relativ
     assert_eq!(gather_live("relative/dir").disk.free_bytes, None);
     assert_eq!(
         gather_live("").disk.free_bytes.is_some(),
-        cfg!(unix),
+        cfg!(any(unix, windows)),
         "no cwd given: the process's own directory, where a reader exists"
     );
 }
