@@ -630,6 +630,18 @@ pub(crate) mod sys {
         }
     }
 
+    /// Whether a process holds `pid`, for a caller that frees what a gone
+    /// owner held. Only "no process holds it" and "it has an exit time" are
+    /// gone; a refusal or an unreadable answer is alive, because a wrong
+    /// "gone" takes from a live owner and a wrong "alive" only waits.
+    pub(crate) fn process_exists(pid: u32) -> bool {
+        match open(pid, QUERY_LIMITED) {
+            Ok(handle) => times(&handle).map_or(true, |times| !times.exited),
+            Err(OpenFail::Gone) => false,
+            Err(OpenFail::Denied(_) | OpenFail::Other(_)) => true,
+        }
+    }
+
     /// What `GetProcessTimes` says.
     pub(crate) struct Times {
         /// Creation, in 100 ns ticks since 1601.
@@ -1026,6 +1038,18 @@ pub(crate) mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This process exists; a pid past any Windows pid does not, and a
+    /// refusal is never read as gone.
+    #[cfg(windows)]
+    #[test]
+    fn process_exists_tells_this_process_from_a_pid_no_process_holds() {
+        assert!(sys::process_exists(std::process::id()));
+        assert!(!sys::process_exists(2_000_000_000));
+        // The System process (pid 4) refuses a query-limited open to a
+        // non-elevated caller and answers it to an elevated one: alive either way.
+        assert!(sys::process_exists(4));
+    }
 
     fn wide(text: &str) -> Vec<u8> {
         text.encode_utf16().flat_map(u16::to_le_bytes).collect()

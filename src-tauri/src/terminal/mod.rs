@@ -1738,16 +1738,37 @@ impl PtyEnv {
     }
 
     fn get(&self, name: &str) -> Option<String> {
-        self.vars.get(name).cloned()
+        env_lookup(&self.vars, name, cfg!(windows)).cloned()
     }
 
     fn os(&self, name: &str) -> Option<std::ffi::OsString> {
-        self.vars.get(name).map(std::ffi::OsString::from)
+        env_lookup(&self.vars, name, cfg!(windows)).map(std::ffi::OsString::from)
     }
 
     fn home(&self) -> Option<std::ffi::OsString> {
         self.os("HOME").or_else(|| self.os("USERPROFILE"))
     }
+}
+
+/// One variable of a captured environment. Windows names are
+/// case-insensitive and its search path is spelled `Path`, so an exact
+/// `PATH` lookup there found nothing: every session's PATH was rebuilt from
+/// the fallback directories alone, without System32, and a bare `cmd.exe`
+/// could not start (Windows CI, shard 3). An exact match still wins.
+fn env_lookup<'a>(
+    vars: &'a HashMap<String, String>,
+    name: &str,
+    fold_case: bool,
+) -> Option<&'a String> {
+    vars.get(name).or_else(|| {
+        fold_case
+            .then(|| {
+                vars.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value)
+            })
+            .flatten()
+    })
 }
 
 /// The command one PTY session runs, plus the binary the requested name
@@ -8275,6 +8296,32 @@ mod tests {
             verbatim,
             "the plain spelling names the same directory"
         );
+    }
+
+    /// Windows spells its search path `Path`; a session's PATH is read from
+    /// it, not rebuilt without it. Elsewhere names are exact.
+    #[test]
+    fn a_captured_environment_finds_windows_path_whatever_its_case() {
+        let vars: HashMap<String, String> = [
+            ("Path".to_string(), r"C:\Windows\system32".to_string()),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            env_lookup(&vars, "PATH", true).map(String::as_str),
+            Some(r"C:\Windows\system32")
+        );
+        assert_eq!(
+            env_lookup(&vars, "PATH", false),
+            None,
+            "exact where names are"
+        );
+        assert_eq!(
+            env_lookup(&vars, "PATHEXT", true).map(String::as_str),
+            Some(".EXE"),
+            "an exact match is taken as is"
+        );
+        assert_eq!(env_lookup(&vars, "HOME", true), None);
     }
 
     /// Spawns `cmd.exe /c <line>` in a trusted scratch repo.

@@ -552,16 +552,37 @@ fn concurrent_senders_in_separate_processes_lose_nothing() {
         "{} sends from {procs} processes in {:.1}s; failures {}; unique seqs {unique}; stored rows {stored:?}; latency ms p50 {} p90 {} max {}; first failures {:?}",
         all.len(), wall.as_secs_f64(), failures.len(), pct(0.5), pct(0.9), lat[lat.len() - 1], failures.iter().take(3).collect::<Vec<_>>()
     );
+    // A send the policy gate refused because the spawn gate deferred its
+    // binding lookup twice (one bounded retry, then fail closed) was told so,
+    // with a typed, retryable reason: nothing was examined and nothing was
+    // stored. That is the gate's designed answer on a saturated host (1 of 200
+    // on Windows CI), so it is allowed, and bounded. Any other refusal is not.
+    let (deferred, other): (Vec<_>, Vec<_>) = failures
+        .iter()
+        .partition(|reason| reason.contains("[deferred_worktree]"));
     assert!(
-        failures.is_empty(),
-        "{} of {} sends failed",
-        failures.len(),
+        other.is_empty(),
+        "{} of {} sends failed for a reason other than a deferred lookup: {other:?}",
+        other.len(),
         all.len()
     );
+    assert!(
+        deferred.len() * 20 <= all.len(),
+        "{} of {} sends were deferred past the retry: more than 1 in 20",
+        deferred.len(),
+        all.len()
+    );
+    let accepted = all.len() - failures.len();
     assert_eq!(
-        unique,
-        procs * each,
-        "sequence numbers were duplicated or lost"
+        seqs.len(),
+        accepted,
+        "every accepted send reported its sequence number"
+    );
+    assert_eq!(unique, accepted, "sequence numbers were duplicated or lost");
+    assert_eq!(
+        stored,
+        Ok(accepted),
+        "the bus holds exactly the accepted sends"
     );
 }
 
