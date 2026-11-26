@@ -309,11 +309,23 @@ fn removing_a_committed_token_is_not_blocked() {
 #[test]
 fn awkward_file_names_keep_their_lines() {
     let dir = repo_with_commit();
+    // Windows cannot hold a tab, a newline or a `*` in a name, so there the
+    // same shapes that it can (a space, a bracket class, a non-ASCII letter)
+    // stand in.
+    #[cfg(not(windows))]
     let names = [
         "sp ace.txt",
         "tab\tname.txt",
         "new\nline.txt",
         "star*[x].txt",
+        "caf\u{e9}.txt",
+    ];
+    #[cfg(windows)]
+    let names = [
+        "sp ace.txt",
+        "semi;colon.txt",
+        "hash#name.txt",
+        "star[x].txt",
         "caf\u{e9}.txt",
     ];
     for (n, name) in names.iter().enumerate() {
@@ -327,7 +339,7 @@ fn awkward_file_names_keep_their_lines() {
     }
     let scan = scan_staged(dir.path(), &[]).expect("scan runs");
     assert_eq!(scan.tally.hits_total, 1);
-    assert_eq!(scan.tally.hits[0].path, "star*[x].txt");
+    assert_eq!(scan.tally.hits[0].path, names[3]);
     assert_eq!(scan.tally.hits[0].line, 3);
     assert_eq!(scan.tally.inputs_scanned, names.len() as u64);
 }

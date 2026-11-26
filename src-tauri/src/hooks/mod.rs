@@ -4062,6 +4062,13 @@ fn parent_agent_process_identity() -> (Option<u32>, Option<u64>) {
             return (Some(pid), start_ns);
         }
     }
+    #[cfg(windows)]
+    {
+        if let Some(pid) = crate::workbench::process_birth::parent_pid() {
+            let start_ns = crate::workbench::process_birth::started_unix_nanos(pid);
+            return (Some(pid), start_ns);
+        }
+    }
     (None, None)
 }
 

@@ -52,6 +52,7 @@ mod snapshot;
 mod thresholds;
 mod trace;
 pub(crate) mod webcontent;
+pub(crate) mod winproc;
 
 pub use exec_probe::ExecLatency;
 pub(crate) use thresholds::format_latency;

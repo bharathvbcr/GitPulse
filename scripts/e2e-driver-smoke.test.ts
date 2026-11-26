@@ -13,6 +13,7 @@ import {
   main,
   parseArgs,
   remainingBudgetMs,
+  webviewOptionsFor,
 } from "./e2e-driver-smoke.mjs";
 
 const TINY_PNG_BASE64 = Buffer.from([
@@ -48,11 +49,16 @@ describe("e2e-driver-smoke", () => {
     expect(linux.GIT_CONFIG_NOSYSTEM).toBe("1");
     expect(linux.WEBKIT_DISABLE_DMABUF_RENDERER).toBe("1");
 
-    const win = buildIsolatedEnv("C:\\temp\\e2e-p", { PATH: "C:\\Windows" }, "win32");
+    const win = buildIsolatedEnv("C:\\temp\\e2e-p", { PATH: "C:\\Windows", WEBVIEW2_USER_DATA_FOLDER: "C:\\runner\\wv2" }, "win32");
     expect(win.USERPROFILE).toBe(path.join("C:\\temp\\e2e-p", "home"));
-    expect(win.APPDATA).toBe(path.join("C:\\temp\\e2e-p", "config"));
-    expect(win.LOCALAPPDATA).toBe(path.join("C:\\temp\\e2e-p", "data"));
-    expect(win.WEBVIEW2_USER_DATA_FOLDER).toBe(path.join("C:\\temp\\e2e-p", "webview2"));
+    // AppData sits where the known-folder lookup finds it under USERPROFILE.
+    expect(win.APPDATA).toBe(path.join("C:\\temp\\e2e-p", "home", "AppData", "Roaming"));
+    expect(win.LOCALAPPDATA).toBe(path.join("C:\\temp\\e2e-p", "home", "AppData", "Local"));
+    // The profile is the driver's to place (webviewOptions.userDataFolder);
+    // the env override, set here or inherited, made session creation hang.
+    expect("WEBVIEW2_USER_DATA_FOLDER" in win).toBe(false);
+    expect(webviewOptionsFor("C:\\temp\\e2e-p", "win32")).toEqual({ userDataFolder: path.join("C:\\temp\\e2e-p", "webview2") });
+    expect(webviewOptionsFor("/tmp/e2e-p", "linux")).toBeUndefined();
   });
 
   it("detects display backend accurately across X11, Wayland, Windows, and headless Linux", () => {
@@ -75,9 +81,23 @@ describe("e2e-driver-smoke", () => {
   it("resolves default binaries honoring CARGO_TARGET_DIR and rejects bad ports/timeouts", () => {
     expect(defaultAppBinary("linux", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "gitpulse"));
     expect(defaultAppBinary("win32", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "gitpulse.exe"));
-    expect(defaultSeedBinary("linux", { CARGO_TARGET_DIR: "/target" }, "/repo")).toBe(path.join("/target", "debug", "examples", "e2e_seed_trust"));
+    expect(defaultSeedBinary("linux", { CARGO_TARGET_DIR: "/target" }, "/repo")).toBe(path.resolve("/target", "debug", "examples", "e2e_seed_trust"));
     expect(() => parseArgs(["--port", "0"])).toThrow(/1\.\.65535/);
     expect(() => parseArgs(["--timeout", "5"])).toThrow(/30 and 900/);
+  });
+
+  it("hands Edge WebDriver the WebView2 profile as tauri:options.webviewOptions", async () => {
+    const bodies: unknown[] = [];
+    const fakeFetch: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("/session")) bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ value: { sessionId: "sess-w" } }), { status: 200 });
+    };
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    const webviewOptions = webviewOptionsFor("C:\\p", "win32");
+    expect(await client.createSession("C:\\gp\\gitpulse", [], webviewOptions)).toBe("sess-w");
+    expect(bodies).toEqual([
+      { capabilities: { alwaysMatch: { "tauri:options": { application: "C:\\gp\\gitpulse", args: [], webviewOptions: { userDataFolder: path.join("C:\\p", "webview2") } } } } },
+    ]);
   });
 
   it("speaks W3C WebDriver HTTP for session creation, script execution, screenshots, and teardown", async () => {
@@ -99,6 +119,7 @@ describe("e2e-driver-smoke", () => {
     const base = "http://127.0.0.1:4444";
     const client = new WebDriverClient(base, fakeFetch);
     expect(await client.createSession("/bin/gitpulse", ["/tmp/repo"])).toBe("sess-123");
+    expect(seen.find(s => s.url.endsWith("/session"))?.body).toEqual({ capabilities: { alwaysMatch: { "tauri:options": { application: "/bin/gitpulse", args: ["/tmp/repo"] } } } });
     expect(await client.executeScript("return 1", [])).toEqual({ ok: true });
     const dir = mkdtempSync(path.join(tmpdir(), "gp-e2e-unit-"));
     try {

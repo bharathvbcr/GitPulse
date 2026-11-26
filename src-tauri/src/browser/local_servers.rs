@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,10 @@ use crate::engine::portless::{read_portless_routes, WorktreeRouteInfo};
 const MAX_RUN_SCRIPT_BYTES: u64 = 64 * 1024;
 const MAX_DISCOVERED_SERVERS: usize = 24;
 const MAX_SCAN_LSOF_LISTENERS: usize = 256;
+// Only the unix `lsof` reader uses these.
+#[cfg(unix)]
 const MAX_LSOF_OUTPUT_BYTES: u64 = 256 * 1024;
+#[cfg(unix)]
 const LSOF_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 const DEV_SERVER_PROCESSES: &[&str] = &[

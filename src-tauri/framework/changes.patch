@@ -38,6 +38,27 @@
      self
    }
  
+@@ -821,7 +821,10 @@
+     target_os = "openbsd"
+   ))]
+   fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
+-    unimplemented!()
++    // GitPulse: the mock has no native window. Callers already treat an
++    // error as "no GTK window" (`if let Ok(w) = window.gtk_window()`); a
++    // panic here aborted every Linux mock app that builds a window with a menu.
++    Err(Error::WindowNotFound)
+   }
+ 
+   #[cfg(any(
+@@ -832,7 +835,7 @@
+     target_os = "openbsd"
+   ))]
+   fn default_vbox(&self) -> Result<gtk::Box> {
+-    unimplemented!()
++    Err(Error::WindowNotFound)
+   }
+ 
+   #[cfg(target_os = "android")]
 --- a/tauri/src/webview/webview_window.rs
 +++ b/tauri/src/webview/webview_window.rs
 @@ -768,7 +768,7 @@

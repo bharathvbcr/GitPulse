@@ -201,70 +201,49 @@ fn observe(pid: u32) -> Result<Option<Birth>, String> {
 
 #[cfg(target_os = "windows")]
 fn observe(pid: u32) -> Result<Option<Birth>, String> {
-    use std::ffi::c_void;
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-        fn GetProcessTimes(
-            process: *mut c_void,
-            creation: *mut FileTime,
-            exit: *mut FileTime,
-            kernel: *mut FileTime,
-            user: *mut FileTime,
-        ) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-    /// What `OpenProcess` reports for a PID no process holds.
-    const ERROR_INVALID_PARAMETER: i32 = 87;
-    /// 1601-01-01 to 1970-01-01, in 100 ns FILETIME ticks.
-    const UNIX_EPOCH_TICKS: u128 = 116_444_736_000_000_000;
+    use crate::sysload::winproc::{self, sys};
     if pid == 0 {
         return Err("Invalid process ID".into());
     }
-    // SAFETY: query-only handle; no inherited access or mutation of the child.
-    let handle = unsafe { OpenProcess(0x1000, 0, pid) };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
-            return Ok(None);
-        }
-        return Err(error.to_string());
-    }
-    let mut creation = FileTime::default();
-    let mut exit = FileTime::default();
-    let mut kernel = FileTime::default();
-    let mut user = FileTime::default();
-    // SAFETY: the handle is live and each pointer targets a writable FILETIME.
-    let result =
-        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    let failure = (result == 0).then(std::io::Error::last_os_error);
-    // SAFETY: this function owns the handle and closes it exactly once.
-    let closed = unsafe { CloseHandle(handle) };
-    if let Some(error) = failure {
-        return Err(error.to_string());
-    }
-    if closed == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
+    // Query-only handle; no inherited access or mutation of the child.
+    let handle = match sys::open(pid, sys::QUERY_LIMITED) {
+        Ok(handle) => handle,
+        Err(sys::OpenFail::Gone) => return Ok(None),
+        Err(other) => return Err(other.message()),
+    };
+    let times = sys::times(&handle)?;
     // A process another handle keeps open still answers, with an exit time.
-    if exit.low != 0 || exit.high != 0 {
+    if times.exited {
         return Ok(None);
     }
-    let ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
-    if ticks == 0 {
+    if times.creation_ticks == 0 {
         return Err("Invalid process creation identity".into());
     }
     Ok(Some(Birth {
-        identity: format!("windows:{pid}:{ticks}"),
-        started_unix_nanos: (u128::from(ticks) * 100).saturating_sub(UNIX_EPOCH_TICKS * 100),
+        identity: format!("windows:{pid}:{}", times.creation_ticks),
+        started_unix_nanos: winproc::unix_nanos(times.creation_ticks),
         zombie: false,
     }))
+}
+
+/// The process that started this one, on Windows, where `getppid` has no
+/// counterpart in `std`. The Toolhelp snapshot records each process's parent
+/// pid as of its creation, and Windows reuses pids, so the answer stands only
+/// when the parent was created no later than this process: a "parent" that
+/// started after its child is a different process that took the pid.
+#[cfg(target_os = "windows")]
+pub(crate) fn parent_pid() -> Option<u32> {
+    use crate::sysload::winproc::sys;
+    let me = std::process::id();
+    let entries = sys::snapshot(crate::sysload::procscan::MAX_SCANNED_PROCESSES).ok()?;
+    let parent = entries
+        .iter()
+        .find(|entry| entry.pid == me)
+        .map(|entry| entry.parent)
+        .filter(|pid| *pid != 0)?;
+    let mine = observe(me).ok().flatten()?;
+    let theirs = observe(parent).ok().flatten()?;
+    (theirs.started_unix_nanos <= mine.started_unix_nanos).then_some(parent)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -281,6 +260,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    /// Windows only (CI): the parent of a test process is a live process that
+    /// started before it, and `running_since` agrees under the recorded start.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_windows_parent_is_found_and_alive_at_its_recorded_start() {
+        let parent = super::parent_pid().expect("a test process has a live parent");
+        assert_ne!(parent, std::process::id());
+        let start = super::started_unix_nanos(parent).expect("the parent's start");
+        assert_eq!(running_since(parent, u128::from(start)), Liveness::Alive);
     }
 
     #[test]

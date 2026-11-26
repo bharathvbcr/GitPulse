@@ -1077,6 +1077,13 @@ mod tests {
         "/repo/root"
     };
 
+    /// A second absolute path, for `--repo` overriding the default.
+    const EXPLICIT_REPO: &str = if cfg!(windows) {
+        r"C:\explicit\repo"
+    } else {
+        "/explicit/repo"
+    };
+
     const SAMPLE_TOKEN: &str =
         "gpst_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1164,7 +1171,7 @@ mod tests {
             &vec_args(&[
                 "list",
                 "--repo",
-                "/explicit/repo",
+                EXPLICIT_REPO,
                 "--caller-session=term-200-9",
                 "--include-repo-shells",
             ]),
@@ -1176,7 +1183,7 @@ mod tests {
         assert_eq!(
             list,
             TermCliOutcome::Call(OrchestrateCall::List {
-                repo_path: "/explicit/repo".into(),
+                repo_path: EXPLICIT_REPO.into(),
                 caller_session_id: Some("term-200-9".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,

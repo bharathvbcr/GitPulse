@@ -560,3 +560,34 @@ fn a_binding_stored_under_the_redacted_path_spelling_is_found() {
     let history = BindingHistory::load(&repo, &odd).unwrap();
     assert_eq!(history.as_of(T0 + 1), bound("T9"));
 }
+
+/// The canonical spelling of a worktree that no longer exists is derived from
+/// the plain one a transcript reports, so it finds the rows `bind` wrote while
+/// the directory was there. Pure text: it holds on every platform; only
+/// Windows asks for it ([`bound_spelling`]).
+#[test]
+fn a_plain_windows_spelling_reads_as_the_canonical_one() {
+    assert_eq!(
+        verbatim_spelling(r"C:\Users\a\w").as_deref(),
+        Some(r"\\?\C:\Users\a\w")
+    );
+    assert_eq!(
+        verbatim_spelling("C:/Users/a/w/").as_deref(),
+        Some(r"\\?\C:\Users\a\w")
+    );
+    assert_eq!(verbatim_spelling(r"C:\").as_deref(), Some(r"\\?\C:\"));
+    assert_eq!(
+        verbatim_spelling(r"\\srv\share\w").as_deref(),
+        Some(r"\\?\UNC\srv\share\w")
+    );
+    for spelled in [
+        r"\\?\C:\Users\a\w",
+        r"\\.\COM1",
+        r"\\?\Volume{1}\w",
+        "/unix/w",
+        "w",
+        "",
+    ] {
+        assert_eq!(verbatim_spelling(spelled), None, "{spelled}");
+    }
+}

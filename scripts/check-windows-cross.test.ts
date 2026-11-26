@@ -110,43 +110,43 @@ describe("check-windows-cross", () => {
     const arm64Split = resolveCrossEnv(
       baseEnv,
       "darwin",
-      (p) => p === path.join(arm64Llvm, "clang-cl") || p === path.join(arm64Lld, "lld-link"),
+      (p) => p === path.posix.join(arm64Llvm, "clang-cl") || p === path.posix.join(arm64Lld, "lld-link"),
     );
     expect(arm64Split.addedLlvmBin).toBe(arm64Llvm);
     expect(arm64Split.addedLldBin).toBe(arm64Lld);
     expect(arm64Split.addedBins).toEqual([arm64Llvm, arm64Lld]);
-    expect(arm64Split.env.PATH).toBe(`${arm64Llvm}${path.delimiter}${arm64Lld}${path.delimiter}/usr/bin:/bin`);
+    expect(arm64Split.env.PATH).toBe(`${arm64Llvm}${path.posix.delimiter}${arm64Lld}${path.posix.delimiter}/usr/bin:/bin`);
 
     // Older Homebrew LLVM bundles `lld-link` inside `/usr/local/opt/llvm/bin`.
     const intelBundled = resolveCrossEnv(
       baseEnv,
       "darwin",
-      (p) => p === path.join(intelLlvm, "clang-cl") || p === path.join(intelLlvm, "lld-link"),
+      (p) => p === path.posix.join(intelLlvm, "clang-cl") || p === path.posix.join(intelLlvm, "lld-link"),
     );
     expect(intelBundled.addedLlvmBin).toBe(intelLlvm);
     expect(intelBundled.addedLldBin).toBeNull();
     expect(intelBundled.addedBins).toEqual([intelLlvm]);
-    expect(intelBundled.env.PATH).toBe(`${intelLlvm}${path.delimiter}/usr/bin:/bin`);
+    expect(intelBundled.env.PATH).toBe(`${intelLlvm}${path.posix.delimiter}/usr/bin:/bin`);
 
     // Only `lld-link` missing (e.g., llvm already on PATH under minimal non-login PATH).
     const lldOnly = resolveCrossEnv(
       { PATH: `${intelLlvm}:/usr/bin` },
       "darwin",
       (p) =>
-        p === path.join(intelLlvm, "clang-cl") ||
-        p === path.join(intelLlvm, "llvm-lib") ||
-        p === path.join(intelLlvm, "llvm-rc") ||
-        p === path.join(intelLld, "lld-link"),
+        p === path.posix.join(intelLlvm, "clang-cl") ||
+        p === path.posix.join(intelLlvm, "llvm-lib") ||
+        p === path.posix.join(intelLlvm, "llvm-rc") ||
+        p === path.posix.join(intelLld, "lld-link"),
     );
     expect(lldOnly.addedLlvmBin).toBeNull();
     expect(lldOnly.addedLldBin).toBe(intelLld);
-    expect(lldOnly.env.PATH).toBe(`${intelLld}${path.delimiter}${intelLlvm}:/usr/bin`);
+    expect(lldOnly.env.PATH).toBe(`${intelLld}${path.posix.delimiter}${intelLlvm}:/usr/bin`);
 
     // Untouched when all 4 tools are already on PATH.
     const alreadyOnPath = resolveCrossEnv(
       { PATH: "/custom/llvm/bin:/usr/bin" },
       "darwin",
-      (p) => p.startsWith(path.join("/custom/llvm/bin", "")),
+      (p) => p.startsWith(path.posix.join("/custom/llvm/bin", "")),
     );
     expect(alreadyOnPath.addedLlvmBin).toBeNull();
     expect(alreadyOnPath.addedLldBin).toBeNull();

@@ -351,6 +351,44 @@ describe("check:workflows", () => {
     }
   });
 
+  // Two ledger tests hold the write lock from the real `sqlite3` CLI, which the
+  // Windows image lacks. The Chocolatey feed answered 504 once, so a single
+  // `choco install` is not enough: the step must retry and then fail loudly.
+  it("puts sqlite3 on PATH on the Windows Rust shards, retrying a failed install, after the manvi build", () => {
+    const ci = readFileSync(fileURLToPath(new URL("../.github/workflows/ci.yml", import.meta.url)), "utf8");
+    const body = ci.slice(ci.search(/^jobs:\s*$/m));
+    const heads = [...body.matchAll(/^ {2}([a-z0-9-]+):\s*$/gm)];
+    const at = heads.findIndex((head) => head[1] === "rust-test-windows");
+    expect(at, "rust-test-windows exists").toBeGreaterThan(-1);
+    const job = body.slice(heads[at].index, heads[at + 1]?.index ?? body.length);
+    const step = job.indexOf("- name: Install sqlite3");
+    const test = job.indexOf("- name: Rust Unit & Integration Tests (nextest shard)");
+    expect(step, "rust-test-windows installs sqlite3").toBeGreaterThan(-1);
+    expect(test, "the tests run after sqlite3").toBeGreaterThan(step);
+    // A step that fails skips every later one, so a feed outage here must not
+    // take the manvi build down with it.
+    expect(step, "sqlite3 comes after the manvi build").toBeGreaterThan(job.indexOf("- name: Keep the manvi build"));
+    const sqlite = job.slice(step, test);
+    expect(sqlite).toContain("choco install sqlite");
+    expect(sqlite, "retries").toMatch(/for \(\$i = 1; \$i -le \$attempts; \$i\+\+\)/);
+    expect(sqlite, "bounded").toMatch(/\$attempts = \d+/);
+    expect(sqlite, "verifies the CLI answers").toContain("sqlite3 -version");
+    expect(sqlite, "fails loudly after the last attempt").toMatch(/throw "sqlite3 could not be installed/);
+  });
+
+  it("builds and tests the desktop app with one feature set, so no test step rebuilds the smoke binary in dev mode", () => {
+    // `cargo test --test gtk_runtime` also builds the `gitpulse` bin. Without
+    // tauri/custom-protocol it recompiled tauri in dev mode and overwrote
+    // target/debug/gitpulse, so the real-binary smoke launched an app that
+    // waited on the dev server (#app never appeared on any platform).
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const invocations = [...e2e.matchAll(/cargo (?:build|test) --manifest-path src-tauri\/Cargo\.toml(?:[^\n]*\\\n)*[^\n]*/g)].map(m => m[0]);
+    expect(invocations.length, "finds the app build and both runtime test steps").toBeGreaterThanOrEqual(5);
+    for (const call of invocations) {
+      expect(call, `every app cargo step keeps the bundled frontend: ${call}`).toContain("--features tauri/custom-protocol");
+    }
+  });
+
   it("keeps e2e-desktop.yml safe on Windows (shell: bash, cygpath, WebView2 msedgedriver matching) and Linux (X11 + Wayland)", () => {
     const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
     const linux = e2e.slice(e2e.indexOf("\n  e2e-linux:"), e2e.indexOf("\n  e2e-windows:"));

@@ -615,15 +615,6 @@ jobs:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
-      # Two ledger tests hold the ledger's write lock from a second process,
-      # the real `sqlite3` CLI, and failed on Windows with "program not found":
-      # the Linux and macOS images ship it, the Windows one does not.
-      - name: Install sqlite3
-        shell: pwsh
-        run: |
-          choco install sqlite -y --no-progress
-          sqlite3 -version
-
       - name: Check out Manvi at MANVI_REV
         shell: bash
         run: |
@@ -664,6 +655,31 @@ jobs:
         with:
           path: ~/.cache/gitpulse-ci/manvi
           key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
+
+      # Two ledger tests hold the ledger's write lock from a second process,
+      # the real `sqlite3` CLI, and failed on Windows with "program not found":
+      # the Linux and macOS images ship it, the Windows one does not.
+      # Last before the tests on purpose: a failed step skips every step after
+      # it, and when it sat above the manvi build a Chocolatey outage also cost
+      # the manvi gate tests ("manvi gate did not run ... not_installed").
+      - name: Install sqlite3
+        shell: pwsh
+        run: |
+          # The Chocolatey community feed answers 504 now and then, so try a
+          # bounded number of times and judge success by the CLI answering,
+          # never by choco's exit code. Out of attempts is a failed job, not a
+          # suite that goes on to fail with a different message.
+          $attempts = 5
+          for ($i = 1; $i -le $attempts; $i++) {
+            choco install sqlite -y --no-progress
+            if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
+              sqlite3 -version
+              if ($LASTEXITCODE -eq 0) { exit 0 }
+            }
+            Write-Host "sqlite3 is not usable after attempt $i of $attempts"
+            if ($i -lt $attempts) { Start-Sleep -Seconds (10 * $i) }
+          }
+          throw "sqlite3 could not be installed after $attempts attempts"
 
       - name: Rust Unit & Integration Tests (nextest shard)
         if: ${{ !cancelled() }}

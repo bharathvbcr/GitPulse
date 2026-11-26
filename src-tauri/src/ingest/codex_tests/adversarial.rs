@@ -584,8 +584,8 @@ fn w01_a_symlink_loop_in_the_codex_root_is_walked_once() {
         &rollout_path(codex.path(), "L"),
         &[session_meta("L", w1), run(1, "once", w1)],
     );
-    std::os::unix::fs::symlink(codex.path(), codex.path().join("2026/loop")).unwrap();
-    std::os::unix::fs::symlink("../..", codex.path().join("2026/09/up")).unwrap();
+    std::os::unix::fs::symlink(codex.path(), codex.path().join_parts("2026/loop")).unwrap();
+    std::os::unix::fs::symlink("../..", codex.path().join_parts("2026/09/up")).unwrap();
     let out = with_roots(Some(claude.path()), Some(codex.path()), || pair.pass());
     assert_eq!((out.recorded, out.transcripts_listed), (1, 1), "{out:?}");
 }
@@ -635,7 +635,7 @@ fn w04_a_rollout_below_the_depth_bound_is_counted_and_the_walk_incomplete() {
     let w1 = &pair.wt[0];
     let codex = tempfile::tempdir().unwrap();
     let claude = tempfile::tempdir().unwrap();
-    let deep = codex.path().join("a/b/c/d/e/f/g");
+    let deep = codex.path().join_parts("a/b/c/d/e/f/g");
     write_lines(
         &deep.join("rollout-deep.jsonl"),
         &[session_meta("D", w1), run(1, "deep", w1)],
@@ -822,7 +822,7 @@ fn d01_a_cursor_reset_does_not_duplicate_rows_for_either_source() {
     let claude = tempfile::tempdir().unwrap();
     let cpath = rollout_path(codex.path(), "R");
     write_lines(&cpath, &[session_meta("R", w1), run(1, "codex-once", w1)]);
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(&lpath, &[claude_edit(w1, "C", 2, &format!("{w1}/c.rs"))]);
     with_roots(Some(claude.path()), Some(codex.path()), || {
         pair.pass();
@@ -861,7 +861,7 @@ fn d01b_two_identical_lines_are_two_rows_and_stay_two_after_a_cursor_reset() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     let line = claude_edit(w1, "C", 2, &format!("{w1}/same.rs"));
     write_lines(&lpath, &[line.clone(), line]);
     with_roots(Some(claude.path()), None, || {
@@ -878,7 +878,7 @@ fn d01c_a_rewritten_transcript_records_only_the_lines_that_changed() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     let edit = |second: u32, name: &str| claude_edit(w1, "C", second, &format!("{w1}/{name}"));
     write_lines(&lpath, &[edit(1, "a.rs"), edit(2, "b.rs"), edit(3, "c.rs")]);
     with_roots(Some(claude.path()), None, || {
@@ -906,7 +906,7 @@ fn d01d_two_passes_racing_after_a_cursor_reset_record_each_row_once() {
     let codex = tempfile::tempdir().unwrap();
     let cpath = rollout_path(codex.path(), "R");
     write_lines(&cpath, &[session_meta("R", w1), run(1, "codex-once", w1)]);
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(&lpath, &[claude_edit(w1, "C", 2, &format!("{w1}/c.rs"))]);
     with_roots(Some(claude.path()), Some(codex.path()), || {
         pair.pass();
@@ -934,7 +934,7 @@ fn d02_one_directory_as_both_roots_parses_each_file_only_by_its_own_source() {
         &[session_meta("R", w1), run(1, "codex-cmd", w1)],
     );
     write_lines(
-        &both.path().join("slug/C.jsonl"),
+        &both.path().join_parts("slug/C.jsonl"),
         &[claude_edit(w1, "C", 2, &format!("{w1}/c.rs"))],
     );
     let out = with_roots(Some(both.path()), Some(both.path()), || pair.pass());
@@ -1000,7 +1000,9 @@ fn adv_bench_unchanged_corpus_pass() {
         .unwrap();
     }
     for i in 0..codex_files {
-        let day = codex.path().join(format!("2026/09/{:02}", 1 + i % 28));
+        let day = codex
+            .path()
+            .join_parts(&format!("2026/09/{:02}", 1 + i % 28));
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(
             day.join(format!("rollout-{i}.jsonl")),

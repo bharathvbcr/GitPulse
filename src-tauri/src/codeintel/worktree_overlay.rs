@@ -2064,21 +2064,6 @@ mod tests {
         );
     }
 
-    fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            for rel in [".local/bin/devmap", ".cargo/bin/devmap"] {
-                let candidate = home.join(rel);
-                if candidate.is_file() {
-                    return crate::devmap::cli::bind_test_binary(
-                        candidate.to_string_lossy().into_owned(),
-                    );
-                }
-            }
-        }
-        let resolved = crate::devmap::cli::resolve_binary().expect("real devmap binary installed");
-        crate::devmap::cli::bind_test_binary(resolved.path)
-    }
-
     fn seed_fresh_anchor_for_zero_copy() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path();
@@ -2105,7 +2090,7 @@ mod tests {
                 "seed fresh anchor",
             ],
         );
-        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        let canon_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         let mut head_out_cmd = Command::new("git");
         crate::test_support::pin_git(&mut head_out_cmd);
         let head_out = head_out_cmd
@@ -2448,7 +2433,7 @@ mod tests {
 
     #[test]
     fn sync_worktree_overlay_marks_deleted_files_and_symbols_with_tombstone() {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -2488,7 +2473,7 @@ mod tests {
 
     #[test]
     fn provision_worktree_devmap_zero_copy_shares_anchor_graph_without_copying_sqlite() {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -2645,7 +2630,7 @@ mod tests {
             &devmap_extract::paths::stack_lease_path(&legit_wt),
         )
         .unwrap();
-        spoofed_lease.worktree_root = fs::canonicalize(stranger)
+        spoofed_lease.worktree_root = crate::engine::process::canonicalize_plain(stranger)
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -2741,7 +2726,7 @@ mod tests {
 
     #[test]
     fn zero_write_on_read_across_all_codeintel_and_radar_surfaces() {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let (anchor_dir, head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -2984,7 +2969,7 @@ mod tests {
 
     #[test]
     fn sync_worktree_overlay_extracts_treesitter_declarations_and_tombstones_removed_symbols() {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let (anchor_dir, head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -3066,7 +3051,7 @@ mod tests {
 
     #[test]
     fn polyglot_treesitter_sync_preserves_live_methods_and_consts() {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path();
         git(anchor, &["init", "-q", "-b", "main"]);
@@ -3092,7 +3077,7 @@ mod tests {
                 "polyglot init",
             ],
         );
-        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        let canon_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         crate::test_support::trust_repo(&canon_anchor);
         crate::devmap::ensure_state_dir_excluded(&canon_anchor);
         let built = crate::devmap::cli::build(&canon_anchor.to_string_lossy())
@@ -3254,7 +3239,7 @@ mod tests {
         let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
         let anchor = anchor_dir.path();
         crate::test_support::trust_repo(anchor);
-        let canonical_anchor = fs::canonicalize(anchor).unwrap();
+        let canonical_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         {
             let anchor_conn = Connection::open(devmap_query::paths::store_path(anchor)).unwrap();
             anchor_conn
@@ -3295,11 +3280,15 @@ mod tests {
         );
 
         let wt_db = devmap_query::paths::store_path(&wt);
-        let canonical_wt = fs::canonicalize(&wt).unwrap();
+        let canonical_wt = crate::engine::process::canonicalize_plain(&wt).unwrap();
         let reopened = Store::open_read_only(&wt_db).unwrap();
         let effective_root = reopened.latest_repo_root().unwrap().unwrap();
         drop(reopened);
-        assert_eq!(fs::canonicalize(&effective_root).unwrap(), canonical_wt);
+        assert_eq!(
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&effective_root))
+                .unwrap(),
+            canonical_wt
+        );
 
         let conn = Connection::open(&wt_db).unwrap();
         let hist_gen_root: String = conn
@@ -3310,7 +3299,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fs::canonicalize(&hist_gen_root).unwrap(),
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&hist_gen_root))
+                .unwrap(),
             canonical_anchor,
             "rebind_staged must preserve historical generation CoW pages"
         );
@@ -3329,7 +3319,13 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(PathBuf::from(rebound_root), canonical_wt);
+        // devmap-store's rebind_staged records the root as std canonicalize
+        // spells it, `\\?\C:\...` on Windows; the lane is the same directory
+        // whichever spelling names it.
+        assert_eq!(
+            PathBuf::from(crate::engine::process::plain_path_text(&rebound_root)),
+            canonical_wt
+        );
     }
 
     #[test]
@@ -3488,7 +3484,7 @@ mod tests {
     #[test]
     fn stacked_delta_sqlite_serves_search_impact_and_affected_tests_and_fails_closed_when_unsynced()
     {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -3577,7 +3573,7 @@ mod tests {
     #[test]
     fn stacked_synced_delta_keeps_status_not_fresh_resolves_import_aliases_and_refuses_tampered_csr(
     ) {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -3685,6 +3681,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&csr_path).unwrap().permissions();
             perms.set_mode(0o644);
+            fs::set_permissions(&csr_path, perms).unwrap();
+        }
+        // Windows has no mode bits: the sidecar is sealed read-only there, and
+        // writing to it is "Access is denied" until the attribute is cleared.
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&csr_path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
             fs::set_permissions(&csr_path, perms).unwrap();
         }
         let mut csr_bytes = fs::read(&csr_path).unwrap();

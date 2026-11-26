@@ -8566,7 +8566,9 @@ mod tests {
         );
 
         // Resource template `gitpulse://campaign{+repo_path}` serves the identical verified document.
-        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        // `repo_uri`, not `encode_path`: a Windows path has no leading `/` and
+        // its `\` and `:` must become a `/C:/...` path, not `%5C` and `%3A`.
+        let uri = uri::repo_uri("campaign", repo_path);
         let res = modern_call("resources/read", json!({ "uri": uri }));
         let res_doc: Value =
             serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");
@@ -8729,7 +8731,9 @@ mod tests {
             );
         }
 
-        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        // `repo_uri`, not `encode_path`: a Windows path has no leading `/` and
+        // its `\` and `:` must become a `/C:/...` path, not `%5C` and `%3A`.
+        let uri = uri::repo_uri("campaign", repo_path);
         let res = modern_call("resources/read", json!({ "uri": uri }));
         let res_doc: Value =
             serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");
@@ -12983,15 +12987,14 @@ mod tests {
             .and_then(|o| o.iter().find(|o| names_path(o, &wt)))
             .unwrap_or_else(|| panic!("no outcome for the busy worktree: {out}"));
         assert_eq!(outcome["status"], "skipped", "{out}");
-        // Windows has no process scan, so it cannot say which process is in the
-        // worktree; it refuses on the session check instead of a named process.
-        let why = if cfg!(windows) {
-            "could not rule out a live agent session"
-        } else {
-            "process"
-        };
+        // The refusal names the live process on every platform. On Windows that
+        // rests on the process scan reading every same-user process (32-bit
+        // ones through their PEB32); it is not run locally and the Windows CI
+        // shards prove it.
         assert!(
-            outcome["reason"].as_str().is_some_and(|r| r.contains(why)),
+            outcome["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("live process(es) use it")),
             "{out}"
         );
         assert_eq!(out["reaped_pids"], json!([]));
@@ -13226,23 +13229,9 @@ mod tests {
         let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
         assert!(!err, "{out}");
         let find = |path: &str| outcome_for(&out, path);
-        if cfg!(windows) {
-            // No process scan, so no worktree can be shown free of a live agent
-            // session, and prune removes none: there is no branch delete to
-            // fail and nothing to keep going past.
-            for path in [&stuck, &other] {
-                let outcome = find(path);
-                assert_eq!(outcome["status"], "skipped", "{out}");
-                assert!(
-                    outcome["reason"]
-                        .as_str()
-                        .is_some_and(|r| r.contains("could not rule out a live agent session")),
-                    "{out}"
-                );
-                assert!(std::path::Path::new(path).is_dir(), "{out}");
-            }
-            return;
-        }
+        // Windows takes this path too: the process scan reads every same-user
+        // process (32-bit ones through their PEB32), so prune can show the lanes
+        // free. That is not run locally; the Windows CI shards prove it.
         let stuck_outcome = find(&stuck);
         assert_eq!(stuck_outcome["status"], "removed_branch_kept", "{out}");
         assert_eq!(stuck_outcome["branch_deleted"], false, "{out}");

@@ -199,12 +199,12 @@ pub(crate) fn detect_capped(root: Node, source: &str, cap: usize) -> LostScan {
 fn follows_double_colon(node: Node) -> bool {
     // A comment between the colons and the word (`String:: /* c */ class`) is a
     // sibling too, and says nothing about what the word is.
-    let mut before = node.prev_sibling();
+    let mut before = crate::parent_index::prev_sibling_of(node);
     while let Some(sibling) = before {
         if !sibling.kind().ends_with("comment") {
             return sibling.kind() == "::";
         }
-        before = sibling.prev_sibling();
+        before = crate::parent_index::prev_sibling_of(sibling);
     }
     false
 }

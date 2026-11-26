@@ -170,6 +170,25 @@ pub(crate) fn inflate_document(frame: &[u8], what: &str) -> rusqlite::Result<Str
     })
 }
 
+/// Compress one JSON document into a checksummed zstd frame, for a file kept
+/// outside the store: the resolution-reuse cache's per-file blobs.
+///
+/// The same codec, level and size cap as a stored extraction. Kept as a thin
+/// wrapper over [`compress_document`] so the store's own frames are written by
+/// exactly the code they always were.
+pub fn compress_json_frame(json: &str) -> Result<Vec<u8>, String> {
+    compress_document(json).map_err(|error| error.to_string())
+}
+
+/// Decompress a frame written by [`compress_json_frame`], refusing a frame that
+/// is damaged, truncated, undeclared in size or larger than the cap.
+///
+/// The refusal text is [`inflate_document`]'s, which calls the payload a
+/// "stored extraction"; `what` names the file, so the message still says which.
+pub fn inflate_json_frame(frame: &[u8], what: &str) -> Result<String, String> {
+    inflate_document(frame, what).map_err(|error| error.to_string())
+}
+
 /// The JSON of a stored extraction, as the column holds it.
 ///
 /// Borrowed when the row is `TEXT`, decompressed when it is a `BLOB`.

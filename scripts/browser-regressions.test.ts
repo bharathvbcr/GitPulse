@@ -41,7 +41,7 @@ describe("browser regression gate", () => {
 
     expect(nativeRunnerBinary("linux", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "examples", "webview_regressions"));
     expect(nativeRunnerBinary("win32", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "examples", "webview_regressions.exe"));
-    expect(nativeRunnerBinary("linux", { CARGO_TARGET_DIR: "/custom-target" }, "/repo")).toBe(path.join("/custom-target", "debug", "examples", "webview_regressions"));
+    expect(nativeRunnerBinary("linux", { CARGO_TARGET_DIR: "/custom-target" }, "/repo")).toBe(path.resolve("/custom-target", "debug", "examples", "webview_regressions"));
     expect(nativeRunnerBinary("linux", { GITPULSE_WEBVIEW_RUNNER_BIN: "/opt/bin/runner" }, "/repo")).toBe(path.resolve("/opt/bin/runner"));
   });
   it("gives a long page its own deadline and keeps the minute for every other page", () => {

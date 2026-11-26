@@ -793,7 +793,14 @@ mod tests {
         // Windows cannot hold a file named `a:5`; the refusal reads only the
         // name, so the path alone is enough there.
         let dir = tempfile::tempdir().expect("temp dir");
-        let target = dir.path().join("a:5");
+        // Spelled by hand: on Windows `join("a:5")` reads `a:` as a drive
+        // prefix, replaces the whole path with the drive-relative `a:5`, and
+        // leaves a file name of `5`, so the colon the refusal reads is gone.
+        let target = PathBuf::from(format!(
+            "{}{}a:5",
+            dir.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
         #[cfg(unix)]
         fs::write(&target, b"x").expect("write");
         let installed = Installed {

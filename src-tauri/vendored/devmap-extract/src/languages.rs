@@ -1276,7 +1276,7 @@ pub const PAYLOAD_GRAMMAR_IDENTITIES: &[(&str, &str)] = &[
     ("solidity", "tree-sitter-solidity@1.2.13:solidity:abi15"),
     ("sql", "tree-sitter-sequel@0.3.11:sql:abi14"),
     ("svelte", "tree-sitter-svelte-ng@1.0.2:svelte:abi14+embedded[tree-sitter-typescript@0.23.2:typescript:abi14,tree-sitter-javascript@0.23.1:javascript:abi14]"),
-    ("swift", "tree-sitter-swift@0.7.3:swift:abi15"),
+    ("swift", "tree-sitter-swift@0.7.4:swift:abi15"),
     ("tsx", "tree-sitter-typescript@0.23.2:tsx:abi14"),
     ("typescript", "tree-sitter-typescript@0.23.2:typescript:abi14"),
     ("vue", "vendored/tree-sitter-vue@ce8011a:vue:abi15+embedded[tree-sitter-typescript@0.23.2:typescript:abi14,tree-sitter-typescript@0.23.2:tsx:abi14,tree-sitter-javascript@0.23.1:javascript:abi14]"),

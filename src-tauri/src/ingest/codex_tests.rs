@@ -135,8 +135,24 @@ fn inert(second: u32) -> Vec<String> {
     ]
 }
 
+/// `rel`, a `/`-separated relative path, joined one component at a time. A
+/// transcript's cursor is keyed by the text of the path the walk reached it
+/// by, which appends each directory entry with the platform separator; a
+/// fixture that joins `"2026/09/01"` in one piece asks for a different key on
+/// Windows, where `/` stays in the text.
+trait JoinParts {
+    fn join_parts(&self, rel: &str) -> std::path::PathBuf;
+}
+
+impl JoinParts for std::path::Path {
+    fn join_parts(&self, rel: &str) -> std::path::PathBuf {
+        rel.split('/')
+            .fold(self.to_path_buf(), |path, part| path.join(part))
+    }
+}
+
 fn rollout_path(root: &std::path::Path, thread: &str) -> std::path::PathBuf {
-    root.join("2026/09/01")
+    root.join_parts("2026/09/01")
         .join(format!("rollout-2026-09-01T12-00-00-{thread}.jsonl"))
 }
 
@@ -301,7 +317,7 @@ fn a_missing_codex_override_is_reported_not_read_as_no_sessions() {
     std::fs::write(&file, "x").unwrap();
     std::fs::create_dir_all(claude.path().join("slug")).unwrap();
     std::fs::write(
-        claude.path().join("slug/S1.jsonl"),
+        claude.path().join_parts("slug/S1.jsonl"),
         serde_json::json!({
             "type": "assistant", "sessionId": "S1", "timestamp": stamp(1), "cwd": repo,
             "message": { "content": [
@@ -407,7 +423,7 @@ fn both_sources_in_one_pass_are_attributed_to_their_own_worktrees() {
     let codex = tempfile::tempdir().unwrap();
     let [w1, w2] = &pair.wt;
     write_lines(
-        &claude.path().join("slug/C1.jsonl"),
+        &claude.path().join_parts("slug/C1.jsonl"),
         &[
             claude_edit(w1, "C1", 1, &format!("{w1}/claude1.rs")),
             claude_edit(w2, "C1", 2, &format!("{w2}/claude2.rs")),
@@ -512,7 +528,7 @@ fn the_legacy_baseline_floor_holds_claude_to_it_and_does_not_hold_codex() {
     let codex = tempfile::tempdir().unwrap();
     // Both calls are from 2026-09-01, long before the baseline.
     write_lines(
-        &claude.path().join("slug/C1.jsonl"),
+        &claude.path().join_parts("slug/C1.jsonl"),
         &[claude_edit(repo, "C1", 1, &format!("{repo}/claude.rs"))],
     );
     write_lines(

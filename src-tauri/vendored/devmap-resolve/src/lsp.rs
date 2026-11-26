@@ -1726,6 +1726,21 @@ fn native_path(_bytes: Vec<u8>) -> Result<PathBuf, LocationDrop> {
     Err(LocationDrop::Undecodable)
 }
 
+/// `\\?\C:\a` and `C:\a` are one place, but `Path::strip_prefix` compares
+/// their prefixes as different. A path without a verbatim drive prefix, and
+/// every path off Windows, is returned unchanged.
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(rest) = path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 /// The repository-relative name of the file a server's URI names.
 ///
 /// The URI is percent-decoded first: a server answers with an encoded URI, so
@@ -1744,17 +1759,24 @@ fn repo_relative_from_uri(repo_root: &Path, uri: &str) -> Result<String, Locatio
     let relative = match absolute.canonicalize() {
         Ok(canonical) => {
             let root = canonical_root.as_deref().unwrap_or(repo_root);
-            canonical.strip_prefix(root).map(Path::to_path_buf)
+            canonical.strip_prefix(root).ok().map(Path::to_path_buf)
         }
-        Err(_) => absolute
-            .strip_prefix(repo_root)
-            .or_else(|error| match canonical_root.as_deref() {
-                Some(root) => absolute.strip_prefix(root),
-                None => Err(error),
-            })
-            .map(Path::to_path_buf),
+        Err(_) => {
+            // The URI names the plain `C:\..` spelling while a canonical root
+            // is `\\?\C:\..`; `strip_prefix` treats those prefixes as different.
+            let absolute = without_verbatim_prefix(&absolute);
+            [Some(repo_root), canonical_root.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|root| {
+                    absolute
+                        .strip_prefix(without_verbatim_prefix(root))
+                        .ok()
+                        .map(Path::to_path_buf)
+                })
+        }
     }
-    .map_err(|_| LocationDrop::OutsideRepo)?;
+    .ok_or(LocationDrop::OutsideRepo)?;
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {

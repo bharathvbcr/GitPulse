@@ -558,7 +558,7 @@ fn rust_node_declares_names(kind: &str) -> bool {
 /// Whether the attributes written directly above `node` include a `cfg` or
 /// `cfg_attr`.
 fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
-    let mut previous = node.prev_sibling();
+    let mut previous = crate::parent_index::prev_sibling_of(node);
     while let Some(sibling) = previous {
         match sibling.kind() {
             "attribute_item" => {
@@ -576,7 +576,7 @@ fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
             "line_comment" | "block_comment" => {}
             _ => return false,
         }
-        previous = sibling.prev_sibling();
+        previous = crate::parent_index::prev_sibling_of(sibling);
     }
     false
 }
@@ -597,7 +597,7 @@ const STD_DERIVES: &[&str] = &[
 /// The attributes written directly above `item`, comments between them skipped.
 fn rust_item_attribute_leaves(item: Node, source: &str) -> Vec<AttributeLeaf> {
     let mut leaves = Vec::new();
-    let mut previous = item.prev_sibling();
+    let mut previous = crate::parent_index::prev_sibling_of(item);
     while let Some(sibling) = previous {
         match sibling.kind() {
             "attribute_item" => {
@@ -607,7 +607,7 @@ fn rust_item_attribute_leaves(item: Node, source: &str) -> Vec<AttributeLeaf> {
             "line_comment" | "block_comment" => {}
             _ => break,
         }
-        previous = sibling.prev_sibling();
+        previous = crate::parent_index::prev_sibling_of(sibling);
     }
     leaves
 }

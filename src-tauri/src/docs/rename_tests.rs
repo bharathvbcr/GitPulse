@@ -1383,10 +1383,42 @@ fn adv_key(path: &str) -> String {
     stem.to_lowercase()
 }
 
+/// Whether Windows can hold a path component of this name: none of
+/// `< > : " / \ | ? *`, no control character, no trailing dot or space (Win32
+/// strips them), and not a device name.
+fn windows_can_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let device = ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+        || ["COM", "LPT"].iter().any(|p| {
+            stem.strip_prefix(p)
+                .is_some_and(|n| n.len() == 1 && n != "0")
+        });
+    !device
+        && !component.ends_with(['.', ' '])
+        && !component
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+}
+
+/// One of `items`; on Windows only one it can create, so the generator draws
+/// names that exist there. Unix draws exactly what it always did.
+fn pick_creatable<'a>(rng: &mut Rng, items: &[&'a str]) -> &'a str {
+    loop {
+        let item = rng.pick(items);
+        if !cfg!(windows) || windows_can_name(item) {
+            return item;
+        }
+    }
+}
+
 fn adv_path(rng: &mut Rng) -> String {
     let depth = rng.below(5);
-    let mut parts: Vec<&str> = (0..depth).map(|_| rng.pick(ADV_DIRS)).collect();
-    parts.push(rng.pick(ADV_NAMES));
+    let mut parts: Vec<&str> = (0..depth).map(|_| pick_creatable(rng, ADV_DIRS)).collect();
+    parts.push(pick_creatable(rng, ADV_NAMES));
     parts.join("/")
 }
 
@@ -1631,11 +1663,25 @@ fn adversarial_a_decomposed_spelling_of_a_composed_note_name_resolves_the_same()
 #[test]
 fn adversarial_a_wikilink_to_a_target_with_a_hash_or_pipe_is_not_left_silently_broken() {
     for to in ["docs/Plan#1.md", "docs/Plan|x.md", "docs/Plan]].md"] {
+        let can_name = to.split('/').all(windows_can_name);
         let dir = repo_with(&[
             ("docs/A.md", "[[docs/Roadmap]] and [[Roadmap]]\n"),
             ("docs/Roadmap.md", "# R\n"),
         ]);
         let path = dir.path().to_str().unwrap();
+        if cfg!(windows) && !can_name {
+            // A name Windows cannot hold is refused by name, loudly, and the
+            // vault is left as it was: neither a silent break nor a half move.
+            let refused = rename_doc(path, "docs/Roadmap.md", to, |_| Ok(()))
+                .expect_err("Windows cannot name this file");
+            assert!(!refused.message().is_empty(), "{to}");
+            assert_eq!(
+                read(&dir, "docs/A.md"),
+                "[[docs/Roadmap]] and [[Roadmap]]\n"
+            );
+            assert!(dir.path().join("docs/Roadmap.md").exists(), "{to}");
+            continue;
+        }
         let outcome = rename_doc(path, "docs/Roadmap.md", to, |_| Ok(())).expect("rename");
         let after = refresh_and_load(path);
         let broken = after.vault.broken_links();

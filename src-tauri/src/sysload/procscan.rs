@@ -45,11 +45,14 @@
 //! another user's processes are counted as not inspected. Sums say how many
 //! members they could not read.
 
-// Where there is no process scan (Windows), the parsing and attribution
-// helpers the macOS and Linux readers feed have no caller outside the tests.
+// Where there is no process scan (neither macOS, Linux nor 64-bit Windows),
+// the parsing and attribution helpers the readers feed have no caller outside
+// the tests. The Windows reader does not use the Unix `/proc` and `sysctl`
+// parsers either, so those stay allowed there too.
 #![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 
 use super::sensor::{Reading, Why};
+use super::winproc;
 use super::RUN_ID_ENV;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -111,11 +114,28 @@ impl AgentKind {
 /// Recognises an agent CLI from the path it was exec'd with and its first
 /// argument (the script, when the executable is a JavaScript runtime).
 pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
+    classify_as(exec, arg1, cfg!(windows))
+}
+
+/// The file name of `path` as the classifiers compare it. On Windows an
+/// executable is `claude.exe`, and `claude` is what is being recognised.
+fn exec_name(path: &Path, windows: bool) -> Option<&str> {
+    let name = path.file_name().and_then(|n| n.to_str())?;
+    Some(if windows {
+        winproc::exe_stem(name)
+    } else {
+        name
+    })
+}
+
+/// [`classify`] with the platform's naming rules chosen by the caller, so the
+/// Windows spellings are tested wherever the tests run.
+fn classify_as(exec: &str, arg1: Option<&str>, windows: bool) -> Option<AgentKind> {
     let path = Path::new(exec);
     fn name(p: Option<&Path>) -> Option<&str> {
         p.and_then(Path::file_name).and_then(|n| n.to_str())
     }
-    let base = name(Some(path))?;
+    let base = exec_name(path, windows)?;
     let parent = name(path.parent());
     let grandparent = name(path.parent().and_then(Path::parent));
     if base == "claude" || (parent == Some("versions") && grandparent == Some("claude")) {
@@ -144,7 +164,14 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
     }
     let runtime = base == "node" || base == "bun" || base.starts_with("node2");
     if runtime {
+        // npm lays a Windows package out with backslashes.
         let script = arg1?;
+        let script = if windows {
+            script.replace('\\', "/")
+        } else {
+            script.to_string()
+        };
+        let script = script.as_str();
         if script.contains("/@anthropic-ai/claude-code/") {
             return Some(AgentKind::Claude);
         }
@@ -173,10 +200,8 @@ pub(crate) fn classify_argv(exec: &str, argv: &[String]) -> Option<AgentKind> {
     if let Some(kind) = classify(exec, argv.get(1).map(String::as_str)) {
         return Some(kind);
     }
-    let is_language_server = Path::new(exec)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "language_server");
+    let is_language_server =
+        exec_name(Path::new(exec), cfg!(windows)).is_some_and(|n| n == "language_server");
     if !is_language_server {
         return None;
     }
@@ -222,7 +247,7 @@ pub(crate) fn is_exec_ide_hosted(exec: &str, kind: AgentKind) -> bool {
     if !kind.is_ide_hosted() {
         return false;
     }
-    Path::new(exec).file_name().and_then(|n| n.to_str()) != Some("agy")
+    exec_name(Path::new(exec), cfg!(windows)) != Some("agy")
 }
 
 /// A name the kernel reports for a versioned installer binary: empty, or a
@@ -247,10 +272,7 @@ pub(crate) fn path_selects_procargs(path: &str) -> bool {
     if classify(path, None).is_some() {
         return true;
     }
-    let base = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
+    let base = exec_name(Path::new(path), cfg!(windows)).unwrap_or("");
     base == "bun" || base == "language_server" || base.starts_with("node")
 }
 
@@ -662,7 +684,7 @@ impl Identity {
         let memguard = name == "memguard"
             || exec
                 .as_deref()
-                .and_then(|e| Path::new(e).file_name())
+                .and_then(|e| exec_name(Path::new(e), cfg!(windows)))
                 .is_some_and(|n| n == "memguard");
         Self {
             name,
@@ -1724,7 +1746,9 @@ const MAX_ANCESTOR_PIDS: usize = 8;
 /// `gitpulse-*`), and session root processes (interactive CLI TUIs and IDE
 /// hosts, whose responsiveness and `fork()` priority inheritance must stay clean).
 pub(crate) fn agent_throttle_candidates() -> Result<Vec<AgentThrottleCandidate>, String> {
-    if !os::SUPPORTED {
+    // Throttling needs `set_background_throttle`, which only macOS and Linux
+    // have: candidates it could not act on are not listed.
+    if !os::SUPPORTED || cfg!(windows) {
         return Err("process scanning is not supported on this platform".into());
     }
     let mut scanner = Scanner::os();
@@ -2145,7 +2169,22 @@ pub struct SessionScan {
 
 /// Start time in microseconds since the Unix epoch of a live process,
 /// or `None` when the process is gone or this platform cannot report it.
+///
+/// On Windows this is the creation time `GetProcessTimes` reports, converted
+/// by the same function that records `proc_start_ns` for peers
+/// (`winproc::unix_nanos`), so a start time read here and one recorded there
+/// are the same number. A process that has exited, or one whose creation time
+/// cannot be read, stays `None` rather than a guessed value.
 pub fn process_start_us(pid: u32) -> Option<u64> {
+    // Read directly, not through a process snapshot: the steward and the alerts
+    // treat `None` as "the writer is gone", so a failed snapshot (or a 32-bit
+    // build, which has no scan) must not turn a live process into that.
+    // `os::pid_ppid_start` reads the same way, so the two agree.
+    if cfg!(windows) {
+        return crate::workbench::process_birth::started_unix_nanos(pid)
+            .map(|nanos| nanos / 1_000)
+            .filter(|&start_us| start_us > 0);
+    }
     if !os::SUPPORTED {
         return None;
     }
@@ -2301,12 +2340,20 @@ pub fn observe_sessions_with_caller() -> Result<SessionScan, String> {
 /// find processes to signal by where they are standing.
 pub(crate) fn working_in(dir: &Path) -> Result<Vec<i32>, String> {
     let me = i32::try_from(std::process::id()).unwrap_or(-1);
+    // Windows spells one directory several ways (`C:\x`, `c:\X`, `\\?\C:\x`);
+    // the reader gives the canonical one, so the caller's is matched in its own
+    // spelling and the canonical one.
+    let spellings = if cfg!(windows) {
+        dir_spellings(dir)
+    } else {
+        vec![dir.to_path_buf()]
+    };
     let mut pids = Vec::new();
     os::list_pids(&mut pids)?;
     Ok(pids
         .into_iter()
         .filter(|pid| *pid > 0 && *pid != me)
-        .filter(|pid| os::cwd(*pid).is_some_and(|cwd| cwd.starts_with(dir)))
+        .filter(|pid| os::cwd(*pid).is_some_and(|cwd| spellings.iter().any(|d| cwd.starts_with(d))))
         .collect())
 }
 
@@ -2472,6 +2519,18 @@ fn dir_spellings(dir: &Path) -> Vec<PathBuf> {
         })
         .collect();
     all.extend(extra);
+    // The verbatim `\\?\C:\x` a canonical path takes on Windows, also as the
+    // `C:\x` an argument or a command line spells it.
+    let plain: Vec<PathBuf> = all
+        .iter()
+        .filter_map(|path| {
+            path.to_str()
+                .and_then(|text| text.strip_prefix(r"\\?\"))
+                .filter(|rest| !rest.starts_with("UNC\\"))
+                .map(PathBuf::from)
+        })
+        .collect();
+    all.extend(plain);
     all.sort();
     all.dedup();
     all
@@ -2511,7 +2570,17 @@ fn lexical_join(cwd: &Path, token: &str) -> PathBuf {
 fn classify_use(spellings: &[PathBuf], process: &ProcessUse) -> Option<UseKind> {
     let text: Vec<&str> = spellings.iter().filter_map(|p| p.to_str()).collect();
     let inside = |path: &Path| spellings.iter().any(|dir| path.starts_with(dir));
-    let names = |value: &str| text.iter().any(|dir| mentions(value, dir));
+    // Windows paths are case-insensitive, so an argument that spells the
+    // directory in another case still names it.
+    let names = |value: &str| {
+        if cfg!(windows) {
+            let value = value.to_ascii_lowercase();
+            text.iter()
+                .any(|dir| mentions(&value, &dir.to_ascii_lowercase()))
+        } else {
+            text.iter().any(|dir| mentions(value, dir))
+        }
+    };
     if process.cwd.as_deref().is_some_and(inside) {
         return Some(UseKind::WorkingDirectory);
     }
@@ -3025,7 +3094,10 @@ impl Scanner {
 /// The process table with every argument list, for the signal guard. `Err`
 /// when the table could not be read.
 pub(crate) fn signal_table() -> Result<Table, String> {
-    if !os::SUPPORTED {
+    // The table answers `kill`, `pkill` and `pgrep`, whose pids and uids are
+    // POSIX's. Windows has a scan but no such signals, and its uids are
+    // stand-ins, so the guard keeps failing closed there as it did before.
+    if !os::SUPPORTED || cfg!(windows) {
         return Err("this platform has no process scan".into());
     }
     let mut buf = Vec::new();
@@ -4327,7 +4399,484 @@ mod os {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// The Windows reader: processes from a Toolhelp snapshot, and the working
+/// directory, command line and environment of a process from its PEB
+/// ([`winproc`] documents the layout and where it was checked).
+///
+/// Who owns a process is its token's user SID against this process's. Where
+/// that cannot be read the process is neither this user's nor another's
+/// ([`Owner::Unknown`]), and what follows from that is the same as on macOS
+/// (`UNKNOWN_OWNER`): the listing counts it with the other users', and the
+/// directory-use check never takes it for one that uses nothing.
+///
+/// A process that refuses even a limited query outranks this one (a protected
+/// or another user's, or `System`). That is an access-control refusal with a
+/// known cause, as Linux's `withheld_by_kernel` is: it is counted, not
+/// unproven. A process that opened but whose parameter block could not then
+/// be read (a block that is not normalised, a read that failed while it is
+/// still running) is the user's own and unexplained, which leaves it
+/// unproven. A 32-bit (WoW64) process is not among them: its parameters are
+/// read through its 32-bit PEB (`winproc::Remote`).
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod os {
+    use super::{
+        Identity, LaunchKey, ProcFacts, ProcLink, ProcSource, MAX_HINT_ARGS, MAX_HINT_ARG_BYTES,
+        MAX_SCANNED_PROCESSES,
+    };
+    use crate::sysload::sensor::{Reading, Why};
+    use crate::sysload::winproc::{self, sys, sys::Owner};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    pub(super) const SUPPORTED: bool = true;
+
+    /// What [`ProcFacts::uid`] says on Windows, where there is no uid. Only
+    /// equality with [`ProcSource::me_uid`] means anything; none is `0` (which
+    /// would make the sender "root") or `u32::MAX` (which `still_orphaned`
+    /// reads as this user off Unix).
+    const UID_ME: u32 = 1;
+    const UID_OTHER: u32 = 2;
+    const UID_UNKNOWN: u32 = 3;
+
+    /// What one look at a process found.
+    enum Look {
+        /// No process holds the pid, or it has exited.
+        Gone,
+        /// Not even a limited query is allowed: it outranks this process.
+        Refused,
+        /// Opened for neither reason; the error is the OS's.
+        Failed(String),
+        Live(Live),
+    }
+
+    struct Live {
+        handle: sys::Handle,
+        /// The handle can read the process's memory.
+        readable: bool,
+        owner: Owner,
+        /// Microseconds since the Unix epoch; 0 when the OS would not say.
+        start_us: u64,
+        cpu_ns: u64,
+    }
+
+    fn look(pid: i32) -> Look {
+        let Ok(id) = u32::try_from(pid) else {
+            return Look::Gone;
+        };
+        let (handle, readable) = match sys::open(id, sys::QUERY_LIMITED | sys::VM_READ) {
+            Ok(handle) => (handle, true),
+            Err(sys::OpenFail::Gone) => return Look::Gone,
+            Err(sys::OpenFail::Denied(_)) => match sys::open(id, sys::QUERY_LIMITED) {
+                Ok(handle) => (handle, false),
+                Err(sys::OpenFail::Gone) => return Look::Gone,
+                Err(sys::OpenFail::Denied(_)) => return Look::Refused,
+                Err(sys::OpenFail::Other(why)) => return Look::Failed(why),
+            },
+            Err(sys::OpenFail::Other(why)) => return Look::Failed(why),
+        };
+        let (start_us, cpu_ns) = match sys::times(&handle) {
+            Ok(times) if times.exited => return Look::Gone,
+            Ok(times) => (
+                u64::try_from(winproc::unix_nanos(times.creation_ticks) / 1_000).unwrap_or(0),
+                times.cpu_ticks.saturating_mul(100),
+            ),
+            Err(_) => (0, 0),
+        };
+        let owner = sys::owner_of(&handle);
+        Look::Live(Live {
+            handle,
+            readable,
+            owner,
+            start_us,
+            cpu_ns,
+        })
+    }
+
+    /// Cap each process list at what the other readers do.
+    fn snapshot() -> Result<Vec<sys::ProcEntry>, String> {
+        sys::snapshot(MAX_SCANNED_PROCESSES)
+    }
+
+    fn pid_of(entry: &sys::ProcEntry) -> Option<i32> {
+        i32::try_from(entry.pid).ok().filter(|pid| *pid > 0)
+    }
+
+    /// The name the classifiers compare: the image's file name without `.exe`.
+    fn stem(name: &str) -> String {
+        winproc::exe_stem(name).to_string()
+    }
+
+    /// A path in the repository's text spelling (`canonicalize_plain`: true
+    /// case, no `\\?\` prefix) when it still exists, else as the loader has
+    /// it. Callers compare it with canonical directories, so `C:\Work`,
+    /// `c:\work` and `\\?\C:\Work` meet; `dir_spellings` and `working_in`
+    /// hold both forms of the other side.
+    fn canonical(path: PathBuf) -> PathBuf {
+        crate::engine::process::canonicalize_plain(&path).unwrap_or(path)
+    }
+
+    pub(crate) fn list_pids(pids: &mut Vec<i32>) -> Result<(), String> {
+        pids.clear();
+        pids.extend(snapshot()?.iter().filter_map(pid_of));
+        Ok(())
+    }
+
+    /// The parameter block of `pid`, when a handle to it can be had and read.
+    fn remote_of<T>(
+        pid: i32,
+        read: impl FnOnce(&sys::Remote<'_>) -> Result<T, String>,
+    ) -> Option<T> {
+        let id = u32::try_from(pid).ok()?;
+        let handle = sys::open(id, sys::QUERY_LIMITED | sys::VM_READ).ok()?;
+        read(&sys::Remote::of(&handle).ok()?).ok()
+    }
+
+    pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
+        remote_of(pid, |remote| remote.cwd()).map(canonical)
+    }
+
+    pub(crate) fn argv_of(pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
+        remote_of(pid, |remote| remote.argv())
+    }
+
+    /// [`argv_of`], bounded for a repository hint: at most `MAX_HINT_ARGS`
+    /// arguments, each read as empty when over `MAX_HINT_ARG_BYTES`.
+    fn hint_argv_of(pid: i32) -> Option<Vec<String>> {
+        let argv = argv_of(pid, &mut Vec::new())?;
+        Some(
+            argv.into_iter()
+                .take(MAX_HINT_ARGS)
+                .map(|arg| {
+                    if arg.len() > MAX_HINT_ARG_BYTES {
+                        String::new()
+                    } else {
+                        arg
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The image `pid` runs, as the kernel names it.
+    fn exe_path(pid: i32) -> Option<String> {
+        let handle = sys::open(u32::try_from(pid).ok()?, sys::QUERY_LIMITED).ok()?;
+        sys::image_path(&handle)
+    }
+
+    fn launch_key(env: &[String]) -> Option<LaunchKey> {
+        LaunchKey::from_env(env.iter().map(String::as_str))
+    }
+
+    /// What does not change for the life of a process, for one of this
+    /// user's: the image path, command line and launch environment.
+    fn read_identity(live: &Live, name: String) -> Identity {
+        let exec = sys::image_path(&live.handle);
+        let (argv, launch) = if live.readable {
+            match sys::Remote::of(&live.handle) {
+                Ok(remote) => (
+                    remote.argv().unwrap_or_default(),
+                    remote.env().ok().and_then(|env| launch_key(&env)),
+                ),
+                Err(_) => (Vec::new(), None),
+            }
+        } else {
+            (Vec::new(), None)
+        };
+        Identity::new(name, exec, argv, launch)
+    }
+
+    fn facts(
+        pid: i32,
+        ppid: i32,
+        name: &str,
+        ident: impl FnOnce(&Live, String) -> Arc<Identity>,
+    ) -> Option<ProcFacts> {
+        let name = stem(name);
+        let unreadable = Reading::Unavailable(Why::Unreadable);
+        let live = match look(pid) {
+            Look::Gone => return None,
+            Look::Refused | Look::Failed(_) => {
+                return Some(ProcFacts {
+                    pid,
+                    ppid,
+                    uid: UID_UNKNOWN,
+                    start_us: 0,
+                    ident: Arc::new(Identity::new(name, None, Vec::new(), None)),
+                    footprint: unreadable,
+                    written: unreadable,
+                    cpu_ns: unreadable,
+                });
+            }
+            Look::Live(live) => live,
+        };
+        let ours = live.owner == Owner::Ours;
+        let uid = match live.owner {
+            Owner::Ours => UID_ME,
+            Owner::Other => UID_OTHER,
+            Owner::Unknown => UID_UNKNOWN,
+        };
+        // Memory and write counters are not measured here, which is not the
+        // same as zero.
+        let not_measured = Reading::Unavailable(Why::Unsupported);
+        Some(ProcFacts {
+            pid,
+            ppid,
+            uid,
+            start_us: live.start_us,
+            footprint: if ours { not_measured } else { unreadable },
+            written: if ours { not_measured } else { unreadable },
+            cpu_ns: if ours {
+                Reading::Value(live.cpu_ns)
+            } else {
+                unreadable
+            },
+            ident: if ours {
+                ident(&live, name)
+            } else {
+                Arc::new(Identity::new(name, None, Vec::new(), None))
+            },
+        })
+    }
+
+    pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
+        let entry = snapshot()
+            .ok()?
+            .into_iter()
+            .find(|entry| pid_of(entry) == Some(pid))?;
+        facts(
+            pid,
+            i32::try_from(entry.parent).unwrap_or(0),
+            &entry.name,
+            |live, name| Arc::new(read_identity(live, name)),
+        )
+    }
+
+    /// The parent and start time of `pid`. The start comes from the reader
+    /// `process_birth` records through, so it is the number a recorded
+    /// `proc_start_ns` is compared with.
+    pub(super) fn pid_ppid_start(pid: i32) -> Option<(i32, u64)> {
+        let id = u32::try_from(pid).ok()?;
+        let parent = snapshot()
+            .ok()?
+            .into_iter()
+            .find(|entry| entry.pid == id)?
+            .parent;
+        let start_us = crate::workbench::process_birth::started_unix_nanos(id)? / 1_000;
+        Some((i32::try_from(parent).unwrap_or(0), start_us))
+    }
+
+    /// What `pid` shows of itself to this user, for the directory-use check.
+    /// `None` when it is gone.
+    ///
+    /// The rule, as on Linux: a refusal the access-control system explains is
+    /// another user's or a more privileged process (`mine: false`, counted);
+    /// one it does not explain is the user's own process whose directory,
+    /// arguments or environment are unknown (`mine: true` with `None`), which
+    /// can never be taken for one that uses nothing.
+    pub(crate) fn read_use(pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
+        if pid <= 0 {
+            return None;
+        }
+        let elsewhere = || super::ProcessUse {
+            pid,
+            mine: false,
+            ..Default::default()
+        };
+        let live = match look(pid) {
+            Look::Gone => return None,
+            // Not even a limited query: outranks this process.
+            Look::Refused => return Some(elsewhere()),
+            Look::Failed(why) => {
+                return Some(super::ProcessUse {
+                    pid,
+                    mine: true,
+                    detail: Some(format!("{pid}: {why}")),
+                    ..Default::default()
+                });
+            }
+            Look::Live(live) => live,
+        };
+        match live.owner {
+            Owner::Other => return Some(elsewhere()),
+            // A token it will not show and memory it will not let be read: it
+            // outranks this process, as `Refused` does.
+            Owner::Unknown if !live.readable => return Some(elsewhere()),
+            Owner::Ours | Owner::Unknown => {}
+        }
+        let exe = sys::image_path(&live.handle).map(|path| {
+            canonical(PathBuf::from(path))
+                .to_string_lossy()
+                .into_owned()
+        });
+        let name = exe
+            .as_deref()
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .map(stem)
+            .unwrap_or_default();
+        let remote = if live.readable {
+            sys::Remote::of(&live.handle)
+        } else {
+            Err("the process does not allow its memory to be read".to_string())
+        };
+        let (cwd, argv, env) = match &remote {
+            Ok(remote) => (remote.cwd(), remote.argv(), remote.env()),
+            Err(why) => (Err(why.clone()), Err(why.clone()), Err(why.clone())),
+        };
+        let failed: Vec<String> = [
+            ("cwd", cwd.as_ref().err()),
+            ("cmdline", argv.as_ref().err()),
+            ("environ", env.as_ref().err()),
+        ]
+        .into_iter()
+        .filter_map(|(what, why)| why.map(|why| format!("{what} ({why})")))
+        .collect();
+        // It exited while it was read: nothing left to read, nothing held.
+        if !failed.is_empty() && sys::times(&live.handle).map_or(true, |t| t.exited) {
+            return None;
+        }
+        Some(super::ProcessUse {
+            pid,
+            mine: true,
+            cwd: cwd.ok().map(canonical),
+            exe,
+            argv: argv.ok(),
+            env: env.ok(),
+            detail: (!failed.is_empty()).then(|| format!("{pid} {name}: {}", failed.join(", "))),
+        })
+    }
+
+    pub(super) struct OsSource {
+        cache: super::IdentityCache,
+    }
+
+    impl OsSource {
+        pub(super) fn new() -> Self {
+            Self {
+                cache: HashMap::with_capacity(512),
+            }
+        }
+    }
+
+    impl ProcSource for OsSource {
+        fn read(&mut self, out: &mut Vec<ProcFacts>) -> Result<(), String> {
+            let entries = snapshot()?;
+            out.clear();
+            for entry in &entries {
+                let Some(pid) = pid_of(entry) else {
+                    continue;
+                };
+                let cache = &mut self.cache;
+                let fact = facts(
+                    pid,
+                    i32::try_from(entry.parent).unwrap_or(0),
+                    &entry.name,
+                    |live, name| {
+                        super::cached_identity(cache, pid, live.start_us, || {
+                            read_identity(live, name)
+                        })
+                    },
+                );
+                if let Some(fact) = fact {
+                    out.push(fact);
+                }
+            }
+            if self.cache.len() > out.len() * 2 + 64 {
+                let live: std::collections::HashSet<i32> = out.iter().map(|f| f.pid).collect();
+                self.cache.retain(|pid, _| live.contains(pid));
+            }
+            Ok(())
+        }
+
+        fn cwd(&self, pid: i32) -> Option<PathBuf> {
+            cwd(pid)
+        }
+
+        fn fd_path(&self, _pid: i32, _fd: i32) -> Reading<String> {
+            Reading::Unavailable(Why::Unsupported)
+        }
+
+        fn me_uid(&self) -> u32 {
+            UID_ME
+        }
+
+        fn is_root(&self) -> bool {
+            // An elevated process still reads no more of another user's than
+            // `look` lets it: there is no root.
+            false
+        }
+    }
+
+    /// The exec path, arguments and launch environment of `pid`. `None` when
+    /// its arguments cannot be read, so the image path decides instead.
+    fn procargs(live: &Live) -> Option<(String, Vec<String>, Option<LaunchKey>)> {
+        if !live.readable {
+            return None;
+        }
+        let remote = sys::Remote::of(&live.handle).ok()?;
+        let argv = remote.argv().ok()?;
+        let exec = sys::image_path(&live.handle).or_else(|| argv.first().cloned())?;
+        let launch = remote.env().ok().and_then(|env| launch_key(&env));
+        Some((exec, argv, launch))
+    }
+
+    /// Classified agent processes only. `Err` when the process table itself
+    /// could not be read: never an empty list standing in for that failure.
+    pub(super) fn read_session_rows() -> Result<super::SessionTable, String> {
+        let entries = snapshot()?;
+        let mut rows = Vec::new();
+        let mut links = HashMap::with_capacity(entries.len());
+        for entry in &entries {
+            let Some(pid) = pid_of(entry) else {
+                continue;
+            };
+            let ppid = i32::try_from(entry.parent).unwrap_or(0);
+            let live = match look(pid) {
+                Look::Gone => continue,
+                // Listed, but nothing of it can be read: its parent is the
+                // snapshot's claim and its start is "the OS would not say".
+                Look::Refused | Look::Failed(_) => {
+                    links.insert(pid, ProcLink { ppid, start_us: 0 });
+                    continue;
+                }
+                Look::Live(live) => live,
+            };
+            // Every process, whoever owns it: a session's ancestor chain runs
+            // through shells and runtimes that are not candidates.
+            links.insert(
+                pid,
+                ProcLink {
+                    ppid,
+                    start_us: live.start_us,
+                },
+            );
+            // Another user's process is not this user's session. One whose
+            // owner could not be read might be, so it stays a candidate.
+            if live.owner == Owner::Other {
+                continue;
+            }
+            let name = stem(&entry.name);
+            let Some(probe) = super::session_probe(&name, || exe_path(pid)) else {
+                continue;
+            };
+            let args = procargs(&live);
+            if let Some(row) =
+                super::session_row(pid, ppid, live.start_us, probe, args, || exe_path(pid))
+            {
+                rows.push(row);
+            }
+        }
+        let cwds = super::session_cwds(&rows, &links, &cwd, &mut hint_argv_of);
+        Ok(super::SessionTable { rows, links, cwds })
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    all(windows, target_pointer_width = "64")
+)))]
 mod os {
     use super::{ProcFacts, ProcSource};
     use crate::sysload::sensor::{Reading, Why};
@@ -7804,5 +8353,199 @@ pub(crate) mod tests {
             vec![203],
             "only the agent server's build; not the server itself, the terminal host, the shell or what was typed in it"
         );
+    }
+
+    /// On Windows the start time is the process birth reader's. Every consumer
+    /// (the steward lease, the session snapshot) reads `None` as "no live
+    /// writer", so a `None` for this very process would make every foreign
+    /// lease look stale there.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_live_process_has_a_stable_nonzero_start_time_and_no_pid_has_none() {
+        let me = std::process::id();
+        let first = process_start_us(me).expect("own start time is readable");
+        assert!(first > 0);
+        assert_eq!(process_start_us(me), Some(first));
+        assert_eq!(process_start_us(0), None);
+    }
+
+    /// The classifiers compare `claude`, not `claude.exe`, and an npm package
+    /// on Windows is laid out with backslashes. Runs everywhere through the
+    /// platform flag: a Windows host is only where the flag is on by itself.
+    #[test]
+    fn windows_spellings_classify_as_the_agents_they_are() {
+        let on = |exec: &str, arg1: Option<&str>| classify_as(exec, arg1, true);
+        assert_eq!(on("C:/u/bin/claude.exe", None), Some(AgentKind::Claude));
+        assert_eq!(on("C:/u/bin/codex.exe", None), Some(AgentKind::Codex));
+        assert_eq!(on("C:/u/bin/agy.exe", None), Some(AgentKind::Antigravity));
+        assert_eq!(
+            on("C:/p/Antigravity.EXE", None),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(
+            on("C:/u/bin/devcouncil.exe", None),
+            Some(AgentKind::DevCouncil)
+        );
+        assert_eq!(on("C:/u/bin/manvi.exe", None), Some(AgentKind::Manvi));
+        // The suffix is only dropped where the platform says so.
+        assert_eq!(classify_as("/u/bin/claude.exe", None, false), None);
+        // A runtime hosting an agent's script, spelled the Windows way.
+        let claude_js =
+            r"C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
+        let codex_js = r"C:\Users\u\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js";
+        assert_eq!(
+            on("C:/n/node.exe", Some(claude_js)),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(on("C:/n/node.exe", Some(codex_js)), Some(AgentKind::Codex));
+        assert_eq!(classify_as("/n/node", Some(claude_js), false), None);
+        // Not an agent: a bare `.exe` and a runtime running something else.
+        assert_eq!(on("C:/n/.exe", None), None);
+        assert_eq!(on("C:/n/node.exe", Some(r"C:\proj\build.js")), None);
+    }
+
+    /// A directory a caller holds as `\\?\C:\x` is also named `C:\x` by an
+    /// argument, and the two are one directory; a UNC root has no such form.
+    #[test]
+    fn a_verbatim_directory_is_also_spelled_plainly() {
+        let spellings = dir_spellings(Path::new(r"\\?\C:\work\lane"));
+        assert!(
+            spellings.contains(&PathBuf::from(r"C:\work\lane")),
+            "{spellings:?}"
+        );
+        assert!(spellings.contains(&PathBuf::from(r"\\?\C:\work\lane")));
+        let unc = dir_spellings(Path::new(r"\\?\UNC\host\share\x"));
+        assert_eq!(unc, vec![PathBuf::from(r"\\?\UNC\host\share\x")]);
+    }
+
+    /// Windows only, and never run by the author: a child standing in a known
+    /// directory is found by every reader the scan is made of, in the
+    /// spellings its callers use, with the start time the birth reader gives.
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn the_windows_reader_sees_a_child_its_directory_arguments_parent_and_start() {
+        use crate::engine::process::canonicalize_plain;
+        use crate::procguard::LockedSpawn;
+        use std::process::Stdio;
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let lane = root.path().join("lane");
+        std::fs::create_dir(&lane).unwrap();
+        let me = i32::try_from(std::process::id()).unwrap();
+        let mut child = Reaped(
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .env(RUN_ID_ENV, "run-win-scan")
+                .current_dir(&lane)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn_locked()
+                .expect("spawn ping"),
+        );
+        let pid = i32::try_from(child.0.id()).unwrap();
+
+        // It shows in the table, and its directory and arguments become
+        // readable once the loader has finished with it.
+        let mut cwd = None;
+        for _ in 0..200 {
+            let mut pids = Vec::new();
+            os::list_pids(&mut pids).expect("the process table");
+            cwd = os::cwd(pid).filter(|_| pids.contains(&pid));
+            if cwd.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let cwd = cwd.expect("the child is listed and its directory read");
+        assert_eq!(
+            canonicalize_plain(&cwd).unwrap(),
+            canonicalize_plain(&lane).unwrap()
+        );
+        let argv = os::argv_of(pid, &mut Vec::new()).expect("its command line");
+        // The command line is as typed; the image name is in its on-disk case.
+        assert!(
+            argv[0].eq_ignore_ascii_case("ping") || argv[0].eq_ignore_ascii_case("ping.exe"),
+            "{argv:?}"
+        );
+        assert!(argv.iter().any(|arg| arg == "127.0.0.1"), "{argv:?}");
+
+        // Parent and start: the start is the birth reader's number.
+        let (ppid, start_us) = os::pid_ppid_start(pid).expect("parent and start");
+        assert_eq!(ppid, me);
+        assert!(start_us > 0);
+        assert_eq!(process_start_us(pid.unsigned_abs()), Some(start_us));
+        // Creation times have 100 ns resolution; `start_us` is those truncated.
+        assert_eq!(
+            crate::workbench::process_birth::started_unix_nanos(pid.unsigned_abs())
+                .map(|nanos| nanos / 1_000),
+            Some(start_us)
+        );
+
+        // The facts a scan tick carries, and the launch it read from the
+        // environment.
+        let facts = probe_one(pid).expect("facts");
+        assert_eq!((facts.ppid, facts.start_us), (me, start_us));
+        assert!(
+            facts.ident.name.eq_ignore_ascii_case("ping"),
+            "{:?}",
+            facts.ident.name
+        );
+        assert!(facts
+            .ident
+            .exec
+            .as_deref()
+            .is_some_and(|exec| exec.to_ascii_lowercase().ends_with("ping.exe")));
+        assert_eq!(
+            facts
+                .ident
+                .launch
+                .as_ref()
+                .and_then(|l| l.run_id.as_deref()),
+            Some("run-win-scan")
+        );
+        assert_eq!(facts.uid, os::OsSource::new().me_uid());
+
+        // The directory is found whichever way the caller spells it.
+        let plain = canonicalize_plain(&lane).unwrap();
+        let verbatim = lane.canonicalize().unwrap();
+        for dir in [&lane, &plain, &verbatim] {
+            assert!(
+                working_in(dir).expect("scan").contains(&pid),
+                "not found in {dir:?}"
+            );
+            assert!(
+                processes_using(dir)
+                    .expect("a process is using it")
+                    .contains(&pid),
+                "not found in {dir:?}"
+            );
+        }
+
+        // What the directory-use check reads of it is whole, so it is proven.
+        let mut scratch = Vec::new();
+        let used = os::read_use(pid, &mut scratch).expect("a row");
+        assert!(used.mine && !used.unproven(), "{used:?}");
+        assert!(used
+            .env
+            .as_ref()
+            .is_some_and(|env| env.contains(&format!("{RUN_ID_ENV}=run-win-scan"))));
+
+        // The session scan lists it as a link, though it is no agent.
+        let table = os::read_session_rows().expect("the sessions table");
+        let link = table.links.get(&pid).expect("the child is in the links");
+        assert_eq!((link.ppid, link.start_us), (me, start_us));
+        assert!(table.rows.iter().all(|row| row.pid != pid));
+        assert!(observe_sessions().is_ok());
+
+        // Gone is gone: an exited process holds nothing.
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(os::read_use(pid, &mut scratch).is_none());
     }
 }
