@@ -89,6 +89,19 @@ export function defaultSeedBinary(platform = process.platform, env = process.env
  * @param {NodeJS.Platform} [platform]
  * @returns {Record<string, string | undefined>}
  */
+/**
+ * The `tauri:options.webviewOptions` for a session: on Windows, the isolated
+ * WebView2 profile folder, which tauri-driver forwards to Edge WebDriver as
+ * `ms:edgeOptions.webviewOptions` (the documented way to choose it).
+ *
+ * @param {string} profileRoot
+ * @param {NodeJS.Platform} [platform]
+ * @returns {{ userDataFolder: string } | undefined}
+ */
+export function webviewOptionsFor(profileRoot, platform = process.platform) {
+  return platform === "win32" ? { userDataFolder: path.join(profileRoot, "webview2") } : undefined;
+}
+
 export function buildIsolatedEnv(profileRoot, baseEnv, platform = process.platform) {
   const home = path.join(profileRoot, "home");
   const config = path.join(profileRoot, "config");
@@ -108,7 +121,11 @@ export function buildIsolatedEnv(profileRoot, baseEnv, platform = process.platfo
     env.USERPROFILE = home;
     env.APPDATA = config;
     env.LOCALAPPDATA = data;
-    env.WEBVIEW2_USER_DATA_FOLDER = path.join(profileRoot, "webview2");
+    // The WebView2 profile goes to Edge WebDriver as
+    // webviewOptions.userDataFolder (webviewOptionsFor), never through
+    // WEBVIEW2_USER_DATA_FOLDER: that variable overrides the folder the
+    // driver chose for the app, and session creation then hung for 60 s.
+    delete env.WEBVIEW2_USER_DATA_FOLDER;
   } else {
     env.XDG_CONFIG_HOME = config;
     env.XDG_DATA_HOME = data;
@@ -221,8 +238,8 @@ export class WebDriverClient {
     }
   }
 
-  /** @param {string} application @param {string[]} [args] */
-  async createSession(application, args = []) {
+  /** @param {string} application @param {string[]} [args] @param {{ userDataFolder: string } | undefined} [webviewOptions] */
+  async createSession(application, args = [], webviewOptions = undefined) {
     const result = await this.request(
       "POST",
       "/session",
@@ -232,6 +249,7 @@ export class WebDriverClient {
             "tauri:options": {
               application,
               args,
+              ...(webviewOptions ? { webviewOptions } : {}),
             },
           },
         },
@@ -648,7 +666,7 @@ async function runSmoke(opts) {
     );
 
     await step("cold-start", async () => {
-      await client.createSession(opts.binary, [repoAlpha]);
+      await client.createSession(opts.binary, [repoAlpha], webviewOptionsFor(profileRoot));
       const boot = await client.executeAsyncScript(`
         const done = arguments[arguments.length - 1];
         const deadline = Date.now() + 20000;
