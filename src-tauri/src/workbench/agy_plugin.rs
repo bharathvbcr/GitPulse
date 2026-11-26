@@ -82,6 +82,131 @@ const PRODUCER_MARKER_BODY: &str = "managed_by=gitpulse\nschema=agent-plugins-1.
 /// show `gitpulse:insights`.
 pub(crate) const ANTIGRAVITY_SKILL_PREFIX: &str = "gitpulse-";
 
+/// Highest Antigravity version known to deny every `PreToolUse` response that
+/// is not `"decision":"allow"` (`{}` included). The `PreToolUse` canary stays
+/// unconditionally disabled at or below this version (Opus A2).
+#[allow(dead_code)]
+pub const PRE_TOOL_USE_BROKEN_MAX_VERSION: (u32, u32, u32) = (2, 32, 1);
+
+/// Documented unlock gate required before `PreToolUse` can ever be enabled for
+/// Antigravity sessions.
+#[allow(dead_code)]
+pub const PRE_TOOL_USE_UNLOCK_GATE: &str =
+    "Disabled on Antigravity <= 2.32.1 (every non-allow PreToolUse response, including {}, denies the tool call). Unlocks ONLY when installed version > 2.32.1 AND a live passthrough canary confirms {} does not deny.";
+
+/// Honest runtime labels surfaced to Desktop and Mobile for Antigravity
+/// sessions (Opus A2).
+#[allow(dead_code)]
+pub const AGY_GATING_LABEL_UNGATED: &str = "ungated";
+#[allow(dead_code)]
+pub const AGY_IDLE_WAKE_LABEL_QUEUED: &str = "Queued (next turn)";
+
+/// Result of evaluating the version-gated `PreToolUse` canary for Antigravity.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgyPreToolUseCanary {
+    pub detected_version: Option<String>,
+    pub passthrough_probe_passed: bool,
+    pub enabled: bool,
+    pub unlock_gate: &'static str,
+}
+
+/// Explicit runtime capability metadata for an Antigravity session.
+///
+/// Manvi does NOT gate Antigravity's own tool calls, and idle Antigravity
+/// sessions have no `asyncRewake` background waiter — both facts are surfaced
+/// explicitly rather than hidden behind a static capability matrix.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgyRuntimeCapabilities {
+    pub harness: &'static str,
+    pub approval_channel: &'static str,
+    pub gating_label: &'static str,
+    pub idle_wake_label: &'static str,
+    pub supports_remote_approval: bool,
+    pub supports_active_steering: bool,
+    pub supports_idle_wake: bool,
+    pub ungated: bool,
+    pub queued_steering_ttl_sec: u64,
+    pub max_stop_continuations: u32,
+    pub pre_tool_use_canary: AgyPreToolUseCanary,
+}
+
+/// Parses the first `MAJOR.MINOR.PATCH` semver triple from an `agy --version`
+/// string (e.g. `"2.32.1"`, `"agy 2.32.1"`, `"Antigravity 2.33.0-beta.1"`).
+#[allow(dead_code)]
+pub fn parse_agy_semver(raw: &str) -> Option<(u32, u32, u32)> {
+    for token in raw.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let trimmed = token.trim().trim_start_matches('v');
+        let core = trimmed.split(['-', '+']).next().unwrap_or("");
+        let mut parts = core.split('.');
+        let (Some(maj), Some(min), Some(pat)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        if let (Ok(maj), Ok(min), Ok(pat)) = (
+            maj.parse::<u32>(),
+            min.parse::<u32>(),
+            pat.parse::<u32>(),
+        ) {
+            return Some((maj, min, pat));
+        }
+    }
+    None
+}
+
+/// Evaluates the version-gated `PreToolUse` canary.
+///
+/// Stays unconditionally disabled for Antigravity `<= 2.32.1` or unknown
+/// versions, even if `passthrough_probe_passed` is `true`.
+#[allow(dead_code)]
+pub fn evaluate_pre_tool_use_canary(
+    detected_version: Option<&str>,
+    passthrough_probe_passed: bool,
+) -> AgyPreToolUseCanary {
+    let parsed = detected_version.and_then(parse_agy_semver);
+    let version_eligible = parsed.is_some_and(|v| v > PRE_TOOL_USE_BROKEN_MAX_VERSION);
+    AgyPreToolUseCanary {
+        detected_version: detected_version.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
+        passthrough_probe_passed,
+        enabled: version_eligible && passthrough_probe_passed,
+        unlock_gate: PRE_TOOL_USE_UNLOCK_GATE,
+    }
+}
+
+/// Builds the explicit runtime capability metadata for an Antigravity session.
+#[allow(dead_code)]
+pub fn runtime_capabilities(
+    detected_version: Option<&str>,
+    passthrough_probe_passed: bool,
+) -> AgyRuntimeCapabilities {
+    let canary = evaluate_pre_tool_use_canary(detected_version, passthrough_probe_passed);
+    let gated = canary.enabled;
+    AgyRuntimeCapabilities {
+        harness: "antigravity",
+        approval_channel: if gated {
+            "presence_gated_hook"
+        } else {
+            "native_only"
+        },
+        gating_label: if gated {
+            "canary_gated"
+        } else {
+            AGY_GATING_LABEL_UNGATED
+        },
+        idle_wake_label: AGY_IDLE_WAKE_LABEL_QUEUED,
+        supports_remote_approval: gated,
+        supports_active_steering: true,
+        supports_idle_wake: false,
+        ungated: !gated,
+        queued_steering_ttl_sec: crate::agent_mailbox::PENDING_TTL.as_secs(),
+        max_stop_continuations: crate::agent_mailbox::MAX_CONTINUATIONS,
+        pre_tool_use_canary: canary,
+    }
+}
+
 /// Installed directory name, then the bundled `SKILL.md` it is written from.
 #[cfg(unix)]
 const SKILLS: [(&str, &str); 9] = [
@@ -733,5 +858,40 @@ mod tests {
         };
 
         assert_eq!(extract(&embedded), extract(&agy_ref));
+    }
+
+    #[test]
+    fn pre_tool_use_canary_stays_disabled_on_2_32_1_and_surfaces_ungated_and_queued_metadata() {
+        assert_eq!(parse_agy_semver("2.32.1"), Some((2, 32, 1)));
+        assert_eq!(parse_agy_semver("agy v2.33.0-beta.1"), Some((2, 33, 0)));
+        assert_eq!(parse_agy_semver("unknown"), None);
+
+        // <= 2.32.1 MUST remain disabled even if passthrough_probe_passed is true.
+        for ver in [None, Some("2.31.9"), Some("2.32.1"), Some("agy 2.32.1")] {
+            let caps = runtime_capabilities(ver, true);
+            assert!(!caps.pre_tool_use_canary.enabled, "{ver:?}");
+            assert!(caps.ungated, "{ver:?}");
+            assert_eq!(caps.gating_label, "ungated");
+            assert_eq!(caps.idle_wake_label, "Queued (next turn)");
+            assert_eq!(caps.approval_channel, "native_only");
+            assert!(!caps.supports_remote_approval);
+            assert!(!caps.supports_idle_wake);
+            assert_eq!(caps.queued_steering_ttl_sec, 7200);
+            assert_eq!(caps.max_stop_continuations, 3);
+            assert!(caps.pre_tool_use_canary.unlock_gate.contains("2.32.1"));
+        }
+
+        // > 2.32.1 still stays disabled until passthrough probe passes.
+        let unprobed = runtime_capabilities(Some("2.33.0"), false);
+        assert!(!unprobed.pre_tool_use_canary.enabled);
+        assert!(unprobed.ungated);
+        assert_eq!(unprobed.gating_label, "ungated");
+
+        // > 2.32.1 + verified passthrough probe unlocks the canary cleanly.
+        let unlocked = runtime_capabilities(Some("2.33.0"), true);
+        assert!(unlocked.pre_tool_use_canary.enabled);
+        assert!(!unlocked.ungated);
+        assert_eq!(unlocked.approval_channel, "presence_gated_hook");
+        assert_eq!(unlocked.idle_wake_label, "Queued (next turn)");
     }
 }

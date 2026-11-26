@@ -84,12 +84,21 @@ serde_json = "1.0"
 # Hashes a transcript row's identity into its ulid (ledger::ids::identity_ulid).
 # Already in the lock through other crates, so it adds no package.
 sha2 = "0.10"
+# Shared audited protocol, canonical JSON/SHA-256 hashing, DeviceCertificate +
+# SignedRevocationList verification, and P-256 hardware approval verification.
+gitpulse-protocol = { path = "../crates/gitpulse-protocol" }
 rayon = "1.12"
 # The async runtime `pools::install_async_runtime` builds and hands to tauri.
 # Pinned to the version already resolved in Cargo.lock (the framework's own
 # `tokio` dependency), so declaring it adds no package: `rt-multi-thread` is
 # the runtime builder, `sync` the semaphore that bounds background commands.
-tokio = { version = "=1.53.3", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "process", "macros", "signal"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+futures-util = "0.3"
+http = "1"
+url = "2"
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
+zeroize = "1"
 notify = "8.2"
 regex = "1.13"
 rfd = "0.17"

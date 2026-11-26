@@ -1236,3 +1236,73 @@ fn live_antigravity_terminal_attempt_and_peer_id_route_through_mailbox() {
     assert_eq!(confirmed["status"], "queued");
     assert_eq!(mb.pending(SESSION), 1);
 }
+
+#[test]
+fn headless_resume_is_blocked_when_live_session_or_unknown_liveness_is_detected() {
+    // 1. Ended external_terminal with no Stop waiter heartbeating, but OS/hub/peer
+    //    liveness proves the session is still live -> routes to Mailbox instead of double-resuming.
+    let route = decide_with_liveness(
+        &run("external_terminal", "claude", "exited", SESSION),
+        never_listening,
+        |_, _| SessionLiveness::Live {
+            detail: "process 9999 is still alive".into(),
+        },
+        no_conversation,
+        no_manvi,
+    );
+    assert_eq!(
+        route,
+        Route::Mailbox {
+            session: SESSION.into(),
+            listening: false,
+            provider: "claude".into(),
+        }
+    );
+
+    // 2. Ended attempt with Unknown liveness -> fails closed (Unavailable), never double-resumes.
+    let route_unknown = decide_with_liveness(
+        &run("external_terminal", "claude", "exited", SESSION),
+        never_listening,
+        |_, _| SessionLiveness::Unknown {
+            reason: "EPERM probing pid".into(),
+        },
+        no_conversation,
+        no_manvi,
+    );
+    let Route::Unavailable { reason } = route_unknown else {
+        panic!("expected Unavailable on Unknown liveness, got {route_unknown:?}");
+    };
+    assert!(reason.contains("double-resuming"), "{reason}");
+
+    // 3. Real OS probe catches current live process by (pid, process_start).
+    let my_pid = std::process::id();
+    let my_birth = crate::workbench::process_birth::read(my_pid).expect("read own birth");
+    let live_run = json!({
+        "id": SESSION,
+        "kind": "external_terminal",
+        "provider": "claude",
+        "state": "exited",
+        "cwd": "/checkout",
+        "pid": my_pid,
+        "process_start": my_birth,
+    });
+    assert!(matches!(
+        probe_session_liveness(&live_run, Some(SESSION)),
+        SessionLiveness::Live { .. }
+    ));
+
+    // 4. Dead / mismatched process birth reports NotLive so legitimate resume proceeds.
+    let gone_run = json!({
+        "id": SESSION,
+        "kind": "external_terminal",
+        "provider": "claude",
+        "state": "exited",
+        "cwd": "/nonexistent-checkout-path",
+        "pid": my_pid,
+        "process_start": "mismatched-birth-id",
+    });
+    assert_eq!(
+        probe_session_liveness(&gone_run, Some(SESSION)),
+        SessionLiveness::NotLive
+    );
+}

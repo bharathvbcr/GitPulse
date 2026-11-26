@@ -55,6 +55,7 @@ pub mod ops;
 pub mod output;
 mod pools;
 pub mod procguard;
+pub mod remote;
 pub mod repository_trust;
 pub mod secrets;
 pub mod singleflight;
