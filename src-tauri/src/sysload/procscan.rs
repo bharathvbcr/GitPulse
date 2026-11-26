@@ -2176,6 +2176,15 @@ pub struct SessionScan {
 /// are the same number. A process that has exited, or one whose creation time
 /// cannot be read, stays `None` rather than a guessed value.
 pub fn process_start_us(pid: u32) -> Option<u64> {
+    // Read directly, not through a process snapshot: the steward and the alerts
+    // treat `None` as "the writer is gone", so a failed snapshot (or a 32-bit
+    // build, which has no scan) must not turn a live process into that.
+    // `os::pid_ppid_start` reads the same way, so the two agree.
+    if cfg!(windows) {
+        return crate::workbench::process_birth::started_unix_nanos(pid)
+            .map(|nanos| nanos / 1_000)
+            .filter(|&start_us| start_us > 0);
+    }
     if !os::SUPPORTED {
         return None;
     }
@@ -3085,7 +3094,10 @@ impl Scanner {
 /// The process table with every argument list, for the signal guard. `Err`
 /// when the table could not be read.
 pub(crate) fn signal_table() -> Result<Table, String> {
-    if !os::SUPPORTED {
+    // The table answers `kill`, `pkill` and `pgrep`, whose pids and uids are
+    // POSIX's. Windows has a scan but no such signals, and its uids are
+    // stand-ins, so the guard keeps failing closed there as it did before.
+    if !os::SUPPORTED || cfg!(windows) {
         return Err("this platform has no process scan".into());
     }
     let mut buf = Vec::new();
@@ -4494,11 +4506,13 @@ mod os {
         winproc::exe_stem(name).to_string()
     }
 
-    /// A path in its canonical spelling when the directory still exists, else
-    /// as the loader has it. `canonicalize` is what the callers compare it
-    /// against, so `C:\Work`, `c:\work` and `\\?\C:\Work` meet.
+    /// A path in the repository's text spelling (`canonicalize_plain`: true
+    /// case, no `\\?\` prefix) when it still exists, else as the loader has
+    /// it. Callers compare it with canonical directories, so `C:\Work`,
+    /// `c:\work` and `\\?\C:\Work` meet; `dir_spellings` and `working_in`
+    /// hold both forms of the other side.
     fn canonical(path: PathBuf) -> PathBuf {
-        std::fs::canonicalize(&path).unwrap_or(path)
+        crate::engine::process::canonicalize_plain(&path).unwrap_or(path)
     }
 
     pub(crate) fn list_pids(pids: &mut Vec<i32>) -> Result<(), String> {
@@ -8453,7 +8467,11 @@ pub(crate) mod tests {
             canonicalize_plain(&lane).unwrap()
         );
         let argv = os::argv_of(pid, &mut Vec::new()).expect("its command line");
-        assert!(argv[0].eq_ignore_ascii_case("ping"), "{argv:?}");
+        // The command line is as typed; the image name is in its on-disk case.
+        assert!(
+            argv[0].eq_ignore_ascii_case("ping") || argv[0].eq_ignore_ascii_case("ping.exe"),
+            "{argv:?}"
+        );
         assert!(argv.iter().any(|arg| arg == "127.0.0.1"), "{argv:?}");
 
         // Parent and start: the start is the birth reader's number.
@@ -8461,16 +8479,22 @@ pub(crate) mod tests {
         assert_eq!(ppid, me);
         assert!(start_us > 0);
         assert_eq!(process_start_us(pid.unsigned_abs()), Some(start_us));
+        // Creation times have 100 ns resolution; `start_us` is those truncated.
         assert_eq!(
-            crate::workbench::process_birth::started_unix_nanos(pid.unsigned_abs()),
-            Some(start_us * 1_000)
+            crate::workbench::process_birth::started_unix_nanos(pid.unsigned_abs())
+                .map(|nanos| nanos / 1_000),
+            Some(start_us)
         );
 
         // The facts a scan tick carries, and the launch it read from the
         // environment.
         let facts = probe_one(pid).expect("facts");
         assert_eq!((facts.ppid, facts.start_us), (me, start_us));
-        assert_eq!(facts.ident.name, "ping");
+        assert!(
+            facts.ident.name.eq_ignore_ascii_case("ping"),
+            "{:?}",
+            facts.ident.name
+        );
         assert!(facts
             .ident
             .exec
