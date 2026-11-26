@@ -646,6 +646,42 @@ fn is_default_profile(choice: &crate::sysload::ProfileChoice) -> bool {
     *choice == crate::sysload::ProfileChoice::default()
 }
 
+/// How aggressively GitPulse sheds caches and hibernates the main WebView when idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleMemoryMode {
+    Off,
+    Aggressive,
+    #[default]
+    #[serde(other)]
+    Balanced,
+}
+
+/// Settings payload for Idle Memory Efficiency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleMemorySettings {
+    #[serde(default)]
+    pub mode: IdleMemoryMode,
+}
+
+fn lenient_idle_memory_mode<'de, D>(deserializer: D) -> Result<IdleMemoryMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable idle_memory_mode, keeping balanced: {error}"
+        );
+        IdleMemoryMode::Balanced
+    }))
+}
+
+fn is_default_idle_memory_mode(mode: &IdleMemoryMode) -> bool {
+    *mode == IdleMemoryMode::default()
+}
+
 /// Whether builds take a slot (`sysload::lease`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1247,6 +1283,279 @@ where
     }))
 }
 
+pub const STEWARD_DEFAULT_INTERVAL_SECS: u64 = 180;
+pub const STEWARD_MIN_INTERVAL_SECS: u64 = 60;
+pub const STEWARD_MAX_INTERVAL_SECS: u64 = 3_600;
+pub const STEWARD_DEFAULT_RETENTION_DAYS: u32 = 3;
+/// The steward cleans only when free disk is critically low, so it keeps its
+/// own floor rather than the 7 days `validate_retention(_, true)` holds for
+/// unattended Storage cleaning on a schedule.
+pub const STEWARD_MIN_RETENTION_DAYS: u32 = 3;
+pub const STEWARD_MAX_REPO_OVERRIDES: usize = 256;
+
+/// Bounds the steward's cleanup retention: [`STEWARD_MIN_RETENTION_DAYS`] up
+/// to the shared hygiene maximum.
+fn validate_steward_retention(days: u32) -> Result<(), String> {
+    if days < STEWARD_MIN_RETENTION_DAYS {
+        return Err(format!(
+            "Retention must be at least {STEWARD_MIN_RETENTION_DAYS} days"
+        ));
+    }
+    devmap_query::hygiene::validate_retention(days, false)
+}
+
+fn steward_default_true() -> bool {
+    true
+}
+
+/// Cleaning and slowing act on the person's machine and agents, so each waits
+/// until they switch it on; messaging only advises and is on from the start.
+fn steward_default_false() -> bool {
+    false
+}
+
+fn steward_default_interval_secs() -> u64 {
+    STEWARD_DEFAULT_INTERVAL_SECS
+}
+
+fn steward_default_retention_days() -> u32 {
+    STEWARD_DEFAULT_RETENTION_DAYS
+}
+
+/// Per-repository override for the Manvi system steward, keyed by the
+/// repository's canonical common Git directory so linked worktrees of one
+/// repository share one policy. `None` on any field inherits the host-wide
+/// setting in [`ManviStewardSettings`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepoStewardOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_agents: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_critical: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean_critical: Option<bool>,
+}
+
+impl RepoStewardOverride {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.message_agents.is_none()
+            && self.slow_critical.is_none()
+            && self.clean_critical.is_none()
+    }
+}
+
+/// Resolved steward policy for one repository (or the host when `common_dir`
+/// is `None`), combining global [`ManviStewardSettings`] with any matching
+/// [`RepoStewardOverride`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectiveStewardPolicy {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub message_agents: bool,
+    pub slow_critical: bool,
+    pub clean_critical: bool,
+    pub clean_retention_days: u32,
+    pub overridden: bool,
+}
+
+/// Host-wide and per-repository settings for GitPulse's periodic Manvi system
+/// steward (`manvi_steward` in `tools.json`).
+///
+/// When Manvi is configured (`manvi use` cloud or local) and `enabled` is true,
+/// the steward checks host pressure every `interval_secs`, messages active
+/// coding agents when load rises, slows runaway agent trees and paces shell
+/// invocations when pressure is critical, and reclaims producer-verified
+/// leftover build caches when storage is critically low.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManviStewardSettings {
+    #[serde(default = "steward_default_true")]
+    pub enabled: bool,
+    #[serde(default = "steward_default_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "steward_default_true")]
+    pub message_agents: bool,
+    #[serde(default = "steward_default_false")]
+    pub slow_critical: bool,
+    #[serde(default = "steward_default_false")]
+    pub clean_critical: bool,
+    #[serde(default = "steward_default_retention_days")]
+    pub clean_retention_days: u32,
+    #[serde(default)]
+    pub repositories: std::collections::BTreeMap<String, RepoStewardOverride>,
+}
+
+impl Default for ManviStewardSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: STEWARD_DEFAULT_INTERVAL_SECS,
+            message_agents: true,
+            slow_critical: false,
+            clean_critical: false,
+            clean_retention_days: STEWARD_DEFAULT_RETENTION_DAYS,
+            repositories: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl ManviStewardSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(STEWARD_MIN_INTERVAL_SECS..=STEWARD_MAX_INTERVAL_SECS).contains(&self.interval_secs) {
+            return Err(format!(
+                "Steward check interval must be between {STEWARD_MIN_INTERVAL_SECS} and {STEWARD_MAX_INTERVAL_SECS} seconds."
+            ));
+        }
+        validate_steward_retention(self.clean_retention_days)
+            .map_err(|e| format!("Steward cleanup retention: {e}"))?;
+        if self.repositories.len() > STEWARD_MAX_REPO_OVERRIDES {
+            return Err(format!(
+                "At most {STEWARD_MAX_REPO_OVERRIDES} repository steward overrides may be stored."
+            ));
+        }
+        for key in self.repositories.keys() {
+            if key.trim().is_empty()
+                || key.len() > 4096
+                || key.chars().any(char::is_control)
+                || !Path::new(key).is_absolute()
+            {
+                return Err(
+                    "Each repository steward override key must be an absolute path.".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Normalizes out-of-range values read from a hand-edited file and drops
+    /// empty repository overrides so `is_default` reflects real differences.
+    pub fn sanitized(mut self) -> Self {
+        self.interval_secs = self
+            .interval_secs
+            .clamp(STEWARD_MIN_INTERVAL_SECS, STEWARD_MAX_INTERVAL_SECS);
+        if validate_steward_retention(self.clean_retention_days).is_err() {
+            self.clean_retention_days = STEWARD_DEFAULT_RETENTION_DAYS;
+        }
+        self.repositories.retain(|key, over| {
+            !over.is_empty()
+                && !key.trim().is_empty()
+                && key.len() <= 4096
+                && !key.chars().any(char::is_control)
+                && Path::new(key).is_absolute()
+        });
+        while self.repositories.len() > STEWARD_MAX_REPO_OVERRIDES {
+            let Some(last) = self.repositories.keys().next_back().cloned() else {
+                break;
+            };
+            self.repositories.remove(&last);
+        }
+        self
+    }
+
+    /// Effective steward policy for `common_dir` (`None` returns global settings).
+    pub fn effective_for(&self, common_dir: Option<&str>) -> EffectiveStewardPolicy {
+        let over = common_dir.and_then(|dir| self.repositories.get(dir));
+        EffectiveStewardPolicy {
+            enabled: over.and_then(|o| o.enabled).unwrap_or(self.enabled),
+            interval_secs: self.interval_secs,
+            message_agents: over
+                .and_then(|o| o.message_agents)
+                .unwrap_or(self.message_agents),
+            slow_critical: over
+                .and_then(|o| o.slow_critical)
+                .unwrap_or(self.slow_critical),
+            clean_critical: over
+                .and_then(|o| o.clean_critical)
+                .unwrap_or(self.clean_critical),
+            clean_retention_days: self.clean_retention_days,
+            overridden: over.is_some_and(|o| !o.is_empty()),
+        }
+    }
+    /// Reads `manvi_steward` from `tools.json` one field at a time so an
+    /// unknown future key or a single malformed field never resets `enabled: false`
+    /// (or a repository opt-out) back to the default `true`.
+    pub fn from_stored(raw: serde_json::Value) -> Self {
+        let mut settings = Self::default();
+        let Some(object) = raw.as_object() else {
+            if !raw.is_null() {
+                log::warn!(
+                    target: "tool_config",
+                    "ignoring a manvi_steward block that is not an object"
+                );
+            }
+            return settings;
+        };
+        fn field<T: serde::de::DeserializeOwned>(
+            object: &serde_json::Map<String, serde_json::Value>,
+            name: &str,
+            into: &mut T,
+        ) {
+            if let Some(value) = object.get(name) {
+                match serde_json::from_value(value.clone()) {
+                    Ok(read) => *into = read,
+                    Err(error) => log::warn!(
+                        target: "tool_config",
+                        "ignoring unreadable manvi_steward.{name}, keeping its default: {error}"
+                    ),
+                }
+            }
+        }
+        field(object, "enabled", &mut settings.enabled);
+        field(object, "interval_secs", &mut settings.interval_secs);
+        field(object, "message_agents", &mut settings.message_agents);
+        field(object, "slow_critical", &mut settings.slow_critical);
+        field(object, "clean_critical", &mut settings.clean_critical);
+        field(
+            object,
+            "clean_retention_days",
+            &mut settings.clean_retention_days,
+        );
+        if let Some(repos_val) = object.get("repositories") {
+            match repos_val.as_object() {
+                Some(repos_map) => {
+                    for (repo_key, entry_val) in repos_map {
+                        let Some(entry_obj) = entry_val.as_object() else {
+                            log::warn!(
+                                target: "tool_config",
+                                "ignoring non-object manvi_steward.repositories[{repo_key}]"
+                            );
+                            continue;
+                        };
+                        let mut over = RepoStewardOverride::default();
+                        field(entry_obj, "enabled", &mut over.enabled);
+                        field(entry_obj, "message_agents", &mut over.message_agents);
+                        field(entry_obj, "slow_critical", &mut over.slow_critical);
+                        field(entry_obj, "clean_critical", &mut over.clean_critical);
+                        settings.repositories.insert(repo_key.clone(), over);
+                    }
+                }
+                None if !repos_val.is_null() => log::warn!(
+                    target: "tool_config",
+                    "ignoring non-object manvi_steward.repositories"
+                ),
+                None => {}
+            }
+        }
+        settings.sanitized()
+    }
+}
+
+fn lenient_manvi_steward<'de, D>(deserializer: D) -> Result<ManviStewardSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(ManviStewardSettings::from_stored(raw))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolConfig {
     pub version: u32,
@@ -1370,6 +1679,20 @@ pub struct ToolConfig {
         skip_serializing_if = "HostLoadIdle::is_default"
     )]
     pub host_load_idle: HostLoadIdle,
+    /// Periodic Manvi system steward settings (host-wide and per-repository).
+    #[serde(
+        default,
+        deserialize_with = "lenient_manvi_steward",
+        skip_serializing_if = "ManviStewardSettings::is_default"
+    )]
+    pub manvi_steward: ManviStewardSettings,
+    /// Idle memory efficiency mode (`off`, `balanced`, `aggressive`).
+    #[serde(
+        default,
+        deserialize_with = "lenient_idle_memory_mode",
+        skip_serializing_if = "is_default_idle_memory_mode"
+    )]
+    pub idle_memory_mode: IdleMemoryMode,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -1398,6 +1721,8 @@ impl Default for ToolConfig {
             turn_checkpoints: TurnCheckpointSettings::default(),
             host_load_leases: HostLoadLeases::default(),
             host_load_idle: HostLoadIdle::default(),
+            manvi_steward: ManviStewardSettings::default(),
+            idle_memory_mode: IdleMemoryMode::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -2184,6 +2509,93 @@ pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
         cfg.lappi = next;
         Ok(())
     })
+}
+
+/// Stored idle memory efficiency mode (`balanced` by default).
+pub fn idle_memory_mode() -> IdleMemoryMode {
+    load().map(|cfg| cfg.idle_memory_mode).unwrap_or_default()
+}
+
+/// Stored idle memory efficiency settings (`balanced` by default).
+pub fn idle_memory_settings() -> IdleMemorySettings {
+    IdleMemorySettings {
+        mode: idle_memory_mode(),
+    }
+}
+
+/// Saves idle memory efficiency settings atomically to `tools.json`.
+pub fn save_idle_memory_settings(next: IdleMemorySettings) -> Result<IdleMemorySettings, String> {
+    update(|cfg| {
+        cfg.idle_memory_mode = next.mode;
+        Ok(())
+    })?;
+    Ok(idle_memory_settings())
+}
+
+/// Saves idle memory efficiency mode atomically to `tools.json`.
+pub fn save_idle_memory_mode(mode: IdleMemoryMode) -> Result<IdleMemoryMode, String> {
+    Ok(save_idle_memory_settings(IdleMemorySettings { mode })?.mode)
+}
+
+/// Host-wide and per-repository Manvi system steward settings, or defaults.
+pub fn manvi_steward_settings() -> ManviStewardSettings {
+    load().map(|cfg| cfg.manvi_steward).unwrap_or_default()
+}
+
+/// [`manvi_steward_settings`] read from `tools.json` in `dir`, for hooks and tests.
+pub fn manvi_steward_settings_in(dir: &Path) -> ManviStewardSettings {
+    read_disk(&dir.join("tools.json"))
+        .map(|cfg| cfg.manvi_steward)
+        .unwrap_or_default()
+}
+
+/// Saves validated [`ManviStewardSettings`], sanitizing intervals, retention
+/// bounds, and repository override entries.
+pub fn set_manvi_steward_settings(next: ManviStewardSettings) -> Result<(), String> {
+    next.validate()?;
+    let clean = next.sanitized();
+    update(|cfg| {
+        cfg.manvi_steward = clean;
+        Ok(())
+    })
+}
+
+/// Sets or clears (`override_policy: None` or empty) one repository's steward
+/// override, keyed by its canonical common Git directory.
+pub fn set_manvi_steward_repo_override(
+    common_dir: &str,
+    override_policy: Option<RepoStewardOverride>,
+) -> Result<ManviStewardSettings, String> {
+    if common_dir.trim().is_empty()
+        || common_dir.len() > 4096
+        || common_dir.chars().any(char::is_control)
+        || !Path::new(common_dir).is_absolute()
+    {
+        return Err(
+            "Repository steward override requires an absolute common Git directory.".into(),
+        );
+    }
+    update(|cfg| {
+        match override_policy {
+            Some(over) if !over.is_empty() => {
+                if !cfg.manvi_steward.repositories.contains_key(common_dir)
+                    && cfg.manvi_steward.repositories.len() >= STEWARD_MAX_REPO_OVERRIDES
+                {
+                    return Err(format!(
+                        "At most {STEWARD_MAX_REPO_OVERRIDES} repository steward overrides may be stored."
+                    ));
+                }
+                cfg.manvi_steward
+                    .repositories
+                    .insert(common_dir.to_string(), over);
+            }
+            _ => {
+                cfg.manvi_steward.repositories.remove(common_dir);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(manvi_steward_settings())
 }
 
 pub fn set_onboarding(state: OnboardingState) -> Result<(), String> {
@@ -3556,6 +3968,63 @@ mod tests {
             assert_eq!(loaded.manvi.source_root.as_deref(), Some("/good/root"));
         });
     }
+
+    #[test]
+    fn idle_memory_mode_defaults_to_balanced_falls_back_on_unknown_and_round_trips() {
+        assert_eq!(IdleMemoryMode::default(), IdleMemoryMode::Balanced);
+        assert_eq!(
+            serde_json::from_str::<IdleMemoryMode>(r#""turbo_invalid""#).unwrap(),
+            IdleMemoryMode::Balanced
+        );
+
+        with_temp_config(|path| {
+            assert_eq!(idle_memory_mode(), IdleMemoryMode::Balanced);
+            assert_eq!(
+                idle_memory_settings(),
+                IdleMemorySettings {
+                    mode: IdleMemoryMode::Balanced
+                }
+            );
+
+            for mode in [
+                IdleMemoryMode::Off,
+                IdleMemoryMode::Balanced,
+                IdleMemoryMode::Aggressive,
+            ] {
+                let saved = save_idle_memory_settings(IdleMemorySettings { mode }).unwrap();
+                assert_eq!(saved.mode, mode);
+                invalidate_cache();
+                assert_eq!(idle_memory_mode(), mode);
+                assert_eq!(idle_memory_settings().mode, mode);
+            }
+
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["idle_memory_mode"], "aggressive");
+
+            save_idle_memory_mode(IdleMemoryMode::Balanced).unwrap();
+            let stored_default: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                stored_default.get("idle_memory_mode").is_none(),
+                "default balanced mode is omitted from tools.json"
+            );
+
+            for raw in [r#""future_mode""#, "42", r#"{"nested":true}"#] {
+                write_raw(
+                    path,
+                    &format!(
+                        r#"{{"version":1,"host_load":{{"enabled":false}},"idle_memory_mode":{raw}}}"#
+                    ),
+                );
+                assert_eq!(idle_memory_mode(), IdleMemoryMode::Balanced, "{raw}");
+                assert!(
+                    !host_load_settings().enabled,
+                    "unreadable idle_memory_mode ({raw}) must not discard other settings"
+                );
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3947,6 +4416,176 @@ mod model_setting_tests {
             let read = agent_defaults();
             assert!(read.commit_models.is_empty());
             assert!(read.model_for("claude").is_some());
+        });
+    }
+
+    #[test]
+    fn manvi_steward_round_trips_global_and_repo_overrides_and_omits_defaults() {
+        // `/repo/alpha/.git` has no drive, so Windows reads it as relative.
+        let alpha = if cfg!(windows) {
+            r"C:\repo\alpha\.git"
+        } else {
+            "/repo/alpha/.git"
+        };
+        with_temp_config(|path| {
+            assert_eq!(manvi_steward_settings(), ManviStewardSettings::default());
+
+            // Saving defaults leaves `manvi_steward` absent from tools.json.
+            set_manvi_steward_settings(ManviStewardSettings::default()).unwrap();
+            let raw: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(raw.get("manvi_steward").is_none());
+
+            // Reject invalid intervals, retentions, and relative repo keys.
+            assert!(set_manvi_steward_settings(ManviStewardSettings {
+                interval_secs: 10,
+                ..ManviStewardSettings::default()
+            })
+            .is_err());
+            assert!(set_manvi_steward_settings(ManviStewardSettings {
+                clean_retention_days: 2,
+                ..ManviStewardSettings::default()
+            })
+            .is_err());
+            assert!(set_manvi_steward_repo_override("relative/.git", None).is_err());
+
+            // Save custom global settings + per-repository override ("glocal").
+            set_manvi_steward_settings(ManviStewardSettings {
+                enabled: true,
+                interval_secs: 300,
+                message_agents: true,
+                slow_critical: true,
+                clean_critical: false,
+                clean_retention_days: 14,
+                repositories: std::collections::BTreeMap::new(),
+            })
+            .unwrap();
+            let updated = set_manvi_steward_repo_override(
+                alpha,
+                Some(RepoStewardOverride {
+                    enabled: None,
+                    message_agents: Some(false),
+                    slow_critical: None,
+                    clean_critical: Some(true),
+                }),
+            )
+            .unwrap();
+            assert_eq!(updated.interval_secs, 300);
+            let global_eff = updated.effective_for(None);
+            assert!(!global_eff.overridden);
+            assert!(global_eff.message_agents);
+            assert!(!global_eff.clean_critical);
+
+            let alpha_eff = updated.effective_for(Some(alpha));
+            assert!(alpha_eff.overridden);
+            assert!(!alpha_eff.message_agents);
+            assert!(alpha_eff.clean_critical);
+            assert!(alpha_eff.slow_critical);
+
+            // Clearing the override restores global inheritance.
+            let cleared = set_manvi_steward_repo_override(alpha, None).unwrap();
+            assert!(!cleared.effective_for(Some(alpha)).overridden);
+
+            // Malformed `manvi_steward` degrades cleanly without losing `devmap` paths.
+            write_raw(
+                path,
+                r#"{"version":1,"devmap":{"disabled":true},"manvi_steward":"corrupt"}"#,
+            );
+            assert!(is_disabled(crate::tool_install::ExternalTool::Devmap));
+            assert_eq!(manvi_steward_settings(), ManviStewardSettings::default());
+
+            // Field-by-field resilience: unknown future keys or one invalid field inside
+            // `manvi_steward` must NEVER reset `enabled: false` back to `true`!
+            write_raw(
+                path,
+                &serde_json::json!({
+                    "version": 1,
+                    "manvi_steward": {
+                        "enabled": false,
+                        "interval_secs": "bad-type",
+                        "future_steward_key": true,
+                        "repositories": {
+                            (alpha): {
+                                "enabled": false,
+                                "slow_critical": "invalid",
+                                "future_repo_flag": 42
+                            },
+                            "relative/.git": {
+                                "enabled": true
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            );
+            let lenient = manvi_steward_settings();
+            assert!(
+                !lenient.enabled,
+                "unknown or sibling invalid field must NOT flip enabled=false back to true"
+            );
+            assert_eq!(
+                lenient.interval_secs,
+                ManviStewardSettings::default().interval_secs
+            );
+            assert!(
+                !lenient.effective_for(Some(alpha)).enabled,
+                "per-repo enabled=false must survive unknown/invalid sibling override fields"
+            );
+            assert!(
+                !lenient.repositories.contains_key("relative/.git"),
+                "relative repository keys must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn manvi_steward_messages_by_default_but_cleans_and_slows_only_when_switched_on() {
+        let defaults = ManviStewardSettings::default();
+        assert!(defaults.enabled && defaults.message_agents);
+        assert!(!defaults.clean_critical, "deleting build caches is opt-in");
+        assert!(!defaults.slow_critical, "slowing agents is opt-in");
+        // A settings file that never named them reads the same defaults.
+        let unnamed =
+            ManviStewardSettings::from_stored(serde_json::json!({ "interval_secs": 300 }));
+        assert!(!unnamed.clean_critical && !unnamed.slow_critical);
+        // A saved choice to switch them on is kept.
+        let chosen = ManviStewardSettings::from_stored(serde_json::json!({
+            "clean_critical": true,
+            "slow_critical": true
+        }));
+        assert!(chosen.clean_critical && chosen.slow_critical);
+    }
+
+    #[test]
+    fn manvi_steward_cleanup_keeps_three_days_of_build_caches_by_default() {
+        let defaults = ManviStewardSettings::default();
+        assert_eq!(defaults.clean_retention_days, 3);
+        assert_eq!(defaults.validate(), Ok(()));
+        // Its own floor, below the 7 days unattended Storage cleaning keeps.
+        assert!(ManviStewardSettings {
+            clean_retention_days: 2,
+            ..ManviStewardSettings::default()
+        }
+        .validate()
+        .is_err());
+        for kept in [3, 7, 3650] {
+            let stored = ManviStewardSettings::from_stored(serde_json::json!({
+                "clean_retention_days": kept
+            }));
+            assert_eq!(stored.clean_retention_days, kept, "a stored {kept} is kept");
+        }
+        for out_of_range in [0, 2, 3651] {
+            let stored = ManviStewardSettings::from_stored(serde_json::json!({
+                "clean_retention_days": out_of_range
+            }));
+            assert_eq!(
+                stored.clean_retention_days, 3,
+                "a stored {out_of_range} falls back to the default"
+            );
+        }
+        with_temp_config(|_| {
+            set_manvi_steward_settings(ManviStewardSettings::default()).unwrap();
+            assert_eq!(manvi_steward_settings().clean_retention_days, 3);
         });
     }
 }

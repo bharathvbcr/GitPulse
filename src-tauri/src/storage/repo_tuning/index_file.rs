@@ -10,9 +10,16 @@
 //! What it checks, from the format document: each entry's fixed fields, a
 //! non-empty path, the `0x4000` extended-flags bit only from version 3, the NUL
 //! padding of versions 2 and 3, the prefix-compressed path of version 4
-//! (strip count, then a NUL-terminated suffix that must leave a non-empty
-//! path), and that the extensions (four byte signature starting with a letter,
-//! four byte size) end exactly where the trailing checksum begins.
+//! (strip count, then a NUL-terminated suffix), and that the extensions (four
+//! byte signature starting with a letter, four byte size) end exactly where the
+//! trailing checksum begins.
+//!
+//! The one entry allowed an empty path is a split index's replacement: an entry
+//! of `$GIT_DIR/index` that stands in for one of the shared index is written
+//! with its name stripped (git's `split-index.c` dies on a replacement that has
+//! one). Whether the index is split is only known from the `link` extension,
+//! after the entries, so empty paths are counted on the way and refused at the
+//! end unless that extension is there.
 //!
 //! What it does NOT check: the checksum itself. No SHA-1 implementation is a
 //! direct dependency of this crate and adding one is not allowed here, so a
@@ -20,7 +27,7 @@
 //! by [`MAX_INDEX_BYTES`]; a larger index is reported as unreadable, never
 //! guessed at. Results are cached by path, size, modification time and inode.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -257,6 +264,9 @@ fn walk_entries(
     let mut fields = vec![0u8; fixed];
     let mut path_buf: Vec<u8> = Vec::new();
     let mut has_skip_worktree = false;
+    // Entries with an empty path: a split index's replacements, or corruption.
+    // Not handed to `on_entry`, which wants paths; they name no path here.
+    let mut stripped_names = 0u64;
     for _ in 0..header.entries {
         cur.take(&mut fields)?;
         let mode = u32::from_be_bytes([fields[24], fields[25], fields[26], fields[27]]);
@@ -278,9 +288,6 @@ fn walk_entries(
             let long = name_len >= 0x0FFF;
             path_buf.clear();
             let path_len = if !long {
-                if name_len == 0 {
-                    return Err("an entry has an empty path".to_string());
-                }
                 path_buf.resize(name_len, 0);
                 cur.take(&mut path_buf)?;
                 name_len
@@ -304,7 +311,11 @@ fn walk_entries(
             if padding.iter().any(|b| *b != 0) {
                 return Err("an entry's padding is not NUL".to_string());
             }
-            on_entry(mode, &path_buf)?;
+            if path_buf.is_empty() {
+                stripped_names += 1;
+            } else {
+                on_entry(mode, &path_buf)?;
+            }
         } else {
             // Version 4: offset-encoded strip count, then a NUL-terminated suffix.
             let mut b = cur.byte()?;
@@ -323,10 +334,13 @@ fn walk_entries(
             }
             path_buf.truncate(path_buf.len() - strip);
             cur.append_until_nul(&mut path_buf)?;
+            // A stripped name leaves `path_buf` empty, which is also what git
+            // prefix-compresses the next entry against.
             if path_buf.is_empty() {
-                return Err("an entry has an empty path".to_string());
+                stripped_names += 1;
+            } else {
+                on_entry(mode, &path_buf)?;
             }
-            on_entry(mode, &path_buf)?;
         }
     }
 
@@ -357,6 +371,9 @@ fn walk_entries(
     if cur.pos != end {
         return Err("the extensions do not end where the checksum begins".to_string());
     }
+    if stripped_names > 0 && !shape.split {
+        return Err("an entry has an empty path".to_string());
+    }
     let mut trailer = vec![0u8; hash_len];
     cur.inner
         .read_exact(&mut trailer)
@@ -366,6 +383,9 @@ fn walk_entries(
 }
 
 /// Result of reading tracked paths from `.git/index` without spawning `git`.
+/// Test-only since `GitReader::list_repo_files` moved to `git ls-files`: its
+/// parser and fail-closed tests are kept until the index walker is retired.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TrackedIndexPaths {
     Paths(Vec<String>),
@@ -514,6 +534,7 @@ pub(crate) fn index_shape_supported(git_dir: &Path, common_dir: &Path) -> bool {
 /// Reads unique tracked UTF-8 paths from `git_dir/index` when config and index
 /// shape are standard; otherwise returns `Unsupported` (caller falls back to
 /// `git ls-files`) or `OverLimit` if unique tracked paths exceed `max_unique`.
+#[cfg(test)]
 pub(crate) fn read_tracked_paths(
     git_dir: &Path,
     common_dir: &Path,
@@ -550,7 +571,7 @@ pub(crate) fn read_tracked_paths(
         return TrackedIndexPaths::Unsupported;
     }
 
-    let mut unique: HashSet<String> = HashSet::new();
+    let mut unique: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut over_limit = false;
     let walked = walk_entries(file, meta.len(), header, hash_len, |mode, raw| {
         if (mode & GITLINK_MODE_MASK) == GITLINK_MODE {
@@ -809,6 +830,80 @@ mod tests {
         if args.first() == Some(&"init") {
             crate::test_support::trust_repo(dir);
         }
+    }
+
+    /// A repository whose index is split and holds at least one replacement:
+    /// the files are committed into the shared index, then `f2.txt` changes,
+    /// so `$GIT_DIR/index` carries an entry standing in for the shared one.
+    fn split_index_with_a_replacement(version: &str) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-b", "main"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "index.version", version]);
+        for name in ["f1.txt", "f2.txt", "f3.txt"] {
+            fs::write(root.join(name), name).unwrap();
+        }
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "init"]);
+        run_git(root, &["update-index", "--split-index"]);
+        fs::write(root.join("f2.txt"), "changed").unwrap();
+        run_git(root, &["add", "f2.txt"]);
+        dir
+    }
+
+    /// Walks `git_dir/index`, returning its shape, how many entries the header
+    /// claims, and how many of them were handed over as paths.
+    fn walk_counting(index: &Path) -> (Result<IndexShape, String>, u32, u32) {
+        let (mut file, meta) = open_regular_file_no_follow(index).unwrap();
+        let mut head = [0u8; INDEX_HEADER_LEN];
+        file.read_exact(&mut head).unwrap();
+        let header = super::super::parse_index_header(&head).unwrap();
+        file.rewind().unwrap();
+        let mut paths = 0u32;
+        let shape = walk_entries(file, meta.len(), header, 20, |_, raw| {
+            assert!(!raw.is_empty(), "an empty path was handed over as a path");
+            paths += 1;
+            Ok(())
+        });
+        (shape, header.entries, paths)
+    }
+
+    /// The defect: git writes a split index's replacement entries with an
+    /// empty name, and the walk refused every such index as corrupt, so a
+    /// split index read as unreadable whenever git had rewritten an entry.
+    #[test]
+    fn a_split_index_with_replacement_entries_walks_in_every_version() {
+        for version in ["2", "3", "4"] {
+            let dir = split_index_with_a_replacement(version);
+            let (shape, claimed, paths) = walk_counting(&dir.path().join(".git/index"));
+            let shape = shape.unwrap_or_else(|why| panic!("version {version}: {why}"));
+            assert!(shape.split, "version {version}: no link extension seen");
+            assert!(
+                paths < claimed,
+                "version {version}: no replacement entry, so the case is not exercised \
+                 ({paths} of {claimed} entries named a path)"
+            );
+        }
+    }
+
+    /// Stripped names are a split index's alone: the same bytes with the
+    /// `link` extension renamed are refused.
+    #[test]
+    fn an_empty_path_without_a_link_extension_is_still_corrupt() {
+        let dir = split_index_with_a_replacement("2");
+        let index = dir.path().join(".git/index");
+        let mut bytes = fs::read(&index).unwrap();
+        let at = bytes
+            .windows(4)
+            .position(|w| w == b"link")
+            .expect("the split index has a link extension");
+        bytes[at + 1] = b'o';
+        let copy = dir.path().join("unlinked-index");
+        fs::write(&copy, &bytes).unwrap();
+        let (shape, _, _) = walk_counting(&copy);
+        assert_eq!(shape, Err("an entry has an empty path".to_string()));
     }
 
     #[test]

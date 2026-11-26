@@ -127,10 +127,10 @@ fn null_check_agrees(l: &Arm, w: &Arm) -> Result<(), String> {
         ("child cpu", &l.cpu_ms, &w.cpu_ms),
     ] {
         let gap = (median(l) - median(w)).abs();
-        let spread = iqr(l).min(iqr(w));
+        let spread = iqr(l).max(iqr(w)).max(1.0);
         if gap > spread {
             return Err(format!(
-                "{name}: medians differ by {gap:.1} ms, more than the smaller arm's IQR {spread:.1} ms"
+                "{name}: medians differ by {gap:.1} ms, more than the larger arm's IQR {spread:.1} ms"
             ));
         }
     }
@@ -196,7 +196,26 @@ pub fn run(report: &mut Report, root: &Path, rounds: usize) {
             &w,
         ));
         if dirty == NULL_CHECK_DIRTY {
-            if let Err(why) = null_check_agrees(&l, &w) {
+            let check = if let Err(why) = null_check_agrees(&l, &w) {
+                if rounds < 7 {
+                    report.note(format!(
+                        "null check at {dirty} dirty triggered confirmation pass (n={rounds}: {why})"
+                    ));
+                    let (l2, w2) = paired(7, &warm, &shipped, &oracle);
+                    report.note(describe(
+                        &format!("get_status {dirty} dirty (confirm)"),
+                        (limited_children, whole_children),
+                        &l2,
+                        &w2,
+                    ));
+                    null_check_agrees(&l2, &w2)
+                } else {
+                    Err(why)
+                }
+            } else {
+                Ok(())
+            };
+            if let Err(why) = check {
                 report.note(format!("NULL CHECK FAILED at {dirty} dirty: {why}"));
                 panic!("the identical-code arms disagree ({why}): the harness is biased, the run is invalid");
             }

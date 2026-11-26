@@ -4,7 +4,11 @@ import { createRepoStore, type RepoState } from "../stores/repoStore";
 import { interfaceStore } from "../stores/interfaceStore";
 import { blockedWhilePrompting, buildMenuState, canDispatchMenuEvent, countAgentsWaiting, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
 import { MENU_LIMITS } from "./menuContract";
-import type { AttentionKind, SessionActivity } from "../terminal/sessionActivity";
+import { projectMenuAgentState } from "./menuState";
+import { parseAttention, type AttentionKind, type SessionActivity } from "../terminal/sessionActivity";
+import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
+import type { TaskRun } from "../workbench/client";
+import type { AgentInboxThread } from "../agents/inboxTypes";
 
 const empty = () => get(createRepoStore({ storage: null }));
 const prefs = () => get(interfaceStore);
@@ -168,6 +172,10 @@ describe("native menu projection", () => {
       { choosing: true, expanded: true })).toEqual({ collapse: "chooser" });
     expect(statusKeyAction({ key: "r", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle))
       .toEqual({ id: "refresh" });
+    expect(statusKeyAction({ key: "a", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle))
+      .toEqual({ id: "agents" });
+    expect(statusKeyAction({ key: "A", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle))
+      .toEqual({ id: "agents" });
     expect(statusKeyAction({ key: "1", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle))
       .toEqual({ id: "section:work:overview" });
     expect(statusKeyAction({ key: "3", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle)).toBeNull();
@@ -241,7 +249,290 @@ describe("agents waiting on the reader", () => {
     const plain = buildMenuState(repo, prefs(), "system", {}, false);
     const asked = buildMenuState(repo, prefs(), "system", {}, false, undefined, undefined, 2);
     expect(asked.agentsWaiting).toBe(2);
-    expect({ ...asked, agentsWaiting: 0 }).toEqual(plain);
+    expect(asked.trayTitle).toBe("2 waiting");
+    expect({ ...asked, agentsWaiting: 0, trayTitle: plain.trayTitle }).toEqual(plain);
+  });
+
+  it("projects R4 terminal requests, managed decisions, and inbox asks in deterministic order", () => {
+    const idlePrompt = parseAttention(
+      { session: "s-idle", channel: "hook", event: "idle_prompt", urgency: "informational" },
+      100,
+    )!.attention!;
+    const permission = parseAttention(
+      { session: "s-perm", channel: "hook", event: "permission_prompt", detail: "Approve git push" },
+      200,
+    )!.attention!;
+    const err = parseAttention(
+      { session: "s-err", channel: "hook", event: "error", detail: "Tool exited 1" },
+      150,
+    )!.attention!;
+    const bareBell: SessionActivity = {
+      lastOutputAt: 50,
+      title: "Shell",
+      attention: { kind: "signalled", urgency: "informational", channel: "bell", label: "Bell", detail: null, at: 50 },
+    };
+    const activity = new Map<string, SessionActivity>([
+      ["s-idle", { lastOutputAt: 100, title: "Claude", attention: idlePrompt }],
+      ["s-perm", { lastOutputAt: 200, title: "Claude Code", attention: permission }],
+      ["s-err", { lastOutputAt: 150, title: "Antigravity", attention: err }],
+      ["s-bell", bareBell],
+    ]);
+    expect(countAgentsWaiting(activity, false)).toBe(2);
+
+    const records: TerminalSessionRecord[] = [
+      { key: "k1", repoPath: "/r/a", label: "Claude", launcher: "claude", status: "running", sessionId: "s-perm", close: async () => {} },
+      { key: "k2", repoPath: "/r/b", label: "Antigravity", launcher: "agy", status: "running", sessionId: "s-err", close: async () => {} },
+      { key: "k3", repoPath: "/r/a", label: "Shell", launcher: "shell", status: "running", sessionId: "s-bell", close: async () => {} },
+    ];
+    const runs = [
+      {
+        id: "run-1",
+        task_id: "t-1",
+        kind: "managed",
+        state: "running",
+        session_id: "ms-1",
+        provider: "codex",
+        task_title: "Review migration",
+        cwd: "/r/c",
+        updated_at: 0.1,
+        expires_at: 9999999999,
+      } as unknown as TaskRun,
+    ];
+    const inbox: AgentInboxThread[] = [
+      {
+        thread_key: "th-1",
+        title: "Choose schema strategy",
+        status: "open",
+        ask_type: "decide",
+        latest_msg: {} as AgentInboxThread["latest_msg"],
+        messages: [],
+        from_agent: "claude",
+        to_agent: "developer",
+        updated_at_ms: 180,
+      },
+      {
+        thread_key: "th-dev",
+        title: "Self ask",
+        status: "open",
+        ask_type: "do",
+        latest_msg: {} as AgentInboxThread["latest_msg"],
+        messages: [],
+        from_agent: "developer",
+        to_agent: "claude",
+        updated_at_ms: 190,
+      },
+    ];
+    const tabs = [
+      { path: "/r/a", label: "GitPulse" },
+      { path: "/r/b", label: "Manvi" },
+    ];
+    const projection = projectMenuAgentState(
+      activity,
+      records,
+      { runs, pending: new Map([["run-1", { count: 2, more: false }]]), clock: 1000 },
+      inbox,
+      tabs,
+      false,
+      { caseInsensitive: false },
+      "/r/a",
+    );
+    expect(projection.agentsWaiting).toBe(4);
+    expect(projection.agentRequestsHidden).toBe(0);
+    // 2 running terminal agents (s-perm, s-err; shell excluded) + 1 live managed run not linked to terminal = 3
+    expect(projection.agentsRunning).toBe(3);
+    // s-idle counts as 1 informational; bare detail-less bell excluded
+    expect(projection.agentsInformational).toBe(1);
+    // Blocking (oldest first: run-1@100, th-1@180, s-perm@200) before error (s-err@150)
+    expect(projection.agentRequests.map((r) => [r.id, r.urgency, r.repoLabel])).toEqual([
+      ["run:run-1", "blocking", "c"],
+      ["inbox:th-1", "blocking", "GitPulse"],
+      ["term:s-perm", "blocking", "GitPulse"],
+      ["term:s-err", "error", "Manvi"],
+    ]);
+
+    const menu = buildMenuState(
+      { ...loaded(), openTabs: [{ id: "1", path: "/r/a", name: "a", label: "GitPulse", pinned: false, isActive: true, isBare: false, isDirty: false, isLoading: false, error: null, currentBranch: "main", conflictedCount: 0, changedCount: 0 }] },
+      { ...prefs(), statusIconCounts: true },
+      "system",
+      {},
+      false,
+      undefined,
+      { caseInsensitive: false },
+      undefined,
+      0,
+      projection,
+    );
+    expect(menu.trayTitle).toBe("4 waiting · 0");
+    expect(canDispatchMenuEvent({ id: "focus-agent", path: "term:s-err", repo_path: "/elsewhere" }, menu, loaded())).toBe(true);
+    expect(blockedWhilePrompting("focus-agent")).toBe(true);
+  });
+
+  it("caps agent requests at 8 with hidden overflow and prioritizes waiting count in trayTitle", () => {
+    const activity = new Map<string, SessionActivity>();
+    for (let i = 0; i < 10; i += 1) {
+      activity.set(`s-${i}`, {
+        lastOutputAt: i + 1,
+        title: `Agent ${i}`,
+        attention: { kind: "needs-you", urgency: "blocking", label: "Needs input", detail: null, at: i + 1 },
+      });
+    }
+    const projection = projectMenuAgentState(activity, []);
+    expect(projection.agentsWaiting).toBe(10);
+    expect(projection.agentRequests).toHaveLength(MENU_LIMITS.agentRequests);
+    expect(projection.agentRequestsHidden).toBe(2);
+
+    const repo = {
+      ...loaded(),
+      statuses: Array.from({ length: 1234 }, (_, i) => ({
+        path: `f-${i}`,
+        status_code: " M",
+        is_staged: false,
+        is_conflicted: true,
+        additions: 0,
+        deletions: 0,
+      })),
+    };
+    const menu = buildMenuState(
+      repo,
+      { ...prefs(), statusIconCounts: true },
+      "system",
+      {},
+      false,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      projection,
+    );
+    expect(menu.trayTitle).toBe("10 waiting");
+  });
+
+  it("handles fractional attention.at, control-only ID suffixes, hidden Unicode in cleanField, and channel-less signalled notices", () => {
+    const activity = new Map<string, SessionActivity>([
+      [
+        "\u0000\u0007\u009f",
+        {
+          lastOutputAt: 100,
+          title: "Ghost ID",
+          attention: { kind: "needs-you", urgency: "blocking", label: "Approve", detail: null, at: 100 },
+        },
+      ],
+      [
+        "s-frac",
+        {
+          lastOutputAt: 200,
+          title: "Claude\u202e\u200bCode\u0085",
+          attention: {
+            kind: "needs-you",
+            urgency: "blocking",
+            label: "Needs\u202e approval",
+            detail: "\u202e\u200b",
+            at: 1_700_000_000_123.5,
+          },
+        },
+      ],
+      [
+        "s-bare-sig",
+        {
+          lastOutputAt: 300,
+          title: "Shell",
+          // Synthetic signalled without channel or detail must stay aligned with plane.ts (0 notices)
+          attention: {
+            kind: "signalled",
+            urgency: "informational",
+            label: "Signal",
+            detail: null,
+            at: 300,
+          } as unknown as SessionActivity["attention"],
+        },
+      ],
+    ]);
+    const runs: TaskRun[] = [
+      {
+        id: "\u0000\u001b",
+        task_id: "t-ctrl",
+        kind: "managed",
+        state: "running",
+        session_id: null,
+        provider: "codex",
+        task_title: "Ignored control run",
+        cwd: "/r/a",
+        updated_at: 10,
+        expires_at: 9999999999,
+      } as unknown as TaskRun,
+      {
+        id: "run-bidi",
+        task_id: "t-bidi",
+        kind: "managed",
+        state: "running",
+        session_id: null,
+        provider: "codex",
+        task_title: "\u202e\u200b",
+        cwd: "/r/a",
+        updated_at: 10,
+        expires_at: 9999999999,
+      } as unknown as TaskRun,
+    ];
+    const inbox: AgentInboxThread[] = [
+      {
+        thread_key: "\u0000\u007f",
+        title: "Ignored control thread",
+        status: "open",
+        ask_type: "decide",
+        latest_msg: {} as AgentInboxThread["latest_msg"],
+        messages: [],
+        from_agent: "claude",
+        to_agent: "developer",
+        updated_at_ms: 400,
+      },
+      {
+        thread_key: "th-bidi",
+        title: "Review\u202ePR\u200b",
+        status: "open",
+        ask_type: "review",
+        latest_msg: {} as AgentInboxThread["latest_msg"],
+        messages: [],
+        from_agent: "claude\u202e",
+        to_agent: "developer",
+        updated_at_ms: 500,
+      },
+    ];
+    const tabs = [{ path: "/r/a", label: "Repo\u202eName\u200b" }];
+    const projection = projectMenuAgentState(
+      activity,
+      [],
+      {
+        runs,
+        pending: new Map([
+          ["\u0000\u001b", { count: 1, more: false }],
+          ["run-bidi", { count: 1, more: false }],
+        ]),
+        clock: 1000,
+      },
+      inbox,
+      tabs,
+      false,
+      { caseInsensitive: false },
+      "/r/a",
+    );
+    expect(projection.agentsInformational).toBe(0);
+    expect(projection.agentRequests.map((r) => r.id)).toEqual([
+      "inbox:th-bidi",
+      "run:run-bidi",
+      "term:s-frac",
+    ]);
+    const termReq = projection.agentRequests.find((r) => r.id === "term:s-frac")!;
+    expect(termReq.atMs).toBe(1_700_000_000_123);
+    expect(termReq.agentLabel).toBe("ClaudeCode");
+    expect(termReq.reason).toBe("Needs approval");
+    expect(termReq.detail).toBeNull();
+    expect(termReq.repoLabel).toBe("RepoName");
+    const runReq = projection.agentRequests.find((r) => r.id === "run:run-bidi")!;
+    expect(runReq.agentLabel).toBe("Codex");
+    expect(runReq.detail).toBeNull();
+    const inboxReq = projection.agentRequests.find((r) => r.id === "inbox:th-bidi")!;
+    expect(inboxReq.agentLabel).toBe("claude");
+    expect(inboxReq.detail).toBe("ReviewPR");
   });
 
   it("bounds the count to a non-negative integer under the ceiling", () => {
@@ -253,6 +544,58 @@ describe("agents waiting on the reader", () => {
     expect(waiting(2.9)).toBe(2);
     expect(waiting(Number.NaN)).toBe(0);
     expect(waiting(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+
+  it("excludes exited, error, and non-agent (browser/file/shell) terminal records from agentsRunning", () => {
+    const records: TerminalSessionRecord[] = [
+      { key: "k1", repoPath: "/r/a", label: "Claude", launcher: "claude", status: "running", sessionId: "s1", close: async () => {} },
+      { key: "k2", repoPath: "/r/a", label: "Claude", launcher: "claude", status: "exited", sessionId: "s2", close: async () => {} },
+      { key: "k3", repoPath: "/r/a", label: "Codex", launcher: "codex", status: "error", sessionId: "s3", close: async () => {} },
+      { key: "k4", repoPath: "/r/a", label: "Browser", launcher: "browser" as never, status: "running", sessionId: "s4", close: async () => {} },
+      { key: "k5", repoPath: "/r/a", label: "File", launcher: "file" as never, status: "running", sessionId: "s5", close: async () => {} },
+      { key: "k6", repoPath: "/r/a", label: "Shell", launcher: "shell", status: "running", sessionId: "s6", close: async () => {} },
+    ];
+    const projection = projectMenuAgentState(
+      new Map(),
+      records,
+      { runs: [], pending: new Map(), clock: 1000 },
+      [],
+      [{ path: "/r/a", label: "a" }],
+      false,
+      { caseInsensitive: false },
+      "/r/a",
+    );
+    expect(projection.agentsRunning).toBe(1);
+  });
+
+  it("attributes background open-repo AgentInbox threads to their originating repo instead of activeRepoPath", () => {
+    const tabs = [
+      { path: "/r/a", label: "a" },
+      { path: "/r/b", label: "b" },
+    ];
+    const projection = projectMenuAgentState(
+      new Map(),
+      [],
+      { runs: [], pending: new Map(), clock: 1000 },
+      [
+        {
+          thread_key: "ask-bg",
+          ask_type: "decide",
+          title: "Choose migration path",
+          status: "open",
+          to_agent: "human",
+          from_agent: "claude-b",
+          updated_at_ms: 900,
+          repo_path: "/r/b",
+        },
+      ],
+      tabs,
+      false,
+      { caseInsensitive: false },
+      "/r/a",
+    );
+    expect(projection.agentRequests[0]?.repoPath).toBe("/r/b");
+    expect(projection.agentRequests[0]?.repoLabel).toBe("b");
   });
 });
 

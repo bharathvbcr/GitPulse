@@ -43,6 +43,9 @@ const NOT_A_CLASSIFIER: readonly Entry[] = [
   { file: "lib/diagnostics/diagnostics.ts", line: "text.includes(", why: "recognises the Tauri runtime's console noise (the IPC custom protocol fallback)" },
   { file: "lib/diagnostics/diagnostics.ts", line: "if (text.startsWith(\"[hmr] Failed to reload \")) return true;", why: "recognises the dev server's console noise" },
   { file: "lib/diagnostics/diagnostics.ts", line: "return /^ResizeObserver loop (?:limit exceeded|completed with undelivered notifications)\\.?$/.test(text);", why: "recognises the browser's own console noise" },
+  { file: "lib/diagnostics/diagnostics.ts", line: "&& entry.message.trim() === \"xterm.js: null\"", why: "drops a restored console entry that @xterm/addon-webgl logged on a lost WebGL context in older builds; webview console noise from a third-party renderer, not a backend error" },
+  { file: "lib/diff/unifiedPatch.ts", line: "if (rawLine.startsWith(\"new file mode \")) {", why: "reads an extended header line of git's unified diff format, which is the content being parsed, not an error" },
+  { file: "lib/diff/unifiedPatch.ts", line: "if (rawLine.startsWith(\"deleted file mode \")) {", why: "reads an extended header line of git's unified diff format, which is the content being parsed, not an error" },
   { file: "lib/diff/wordDiff.ts", line: "if (line.startsWith(\"Binary files \") || line.startsWith(\"GIT binary patch\")) return \"binary\";", why: "reads the header lines of a diff, which is the content being shown" },
   { file: "lib/firebase/rolloutState.ts", line: "sublabel: displayText((rollout.commit?.message ?? \"\").split(\"\\n\")[0]),", why: "takes the first line of a commit message to show" },
   { file: "lib/platform.ts", line: "return /Mac/.test(platform) || /Macintosh|Mac OS X/.test(ua);", why: "reads the browser's user agent, not an error" },
@@ -53,6 +56,7 @@ const NOT_A_CLASSIFIER: readonly Entry[] = [
   { file: "lib/stores/mutationScan.ts", line: "if (isRange(inner) && !templateType.test(String((inner as { type?: unknown }).type))) {", why: "tests a syntax-tree node's type name in a source scan" },
   { file: "lib/stores/repoStore.ts", line: "runMutating(\"commit\", message.split(\"\\n\")[0].slice(0, 80), (path) =>", count: 2, why: "takes the first line of the commit message the user typed, for the activity label" },
   { file: "lib/stores/sourceScan.ts", line: "const next = rest.search(/\\n  (?:async )?function \\w+\\(|\\n<\\/script>/);", why: "searches source text for the next function, in a source scan" },
+  { file: "lib/terminal/xtermLogger.ts", line: "return trimmed === \"\" || trimmed === \"null\" || trimmed === \"undefined\";", count: 2, why: "recognises the empty shader/program info log that @xterm/addon-webgl hands its logger on a lost WebGL context (`null` coerced to text); a third-party renderer's log message, not a backend error" },
 ];
 
 /**

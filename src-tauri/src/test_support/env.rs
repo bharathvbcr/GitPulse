@@ -187,8 +187,31 @@ pub(crate) fn bind_env_owned(serial: EnvGuard) -> EnvBinding<'static> {
 
 impl EnvBinding<'_> {
     /// Set `key` to `value` until this binding is dropped.
-    pub(crate) fn set(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
-        let key = key.as_ref();
+    ///
+    /// Setting `HOME` moves the whole home on Windows: the per-user config and
+    /// cache directories there come from `USERPROFILE`, `APPDATA` and
+    /// `LOCALAPPDATA`, not from `HOME`, so a test that bound only `HOME` kept
+    /// writing GitPulse's state into the one directory every test shares.
+    pub(crate) fn set(self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        let (key, value) = (key.as_ref(), value.as_ref());
+        let mut this = self.set_one(key, value);
+        if cfg!(windows) && key == "HOME" {
+            let home = std::path::Path::new(value);
+            this = this
+                .set_one(OsStr::new("USERPROFILE"), home.as_os_str())
+                .set_one(
+                    OsStr::new("APPDATA"),
+                    home.join("AppData").join("Roaming").as_os_str(),
+                )
+                .set_one(
+                    OsStr::new("LOCALAPPDATA"),
+                    home.join("AppData").join("Local").as_os_str(),
+                );
+        }
+        this
+    }
+
+    fn set_one(mut self, key: &OsStr, value: &OsStr) -> Self {
         self.save(key);
         // SAFETY: serialized behind the guard `bind_env` required, and undone
         // by this binding's `Drop` on the unwinding path as well as the normal
@@ -265,10 +288,47 @@ impl Drop for EnvBinding<'_> {
 /// [`hermetic::pinned_git_config`].
 pub(crate) const GIT_MAINTENANCE_PIN: &str = "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n\treflogExpire = never\n\treflogExpireUnreachable = never\n";
 
+/// The identity the hermetic git configs give git, the one the fixtures
+/// already commit as (`git_in` passes it with `-c`).
+///
+/// Without it, a commit the application makes itself (a rebase step, a merge,
+/// a release tag) takes git's identity from the account it runs as. On a
+/// developer's machine that has a full name; GitHub's Linux runner account has
+/// none, so those commits fail there with `fatal: empty ident name`, and a
+/// container that runs as root fails with "unable to auto-detect email
+/// address". The suite then passes or fails on the machine, which is what the
+/// hermetic environment exists to rule out. The address is a fixture one, so
+/// this checkout's commit hooks refuse it if it ever leaks into a real commit.
+pub(crate) const GIT_IDENTITY_PIN: &str =
+    "[user]\n\tname = GitPulse\n\temail = gitpulse@test.local\n";
+
 /// Writes `path` as a git config holding [`GIT_MAINTENANCE_PIN`] followed by
 /// `extra` (more git config text, or empty).
 pub(crate) fn write_git_config(path: &std::path::Path, extra: &str) -> std::io::Result<()> {
     std::fs::write(path, format!("{GIT_MAINTENANCE_PIN}{extra}"))
+}
+
+/// `text` as one git config value: double-quoted, with `\` and `"` escaped.
+///
+/// A config value is not a raw string. Git reads a backslash as an escape and
+/// accepts only `\\`, `\"`, `\n`, `\t` and `\b`, so `file = C:\Users\x` is
+/// `fatal: bad config line N` on Windows, and a path containing `#` or `;`
+/// would be cut at the comment. Every fixture that writes a path (or any text
+/// it did not author) into config text goes through here.
+pub(crate) fn git_config_value(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for ch in text.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Names the per-process root. Its presence means this process is already
@@ -278,7 +338,9 @@ pub(crate) fn write_git_config(path: &std::path::Path, extra: &str) -> std::io::
 /// pointed it at.
 const ROOT_MARKER: &str = "GITPULSE_TEST_HERMETIC_ROOT";
 /// The developer's real `HOME`, kept so a canary can prove nothing resolves
-/// under it. Informational only; nothing reads state from it.
+/// under it. The suite reads no state from it; only the opt-in live test
+/// `harness::steward::live_key_tests` binds it, while it starts a Manvi worker
+/// on the developer's own Anthropic account.
 const REAL_HOME_MARKER: &str = "GITPULSE_TEST_REAL_HOME";
 /// The pid whose constructor has already started the disk-write guard.
 const GUARDED_MARKER: &str = "GITPULSE_TEST_GUARDED_PID";
@@ -341,6 +403,15 @@ pub(crate) mod hermetic {
             .map(PathBuf::from)
     }
 
+    /// Whether `path` reaches the developer's own home: under the real `HOME`
+    /// and not under this process's root. "Under the real home" alone is not
+    /// the leak: on Windows the root lives in `%TEMP%`, which is
+    /// `%USERPROFILE%\AppData\Local\Temp`, so every hermetic path is under the
+    /// real home there and none of them is the developer's state.
+    pub(crate) fn reaches_real_home(path: &Path) -> bool {
+        real_home().is_some_and(|real| path.starts_with(&real) && !path.starts_with(root()))
+    }
+
     /// Variables that, set in the developer's shell or leaked by a git hook that
     /// launched the test run, redirect git or point GitPulse at their state.
     const SCRUBBED: &[&str] = &[
@@ -362,7 +433,96 @@ pub(crate) mod hermetic {
         "CODEX_HOME",
         "ANTIGRAVITY_HOME",
         "GITPULSE_BACKUPS_DIR",
+        // Claude Code exports it into every session; steward's hygiene sweep
+        // (`default_session_tmp_roots`) adds it as a root to clean, so an
+        // inherited value would point a test at the developer's real tmp dir.
+        "CLAUDE_CODE_TMPDIR",
     ];
+
+    /// Name prefixes whose inherited values are removed: every variable a
+    /// GitPulse, Manvi, lappi or portless process could export to override
+    /// where this code reads state or whom it talks to. GitPulse itself injects
+    /// several into every hosted terminal (`GITPULSE_SESSION_ID`,
+    /// `GITPULSE_NOTIFY_SOCKET`, `GITPULSE_AGENT_KIND`, `LAPPI_SOCKET`), so a
+    /// `cargo test` launched from one would otherwise read the host's values.
+    /// A prefix rather than a list so a name added to production tomorrow is
+    /// covered today; the `env_names_read_by_production` contract test in
+    /// `tests/hermetic_contract.rs` pins the names that are *not* covered.
+    const SCRUBBED_PREFIXES: &[&str] = &["GITPULSE_", "MANVI_", "LAPPI_", "PORTLESS_"];
+
+    /// Opt-in test drivers a developer exports on purpose (`GITPULSE_TEST_NPM=1`,
+    /// `GITPULSE_LIVE_AI=1`, a benchmark's repository): they only ever switch a
+    /// test on or point it at an input, and nothing in production reads them.
+    /// Removing them would silently turn those suites off. The four hermetic
+    /// markers are `GITPULSE_TEST_*` and are kept by the first entry. Each entry
+    /// is a prefix and says why it is kept.
+    const KEPT_PREFIXES: &[(&str, &str)] = &[
+        (
+            "GITPULSE_TEST_",
+            "opt-in suite switches and the hermetic markers",
+        ),
+        ("GITPULSE_BENCH_", "benchmark drivers"),
+        ("GITPULSE_LIVE_", "live-service suites, opt-in"),
+        ("GITPULSE_SMOKE_", "smoke-run inputs"),
+        (
+            "GITPULSE_REQUIRE_",
+            "CI strictness switches that fail instead of skip",
+        ),
+        (
+            "GITPULSE_HOST_LOAD_",
+            "host-load bench and soak inputs: `_ONCE` picks the single sample a \
+             sampler asks one bench process for, `_REPO` and `_SOAK_*` size the run",
+        ),
+        (
+            "GITPULSE_MANVI_BIN",
+            "the manvi a developer points `hook_scope_fence` and the real-Manvi \
+             tests at; read by the test itself, not state",
+        ),
+        (
+            "GITPULSE_DEVMAP_BIN",
+            "the devmap build under test (`devmap_embedding`, the `cli_e2e` \
+             zero-copy tests, `worktree_create`); read by the test itself",
+        ),
+        ("GITPULSE_COW_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_WALK_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_DRIVER_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_FSEVENTSD_", "measurement-run inputs"),
+        ("GITPULSE_WATCH_TIMING_", "measurement-run inputs"),
+        ("GITPULSE_LEDGER_RELIABILITY_", "reliability-run inputs"),
+        ("GITPULSE_LEDGER_FRESHNESS_", "reliability-run inputs"),
+        ("GITPULSE_LEAK_", "leak-corpus run inputs"),
+        ("GITPULSE_AVATAR_LIVE_", "live-repository suite inputs"),
+        ("GITPULSE_ADV_SHAPE_", "adversarial-shape run output"),
+        (
+            "GITPULSE_BLESS_FIXTURES",
+            "regenerates committed fixtures on request",
+        ),
+        ("GITPULSE_VERDICT_BENCH_STORE", "benchmark input"),
+        ("GITPULSE_SCAN_REPO", "scan-benchmark input"),
+        ("GITPULSE_CODEINTEL_TEST_REPO", "code-intel suite input"),
+        ("GITPULSE_PULSE_REPO", "pulse suite input"),
+        ("GITPULSE_HOOK_STRESS_GRANT_REPO", "hook stress suite input"),
+        ("GITPULSE_MCP_BIN", "path of the binary an MCP suite drives"),
+    ];
+
+    /// Whether the constructor removes `name` from the test process. The
+    /// canary and the env-name contract test ask the same question, so there is
+    /// one answer.
+    pub(crate) fn is_scrubbed(name: &str) -> bool {
+        SCRUBBED.contains(&name)
+            || (SCRUBBED_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                && !is_kept_test_knob(name))
+    }
+
+    /// Whether `name` is a scoped-prefix name kept on purpose (a hermetic
+    /// marker or an opt-in test driver).
+    pub(crate) fn is_kept_test_knob(name: &str) -> bool {
+        KEPT_PREFIXES
+            .iter()
+            .any(|(prefix, _)| name.starts_with(prefix))
+    }
 
     /// Toolchain homes that default to a directory under `HOME`. The tests
     /// spawn `cargo`, `rustc` and `go` through rustup shims that find their
@@ -373,6 +533,75 @@ pub(crate) mod hermetic {
                 // SAFETY: runs in the pre-`main` constructor, single-threaded.
                 unsafe { std::env::set_var(key, real_home.join(relative)) };
             }
+        }
+    }
+
+    /// `canonicalize` on Windows answers in the Win32 verbatim spelling
+    /// (`\\?\C:\…`, `\\?\UNC\server\share\…`). Every path below the root
+    /// reaches git as `GIT_CONFIG_GLOBAL`, `HOME` and `USERPROFILE`, and Git
+    /// for Windows cannot read a config file named that way: every `git`
+    /// a test ran failed with "unknown error occurred while reading the
+    /// configuration files". The prefix is a spelling of the same directory,
+    /// so dropping it changes nothing else; on other platforms it never occurs.
+    pub(crate) fn plain_spelling(path: &Path) -> PathBuf {
+        let text = path.to_string_lossy();
+        let Some(rest) = text.strip_prefix(r"\\?\") else {
+            return path.to_path_buf();
+        };
+        match rest.strip_prefix(r"UNC\") {
+            Some(share) => PathBuf::from(format!(r"\\{share}")),
+            None => PathBuf::from(rest),
+        }
+    }
+
+    /// Where the per-process root lives. The root also becomes `temp_dir()`
+    /// (`TMPDIR`), and a Unix socket path must fit in `sun_path` (104 bytes on
+    /// macOS), which macOS's per-user temp dir (`/private/var/folders/xx/..`,
+    /// ~50 bytes before the root's own name) does not leave room for: every
+    /// socket fixture under `temp_dir()` failed. So Unix uses the short, fixed
+    /// `/tmp` (`/private/tmp` on macOS), kept canonical so no path under it
+    /// crosses a symlink (the storage cleaner refuses a symlinked root:
+    /// "Symlink paths are not eligible"). Elsewhere, and where `/tmp` is not a
+    /// directory, it is the canonical `temp_dir()`.
+    fn root_base() -> PathBuf {
+        let mut base = std::env::temp_dir();
+        if cfg!(unix) && Path::new("/tmp").is_dir() {
+            base = PathBuf::from("/tmp");
+        }
+        std::fs::canonicalize(&base).map_or(base, |canonical| plain_spelling(&canonical))
+    }
+
+    /// Creates the root itself, failing if it already exists. `/tmp` is shared
+    /// and world-writable, so a pre-existing path is another party's, and on
+    /// Unix the root is made `0700` and checked to be ours before anything
+    /// (git config, `HOME`) is placed under it.
+    fn create_private_root(root: &Path) {
+        #[cfg(unix)]
+        let builder = {
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        builder
+            .create(root)
+            .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", root.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            extern "C" {
+                fn geteuid() -> u32;
+            }
+            let meta = std::fs::symlink_metadata(root)
+                .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", root.display()));
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            let euid = unsafe { geteuid() };
+            assert!(
+                meta.is_dir() && meta.uid() == euid && meta.mode() & 0o077 == 0,
+                "hermetic test root {} is not a private directory owned by this user",
+                root.display()
+            );
         }
     }
 
@@ -391,18 +620,16 @@ pub(crate) mod hermetic {
         if std::env::var_os(super::ROOT_MARKER).is_some() {
             return;
         }
-        // Canonical, so no path under it crosses a symlink: macOS's temp dir is
-        // `/var/folders/..`, and `/var` is a link to `/private/var`, which the
-        // storage cleaner refuses as a root ("Symlink paths are not eligible").
-        let temp = std::env::temp_dir();
-        let temp = std::fs::canonicalize(&temp).unwrap_or(temp);
-        let root = temp.join(format!(
-            "gitpulse-hermetic-{}-{}",
+        let root = root_base().join(format!(
+            "gph-{}-{:08x}",
             std::process::id(),
+            // The low 32 bits of the clock: the pid already separates live
+            // processes, this separates a reused pid.
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
+                .map_or(0, |elapsed| elapsed.as_nanos() as u32)
         ));
+        create_private_root(&root);
         let home = root.join("home");
         let dirs = [
             home.clone(),
@@ -421,12 +648,12 @@ pub(crate) mod hermetic {
                 .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", dir.display()));
         }
         let gitconfig = root.join("gitconfig");
-        super::write_git_config(&gitconfig, "")
+        super::write_git_config(&gitconfig, super::GIT_IDENTITY_PIN)
             .unwrap_or_else(|error| panic!("hermetic gitconfig {}: {error}", gitconfig.display()));
         // The application's own git runs with `GIT_CONFIG_GLOBAL` stripped and
-        // reads `$HOME/.gitconfig` instead, so the pin has to be there too.
+        // reads `$HOME/.gitconfig` instead, so the pins have to be there too.
         let home_config = home.join(".gitconfig");
-        super::write_git_config(&home_config, "").unwrap_or_else(|error| {
+        super::write_git_config(&home_config, super::GIT_IDENTITY_PIN).unwrap_or_else(|error| {
             panic!("hermetic gitconfig {}: {error}", home_config.display())
         });
 
@@ -447,6 +674,7 @@ pub(crate) mod hermetic {
         set("XDG_CONFIG_HOME", &home.join(".config"));
         set("XDG_CACHE_HOME", &home.join(".cache"));
         set("XDG_DATA_HOME", &home.join(".local").join("share"));
+        set("XDG_STATE_HOME", &home.join(".local").join("state"));
         set("CLAUDE_CONFIG_DIR", &home.join(".claude"));
         set("GIT_CONFIG_GLOBAL", &gitconfig);
         // SAFETY: as above.
@@ -454,6 +682,23 @@ pub(crate) mod hermetic {
             std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
             for key in SCRUBBED {
                 std::env::remove_var(key);
+            }
+            let inherited: Vec<String> = std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| is_scrubbed(name))
+                .collect();
+            for name in inherited {
+                std::env::remove_var(name);
+            }
+            // Point the temp directory inside the root too: `temp_dir()`
+            // callers (hook markers, viz scratch, fixtures) must not write to
+            // the developer's real one, and the root's own removal then
+            // cleans what they leave.
+            let tmp = root.join("tmp");
+            std::fs::create_dir_all(&tmp)
+                .unwrap_or_else(|error| panic!("hermetic tmp {}: {error}", tmp.display()));
+            for key in ["TMPDIR", "TEMP", "TMP"] {
+                std::env::set_var(key, &tmp);
             }
             std::env::set_var(super::OWNER_MARKER, std::process::id().to_string());
             std::env::set_var(super::ROOT_MARKER, &root);
@@ -917,6 +1162,86 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PROBE: &str = "GITPULSE_TEST_ENV_BINDING_PROBE";
+
+    /// The verbatim prefix is dropped in both of its forms and nothing else
+    /// is touched.
+    #[test]
+    fn the_hermetic_root_spelling_drops_only_the_win32_verbatim_prefix() {
+        use std::path::Path;
+        let plain = hermetic::plain_spelling;
+        assert_eq!(
+            plain(Path::new(r"\\?\C:\Users\r\Temp")),
+            Path::new(r"C:\Users\r\Temp")
+        );
+        assert_eq!(
+            plain(Path::new(r"\\?\UNC\srv\share\t")),
+            Path::new(r"\\srv\share\t")
+        );
+        assert_eq!(
+            plain(Path::new(r"C:\Users\r\Temp")),
+            Path::new(r"C:\Users\r\Temp")
+        );
+        assert_eq!(
+            plain(Path::new("/private/var/folders/x")),
+            Path::new("/private/var/folders/x")
+        );
+    }
+
+    /// Regression (Windows, every git fixture failed): the constructor built
+    /// the root from `canonicalize(temp_dir())`, which on Windows is
+    /// `\\?\C:\…`, and handed paths under it to git as `GIT_CONFIG_GLOBAL`
+    /// and `HOME`. Git for Windows refuses that spelling, so `git init` in
+    /// every fixture died with "unknown error occurred while reading the
+    /// configuration files". Every path the constructor hands git must carry a
+    /// spelling git can open.
+    #[test]
+    fn the_paths_the_hermetic_environment_gives_git_are_not_verbatim() {
+        let mut keys = vec![super::ROOT_MARKER];
+        keys.extend([
+            "GIT_CONFIG_GLOBAL",
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+        ]);
+        for key in keys {
+            let value = std::env::var_os(key).unwrap_or_else(|| panic!("{key} is not set"));
+            assert!(
+                !value.to_string_lossy().starts_with(r"\\?\"),
+                "{key} is {value:?}: Git for Windows cannot read a config named in the verbatim spelling"
+            );
+        }
+        for path in [hermetic::pinned_git_config(), hermetic::home()] {
+            assert!(
+                !path.to_string_lossy().starts_with(r"\\?\"),
+                "{} is verbatim",
+                path.display()
+            );
+        }
+    }
+
+    /// Regression (70 socket fixtures failed): `TMPDIR` points inside the
+    /// hermetic root, and a Unix socket path must fit in `sun_path` (104 bytes
+    /// on macOS, 108 on Linux). The deepest socket fixture under `temp_dir()`
+    /// is a `tempfile` directory (prefix plus 6 random bytes, allowed 24) holding
+    /// a nested profile directory (allowed 24) holding `instance.sock`; the
+    /// temp dir must leave room for all of it.
+    #[cfg(unix)]
+    #[test]
+    fn the_hermetic_temp_dir_leaves_room_for_the_deepest_socket_fixture() {
+        const SUN_PATH_MIN: usize = 104;
+        let temp = std::env::temp_dir();
+        assert!(
+            temp.starts_with(hermetic::root()),
+            "{} is not under the hermetic root",
+            temp.display()
+        );
+        let worst = temp.as_os_str().len() + 1 + 24 + 1 + 24 + 1 + "instance.sock".len();
+        assert!(
+            worst < SUN_PATH_MIN,
+            "a socket fixture under {} can reach {worst} bytes; sun_path holds {SUN_PATH_MIN} including the NUL",
+            temp.display()
+        );
+    }
 
     /// Regression (a panic leaks a process-global override): the whole point of
     /// the type. A test that fails while holding an override must leave the

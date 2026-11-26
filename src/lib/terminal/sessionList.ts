@@ -7,7 +7,8 @@
  * record; a status is called idle only when the registry itself says so.
  */
 
-import { DETACHED_STATUS, ENDING_STATUS } from "./detachedSessions";
+import { DETACHED_STATUS, ENDING_STATUS, sessionIsLive } from "./sessionStatus";
+export { sessionIsLive };
 
 /** Visible toolbar text. Not `0/32`: each number says what it counts. */
 export function sessionCountLabel(open: number, limit: number): string {
@@ -37,17 +38,6 @@ export function sessionStatusLabel(status: string): string {
       return trimmed || "Unknown";
     }
   }
-}
-
-/** A session that still holds a process, from the status string alone. */
-export function sessionIsLive(status: string): boolean {
-  return (
-    status === "running" ||
-    status === "starting" ||
-    status === "closing" ||
-    status === DETACHED_STATUS ||
-    status === ENDING_STATUS
-  );
 }
 
 export function sessionListNotice(total: number, shown: number, live: number): string | null {

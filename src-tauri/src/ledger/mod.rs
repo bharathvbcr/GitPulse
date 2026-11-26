@@ -1047,18 +1047,41 @@ struct Live {
 
 /// Device and inode of the database file: enough to notice that
 /// `.devcouncil/` was deleted and recreated underneath an open connection.
+/// On Windows the volume serial and the 128-bit file ID (`FILE_ID_INFO`), so
+/// the second field is wide enough to hold it whole: a truncated ID could
+/// call two different files the same one.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileId(u64, u64);
+struct FileId(u64, u128);
 
 #[cfg(unix)]
 fn file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(path)
         .ok()
-        .map(|meta| FileId(meta.dev(), meta.ino()))
+        .map(|meta| FileId(meta.dev(), u128::from(meta.ino())))
 }
 
-#[cfg(not(unix))]
+/// `None` here made every warm consolidation pass on Windows re-open every
+/// sibling ledger: [`consolidated::is_current`] trusts a remembered import only
+/// for a known anchor file, and without an identity there never was one.
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_READ_ATTRIBUTES, every share mode so SQLite's own handles are never
+    // refused, and the reparse point itself rather than its target, as
+    // `symlink_metadata` reads the Unix entry. BACKUP_SEMANTICS opens a
+    // directory too, which a path that was swapped for one may now be.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x80)
+        .share_mode(1 | 2 | 4)
+        .custom_flags(0x0020_0000 | 0x0200_0000)
+        .open(path)
+        .ok()?;
+    let (volume, id) = crate::fs_entry::windows_file_identity(&file).ok()?;
+    Some(FileId(volume, u128::from_le_bytes(id)))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn file_id(_path: &Path) -> Option<FileId> {
     None
 }
@@ -1099,6 +1122,34 @@ fn prune_departed(reg: &mut HashMap<PathBuf, std::sync::Arc<Slot>>) {
 pub(crate) fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Best-effort, non-blocking idle trim across already-open repository ledger
+/// connections (`PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);`).
+pub(crate) fn trim_idle() -> usize {
+    let slots: Vec<std::sync::Arc<Slot>> = {
+        let Ok(reg) = registry().try_lock() else {
+            return 0;
+        };
+        reg.values().cloned().collect()
+    };
+    let mut trimmed = 0usize;
+    for slot in slots {
+        let Ok(guard) = slot.conn.try_lock() else {
+            continue;
+        };
+        let Some(live) = guard.as_ref() else {
+            continue;
+        };
+        if live
+            .conn
+            .execute_batch("PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);")
+            .is_ok()
+        {
+            trimmed += 1;
+        }
+    }
+    trimmed
 }
 
 /// Failed appends counted by the canonical database they would have reached.
@@ -3766,9 +3817,13 @@ fn is_object_id(text: &str) -> bool {
 /// be mistaken for another sibling's.
 ///
 /// Answered from this process's memo, then from the row the anchor already
-/// stores for the source (`stored`, asked only on a memo miss), and only for a
-/// source never seen does it spawn `git hash-object --stdin`: Git is the
-/// authority on the object format, and an id computed here would be a guess at it.
+/// stores for the source (`stored`, asked only on a memo miss), then in process:
+/// the blob id [`blob_id`] computes, in the object format the anchor's own
+/// config declares (read, not guessed; see [`blob_id::blob_id_in_repo`]). Only
+/// when that format cannot be determined for certain (unreadable config, an
+/// unknown value, a malformed `.git` or `commondir` pointer) does it spawn
+/// `git hash-object --stdin`, so a doubt falls toward Git, the authority, and
+/// never toward a key of the wrong length. Both routes give the same key.
 fn family_source_key(
     anchor: &Path,
     source: &str,
@@ -3780,7 +3835,10 @@ fn family_source_key(
     let memo_key = (anchor.to_path_buf(), source.to_string());
     let key = match stored() {
         Some(key) => key,
-        None => hash_family_source(anchor, source)?,
+        None => match blob_id::blob_id_in_repo(anchor, source.as_bytes()) {
+            Some(key) => key,
+            None => hash_family_source(anchor, source)?,
+        },
     };
     family_keys()
         .lock()
@@ -6431,6 +6489,12 @@ pub(crate) mod tests_support {
                 .map_err(|error| super::LedgerError::new("query_failed", error.to_string()))
         })
         .expect("anchor ledger")
+    }
+
+    /// The key the in-process route gives `source` in the repository at
+    /// `anchor`, or `None` when it cannot tell the object format.
+    pub fn in_process_key(anchor: &std::path::Path, source: &str) -> Option<String> {
+        super::blob_id::blob_id_in_repo(anchor, source.as_bytes())
     }
 
     /// Forgets every sibling key this thread has worked out, as a new process

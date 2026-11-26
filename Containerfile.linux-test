@@ -1,0 +1,262 @@
+# GitPulse Ubuntu 22.04 Linux test floor image.
+#
+# Pinned to Ubuntu 22.04 deliberately to match `.github/workflows/release.yml`
+# (`ubuntu-22.04` and `ubuntu-22.04-arm`): glibc 2.35, GTK 3, WebKitGTK 4.1,
+# WebKitWebDriver (`webkit2gtk-driver`), Xvfb (X11), headless Weston (Wayland),
+# D-Bus session bus, software Mesa GL/EGL, Node 22, Bun 1.4.2, Rust stable,
+# `cargo-nextest` 0.9.150 (matching `ci.yml`), `tauri-driver`, and pinned
+# `devmap` + `manvi` CLIs matching `ci.yml`/`release.yml`.
+#
+# Built and driven by `scripts/linux-podman.mjs` against a named Cargo target
+# volume so macOS host `target/` and `node_modules/` are never mutated.
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG NODE_VERSION=22.14.0
+ARG BUN_VERSION=1.4.2
+ARG NEXTEST_VERSION=0.9.150
+ARG TAURI_DRIVER_VERSION=2.0.5
+ARG GO_VERSION=1.27.4
+ARG DEVMAP_REV=b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+ARG MANVI_REV=abb2a72276269c63f6300a59a26e774a0383a8ab
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    wget \
+    file \
+    openssh-client \
+    unzip \
+    xz-utils \
+    build-essential \
+    pkg-config \
+    libwebkit2gtk-4.1-dev \
+    webkit2gtk-driver \
+    libgtk-3-dev \
+    libxdo-dev \
+    libssl-dev \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
+    xvfb \
+    xauth \
+    dbus-x11 \
+    weston \
+    libgl1-mesa-dri \
+    libegl1-mesa \
+    libgles2-mesa \
+    libgbm1 \
+    fonts-dejavu-core \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Git >= 2.36 (currently 2.56.x) from the official Launchpad git-core PPA
+# using its pinned signing key. Stock Ubuntu 22.04 ships Git 2.34.1, which is below
+# GitPulse's MIN_GIT_VERSION (2.36.0, `git worktree list --porcelain -z`),
+# MIN_CLONE_GIT_VERSION (2.45.1), and MIN_SUBMODULE_GIT_VERSION (2.50.1).
+RUN set -eux; \
+    curl -fsSL -o /tmp/git-core-ppa.asc "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xE1DD270288B4E6030699E45FA1715D88E1DF1F24"; \
+    gpg --dearmor -o /usr/share/keyrings/git-core-ppa.gpg /tmp/git-core-ppa.asc; \
+    rm -f /tmp/git-core-ppa.asc; \
+    echo "deb [signed-by=/usr/share/keyrings/git-core-ppa.gpg] https://ppa.launchpadcontent.net/git-core/ppa/ubuntu jammy main" > /etc/apt/sources.list.d/git-core-ppa.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends git; \
+    rm -rf /var/lib/apt/lists/*; \
+    git --version; \
+    command -v ssh; \
+    tmp_repo="$(mktemp -d)"; \
+    git init -q "$tmp_repo"; \
+    git -C "$tmp_repo" worktree list --porcelain -z >/dev/null; \
+    rm -rf "$tmp_repo"
+
+# Install Node.js 22 matching architecture (x64 or arm64).
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) node_arch="x64" ;; \
+      arm64) node_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1; \
+    rm -f /tmp/node.tar.xz; \
+    node --version
+
+# Install Bun matching package.json's pinned version and architecture.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) bun_arch="x64" ;; \
+      arm64) bun_arch="aarch64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${bun_arch}.zip"; \
+    unzip -q /tmp/bun.zip -d /tmp/bun-unpack; \
+    install -m 0755 "/tmp/bun-unpack/bun-linux-${bun_arch}/bun" /usr/local/bin/bun; \
+    rm -rf /tmp/bun.zip /tmp/bun-unpack; \
+    bun --version
+
+# Install Rust stable into /opt/rust so mounting a cache volume at /cargo-home
+# never shadows rustc, cargo, clippy, rustfmt, cargo-nextest, or tauri-driver.
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH="/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) rust_triple="x86_64-unknown-linux-gnu" ;; \
+      arm64) rust_triple="aarch64-unknown-linux-gnu" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/dist/${rust_triple}/rustup-init"; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain stable --component clippy,rustfmt; \
+    rm -f /tmp/rustup-init; \
+    rustc --version; \
+    cargo --version
+
+# Install pinned cargo-nextest binary (exact version ci.yml uses).
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) nextest_triple="x86_64-unknown-linux-gnu" ;; \
+      arm64) nextest_triple="aarch64-unknown-linux-gnu" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/nextest.tar.gz "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${nextest_triple}.tar.gz"; \
+    tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest; \
+    chmod +x /usr/local/bin/cargo-nextest; \
+    rm -f /tmp/nextest.tar.gz; \
+    cargo nextest --version
+
+# Build pinned tauri-driver into /usr/local/bin.
+RUN set -eux; \
+    cargo install --locked -j 4 --root /usr/local tauri-driver --version "${TAURI_DRIVER_VERSION}"; \
+    rm -rf /opt/rust/cargo/registry/cache /opt/rust/cargo/registry/src; \
+    command -v tauri-driver; \
+    tauri-driver --help >/dev/null; \
+    command -v WebKitWebDriver; \
+    WebKitWebDriver --help >/dev/null
+
+# Build pinned `devmap` CLI into /usr/local/bin matching ci.yml/release.yml's
+# DEVMAP_REV so `bun run check:vendor-schema` and worktree-overlay/agent-bus
+# tests run against the real CLI inside Podman.
+RUN set -eux; \
+    cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "${DEVMAP_REV}" devmap-cli --locked -j 4 --root /usr/local; \
+    rm -rf /opt/rust/cargo/registry/cache /opt/rust/cargo/registry/src /opt/rust/cargo/git; \
+    command -v devmap; \
+    devmap --version
+
+# Build pinned `manvi` CLI into /usr/local/bin matching ci.yml/release.yml's
+# MANVI_REV (CGO_ENABLED=0) so MANVI gate tests run against the real binary.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) go_arch="amd64" ;; \
+      arm64) go_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-${go_arch}.tar.gz"; \
+    tar -xzf /tmp/go.tar.gz -C /tmp; \
+    rm -f /tmp/go.tar.gz; \
+    mkdir -p /tmp/manvi-src; \
+    git clone --quiet --filter=blob:none https://github.com/bharathvbcr/Manvi.git /tmp/manvi-src/Manvi; \
+    git -C /tmp/manvi-src/Manvi checkout --quiet "${MANVI_REV}"; \
+    bash /tmp/manvi-src/Manvi/scripts/fetch-modules.sh; \
+    CGO_ENABLED=0 GOTOOLCHAIN=local GOCACHE=/tmp/go-build-cache GOPATH=/tmp/gopath \
+      /tmp/go/bin/go -C /tmp/manvi-src/Manvi/manvi build -trimpath -o /usr/local/bin/manvi ./cmd/manvi; \
+    chmod 0755 /usr/local/bin/manvi; \
+    chmod -R u+w /tmp/gopath 2>/dev/null || true; \
+    rm -rf /tmp/go /tmp/manvi-src /tmp/go-build-cache /tmp/gopath; \
+    command -v manvi; \
+    manvi --version
+
+# Runtime utilities pre-installed on GitHub Actions Ubuntu runners that Rust
+# hygiene/SQLite tests invoke (`lsof` for `open_files_under`, `sqlite3` CLI).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    lsof \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && command -v lsof \
+    && command -v sqlite3
+
+# Helper wrapper that launches a command under either X11 (Xvfb + D-Bus) or
+# headless Wayland (Weston headless backend + D-Bus) and cleans up the server.
+RUN cat <<'EOF' > /usr/local/bin/with-display
+#!/usr/bin/env bash
+set -euo pipefail
+mode="${1:-}"
+shift || true
+if [ -z "$mode" ] || [ $# -eq 0 ]; then
+  echo "Usage: with-display <x11|wayland> <command> [args...]" >&2
+  exit 2
+fi
+export WEBKIT_DISABLE_DMABUF_RENDERER="${WEBKIT_DISABLE_DMABUF_RENDERER:-1}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+export NO_AT_BRIDGE="${NO_AT_BRIDGE:-1}"
+case "$mode" in
+  x11)
+    unset WAYLAND_DISPLAY
+    export GDK_BACKEND=x11
+    rtdir=""
+    if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+      rtdir="$(mktemp -d /tmp/gp-xdg-runtime.XXXXXX)"
+      chmod 0700 "$rtdir"
+      export XDG_RUNTIME_DIR="$rtdir"
+      trap 'rm -rf "$rtdir"' EXIT
+    fi
+    # Never `exec xvfb-run`: if this script runs as PID 1 without --init,
+    # Linux PID 1 signal semantics can deadlock xvfb-run's SIGUSR1 readiness wait.
+    xvfb-run -a -s "-screen 0 1400x1000x24" dbus-run-session -- "$@"
+    ;;
+  wayland)
+    unset DISPLAY
+    rtdir="$(mktemp -d /tmp/gp-xdg-runtime.XXXXXX)"
+    chmod 0700 "$rtdir"
+    export XDG_RUNTIME_DIR="$rtdir"
+    export WAYLAND_DISPLAY="wayland-gitpulse"
+    export GDK_BACKEND=wayland
+    weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --width=1400 --height=1000 --idle-time=0 >"$rtdir/weston.log" 2>&1 &
+    weston_pid=$!
+    cleanup() {
+      kill "$weston_pid" 2>/dev/null || true
+      wait "$weston_pid" 2>/dev/null || true
+      rm -rf "$rtdir"
+    }
+    trap cleanup EXIT
+    ready=0
+    for _ in $(seq 1 50); do
+      if [ -S "$rtdir/$WAYLAND_DISPLAY" ]; then
+        ready=1
+        break
+      fi
+      if ! kill -0 "$weston_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if [ "$ready" -ne 1 ]; then
+      echo "Headless Weston failed to create $rtdir/$WAYLAND_DISPLAY:" >&2
+      cat "$rtdir/weston.log" >&2 || true
+      exit 1
+    fi
+    dbus-run-session -- "$@"
+    ;;
+  *)
+    echo "Unknown display mode: $mode (expected x11 or wayland)" >&2
+    exit 2
+    ;;
+esac
+EOF
+RUN chmod 0755 /usr/local/bin/with-display && \
+    git config --system --add safe.directory /workspace
+
+# Runtime cache/target dirs backed by named Podman volumes.
+ENV CARGO_HOME=/cargo-home \
+    CARGO_TARGET_DIR=/cargo-target \
+    BUN_INSTALL_CACHE_DIR=/bun-cache
+
+WORKDIR /workspace

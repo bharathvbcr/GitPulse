@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// the rules that produced it. The commit is there because the table changes
 /// without the version moving. Kept equal to `vendored/dc-redact/Cargo.toml`
 /// and `vendored/VENDOR.json` by test.
-pub const ENGINE: &str = "dc-redact 0.2.5 (devcouncil@b9b2314d)";
+pub const ENGINE: &str = "dc-redact 0.2.5 (devcouncil@84b97f0b)";
 
 /// Rows carried in a refusal. A diff full of fixtures can match thousands of
 /// lines; past this the count still says how many there were.

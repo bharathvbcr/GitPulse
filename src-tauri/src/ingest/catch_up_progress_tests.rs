@@ -6,6 +6,17 @@ use super::*;
 use crate::engine::process::{spawn_log, Admission};
 use crate::test_support::repo_with_worktrees;
 
+/// Serializes the heavy multi-worktree catch-up tests in this module so they do
+/// not saturate the shared `SpawnGate` background bucket concurrently while
+/// leaving other test modules unblocked.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn plain(path: &std::path::Path) -> String {
     crate::engine::process::canonicalize_plain(path)
         .expect("canonical")
@@ -13,20 +24,24 @@ fn plain(path: &std::path::Path) -> String {
         .into_owned()
 }
 
-/// Runs `f` with the transcript root pointed at an empty corpus.
+/// `dir` in the spelling a pass spawns its git children under. The repository
+/// address names every checkout by its canonical path (`\\?\C:\...` on
+/// Windows), and the spawn log files a child under the directory it was given.
+pub(super) fn as_spawned(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Runs `f` with the transcript root pointed at an empty corpus on this thread.
 fn with_empty_transcripts<T>(f: impl FnOnce() -> T) -> T {
     let corpus = tempfile::tempdir().expect("corpus");
-    let serial = crate::test_support::env::env_serial();
-    let _env =
-        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", corpus.path());
-    f()
+    test_transcript_root::with(corpus.path(), f)
 }
 
 /// Every git child the gate started in `dirs`, with the class it was admitted
 /// under.
 fn classed_git_children(dirs: &[std::path::PathBuf]) -> Vec<(Vec<String>, Admission)> {
     dirs.iter()
-        .flat_map(|dir| spawn_log::classed_spawns_in(dir))
+        .flat_map(|dir| spawn_log::classed_spawns_in(&as_spawned(dir)))
         .collect()
 }
 
@@ -35,6 +50,7 @@ fn classed_git_children(dirs: &[std::path::PathBuf]) -> Vec<(Vec<String>, Admiss
 /// family starts dozens of children.
 #[test]
 fn a_catch_up_pass_starts_its_git_children_in_the_background_class() {
+    let _serial = serial();
     let (main, _parent, linked) = repo_with_worktrees(2);
     let anchor = plain(main.path());
     let dirs: Vec<std::path::PathBuf> = std::iter::once(std::path::PathBuf::from(&anchor))
@@ -113,7 +129,7 @@ fn eager_gate() -> flight::Gate {
 
 fn git_count(dirs: &[std::path::PathBuf], verb: &[&str]) -> usize {
     dirs.iter()
-        .flat_map(|dir| spawn_log::spawns_in(dir))
+        .flat_map(|dir| spawn_log::spawns_in(&as_spawned(dir)))
         .filter(|argv| verb.iter().all(|word| argv.iter().any(|arg| arg == word)))
         .count()
 }
@@ -127,6 +143,7 @@ fn git_count(dirs: &[std::path::PathBuf], verb: &[&str]) -> usize {
 #[cfg(unix)]
 #[test]
 fn passes_over_a_slow_git_and_twenty_worktrees_add_up_to_a_completed_catch_up() {
+    let _serial = serial();
     let (main, _parent, linked) = repo_with_worktrees(20);
     let anchor = plain(main.path());
     let corpus = one_transcript_corpus(&anchor);
@@ -137,27 +154,27 @@ fn passes_over_a_slow_git_and_twenty_worktrees_add_up_to_a_completed_catch_up() 
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let serial = crate::test_support::env::env_serial();
-    let _env = crate::test_support::env::bind_env(&serial)
-        .set("GITPULSE_TRANSCRIPT_ROOT", corpus.path())
-        .set("PATH", &path);
 
     let gate = eager_gate();
     let mut passes = Vec::new();
-    for _ in 0..6 {
-        let out = catch_up_through(&gate, &anchor);
-        let done = !out.truncated && out.error.is_empty();
-        if passes.is_empty() {
-            assert!(
-                out.transcripts > 0,
-                "the first pass left the transcripts to what the reflogs left over: {out:?}"
-            );
-        }
-        passes.push(out);
-        if done {
-            break;
-        }
-    }
+    test_transcript_root::with(corpus.path(), || {
+        crate::engine::git_cli::with_test_git_path(&path, || {
+            for _ in 0..6 {
+                let out = catch_up_through(&gate, &anchor);
+                let done = !out.truncated && out.error.is_empty();
+                if passes.is_empty() {
+                    assert!(
+                        out.transcripts > 0,
+                        "the first pass left the transcripts to what the reflogs left over: {out:?}"
+                    );
+                }
+                passes.push(out);
+                if done {
+                    break;
+                }
+            }
+        });
+    });
     let last = passes.last().unwrap();
     assert!(
         !last.truncated && last.error.is_empty(),
@@ -208,6 +225,7 @@ fn one_transcript_corpus(anchor: &str) -> tempfile::TempDir {
 #[cfg(unix)]
 #[test]
 fn a_slow_default_branch_lookup_does_not_spend_the_transcripts_share() {
+    let _serial = serial();
     let (main, _parent, linked) = repo_with_worktrees(2);
     let anchor = plain(main.path());
     let corpus = one_transcript_corpus(&anchor);
@@ -219,25 +237,26 @@ fn a_slow_default_branch_lookup_does_not_spend_the_transcripts_share() {
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let serial = crate::test_support::env::env_serial();
-    let _env = crate::test_support::env::bind_env(&serial)
-        .set("GITPULSE_TRANSCRIPT_ROOT", corpus.path())
-        .set("PATH", &path);
 
     let gate = eager_gate();
-    let first = catch_up_through(&gate, &anchor);
-    assert!(
-        first.transcripts > 0,
-        "the default-branch lookup spent the transcripts' share: {first:?}"
-    );
-    let mut passes = vec![first];
-    for _ in 0..8 {
-        let last = passes.last().unwrap();
-        if !last.truncated && last.error.is_empty() {
-            break;
-        }
-        passes.push(catch_up_through(&gate, &anchor));
-    }
+    let mut passes = Vec::new();
+    test_transcript_root::with(corpus.path(), || {
+        crate::engine::git_cli::with_test_git_path(&path, || {
+            let first = catch_up_through(&gate, &anchor);
+            assert!(
+                first.transcripts > 0,
+                "the default-branch lookup spent the transcripts' share: {first:?}"
+            );
+            passes.push(first);
+            for _ in 0..8 {
+                let last = passes.last().unwrap();
+                if !last.truncated && last.error.is_empty() {
+                    break;
+                }
+                passes.push(catch_up_through(&gate, &anchor));
+            }
+        });
+    });
     let last = passes.last().unwrap();
     assert!(
         !last.truncated && last.error.is_empty(),
@@ -262,6 +281,7 @@ fn a_slow_default_branch_lookup_does_not_spend_the_transcripts_share() {
 /// worktree added in between is seen by the next one.
 #[test]
 fn the_repository_address_asks_git_once_and_again_after_a_worktree_is_added() {
+    let _serial = serial();
     let (main, parent, _linked) = repo_with_worktrees(3);
     let anchor = plain(main.path());
     let dirs = [std::path::PathBuf::from(&anchor)];
@@ -301,6 +321,7 @@ fn the_repository_address_asks_git_once_and_again_after_a_worktree_is_added() {
 /// complete, however fast git was.
 #[test]
 fn a_twenty_worktree_family_is_read_whole_by_one_unhurried_pass() {
+    let _serial = serial();
     let (main, _parent, _linked) = repo_with_worktrees(20);
     let anchor = plain(main.path());
     let out = with_empty_transcripts(|| catch_up_into_bounded(&anchor, &anchor, None));
@@ -314,6 +335,7 @@ fn a_twenty_worktree_family_is_read_whole_by_one_unhurried_pass() {
 #[cfg(unix)]
 #[test]
 fn a_pass_cut_short_leaves_its_recorded_refs_recorded_once() {
+    let _serial = serial();
     let (main, _parent, linked) = repo_with_worktrees(12);
     let anchor = plain(main.path());
     for (index, worktree) in linked.iter().enumerate() {
@@ -333,12 +355,10 @@ fn a_pass_cut_short_leaves_its_recorded_refs_recorded_once() {
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let first = {
-        let serial = crate::test_support::env::env_serial();
-        let _env = crate::test_support::env::bind_env(&serial).set("PATH", &path);
+    let first = crate::engine::git_cli::with_test_git_path(&path, || {
         let budget = Budget::within(std::time::Duration::from_millis(4000));
         ingest_reflogs(&anchor, &anchor, &family, MAX_REFLOG_WORKTREES, &budget)
-    };
+    });
     assert!(
         first.truncated && first.reflog_refs_skipped > 0,
         "{first:?}"
@@ -372,6 +392,7 @@ fn a_pass_cut_short_leaves_its_recorded_refs_recorded_once() {
 /// no failed write, and every part of `error` a "catch-up truncated: " note.
 #[test]
 fn a_pass_whose_spawns_are_shed_ends_truncated_and_is_not_a_failure() {
+    let _serial = serial();
     use crate::sysload::{GovernorInput, Level};
     let (main, _parent, linked) = repo_with_worktrees(3);
     let anchor = plain(main.path());
@@ -425,6 +446,7 @@ fn a_pass_whose_spawns_are_shed_ends_truncated_and_is_not_a_failure() {
 /// time: that is not progress, however many reads it did cleanly.
 #[test]
 fn a_pass_that_keeps_failing_over_unchanged_refs_is_not_progress() {
+    let _serial = serial();
     let (main, _parent, linked) = repo_with_worktrees(2);
     let anchor = plain(main.path());
     with_empty_transcripts(|| {

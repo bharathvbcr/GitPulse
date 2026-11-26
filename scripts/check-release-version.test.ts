@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  BETA_BUNDLE_TARGETS,
   CRATE_NAME,
   discoverPluginPackages,
   msiVersion,
@@ -54,6 +55,8 @@ async function scratchTree(
     pluginCodex: string;
     /** `bundle.windows.wix.version`; omitted when undefined. */
     wix: string;
+    /** `bundle.targets`; omitted when undefined unless defaulted for a beta. */
+    targets: "all" | readonly string[];
   }> = {},
 ) {
   const base = "0.4.2";
@@ -77,13 +80,16 @@ async function scratchTree(
     path.join(dir, "package.json"),
     JSON.stringify({ name: CRATE_NAME, version: v.pkg }, null, 2),
   );
+  const bundle: Record<string, unknown> = {};
+  if (v.wix !== undefined) bundle.windows = { wix: { version: v.wix } };
+  if (v.targets !== undefined) bundle.targets = v.targets;
   await writeFile(
     path.join(dir, "src-tauri", "tauri.conf.json"),
     JSON.stringify(
       {
         productName: "GitPulse",
         version: v.tauri,
-        ...(v.wix === undefined ? {} : { bundle: { windows: { wix: { version: v.wix } } } }),
+        ...(Object.keys(bundle).length === 0 ? {} : { bundle }),
       },
       null,
       2,
@@ -291,10 +297,18 @@ describe("release version gate", () => {
     expect(suffixed.stdout).toMatch(/must be v<major>\.<minor>\.<patch> or v<major>\.<minor>\.<patch>-beta\.<n>/);
   });
 
-  it("passes a beta tree whose MSI version is derived from the beta number", async () => {
+  it("passes a beta tree whose MSI version and bundle targets match the beta rules", async () => {
     const beta = "0.2.0-beta.3";
     const dir = await scratchTree("beta", {
-      pkg: beta, tauri: beta, cargoToml: beta, cargoLock: beta, plugin: beta, pluginClaude: beta, pluginCodex: beta, wix: "0.2.0.3",
+      pkg: beta,
+      tauri: beta,
+      cargoToml: beta,
+      cargoLock: beta,
+      plugin: beta,
+      pluginClaude: beta,
+      pluginCodex: beta,
+      wix: "0.2.0.3",
+      targets: BETA_BUNDLE_TARGETS,
     });
     const { code, stdout } = await runScript(["--root", dir, "--tag", "v0.2.0-beta.3"]);
     expect(code).toBe(0);
@@ -305,7 +319,16 @@ describe("release version gate", () => {
     // Tauri's MSI bundler refuses a -beta.N app version, so a missing or stale
     // override would only surface as a failed Windows leg mid-release.
     const beta = "0.2.0-beta.3";
-    const all = { pkg: beta, tauri: beta, cargoToml: beta, cargoLock: beta, plugin: beta, pluginClaude: beta, pluginCodex: beta };
+    const all = {
+      pkg: beta,
+      tauri: beta,
+      cargoToml: beta,
+      cargoLock: beta,
+      plugin: beta,
+      pluginClaude: beta,
+      pluginCodex: beta,
+      targets: BETA_BUNDLE_TARGETS,
+    };
     const missing = await runScript(["--root", await scratchTree("beta-no-wix", all)]);
     expect(missing.code).toBe(1);
     expect(missing.stdout).toMatch(/beta 0\.2\.0-beta\.3 needs bundle\.windows\.wix\.version = "0\.2\.0\.3".*found null/);
@@ -314,8 +337,31 @@ describe("release version gate", () => {
     expect(stale.stdout).toMatch(/found "0\.2\.0\.2"/);
   });
 
+  it("fails a beta whose bundle.targets is 'all' or includes 'rpm', and a stable left on beta targets", async () => {
+    const beta = "0.2.0-beta.3";
+    const betaBase = {
+      pkg: beta,
+      tauri: beta,
+      cargoToml: beta,
+      cargoLock: beta,
+      plugin: beta,
+      pluginClaude: beta,
+      pluginCodex: beta,
+      wix: "0.2.0.3",
+    };
+    const allTargets = await runScript(["--root", await scratchTree("beta-all-targets", { ...betaBase, targets: "all" })]);
+    expect(allTargets.code).toBe(1);
+    expect(allTargets.stdout).toMatch(/beta 0\.2\.0-beta\.3 needs bundle\.targets.*RPM/);
+    const withRpm = await runScript(["--root", await scratchTree("beta-rpm-targets", { ...betaBase, targets: [...BETA_BUNDLE_TARGETS, "rpm"] })]);
+    expect(withRpm.code).toBe(1);
+    expect(withRpm.stdout).toMatch(/RPM/);
+    const stableBetaTargets = await runScript(["--root", await scratchTree("stable-beta-targets", { targets: BETA_BUNDLE_TARGETS })]);
+    expect(stableBetaTargets.code).toBe(1);
+    expect(stableBetaTargets.stdout).toMatch(/stable 0\.4\.2 must set bundle\.targets = "all"/);
+  });
+
   it("fails a stable release that still carries a beta's MSI version", async () => {
-    const dir = await scratchTree("stable-wix", { wix: "0.4.2.1" });
+    const dir = await scratchTree("stable-wix", { wix: "0.4.2.1", targets: "all" });
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
     expect(stdout).toMatch(/stable 0\.4\.2 must not set bundle\.windows\.wix\.version/);

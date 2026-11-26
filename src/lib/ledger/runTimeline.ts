@@ -65,10 +65,10 @@ export function stateFor(event: SessionStateEvent): RunState {
       return "working";
     case "turn_finished":
     case "agent_completed":
+    case "idle_prompt":
       return "idle";
     case "permission_request":
     case "permission_prompt":
-    case "idle_prompt":
     case "agent_needs_input":
     case "elicitation_dialog":
     case "elicitation_url_dialog":

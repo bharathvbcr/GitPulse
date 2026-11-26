@@ -53,6 +53,7 @@ import { hostLoadPulse, startHostLoad } from "./hostLoadStore";
 import { themeStore } from "./themeStore";
 import { hostPlatform } from "./platformStore";
 import { isAgentFilter, type AgentFilter } from "../agents/plane";
+import { isAgentGroupMode, type AgentGroupMode } from "../agents/viewModel";
 import {
   DEFAULT_TAB_WIDTH,
   isDiffLayout,
@@ -100,6 +101,7 @@ import {
 } from "../ui/taskBoardViews";
 import { defaultHandoff, reconcileHandoff, sanitizeHandoff, type HandoffSettings } from "../workbench/taskHandoff";
 import type { CodePercentageMode } from "../language/barStats";
+import { DEFAULT_EDITOR_CHOICE, isEditorChoice, type EditorChoice } from "../desktop/editorChoice";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks" | "agents";
 
@@ -255,6 +257,8 @@ export interface InterfacePrefs extends AppearancePrefs {
   agentsCompact: boolean;
   /** Which sessions the Agents plane lists. Anything else reads as all. */
   agentsFilter: AgentFilter;
+  /** How the Agents plane groups rows by repository: auto, repo, or flat. */
+  agentsGroupByRepo: AgentGroupMode;
   /**
    * Layout the Tasks board opens in. The header still switches the one on
    * screen; this is what a fresh window starts with.
@@ -456,6 +460,12 @@ export interface InterfacePrefs extends AppearancePrefs {
    * (`repoStore` subscribes).
    */
   watchScope: WatchScope;
+  /**
+   * The external editor "Open in editor" hands a file to. `auto` takes the
+   * first installed of VS Code, Antigravity IDE, Cursor and Zed; an unknown stored value reads
+   * as `auto`, so a preference can never become something Rust has not named.
+   */
+  preferredEditor: EditorChoice;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -545,6 +555,7 @@ const DEFAULTS: InterfacePrefs = {
   agentsHiddenColumns: [],
   agentsCompact: false,
   agentsFilter: "all",
+  agentsGroupByRepo: "auto",
   taskLayout: "board",
   taskDensity: "comfortable",
   taskHiddenColumns: [],
@@ -579,6 +590,7 @@ const DEFAULTS: InterfacePrefs = {
   bellAsksForReader: false,
   bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
   watchScope: "narrow",
+  preferredEditor: DEFAULT_EDITOR_CHOICE,
 };
 
 /**
@@ -724,6 +736,7 @@ function readPrefs(): InterfacePrefs {
       agentsHiddenColumns: columnKeys(parsed.agentsHiddenColumns, DEFAULTS.agentsHiddenColumns),
       agentsCompact: bool(parsed.agentsCompact, DEFAULTS.agentsCompact),
       agentsFilter: isAgentFilter(parsed.agentsFilter) ? parsed.agentsFilter : DEFAULTS.agentsFilter,
+      agentsGroupByRepo: isAgentGroupMode(parsed.agentsGroupByRepo) ? parsed.agentsGroupByRepo : DEFAULTS.agentsGroupByRepo,
       taskLayout: isBoardLayout(parsed.taskLayout) ? parsed.taskLayout : DEFAULTS.taskLayout,
       taskDensity: isTaskDensity(parsed.taskDensity) ? parsed.taskDensity : DEFAULTS.taskDensity,
       // Both sanitizers bound and normalize the stored array; neither can
@@ -795,6 +808,9 @@ function readPrefs(): InterfacePrefs {
       ),
       bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
       watchScope: isWatchScope(parsed.watchScope) ? parsed.watchScope : DEFAULTS.watchScope,
+      preferredEditor: isEditorChoice(parsed.preferredEditor)
+        ? parsed.preferredEditor
+        : DEFAULTS.preferredEditor,
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -1019,6 +1035,8 @@ function createInterfaceStore() {
     showAllAgentsColumns: () => patch({ agentsHiddenColumns: [] }),
     toggleAgentsCompact: () => patch((prefs) => ({ agentsCompact: !prefs.agentsCompact })),
     setAgentsFilter: (agentsFilter: AgentFilter) => patch({ agentsFilter }),
+    setAgentsGroupByRepo: (mode: AgentGroupMode) =>
+      patch({ agentsGroupByRepo: isAgentGroupMode(mode) ? mode : DEFAULTS.agentsGroupByRepo }),
     setTaskLayout: (taskLayout: BoardLayout) => patch({ taskLayout }),
     setTaskDensity: (taskDensity: TaskDensity) => patch({ taskDensity }),
     /** Adds or removes one status column; never hides the last visible one. */
@@ -1140,6 +1158,8 @@ function createInterfaceStore() {
     resetCoachMarks: () => patch({ seenCoachMarks: {} }),
     setBellAsksForReader: (on: boolean) => patch({ bellAsksForReader: on }),
     setWatchScope: (scope: WatchScope) => patch({ watchScope: isWatchScope(scope) ? scope : "narrow" }),
+    setPreferredEditor: (editor: EditorChoice) =>
+      patch({ preferredEditor: isEditorChoice(editor) ? editor : DEFAULT_EDITOR_CHOICE }),
     reset: () => commit(freshDefaults()),
   };
 }

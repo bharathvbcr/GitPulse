@@ -264,6 +264,7 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
                             parent_session_id: None,
                             title: None,
                             quiet_ms: None,
+                            protected: false,
                         })
                         .collect();
                     Ok(serde_json::to_value(listed).unwrap())

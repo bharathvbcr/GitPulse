@@ -53,12 +53,11 @@ pub fn state_of(event: &str) -> Option<&'static str> {
         "prompt_submitted" | "tool_finished" => "working",
         "permission_prompt"
         | "permission_request"
-        | "idle_prompt"
         | "agent_needs_input"
         | "elicitation_dialog"
         | "elicitation_url_dialog"
         | "error" => "waiting_you",
-        "turn_finished" | "agent_completed" => "idle",
+        "turn_finished" | "agent_completed" | "idle_prompt" => "idle",
         "session_ended" => "ended",
         _ => return None,
     })
@@ -154,8 +153,12 @@ mod tests {
         assert_eq!(state_of("prompt_submitted"), Some("working"));
         assert_eq!(state_of("tool_finished"), Some("working"));
         assert_eq!(state_of("permission_request"), Some("waiting_you"));
+        assert_eq!(state_of("permission_prompt"), Some("waiting_you"));
+        assert_eq!(state_of("agent_needs_input"), Some("waiting_you"));
         assert_eq!(state_of("error"), Some("waiting_you"));
         assert_eq!(state_of("turn_finished"), Some("idle"));
+        assert_eq!(state_of("agent_completed"), Some("idle"));
+        assert_eq!(state_of("idle_prompt"), Some("idle"));
         assert_eq!(state_of("session_ended"), Some("ended"));
     }
 

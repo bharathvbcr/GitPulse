@@ -236,6 +236,7 @@ pub async fn cmd_claude_key_save(
     off_thread(move || {
         crate::harness::claude_key::Keychain::system()?.save(&key)?;
         workbench.retire_claude_worker();
+        crate::harness::steward::note_claude_credential_changed();
         Ok(())
     })
     .await
@@ -250,6 +251,7 @@ pub async fn cmd_claude_key_delete(
     off_thread(move || {
         crate::harness::claude_key::Keychain::system()?.delete()?;
         workbench.retire_claude_worker();
+        crate::harness::steward::note_claude_credential_changed();
         Ok(())
     })
     .await

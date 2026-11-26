@@ -4,6 +4,7 @@
 
 mod attention;
 mod automation;
+mod backups;
 mod briefs;
 mod compaction;
 mod decisions;
@@ -18,8 +19,14 @@ mod refine;
 mod runs;
 mod scope;
 mod signals;
+mod vacuum;
 
+pub use backups::{
+    BackupRetention, DEFAULT_KEPT_BACKUPS, KEEP_BACKUPS_ENV, MAX_MOVED_ASIDE, PruneReport,
+    moved_aside_copies,
+};
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
+pub use legacy::Retired;
 pub(crate) use legacy::{require_retired as require_legacy_retired, retire as retire_legacy_tasks};
 pub use runs::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
 
@@ -181,7 +188,7 @@ impl Store {
                 message: "this host does not upgrade a shared workbench profile".into(),
             });
         }
-        ensure_schema(&self.conn, true)
+        ensure_schema(&self.conn, true, self.backup_retention)
     }
 
     /// Registers [`LOCAL_REPOSITORY_ID`] if the profile does not hold it, so an
@@ -257,6 +264,7 @@ impl Store {
                 | "outbox.cancel"
                 | "store.compact"
                 | "store.upgrade"
+                | "store.vacuum"
         );
         if !writing
             && !matches!(
@@ -301,7 +309,16 @@ impl Store {
         }
         // Reads never upgrade a profile; a write upgrades it only when this
         // handle may, and only after an online backup.
-        let upgraded = ensure_schema(&self.conn, writing && self.workbench_upgrades)?;
+        //
+        // `store.vacuum` is the exception: it rewrites the whole file, so it
+        // never runs as part of a migration. An older profile is refused with
+        // `schema_upgrade_required` and upgraded (with its backup) by a request
+        // that is allowed to, then vacuumed by a later one.
+        let may_upgrade = writing && self.workbench_upgrades && method != "store.vacuum";
+        let upgraded = ensure_schema(&self.conn, may_upgrade, self.backup_retention)?;
+        if method == "store.vacuum" {
+            return vacuum::vacuum(&input);
+        }
         if method == "store.compact" {
             // Deletes commit before the WAL checkpoint. Inside this request's
             // transaction a checkpoint cannot see those pages, so the receipt
@@ -321,9 +338,10 @@ impl Store {
                 // The upgrade already ran, with its backup, above; this
                 // reports it. It commits no event, like `store.compact`.
                 input.fields(&[])?;
+                let prune = prune_json(&self.conn, &upgraded.prune)?;
                 self.conn.query_row(
-                    "SELECT json_object('ok',json('true'),'item',json_object('id','schema','revision',?1,'from',?2,'to',?1,'upgraded',json(CASE WHEN ?2>0 AND ?2<?1 THEN 'true' ELSE 'false' END),'backup',?3))",
-                    params![upgraded.to, upgraded.from, upgraded.backup],
+                    "SELECT json_object('ok',json('true'),'item',json_object('id','schema','revision',?1,'from',?2,'to',?1,'upgraded',json(CASE WHEN ?2>0 AND ?2<?1 THEN 'true' ELSE 'false' END),'backup',?3,'pruned_backups',json(?4)))",
+                    params![upgraded.to, upgraded.from, upgraded.backup, prune],
                     |r| r.get(0),
                 )?
             } else {
@@ -372,9 +390,15 @@ impl Store {
 /// own `VACUUM INTO` before the first migration step, so an upgrade — which
 /// older hosts cannot undo by refusing the profile — can be rolled back by
 /// restoring the copy. An in-memory profile has nothing to lose. A backup that
-/// cannot be made refuses the upgrade; one already made for this version (an
-/// earlier, interrupted upgrade) is kept, not overwritten.
-fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<String>> {
+/// cannot be made, or that does not read back, refuses the upgrade; one already
+/// made for this version (an earlier, interrupted upgrade) is kept, not
+/// overwritten. When this call wrote the backup, older `pre-schema` copies
+/// beyond `retention` are removed (see `backups`).
+fn backup_before_upgrade(
+    conn: &Connection,
+    version: i64,
+    retention: BackupRetention,
+) -> Result<(Option<String>, PruneReport)> {
     let refusal = |backup: &std::path::Path, detail: String| {
         format!(
             "the workbench profile is at schema {version} and cannot be upgraded to {WORKBENCH_SCHEMA} \
@@ -382,36 +406,352 @@ fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<Strin
             backup.display()
         )
     };
-    backup_profile(conn, &format!("pre-schema-{version}"), refusal)
+    let Some(backup) = backup_profile(
+        conn,
+        &format!("pre-schema-{version}"),
+        Some(version),
+        None,
+        refusal,
+    )?
+    else {
+        return Ok((None, PruneReport::default()));
+    };
+    let pruned = match (backup.created, conn.path()) {
+        (true, Some(profile)) => {
+            backups::prune(std::path::Path::new(profile), &backup.path, retention)
+        }
+        _ => PruneReport::default(),
+    };
+    let mut pruned = pruned;
+    pruned.unverified.extend(backup.displaced);
+    Ok((Some(backup.path.display().to_string()), pruned))
+}
+
+/// `report` as the JSON `store.upgrade` returns, encoded by SQLite so names are
+/// escaped exactly as every other reply's text is.
+fn prune_json(conn: &Connection, report: &PruneReport) -> Result<String> {
+    let array = |items: &[String]| -> Result<String> {
+        let mut out = String::from("[");
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let quoted: String = conn.query_row("SELECT json_quote(?1)", [item], |r| r.get(0))?;
+            out.push_str(&quoted);
+        }
+        out.push(']');
+        Ok(out)
+    };
+    Ok(conn.query_row(
+        "SELECT json_object('removed',json(?1),'unverified',json(?2),'errors',json(?3))",
+        params![
+            array(&report.removed)?,
+            array(&report.unverified)?,
+            array(&report.errors)?
+        ],
+        |r| r.get(0),
+    )?)
+}
+
+thread_local! {
+    static BACKUP_WINDOW_HOOK: std::cell::RefCell<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a hook that runs on this thread inside [`backup_profile`], after
+/// it found no backup and before it writes one: the window two hosts used to
+/// race through. Production never installs one. Tests do, because an
+/// integration test links this library without `cfg(test)`.
+#[doc(hidden)]
+pub fn set_backup_window_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    BACKUP_WINDOW_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn backup_window() {
+    let hook = BACKUP_WINDOW_HOOK.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// A backup file, and whether this call is the one that wrote it.
+struct Backup {
+    path: std::path::PathBuf,
+    created: bool,
+    /// What was found at the backup name and moved aside, when something was.
+    displaced: Option<String>,
 }
 
 /// The shared `VACUUM INTO` copy: `<profile>.<stamp>.bak`, written beside the
-/// profile and renamed into place only when complete.
+/// profile, verified readable (and, when `expected_version` is given, at that
+/// schema) and only then renamed into place, so no file carries the `.bak` name
+/// until it has been read back.
+///
+/// The exists-check, the copy and the rename share one write lock
+/// (`BEGIN IMMEDIATE`), so a second host cannot pass the exists-check beside
+/// this one, and a host that waited for the lock finds the copy the first one
+/// made instead of replacing it with a copy of a profile that has since moved
+/// on. `VACUUM INTO` cannot run on a connection with a transaction open, so
+/// the copy is read by a second connection while this one holds the lock; a
+/// writer lock lets readers in, in WAL and in rollback-journal mode alike.
+/// The lock is released before this returns, because the caller's migration
+/// opens its own transactions. `locking_mode=EXCLUSIVE` is not used: with
+/// another connection already open it never acquires the file lock.
 fn backup_profile(
     conn: &Connection,
     stamp: &str,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
     refusal: impl Fn(&std::path::Path, String) -> String,
-) -> Result<Option<String>> {
+) -> Result<Option<Backup>> {
     let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
         return Ok(None);
     };
     let backup = std::path::PathBuf::from(format!("{path}.{stamp}.bak"));
-    if backup.exists() {
-        return Ok(Some(backup.display().to_string()));
-    }
     let fail = |detail: String| Error {
         code: "backup_failed",
         message: refusal(&backup, detail),
     };
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| fail(error.to_string()))?;
+    let outcome = write_backup_under_lock(conn, path, &backup, expected_version, must_hold_table)
+        .map_err(&fail);
+    match outcome {
+        Ok(made) => {
+            tx.commit().map_err(|error| fail(error.to_string()))?;
+            Ok(Some(made))
+        }
+        Err(mut error) => {
+            if let Err(rollback) = tx.rollback() {
+                error.message.push_str(&format!(
+                    "; rolling back the backup lock also failed: {rollback}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// A file already at the backup name is a backup only if it reads back: it
+/// verifies at `expected_version` and holds `must_hold_table` with its rows
+/// readable. One that does not (empty, truncated, another schema, no legacy
+/// table, or one that no longer matches the profile) is never deleted, because
+/// it may be someone's only copy: it is moved to
+/// `<name>.invalid-<unix seconds>[-n]`, which no prune rule matches, and a
+/// fresh copy is written in its place.
+fn existing_backup_verdict(
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<(), String> {
+    backups::verify(backup, expected_version)?;
+    match must_hold_table {
+        Some(table) => backups::verify_holds_table(backup, table),
+        None => Ok(()),
+    }
+}
+
+/// A backup that reads back is still not the backup of this profile when the
+/// profile has changed since it was written (a restore followed by new rows, a
+/// `pre-tasks-retire` copy older than the rows now in `tasks`). The copy is
+/// compared with the profile under the write lock: the rows of
+/// `must_hold_table` when there is one, else every table of a versioned
+/// `pre-schema` copy. An interrupted upgrade leaves the profile as it was, so
+/// its resumption still finds the copy current. A comparison that cannot be
+/// made is neither: it is an `Err`, and the file is left where it is, because
+/// an always-failing comparison must not spend a moved-aside slot per attempt.
+fn backup_is_current(
+    conn: &Connection,
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<std::result::Result<(), String>, String> {
+    let scope = match (must_hold_table, expected_version) {
+        (Some(table), _) => Some(Some(table)),
+        (None, Some(_)) => Some(None),
+        (None, None) => None,
+    };
+    let Some(table) = scope else {
+        return Ok(Ok(()));
+    };
+    // A profile another host has already moved past `expected_version` cannot
+    // be compared: the copy is that host's pre-upgrade backup, which is what
+    // this call would otherwise have kept.
+    if let Some(expected) = expected_version
+        && current_version(conn).map_err(|error| error.message)? != expected
+    {
+        return Ok(Ok(()));
+    }
+    let copy = Connection::open_with_flags(
+        backup,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("it cannot be compared with the profile: {error}"))?;
+    let compare =
+        |error: rusqlite::Error| format!("it cannot be compared with the profile: {error}");
+    let profile_rows = backups::content_digest(conn, table).map_err(compare)?;
+    let copy_rows = backups::content_digest(&copy, table).map_err(compare)?;
+    Ok(if profile_rows == copy_rows {
+        Ok(())
+    } else {
+        Err("it is out of date: the profile has changed since it was written".to_string())
+    })
+}
+
+/// Moves the unusable file at `backup` to a name beside it that is not taken,
+/// and returns that name. Refuses when [`backups::MAX_MOVED_ASIDE`] copies are
+/// already beside it: nothing is deleted to make room.
+fn move_aside(backup: &std::path::Path) -> std::result::Result<std::path::PathBuf, String> {
+    let held = backups::moved_aside_from(backup).map_err(|error| {
+        format!("the moved-aside copies beside it cannot be counted, so none is added: {error}")
+    })?;
+    if held.len() >= backups::MAX_MOVED_ASIDE {
+        let dir = backup.parent().unwrap_or(std::path::Path::new("."));
+        let pattern = format!(
+            "{}.invalid-*",
+            backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<backup>")
+        );
+        let listed: Vec<String> = held.iter().map(|path| path.display().to_string()).collect();
+        return Err(format!(
+            "{} moved-aside copies already sit beside it in {} (the limit is {}): {}; none is \
+             deleted automatically, so remove or archive the `{pattern}` files you do not need \
+             in that directory, then retry",
+            held.len(),
+            dir.display(),
+            backups::MAX_MOVED_ASIDE,
+            listed.join(", ")
+        ));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let mut name = backup.as_os_str().to_owned();
+    name.push(format!(".invalid-{stamp}"));
+    let base = std::path::PathBuf::from(&name);
+    let mut aside = base.clone();
+    let mut n = 0u32;
+    // The write lock is held, so no other host picks the same name between the
+    // check and the rename.
+    while std::fs::symlink_metadata(&aside).is_ok() {
+        n += 1;
+        let mut next = base.as_os_str().to_owned();
+        next.push(format!("-{n}"));
+        aside = std::path::PathBuf::from(next);
+    }
+    std::fs::rename(backup, &aside).map_err(|error| error.to_string())?;
+    Ok(aside)
+}
+
+/// The body of [`backup_profile`], run while the caller holds the write lock.
+fn write_backup_under_lock(
+    conn: &Connection,
+    path: &str,
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<Backup, String> {
+    // A legacy table another host already retired is not required of a copy.
+    let must_hold_table = match must_hold_table {
+        Some(table) if backups::table_present(conn, table).map_err(|e| e.to_string())? => {
+            Some(table)
+        }
+        _ => None,
+    };
+    let mut displaced = None;
+    if std::fs::symlink_metadata(backup).is_ok() {
+        let verdict = match existing_backup_verdict(backup, expected_version, must_hold_table) {
+            Ok(()) => backup_is_current(conn, backup, expected_version, must_hold_table)
+                .map_err(|error| {
+                    // Not a verdict on the file: it stays where it is.
+                    format!(
+                        "the file already at {} could not be compared with the profile and was left in place: {error}",
+                        backup.display()
+                    )
+                })?,
+            unusable => unusable,
+        };
+        match verdict {
+            Ok(()) => {
+                return Ok(Backup {
+                    path: backup.to_path_buf(),
+                    created: false,
+                    displaced: None,
+                });
+            }
+            Err(reason) => {
+                let aside = move_aside(backup).map_err(|error| {
+                    format!(
+                        "the file already at {} does not read back ({reason}) and could not be moved aside: {error}",
+                        backup.display()
+                    )
+                })?;
+                let note = format!(
+                    "{}: {reason}; moved aside to {}",
+                    backup.display(),
+                    aside.display()
+                );
+                eprintln!("dc-store: workbench backup {note}");
+                displaced = Some(note);
+            }
+        }
+    }
+    // The old file now lives only under its moved-aside name, so a failure to
+    // write the new copy (a full disk, say) must say where it went.
+    let mut made =
+        write_fresh_copy(path, backup, expected_version, must_hold_table).map_err(|detail| {
+            match &displaced {
+                Some(note) => format!("{detail}; the earlier backup was moved aside: {note}"),
+                None => detail,
+            }
+        })?;
+    made.displaced = displaced;
+    Ok(made)
+}
+
+/// Writes `backup` as a verified copy of the profile: `VACUUM INTO` a
+/// `.partial`, read it back, then rename it into place.
+fn write_fresh_copy(
+    path: &str,
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<Backup, String> {
+    backup_window();
     let partial = backup.with_extension("bak.partial");
     let _ = std::fs::remove_file(&partial);
     let target = partial
         .to_str()
-        .ok_or_else(|| fail("the path is not UTF-8".into()))?;
-    conn.execute("VACUUM INTO ?1", [target])
-        .map_err(|error| fail(error.to_string()))?;
-    std::fs::rename(&partial, &backup).map_err(|error| fail(error.to_string()))?;
-    Ok(Some(backup.display().to_string()))
+        .ok_or_else(|| "the path is not UTF-8".to_string())?;
+    // A copy that did not complete is removed at once: left behind it would be
+    // a second profile-sized file on a disk that was already short of space.
+    let discard = |detail: String| {
+        let _ = std::fs::remove_file(&partial);
+        detail
+    };
+    // Read-only: a profile that vanished must fail the copy, not be created
+    // empty and copied. `VACUUM INTO` only reads the source.
+    let reader = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| discard(error.to_string()))?;
+    reader
+        .busy_timeout(crate::BUSY_TIMEOUT)
+        .map_err(|error| discard(error.to_string()))?;
+    reader
+        .execute("VACUUM INTO ?1", [target])
+        .map_err(|error| discard(error.to_string()))?;
+    existing_backup_verdict(&partial, expected_version, must_hold_table)
+        .map_err(|reason| discard(format!("the copy it wrote does not read back: {reason}")))?;
+    std::fs::rename(&partial, backup).map_err(|error| discard(error.to_string()))?;
+    Ok(Backup {
+        path: backup.to_path_buf(),
+        created: true,
+        displaced: None,
+    })
 }
 
 fn local_repository_request() -> String {
@@ -428,6 +768,8 @@ pub struct UpgradeReport {
     pub to: i64,
     /// The online backup taken before the first step, when there was one.
     pub backup: Option<String>,
+    /// Older `pre-schema` backups removed once that backup was verified.
+    pub prune: PruneReport,
 }
 
 /// The profile's schema version; `None` when the database has no workbench
@@ -577,8 +919,12 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
     Ok(())
 }
 
-fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
-    ensure_schema_in(conn, may_upgrade, true)
+fn ensure_schema(
+    conn: &Connection,
+    may_upgrade: bool,
+    retention: BackupRetention,
+) -> Result<UpgradeReport> {
+    ensure_schema_in(conn, may_upgrade, true, retention)
 }
 
 /// The same steps as [`ensure_schema`], run inside the caller's transaction.
@@ -586,18 +932,22 @@ fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> 
 /// so the caller does both before `BEGIN`. Migrate steps and a profile this
 /// call creates are not committed here.
 fn ensure_schema_within(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
-    ensure_schema_in(conn, may_upgrade, false)
+    // No backup is taken here (the caller took it before BEGIN), so there is
+    // nothing for a retention to prune.
+    ensure_schema_in(conn, may_upgrade, false, BackupRetention::KeepAll)
 }
 
 fn ensure_schema_in(
     conn: &Connection,
     may_upgrade: bool,
     own_transaction: bool,
+    retention: BackupRetention,
 ) -> Result<UpgradeReport> {
     let mut report = UpgradeReport {
         from: 0,
         to: WORKBENCH_SCHEMA,
         backup: None,
+        prune: PruneReport::default(),
     };
     if own_transaction {
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -639,7 +989,7 @@ fn ensure_schema_in(
         // VACUUM INTO cannot run inside a transaction. A caller that already
         // holds one took the backup before BEGIN.
         if own_transaction {
-            report.backup = backup_before_upgrade(conn, version)?;
+            (report.backup, report.prune) = backup_before_upgrade(conn, version, retention)?;
         }
     }
     // An existing profile moves one step per transaction when this call owns
@@ -1152,7 +1502,9 @@ fn relink_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Re
             "the repository is already linked to that checkout",
         ));
     }
-    if runs::active_on_repository(input.conn, id, now)? || queue::active_on_repository(input.conn, id)? {
+    if runs::active_on_repository(input.conn, id, now)?
+        || queue::active_on_repository(input.conn, id)?
+    {
         return Err(Error {
             code: "repository_busy",
             message: "a run or queue lease is active on this repository; finish or cancel it before relinking"
@@ -2001,6 +2353,8 @@ fn item_query(
 }
 
 #[cfg(test)]
+mod backup_lock_tests;
+#[cfg(test)]
 mod enhancement_lifecycle_tests;
 #[cfg(test)]
 mod item_query_tests;
@@ -2158,5 +2512,31 @@ mod bounded_total_tests {
         // A last page is exact without a count at all (no table needed).
         let (total, exact) = bounded_total(&conn, "FROM missing", &[], 2, false, 4).unwrap();
         assert_eq!((total, exact), (2, true));
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+
+    /// A copy that cannot be read for the comparison is neither current nor out
+    /// of date: the outer result is an error, so the caller leaves the file where
+    /// it is instead of spending a moved-aside slot on it.
+    #[test]
+    fn a_comparison_that_cannot_be_made_is_an_error_not_an_out_of_date_verdict() {
+        let dir = std::env::temp_dir().join(format!("dc-store-compare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unreadable = dir.join("not-a-database.bak");
+        std::fs::write(&unreadable, vec![0xA5u8; 8192]).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO work_meta VALUES (1, 11);",
+        )
+        .unwrap();
+        let verdict = backup_is_current(&conn, &unreadable, Some(11), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = verdict.expect_err("a copy that cannot be read was given a verdict");
+        assert!(error.contains("cannot be compared"), "{error}");
     }
 }

@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::artifacts::write_atomic;
+use crate::artifacts::{file_area, refuse_foreign_artifact, write_atomic, write_consumer_artifact};
 use crate::engine::byte_span_to_line_range_in;
 use crate::manifest::{entry_root_paths, CONSUMER_MAP_ENGINE, UNWIRED_CANDIDATE_CAP};
 use crate::model::FreshnessInfo;
@@ -236,15 +236,6 @@ pub(crate) fn confidence_label(value: f32) -> &'static str {
 }
 
 /// Bucket label for a file, shared with `repo_map.json`'s `files[].area`.
-fn file_area(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .and_then(|parent| parent.to_str())
-        .filter(|parent| !parent.is_empty() && *parent != ".")
-        .unwrap_or(".")
-        .replace('\\', "/")
-}
-
 /// A symbol's identity relative to its own file: `MyClass.execute`.
 ///
 /// Mirrors `dead_symbol_identity` in `devmap-analyze`, which builds the
@@ -807,7 +798,7 @@ fn graph_core(
             devmap_extract::MAX_SOURCE_BYTES,
         )
         .ok()
-        .filter(|text| devmap_extract::content_hash(text) == ext.content_hash)
+        .filter(|text| devmap_extract::source_identity(text) == ext.content_hash)
         .map(|text| LineIndex::new(&text));
         if lines.is_none() {
             provenance.files_without_readable_source += 1;
@@ -1856,8 +1847,13 @@ pub fn decode_compact(compact: &Value) -> anyhow::Result<Value> {
 /// `force` is set. Identity is `meta.map_engine == "devmap-rust"`; missing that
 /// key is the live Python schema, which writes no engine marker at all.
 pub fn write_code_graph_atomically(path: &Path, json: &str, force: bool) -> anyhow::Result<bool> {
-    refuse_foreign_code_graph(path, force)?;
-    Ok(write_atomic(path, json.as_bytes())?)
+    write_consumer_artifact(
+        path,
+        json.as_bytes(),
+        force,
+        "/meta/map_engine",
+        "code graph",
+    )
 }
 
 /// [`write_code_graph_atomically`] for the verbose encoding, laid out so that a
@@ -1874,21 +1870,11 @@ pub fn write_verbose_code_graph_atomically(
     json: &str,
     force: bool,
 ) -> anyhow::Result<bool> {
-    refuse_foreign_code_graph(path, force)?;
+    refuse_foreign_artifact(path, force, "/meta/map_engine", "code graph")?;
     let previous = read_previous_layout(path);
     let laid_out =
         crate::block_layout::lay_out(json, previous.as_deref(), CODE_GRAPH_EXPORT_MAX_BYTES);
     Ok(write_atomic(path, &laid_out)?)
-}
-
-fn refuse_foreign_code_graph(path: &Path, force: bool) -> anyhow::Result<()> {
-    if path.exists() && !force && is_foreign_code_graph(path)? {
-        anyhow::bail!(
-            "refuse to overwrite a non-devmap-rust code graph at {} (pass --force to replace)",
-            path.display()
-        );
-    }
-    Ok(())
 }
 
 /// The bytes of the file about to be replaced, as a layout hint. Absent, not a
@@ -1908,63 +1894,19 @@ fn read_previous_layout(path: &Path) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= CODE_GRAPH_EXPORT_MAX_BYTES).then_some(bytes)
 }
 
-fn is_foreign_code_graph(path: &Path) -> anyhow::Result<bool> {
-    let existing = std::fs::read_to_string(path)?;
-    let Ok(value) = serde_json::from_str::<Value>(&existing) else {
-        // A check that could not run must never report the same result as a
-        // check that ran and passed.
-        return Ok(true);
-    };
-    Ok(value
-        .get("meta")
-        .and_then(|meta| meta.get("map_engine"))
-        .and_then(Value::as_str)
-        != Some(CONSUMER_MAP_ENGINE))
-}
-
 #[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
+    use crate::artifacts::is_foreign_artifact;
+    use crate::artifacts::test_support::{
+        analysis, empty_analysis, freshness, tmp_artifact_file, tmp_scratch_dir,
+    };
     // Only the tests construct caller-supplied freshness; the emitters read it
     // off `FreshnessInfo`.
     use crate::model::StampedFreshness;
     use devmap_analyze::model::{AnalysisStatus, CommunityReport, DeadSymbolReport};
     use devmap_extract::extract_file;
     use devmap_extract::model::Confidence;
-
-    fn freshness() -> FreshnessInfo {
-        FreshnessInfo {
-            head_sha: "abc123".to_string(),
-            generation_id: 1,
-            pending_count: 0,
-            stamped: Default::default(),
-        }
-    }
-
-    fn analysis(dead: Vec<DeadSymbolReport>, communities: Vec<CommunityReport>) -> AnalysisSummary {
-        AnalysisSummary {
-            // No discovery step ran over this hand-built corpus, so there is no
-            // refusal count to report. `None` says that; `0` would claim a walk.
-            discovery_refused_files: None,
-            total_files: 0,
-            total_symbols: 0,
-            total_edges: 0,
-            dead_symbols: dead,
-            communities,
-            status: AnalysisStatus::Ok,
-            unresolved_calls: 0,
-            clone_coverage: Default::default(),
-            // Fields this fixture does not exercise. Spread rather than
-            // enumerated so a new analysis field does not break every test
-            // literal in the workspace; the one production construction in
-            // `analyze()` still names every field exhaustively.
-            ..Default::default()
-        }
-    }
-
-    fn empty_analysis() -> AnalysisSummary {
-        analysis(Vec::new(), Vec::new())
-    }
 
     fn edge(source: &str, target: &str, kind: EdgeKind, confidence: Confidence) -> ResolvedEdge {
         ResolvedEdge {
@@ -1993,38 +1935,13 @@ mod tests {
     /// A scratch directory holding a real source file, so line derivation has
     /// something to read.
     fn tmp_source_dir(name: &str, contents: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "devmap-cg-src-{}-{stamp}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp_scratch_dir("devmap-cg-src");
         std::fs::write(dir.join(name), contents).unwrap();
         dir
     }
 
     fn tmp_graph(contents: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "devmap-code-graph-{}-{stamp}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("code_graph.json");
-        std::fs::write(&path, contents).unwrap();
-        path
+        tmp_artifact_file("devmap-code-graph", "code_graph.json", contents)
     }
 
     /// The keys the Python `CodeGraph` model declares, all of them, exactly.
@@ -2810,7 +2727,7 @@ mod tests {
             r#"{{"meta": {{"map_engine": "{CONSUMER_MAP_ENGINE}"}}}}"#
         ));
         assert!(
-            !is_foreign_code_graph(&ours).unwrap(),
+            !is_foreign_artifact(&ours, "/meta/map_engine").unwrap(),
             "a graph devmap wrote itself must be refreshable"
         );
 
@@ -2818,19 +2735,19 @@ mod tests {
         let python =
             tmp_graph(r#"{"schema_version": 2, "nodes": [], "meta": {"parse_cache_version": 8}}"#);
         assert!(
-            is_foreign_code_graph(&python).unwrap(),
+            is_foreign_artifact(&python, "/meta/map_engine").unwrap(),
             "the Python-written graph must be protected from being clobbered"
         );
 
         let no_meta = tmp_graph(r#"{"schema_version": 2, "nodes": []}"#);
         assert!(
-            is_foreign_code_graph(&no_meta).unwrap(),
+            is_foreign_artifact(&no_meta, "/meta/map_engine").unwrap(),
             "no meta at all is foreign"
         );
 
         let broken = tmp_graph("not json {{{");
         assert!(
-            is_foreign_code_graph(&broken).unwrap(),
+            is_foreign_artifact(&broken, "/meta/map_engine").unwrap(),
             "unreadable content must fail closed"
         );
 

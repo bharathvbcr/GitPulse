@@ -1,4 +1,4 @@
-import type { RepoState } from "../stores/repoStore";
+import type { OpenRepoTab, RepoState } from "../stores/repoStore";
 import type { InterfacePrefs } from "../stores/interfaceStore";
 import type { ThemePreference } from "../stores/themeStore";
 import { REGISTERED_VIEWS, resolveSection } from "../views/viewRegistry";
@@ -6,8 +6,26 @@ import { actionLabel, blocksOtherMutations, headline } from "../repos/operation"
 import type { NativeEvent } from "./nativeActions";
 import { jumpTargetIndex } from "../repos/stripNav";
 import { hasUnstagedChanges } from "../files/fileStatus";
-import { asksForReader, type SessionActivity } from "../terminal/sessionActivity";
-import { byteLength, clampCount, MENU_LIMITS, MENU_WATCH_STATUSES, REPO_TAB_JUMP_IDS } from "./menuContract";
+import {
+  asksForReader,
+  classifyAttentionUrgency,
+  clean,
+  isInformationalAttention,
+  type SessionActivity,
+} from "../terminal/sessionActivity";
+import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
+import { sessionIsLive } from "../terminal/sessionStatus";
+import type { TaskRun } from "../workbench/client";
+import type { PendingRequests } from "../workbench/taskSessions";
+import type { AgentInboxThread } from "../agents/inboxTypes";
+import {
+  byteLength,
+  clampCount,
+  clampText,
+  MENU_LIMITS,
+  MENU_WATCH_STATUSES,
+  REPO_TAB_JUMP_IDS,
+} from "./menuContract";
 import {
   identityKey,
   isCaseInsensitiveFs,
@@ -69,6 +87,27 @@ const STATUS_SHORTCUTS: StatusShortcut[] = [
   { id: "open-remote", label: "Remote", group: "tool" },
   { id: "toggle-theme", label: "Appearance", group: "tool" },
 ];
+export interface MenuAgentRequest {
+  id: string;
+  source: "terminal" | "managed" | "inbox" | "external";
+  provider: "claude" | "agy" | "codex" | "manvi" | "grok" | "shell" | "other";
+  agentLabel: string;
+  repoLabel: string;
+  repoPath: string | null;
+  urgency: "blocking" | "error" | "informational";
+  reason: string;
+  detail: string | null;
+  atMs: number | null;
+}
+
+export interface MenuAgentProjection {
+  agentsWaiting: number;
+  agentRequests: MenuAgentRequest[];
+  agentRequestsHidden: number;
+  agentsRunning: number;
+  agentsInformational: number;
+}
+
 /** Bounded presentation, shared with desktop::state. Git authorization stays in the existing commands. */
 export interface MenuState {
   enabled: string[];
@@ -90,6 +129,10 @@ export interface MenuState {
    * it is the one GitPulse surface still on screen while the window is not.
    */
   agentsWaiting: number;
+  agentRequests: MenuAgentRequest[];
+  agentRequestsHidden: number;
+  agentsRunning: number;
+  agentsInformational: number;
   status: StatusCard;
 }
 
@@ -138,10 +181,289 @@ function switcherCount(value: number): number | null {
  * that has asked nothing is not counted at all. Unbounded here: the ceiling is
  * the payload's, and `buildMenuState` applies it.
  */
-export function countAgentsWaiting(activity: ReadonlyMap<string, SessionActivity>): number {
+export function countAgentsWaiting(
+  activity: ReadonlyMap<string, SessionActivity>,
+  bellAsks?: boolean,
+): number {
   let waiting = 0;
-  for (const session of activity.values()) if (asksForReader(session.attention?.kind)) waiting += 1;
+  for (const session of activity.values()) {
+    if (asksForReader(session.attention, bellAsks)) waiting += 1;
+  }
   return waiting;
+}
+
+const HOLDING_RUN_STATES = new Set(["starting", "running", "unresolved"]);
+
+function holdsCheckout(run: { state: string; expires_at: number }, now: number): boolean {
+  if (HOLDING_RUN_STATES.has(run.state)) return true;
+  return run.state === "prepared" && Number(run.expires_at) * 1000 > now;
+}
+
+function resolveProvider(
+  launcher?: string | null,
+  hint?: string | null,
+): MenuAgentRequest["provider"] {
+  const match = (raw: string | null | undefined): MenuAgentRequest["provider"] | null => {
+    const normalized = raw?.trim().toLowerCase() ?? "";
+    if (!normalized) return null;
+    if (normalized === "claude" || normalized.includes("claude")) return "claude";
+    if (normalized === "agy" || normalized.includes("antigravity")) return "agy";
+    if (normalized === "codex" || normalized.includes("codex")) return "codex";
+    if (normalized === "manvi" || normalized.includes("manvi")) return "manvi";
+    if (normalized === "grok" || normalized.includes("grok")) return "grok";
+    if (normalized === "shell") return "shell";
+    return null;
+  };
+  return match(launcher) ?? match(hint) ?? "other";
+}
+
+function launcherDisplay(provider: MenuAgentRequest["provider"]): string {
+  switch (provider) {
+    case "claude":
+      return "Claude";
+    case "agy":
+      return "Antigravity";
+    case "codex":
+      return "Codex";
+    case "manvi":
+      return "Manvi";
+    case "grok":
+      return "Grok";
+    case "shell":
+      return "Terminal";
+    default:
+      return "Agent";
+  }
+}
+
+function cleanField(value: string | null | undefined, maxChars: number): string | null {
+  const cleaned = clean(value, maxChars);
+  if (!cleaned) return null;
+  const text = clampText(cleaned, MENU_LIMITS.text).trim();
+  return text || null;
+}
+
+function cleanRequestId(prefix: "term" | "run" | "inbox", rawSuffix: string): string | null {
+  if (typeof rawSuffix !== "string") return null;
+  const suffix = rawSuffix.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+  if (!suffix) return null;
+  const id = `${prefix}:${suffix}`;
+  return byteLength(id) <= MENU_LIMITS.agentRequestIdBytes ? id : null;
+}
+
+function safePositiveMs(raw: number | null | undefined): number | null {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return null;
+  const truncated = Math.trunc(raw);
+  return truncated > 0 && Number.isSafeInteger(truncated) ? truncated : null;
+}
+
+function resolveRepoLabel(
+  rawPath: string | null | undefined,
+  openTabs: readonly Pick<OpenRepoTab, "path" | "label">[],
+  options: PathIdentityOptions,
+): string {
+  if (!rawPath) return "";
+  const matched = openTabs.find((tab) => sameRepo(tab.path, rawPath, options));
+  const rawLabel = matched?.label ?? rawPath.split(/[\\/]/).filter(Boolean).pop() ?? rawPath;
+  return cleanField(rawLabel, 80) ?? "";
+}
+
+function askReasonLabel(askType: string | null | undefined): string {
+  switch (askType) {
+    case "decide":
+      return "Waiting for a decision";
+    case "do":
+      return "Waiting for an action";
+    case "review":
+      return "Waiting for review";
+    case "answer":
+      return "Waiting for an answer";
+    default:
+      return "Waiting for response";
+  }
+}
+
+function urgencyRank(urgency: MenuAgentRequest["urgency"]): number {
+  if (urgency === "blocking") return 0;
+  if (urgency === "error") return 1;
+  return 2;
+}
+
+export interface MenuAgentBoardInput {
+  runs: readonly Pick<
+    TaskRun,
+    "id" | "kind" | "state" | "session_id" | "provider" | "task_title" | "cwd" | "updated_at" | "expires_at"
+  >[];
+  pending: ReadonlyMap<string, Pick<PendingRequests, "count" | "more">>;
+  clock?: number;
+}
+
+const EMPTY_BOARD: MenuAgentBoardInput = { runs: [], pending: new Map() };
+const NON_AGENT_LAUNCHERS = new Set(["shell", "browser", "file"]);
+
+export function projectMenuAgentState(
+  activity: ReadonlyMap<string, SessionActivity>,
+  records: readonly (Pick<
+    TerminalSessionRecord,
+    "sessionId" | "repoPath" | "launcher" | "title" | "label" | "taskRunId" | "continuesRunId"
+  > & { status?: string })[] = [],
+  board: MenuAgentBoardInput = EMPTY_BOARD,
+  inboxThreads: readonly (Pick<
+    AgentInboxThread,
+    "thread_key" | "title" | "status" | "ask_type" | "from_agent" | "to_agent" | "updated_at_ms"
+  > & { repo_path?: string | null; repoPath?: string | null })[] = [],
+  openTabs: readonly Pick<OpenRepoTab, "path" | "label">[] = [],
+  bellAsks?: boolean,
+  options: PathIdentityOptions = { caseInsensitive: isCaseInsensitiveFs() },
+  activeRepoPath: string | null = null,
+): MenuAgentProjection {
+  const bySessionId = new Map<string, (typeof records)[number]>();
+  for (const record of records) {
+    if (record.sessionId) bySessionId.set(record.sessionId, record);
+  }
+
+  const requests: MenuAgentRequest[] = [];
+  let informational = 0;
+
+  for (const [sessionId, session] of activity) {
+    const attention = session.attention;
+    if (asksForReader(attention, bellAsks)) {
+      const id = cleanRequestId("term", sessionId);
+      if (!id) continue;
+      const record = bySessionId.get(sessionId);
+      const provider = resolveProvider(record?.launcher, session.title ?? record?.title ?? record?.label);
+      const urgency: "blocking" | "error" =
+        classifyAttentionUrgency(attention, bellAsks) === "error" ? "error" : "blocking";
+      const rawRepoPath = record?.repoPath ?? activeRepoPath ?? "";
+      requests.push({
+        id,
+        source: "terminal",
+        provider,
+        agentLabel:
+          cleanField(session.title, 80) ??
+          cleanField(record?.title, 80) ??
+          cleanField(record?.label, 80) ??
+          launcherDisplay(provider),
+        repoLabel: resolveRepoLabel(rawRepoPath, openTabs, options),
+        repoPath: rawRepoPath ? switcherPath(rawRepoPath) : null,
+        urgency,
+        reason:
+          cleanField(attention?.label, 80) ??
+          (urgency === "error" ? "Stopped on an error" : "Needs your input"),
+        detail: cleanField(attention?.detail, 240),
+        atMs: safePositiveMs(attention?.at),
+      });
+    } else if (isInformationalAttention(attention, bellAsks)) {
+      const channel = attention?.channel?.toLowerCase();
+      if (attention?.kind === "signalled") {
+        if ((channel && channel !== "bell") || Boolean(attention?.detail)) {
+          informational += 1;
+        }
+      } else {
+        informational += 1;
+      }
+    }
+  }
+
+  const clock = board.clock ?? Date.now();
+  const liveManagedRuns = board.runs.filter((run) => run.kind === "managed" && holdsCheckout(run, clock));
+  for (const run of liveManagedRuns) {
+    const pending = board.pending.get(run.id);
+    if (!pending || pending.count <= 0) continue;
+    const id = cleanRequestId("run", run.id);
+    if (!id) continue;
+    const provider = resolveProvider(run.provider);
+    const reason = pending.more
+      ? `${pending.count}+ pending decisions`
+      : pending.count === 1
+        ? "Pending decision"
+        : `${pending.count} pending decisions`;
+    requests.push({
+      id,
+      source: "managed",
+      provider,
+      agentLabel: cleanField(run.task_title, 80) ?? launcherDisplay(provider),
+      repoLabel: resolveRepoLabel(run.cwd, openTabs, options),
+      repoPath: switcherPath(run.cwd),
+      urgency: "blocking",
+      reason,
+      detail: cleanField(run.task_title, 240),
+      atMs: safePositiveMs(run.updated_at * 1000),
+    });
+  }
+
+  for (const thread of inboxThreads) {
+    if (
+      thread.status !== "open" ||
+      thread.ask_type === null ||
+      thread.from_agent === "developer" ||
+      (thread.to_agent !== null &&
+        thread.to_agent !== "developer" &&
+        thread.to_agent !== "human" &&
+        thread.to_agent !== "user")
+    ) {
+      continue;
+    }
+    const id = cleanRequestId("inbox", thread.thread_key);
+    if (!id) continue;
+    const provider = resolveProvider(null, thread.from_agent);
+    const threadRepoPath = thread.repoPath ?? thread.repo_path ?? activeRepoPath;
+    requests.push({
+      id,
+      source: "inbox",
+      provider,
+      agentLabel: cleanField(thread.from_agent, 80) ?? "Agent",
+      repoLabel: resolveRepoLabel(threadRepoPath, openTabs, options),
+      repoPath: threadRepoPath ? switcherPath(threadRepoPath) : null,
+      urgency: "blocking",
+      reason: askReasonLabel(thread.ask_type),
+      detail: cleanField(thread.title, 240),
+      atMs: safePositiveMs(thread.updated_at_ms),
+    });
+  }
+
+  const deduped = new Map<string, MenuAgentRequest>();
+  for (const req of requests) {
+    if (!deduped.has(req.id)) deduped.set(req.id, req);
+  }
+  const sorted = [...deduped.values()].sort((a, b) => {
+    const rankDiff = urgencyRank(a.urgency) - urgencyRank(b.urgency);
+    if (rankDiff !== 0) return rankDiff;
+    const timeA = a.atMs ?? Number.MAX_SAFE_INTEGER;
+    const timeB = b.atMs ?? Number.MAX_SAFE_INTEGER;
+    if (timeA !== timeB) return timeA - timeB;
+    return a.id.localeCompare(b.id);
+  });
+
+  const liveRecords = records.filter(
+    (record) => record.status === undefined || sessionIsLive(record.status),
+  );
+  const runningFromTerminals = liveRecords.filter(
+    (record) =>
+      Boolean(record.sessionId) &&
+      record.launcher !== undefined &&
+      !NON_AGENT_LAUNCHERS.has(record.launcher),
+  ).length;
+  const terminalTaskIds = new Set(
+    liveRecords
+      .map((record) => record.taskRunId || record.continuesRunId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const runningManagedExtra = liveManagedRuns.filter((run) => !terminalTaskIds.has(run.id)).length;
+
+  const agentRequests = sorted.slice(0, MENU_LIMITS.agentRequests);
+  const totalWaiting = sorted.length;
+  const hidden = Math.max(0, totalWaiting - agentRequests.length);
+  return {
+    agentsWaiting: clampCount(totalWaiting, MENU_LIMITS.agentsWaiting) ?? 0,
+    agentRequests,
+    agentRequestsHidden:
+      agentRequests.length < MENU_LIMITS.agentRequests
+        ? 0
+        : (clampCount(hidden, MENU_LIMITS.agentsWaiting) ?? 0),
+    agentsRunning: clampCount(runningFromTerminals + runningManagedExtra, MENU_LIMITS.agentsWaiting) ?? 0,
+    agentsInformational: clampCount(informational, MENU_LIMITS.agentsWaiting) ?? 0,
+  };
 }
 
 /**
@@ -194,6 +516,7 @@ export function buildMenuState(
   // to none, which disables the digit items: an unknown count must not enable
   // an item that may do nothing.
   jumpStops = 0,
+  agentState?: MenuAgentProjection,
 ): MenuState {
   const enabled = new Set(GLOBAL_ACTIONS);
   const checked = new Set([`theme-${theme}`]);
@@ -365,10 +688,37 @@ export function buildMenuState(
   // at a repository the switcher does not list is the other half of the same
   // rejection.
   const activePath = repositories.find((entry) => entry.active)?.path ?? null;
-  const rawTitle = !prefs.statusIconCounts || !hasRepo || !loaded || repo.isBare
+  const effectiveWaiting = clampCount(
+    agentState ? agentState.agentsWaiting : agentsWaiting,
+    MENU_LIMITS.agentsWaiting,
+  ) ?? 0;
+  const waitPart = effectiveWaiting > 0 ? `${effectiveWaiting} waiting` : null;
+  const gitPart = !prefs.statusIconCounts || !hasRepo || !loaded || repo.isBare
     ? null
     : [String(changes), conflicts ? `⚠${conflicts}` : null].filter(Boolean).join(" · ");
-  const trayTitle = rawTitle ? menuText(rawTitle, 24) : null;
+  let trayTitle: string | null = null;
+  if (waitPart && gitPart) {
+    const combined = `${waitPart} · ${gitPart}`;
+    trayTitle =
+      Array.from(combined).length <= MENU_LIMITS.trayTitleChars
+        ? combined
+        : menuText(waitPart, MENU_LIMITS.trayTitleChars);
+  } else if (waitPart) {
+    trayTitle = menuText(waitPart, MENU_LIMITS.trayTitleChars);
+  } else if (gitPart) {
+    trayTitle = menuText(gitPart, MENU_LIMITS.trayTitleChars);
+  }
+  const agentRequests = agentState ? agentState.agentRequests.slice(0, MENU_LIMITS.agentRequests) : [];
+  const agentRequestsHidden =
+    agentState && agentRequests.length >= MENU_LIMITS.agentRequests
+      ? (clampCount(agentState.agentRequestsHidden, MENU_LIMITS.agentsWaiting) ?? 0)
+      : 0;
+  const agentsRunning = agentState
+    ? (clampCount(agentState.agentsRunning, MENU_LIMITS.agentsWaiting) ?? 0)
+    : 0;
+  const agentsInformational = agentState
+    ? (clampCount(agentState.agentsInformational, MENU_LIMITS.agentsWaiting) ?? 0)
+    : 0;
   return {
     // Every list is capped on the way out. The counts below sit well inside
     // their ceilings today, but the ceilings belong to state.rs, and a payload
@@ -417,7 +767,11 @@ export function buildMenuState(
       repo.watch.status === "degraded" ? "Not live" : "", elsewhere ? `${elsewhere} running elsewhere` : ""].filter(Boolean).join(" · "), 72) },
     trayDetail: hasRepo ? [menuText(activeRepo?.label ?? repo.currentPath?.split(/[\\/]/).pop() ?? "Repository", 32),
       menuText(branch, 36)].join(" · ") : "GitPulse",
-    agentsWaiting: clampCount(agentsWaiting, MENU_LIMITS.agentsWaiting) ?? 0,
+    agentsWaiting: effectiveWaiting,
+    agentRequests,
+    agentRequestsHidden,
+    agentsRunning,
+    agentsInformational,
   };
 }
 
@@ -481,6 +835,7 @@ export function statusKeyAction(
   }
   if (!snapshot || ui.choosing) return null;
   const can = (id: string) => snapshot.enabled.includes(id);
+  if (event.key === "a" || event.key === "A") return can("agents") ? { id: "agents" } : null;
   if (event.key === "r" || event.key === "R") return can("refresh") ? { id: "refresh" } : null;
   if (event.key === "Enter") return can(snapshot.traySummary.id) ? { id: snapshot.traySummary.id } : null;
   const card = snapshot.status;
@@ -497,7 +852,7 @@ export function statusKeyAction(
  * prompt of their own, because a second prompt retires the first as cancelled.
  */
 const HELD_WHILE_PROMPTING: ReadonlySet<string> = new Set([
-  "activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", "clone",
+  "activate-repo", "focus-agent", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", "clone",
   "create-branch", "rename-branch", "quick-commit", "stash", "stash-pop",
   "operation-continue", "operation-abort", "operation-skip",
   ...REPO_TAB_JUMP_IDS,
@@ -537,6 +892,9 @@ export function canDispatchMenuEvent(
   }
   if (event.id === "activate-repo") {
     return !!event.path && state.repositories.some((entry) => sameRepo(entry.path, event.path ?? "", options));
+  }
+  if (event.id === "focus-agent") {
+    return Boolean(event.path);
   }
   if (!menuActionEnabled(state, event.id)) return false;
   const global = GLOBAL_ACTIONS.includes(event.id) || ["zoom-in", "zoom-out", "reset-zoom", "check-updates",

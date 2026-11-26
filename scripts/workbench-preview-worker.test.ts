@@ -6,6 +6,23 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
+import { HOST_CLOSE_KILL_MS } from "./workbench-preview-worker.mjs";
+
+/**
+ * How long the preview may take to exit after SIGTERM before this test kills
+ * it, which would read as `null` instead of 0. Shutdown is bounded by design:
+ * the Manvi host step alone takes up to `HOST_CLOSE_KILL_MS`, Vite's close and
+ * the profile removal (1.5 s of retries) come on top. The fixed 10 s this was
+ * is that sum with 0.5 s of slack on a quiet host, which a stalled host spends:
+ * with 40 busy loops started on an 18-core machine, one run in eight had the
+ * host exit 9.7 s after stdin closed (its own 250 ms exit, and the preview's
+ * 5.5 s timer, both late), 10.8 s end to end. Three times the designed worst
+ * case still fails a child that never exits, which is all this deadline is for.
+ */
+const SHUTDOWN_DEADLINE_MS = wallClockBudget(3 * (HOST_CLOSE_KILL_MS + 1_500 + 1_000));
+/** Vite's cold start (config load, optimizer) before it prints the preview URL. */
+const STARTUP_DEADLINE_MS = 30_000;
 
 describe("disposable Manvi preview lifecycle", () => {
   it("announces the listen URL without stdio buffering", () => {
@@ -36,7 +53,7 @@ lines.on('close', () => setTimeout(() => process.exit(0), 250));
     const done = new Promise<number | null>((resolve) => child.once("exit", resolve));
     try {
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error(`Preview did not listen: ${diagnostics}\nstdout: ${output}`)), 30_000);
+        const timeout = setTimeout(() => reject(new Error(`Preview did not listen: ${diagnostics}\nstdout: ${output}`)), STARTUP_DEADLINE_MS);
         child.once("error", (error) => { clearTimeout(timeout); reject(error); });
         child.stdout.on("data", (chunk: Buffer) => {
           output += chunk.toString();
@@ -46,9 +63,7 @@ lines.on('close', () => setTimeout(() => process.exit(0), 250));
       root = output.split("Disposable fixture directory: ")[1]?.split("\n")[0] ?? "";
       expect(root).not.toBe("");
       child.kill("SIGTERM");
-      // The fixture waits up to 6.5s for the Manvi child before SIGKILL; this
-      // budget must stay strictly above that or CI reports null instead of 0.
-      const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      const timeout = setTimeout(() => child.kill("SIGKILL"), SHUTDOWN_DEADLINE_MS);
       const code = await done;
       clearTimeout(timeout);
       expect(code, `${diagnostics}\nsignal=${child.signalCode}`).toBe(0);
@@ -56,14 +71,14 @@ lines.on('close', () => setTimeout(() => process.exit(0), 250));
     } finally {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGTERM");
-        const kill = setTimeout(() => child.kill("SIGKILL"), 10_000);
+        const kill = setTimeout(() => child.kill("SIGKILL"), SHUTDOWN_DEADLINE_MS);
         await done;
         clearTimeout(kill);
       }
       if (root) await rm(root, { recursive: true, force: true });
       await rm(fixture, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, STARTUP_DEADLINE_MS + SHUTDOWN_DEADLINE_MS + 30_000);
   it("removes the disposable profile when the host cannot start", async () => {
     const script = fileURLToPath(new URL("./workbench-preview.mjs", import.meta.url));
     let output = "";

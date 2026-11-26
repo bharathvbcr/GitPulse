@@ -10,6 +10,7 @@ import {
   DEFAULT_LIB_RS,
   DEFAULT_SRC_DIR,
   ORPHAN_ALLOWLIST,
+  allowPermissionFor,
   formatReport,
   runContractCheck,
   scanAnnotatedCommands,
@@ -276,6 +277,7 @@ describe("report alignment (A3)", () => {
       violations: [] as string[],
       unregistered: [] as string[],
       annotatedCount: 95,
+      ungranted: [] as string[] | null,
       ok: true,
     };
     const long = formatReport(result, "a/very/deeply/nested/path/to/src-tauri/src/lib.rs".repeat(3));
@@ -346,14 +348,41 @@ describe("annotated but unregistered commands", () => {
     // cmd_host_load_leases, cmd_host_load_idle and cmd_host_load_park (build
     // slots and idle sessions, from the load-leases branch). 336 with
     // cmd_terminal_set_title (a renamed terminal keeps its title across
-    // reloads and restarts), from the terminal landing in e8f7bad9c. 346 with
-    // the ten cmd_mavi_* handlers (Mavi: agent conversations over Claude
-    // Code's stream-json, locally or through ssh). 347 with
+    // reloads and restarts), from the terminal landing in e8f7bad9c. 340 with
+    // the Manvi system steward's cmd_manvi_steward_status, _save, _set_repo
+    // and _run_now. 341 with cmd_open_in_editor (Open in editor, at a line).
+    // 344 with cmd_terminal_legacy_hosts, _legacy_kill and _legacy_transcript
+    // (sessions an earlier version's terminal host still runs).
+    // 350 with the idle memory efficiency and main-window hibernation commands
+    // (cmd_webview_idle_hint, cmd_main_hibernate, cmd_main_ready,
+    // cmd_idle_memory_status, cmd_idle_memory_settings,
+    // cmd_idle_memory_settings_save).
+    // 355 with the ten cmd_mavi_* handlers (Mavi: agent conversations over
+    // Claude Code's stream-json, locally or through ssh) and
     // cmd_mavi_conversation_check (whether a terminal tab's conversation can
-    // continue in Mavi, asked before the tab is ended).
-    expect(found.size).toBe(347);
+    // continue in Mavi, asked before the tab is ended): 344 + the eleven Mavi
+    // handlers. 361 with both: 344 + 6 idle + 11 Mavi. 365 with
+    // cmd_browser_discover_local_servers, cmd_list_turn_checkpoints,
+    // cmd_diff_turn_checkpoint and cmd_github_pr_diff.
+    expect(found.size).toBe(365);
+    for (const legacy of ["hosts", "kill", "transcript"]) {
+      expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
+    }
+    for (const idleCmd of [
+      "cmd_webview_idle_hint",
+      "cmd_main_hibernate",
+      "cmd_main_ready",
+      "cmd_idle_memory_status",
+      "cmd_idle_memory_settings",
+      "cmd_idle_memory_settings_save",
+    ]) {
+      expect(found.has(idleCmd)).toBe(true);
+    }
     expect(found.has("cmd_mavi_start")).toBe(true);
     expect(found.has("cmd_terminal_set_title")).toBe(true);
+    for (const steward of ["status", "save", "set_repo", "run_now"]) {
+      expect(found.has(`cmd_manvi_steward_${steward}`)).toBe(true);
+    }
     expect(found.has("cmd_manvi_use")).toBe(true);
     expect(found.has("cmd_host_load_leases")).toBe(true);
     expect(found.has("cmd_host_load_idle")).toBe(true);
@@ -431,5 +460,49 @@ describe("annotated but unregistered commands", () => {
     expect(result.violations.join(" ")).toContain("cmd_dead");
     // The text report must name it, not just the JSON.
     expect(formatReport(result, "lib.rs")).toContain("annotated but never registered");
+  });
+
+  it("fails an invoked command the capability file does not grant, and says when it could not check", async () => {
+    // build.rs puts every registered command into the ACL; without an
+    // allow-cmd-* entry Tauri refuses it for the main window. Eleven Labs
+    // commands shipped invoked, registered and ungranted.
+    const dir = await mkdtemp(path.join(tmpdir(), "gp-ungranted-"));
+    tempDirs.push(dir);
+    const srcDir = path.join(dir, "src-tauri", "src");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(
+      path.join(srcDir, "lib.rs"),
+      "fn main() {\n  tauri::generate_handler![commands::cmd_granted, commands::cmd_spend_summary];\n}\n",
+    );
+    await writeFile(
+      path.join(srcDir, "commands.rs"),
+      "#[tauri::command]\npub fn cmd_granted() {}\n#[tauri::command]\npub fn cmd_spend_summary() {}\n",
+    );
+    const frontend = path.join(dir, "src");
+    await mkdir(frontend, { recursive: true });
+    await writeFile(path.join(frontend, "app.ts"), 'invoke("cmd_granted");\ninvoke("cmd_spend_summary");\n');
+    const libPath = path.join(srcDir, "lib.rs");
+
+    // No capability file: the grant check did not run, and the report says so.
+    const unchecked = runContractCheck({ libPath, srcDirs: [frontend] });
+    expect(unchecked.ungranted).toBeNull();
+    expect(formatReport(unchecked, "lib.rs")).toMatch(/ungranted commands\s*: not checked/);
+
+    const capabilities = path.join(dir, "src-tauri", "capabilities");
+    await mkdir(capabilities, { recursive: true });
+    const write = (permissions: unknown[]) =>
+      writeFile(path.join(capabilities, "default.json"), JSON.stringify({ identifier: "default", permissions }));
+
+    await write(["core:default", allowPermissionFor("cmd_granted")]);
+    const refused = runContractCheck({ libPath, srcDirs: [frontend] });
+    expect(refused.ok).toBe(false);
+    expect(refused.ungranted).toEqual(["cmd_spend_summary"]);
+    expect(refused.violations.join(" ")).toContain('"allow-cmd-spend-summary"');
+    expect(formatReport(refused, "lib.rs")).toContain("ungranted commands:");
+
+    await write(["allow-cmd-granted", { identifier: "allow-cmd-spend-summary" }]);
+    const granted = runContractCheck({ libPath, srcDirs: [frontend] });
+    expect(granted.ungranted).toEqual([]);
+    expect(granted.violations.filter((v) => v.startsWith("ungranted:"))).toEqual([]);
   });
 });

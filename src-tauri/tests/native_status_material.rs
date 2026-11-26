@@ -123,8 +123,49 @@ fn main() {
         }
         let handle = app.clone();
         std::thread::spawn(move || {
-            // AppKit lays out a newly installed status item after Ready.
-            std::thread::sleep(Duration::from_millis(300));
+            // AppKit lays out a newly installed status item after Ready, and
+            // until it has, the item reports a frame off every display (CI saw
+            // (0, 768) on a 1024x768 screen after a fixed 300 ms, 8112e2aac),
+            // which the popover rightly refuses. Wait for it to land on a
+            // display, bounded well inside the 20 s deadline. If it never
+            // does, step 0 still runs and fails with the rect it read; with no
+            // display at all, step 0 takes its own path below.
+            let placed_by = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                let app = handle.clone();
+                let (sent, received) = mpsc::channel::<bool>();
+                handle
+                    .run_on_main_thread(move || {
+                        let monitors = app.available_monitors().unwrap_or_default();
+                        let rect = app
+                            .tray_by_id("gitpulse-status")
+                            .and_then(|tray| tray.rect().ok().flatten());
+                        let placed = monitors.is_empty()
+                            || rect.is_some_and(|rect| {
+                                let point = rect.position.to_physical::<f64>(1.0);
+                                let size = rect.size.to_physical::<f64>(1.0);
+                                let (x, y) =
+                                    (point.x + size.width / 2.0, point.y + size.height / 2.0);
+                                monitors.iter().any(|monitor| {
+                                    let origin = monitor.position();
+                                    let extent = monitor.size();
+                                    x >= f64::from(origin.x)
+                                        && y >= f64::from(origin.y)
+                                        && x < f64::from(origin.x) + f64::from(extent.width)
+                                        && y < f64::from(origin.y) + f64::from(extent.height)
+                                })
+                            });
+                        let _ = sent.send(placed);
+                    })
+                    .expect("schedule status item placement read");
+                let placed = received
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("status item placement read completed");
+                if placed || std::time::Instant::now() >= placed_by {
+                    break;
+                }
+            }
             for step in 0..4 {
                 let app = handle.clone();
                 // Carries "keep going": a skip has to stop the remaining steps

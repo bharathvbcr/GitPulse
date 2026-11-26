@@ -6,7 +6,7 @@
  * before it ever reaches the DOM.
  */
 
-import { fuzzyMatch } from "../branches/groupBranches";
+import { matchFolded } from "../branches/groupBranches";
 import {
   launcherLabel,
   tabLabel,
@@ -38,15 +38,114 @@ export function normalizeTerminalSearchQuery(
     .trim();
 }
 
+function isSeparatorCode(code: number): boolean {
+  // space, tab, '-', '_', '/', '\', '.', ':'
+  return (
+    code === 32 ||
+    code === 9 ||
+    code === 45 ||
+    code === 95 ||
+    code === 47 ||
+    code === 92 ||
+    code === 46 ||
+    code === 58
+  );
+}
+
+function isWordBoundary(text: string, index: number): boolean {
+  if (index <= 0) return true;
+  const prev = text.charCodeAt(index - 1);
+  if (isSeparatorCode(prev)) return true;
+  const curr = text.charCodeAt(index);
+  const currUpper = curr >= 65 && curr <= 90;
+  const prevLowerOrDigit = (prev >= 97 && prev <= 122) || (prev >= 48 && prev <= 57);
+  return currUpper && prevLowerOrDigit;
+}
+
+function wordInitials(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (isSeparatorCode(code)) continue;
+    if (isWordBoundary(text, i)) out += text[i].toLowerCase();
+  }
+  return out;
+}
+
+/**
+ * Quality rank of one folded token against one field:
+ * - 0: no match
+ * - 1: fuzzy subsequence
+ * - 2: contiguous substring
+ * - 3: word-boundary prefix or camelCase/separator initials (len >= 2)
+ * - 4: field prefix
+ * - 5: exact match
+ */
+export function fieldSearchRank(tokenLower: string, field: string): number {
+  if (!tokenLower) return 5;
+  if (!field) return 0;
+  const folded = field.toLowerCase();
+  if (folded === tokenLower) return 5;
+  if (folded.startsWith(tokenLower)) return 4;
+  let hasSubstring = false;
+  for (
+    let at = folded.indexOf(tokenLower);
+    at !== -1;
+    at = folded.indexOf(tokenLower, at + 1)
+  ) {
+    hasSubstring = true;
+    if (isWordBoundary(field, at)) return 3;
+  }
+  if (tokenLower.length >= 2 && wordInitials(field).startsWith(tokenLower)) {
+    return 3;
+  }
+  if (hasSubstring) return 2;
+  return matchFolded(tokenLower, folded) ? 1 : 0;
+}
+
+/**
+ * Ranked match across one or more searchable fields. Supports both phrase
+ * matches inside a single field and multi-token queries spread across fields
+ * (e.g. `"devcouncil claude"` matching repo `"DevCouncil"` + agent `"Claude"`).
+ */
+export function terminalSearchRank(
+  query: unknown,
+  ...fields: Array<string | null | undefined>
+): number {
+  const needle = normalizeTerminalSearchQuery(query).toLowerCase();
+  if (!needle) return 5;
+  const validFields: string[] = [];
+  for (const field of fields) {
+    if (typeof field === "string" && field.length > 0) validFields.push(field);
+  }
+  if (validFields.length === 0) return 0;
+  let wholeBest = 0;
+  for (const field of validFields) {
+    const rank = fieldSearchRank(needle, field);
+    if (rank > wholeBest) wholeBest = rank;
+    if (wholeBest === 5) return 5;
+  }
+  const tokens = needle.split(/\s+/).filter(Boolean);
+  if (tokens.length <= 1) return wholeBest;
+  let minTokenRank = 5;
+  for (const token of tokens) {
+    let tokenBest = 0;
+    for (const field of validFields) {
+      const rank = fieldSearchRank(token, field);
+      if (rank > tokenBest) tokenBest = rank;
+      if (tokenBest === 5) break;
+    }
+    if (tokenBest === 0) return wholeBest;
+    if (tokenBest < minTokenRank) minTokenRank = tokenBest;
+  }
+  return Math.max(wholeBest, minTokenRank);
+}
+
 export function matchesTerminalSearch(
   query: unknown,
   ...fields: Array<string | null | undefined>
 ): boolean {
-  const needle = normalizeTerminalSearchQuery(query);
-  if (!needle) return true;
-  return fields.some(
-    (field) => typeof field === "string" && field.length > 0 && fuzzyMatch(needle, field),
-  );
+  return terminalSearchRank(query, ...fields) > 0;
 }
 
 export function filterTerminalTabs(

@@ -169,7 +169,14 @@ pub(crate) const MAX_EXCLUSIONS: usize = 256;
 /// What a glob reads as a pattern. `--exclude` takes a glob, so a tree whose
 /// absolute path holds one of these could leave out something else; it is
 /// scanned instead.
-const GLOB_METACHARACTERS: [char; 8] = ['*', '?', '[', ']', '{', '}', '\\', '!'];
+///
+/// A backslash is one on Unix, where it escapes the next character. On Windows
+/// it is the path separator every absolute path is full of; read as an escape
+/// it could only make a pattern match less than the path (the escaped character
+/// stands for itself), never more, so a tree is not given up for holding one.
+fn is_glob_metacharacter(c: char) -> bool {
+    matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '!') || (c == '\\' && !cfg!(windows))
+}
 
 /// The trees a scan of `root` leaves out, repo-relative and ending in `/`:
 /// wholly ignored directories named in [`BULK_IGNORED_DIRS`] (a directory of
@@ -201,7 +208,7 @@ pub(crate) fn scan_exclusions(
         !root
             .join(rel.trim_end_matches('/'))
             .to_string_lossy()
-            .contains(GLOB_METACHARACTERS)
+            .contains(is_glob_metacharacter)
     });
     trees.sort();
     trees.dedup();

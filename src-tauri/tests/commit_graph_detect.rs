@@ -424,7 +424,10 @@ fn detection_spawns_no_git_process() {
     // trace2 is only honoured from user-level config. The test's git reads
     // GIT_CONFIG_GLOBAL and the app's (which strips it) reads `$HOME/.gitconfig`,
     // so both files arm the log.
-    let arm = format!("\n[trace2]\n\teventTarget = {}\n", log.display());
+    let arm = format!(
+        "\n[trace2]\n\teventTarget = {}\n",
+        common::env::git_config_value(&log.to_string_lossy())
+    );
     let files = [
         PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").expect("hermetic config")),
         PathBuf::from(std::env::var_os("HOME").expect("hermetic HOME")).join(".gitconfig"),

@@ -14,26 +14,6 @@ export interface EditorTab {
 export interface EditorTabState {
   tabs: EditorTab[];
   active: string | null;
-  /** Unsaved editor content, owned by the same per-repository state as tabs. */
-  drafts: Record<string, EditorDraft>;
-}
-
-export interface EditorDraft {
-  content: string;
-  /**
-   * File content against which this draft first became dirty. Kept for the
-   * life of the draft: a file that changes on disk afterwards must not
-   * quietly become the draft's new baseline.
-   */
-  sourceContent: string;
-  /**
-   * The disk version (`FileBlob.disk_base`) this draft was made from, sent
-   * with the save so the backend refuses it when the file has moved on. Null
-   * when the blob carried none: such a draft is refused on save (the editor
-   * shows the conflict banner) and is written only by an explicit, confirmed
-   * Overwrite.
-   */
-  base: string | null;
 }
 
 function makeTab(path: string, preview: boolean): EditorTab {
@@ -41,16 +21,24 @@ function makeTab(path: string, preview: boolean): EditorTab {
 }
 
 export function emptyEditorTabs(): EditorTabState {
-  return { tabs: [], active: null, drafts: {} };
+  return { tabs: [], active: null };
 }
 
-/** Single-click: reuse or replace the preview tab. Pinned matches just activate. */
-export function openPreview(state: EditorTabState, path: string): EditorTabState {
+/**
+ * Single-click: reuse or replace the preview tab. Pinned matches just activate.
+ * `isDirty` says whether a path owns unsaved work (the drafts live in the
+ * open-file store, not in the tabs).
+ */
+export function openPreview(
+  state: EditorTabState,
+  path: string,
+  isDirty: (path: string) => boolean = () => false,
+): EditorTabState {
   if (!path) return state;
   // A preview becomes permanent as soon as it owns unsaved work. This keeps a
   // subsequent single-click browse from becoming a destructive operation.
   const currentTabs = state.tabs.map((tab) =>
-    tab.preview && isEditorTabDirty(state, tab.path) ? { ...tab, preview: false } : tab,
+    tab.preview && isDirty(tab.path) ? { ...tab, preview: false } : tab,
   );
   const existing = currentTabs.findIndex((tab) => tab.path === path);
   if (existing >= 0) {
@@ -97,11 +85,9 @@ export function closeEditorTab(state: EditorTabState, path: string): EditorTabSt
   const idx = state.tabs.findIndex((tab) => tab.path === path);
   if (idx < 0) return state;
   const tabs = state.tabs.filter((tab) => tab.path !== path);
-  const drafts = { ...state.drafts };
-  delete drafts[path];
-  if (state.active !== path) return { tabs, active: state.active, drafts };
+  if (state.active !== path) return { tabs, active: state.active };
   const neighbor = tabs[Math.min(idx, tabs.length - 1)];
-  return { tabs, active: neighbor?.path ?? null, drafts };
+  return { tabs, active: neighbor?.path ?? null };
 }
 
 /**
@@ -123,118 +109,21 @@ export function closeEditorTabs(
 export function closeOtherEditorTabs(state: EditorTabState, keepPath: string): EditorTabState {
   const keep = state.tabs.find((tab) => tab.path === keepPath);
   if (!keep) return state;
-  const draft = state.drafts[keepPath];
-  return {
-    tabs: [{ ...keep, preview: false }],
-    active: keepPath,
-    drafts: draft ? { [keepPath]: draft } : {},
-  };
+  return { tabs: [{ ...keep, preview: false }], active: keepPath };
 }
 
 export function closeAllEditorTabs(): EditorTabState {
   return emptyEditorTabs();
 }
 
-export function editorDraft(state: EditorTabState, path: string): EditorDraft | undefined {
-  return state.drafts[path];
-}
-
-export function isEditorTabDirty(state: EditorTabState, path: string): boolean {
-  return editorDraft(state, path) !== undefined;
-}
-
-export function hasDirtyEditorTabs(state: EditorTabState): boolean {
-  return Object.keys(state.drafts).length > 0;
-}
-
-/**
- * Store the latest input synchronously. Dirty previews are pinned so rapid
- * browse events cannot replace their tab before the next render.
- */
-export function updateEditorDraft(
-  state: EditorTabState,
-  path: string,
-  content: string,
-  sourceContent: string,
-  base: string | null = null,
-): EditorTabState {
-  if (!state.tabs.some((tab) => tab.path === path)) return state;
-  const drafts = { ...state.drafts };
-  // Only the first dirtying keystroke fixes the baseline and the base. Later
-  // keystrokes arrive carrying whatever blob is loaded now, which after an
-  // external change is not the version this draft was made from.
-  const existing = drafts[path];
-  const source = existing ? existing.sourceContent : sourceContent;
-  if (content === source) {
-    delete drafts[path];
-  } else {
-    drafts[path] = { content, sourceContent: source, base: existing ? existing.base : base };
-  }
-  const tabs = content === source
-    ? state.tabs
-    : state.tabs.map((tab) => tab.path === path ? { ...tab, preview: false } : tab);
-  return { tabs, active: state.active, drafts };
-}
-
-function clearEditorDraft(state: EditorTabState, path: string): EditorTabState {
-  if (!state.drafts[path]) return state;
-  const drafts = { ...state.drafts };
-  delete drafts[path];
-  return { ...state, drafts };
-}
-
-/**
- * Successful writes are the only save-path callers allowed to clear dirty state.
- *
- * `savedBase` is the disk version the write produced. Input can race a slow
- * write, so a draft that has moved past what was saved stays dirty; it is then
- * re-based onto the saved text and version, because the disk now holds what it
- * saved and the next save must be judged against that, not the version from
- * before this one. Omit `savedBase` to leave such a draft untouched.
- */
-export function completeEditorSave(
-  state: EditorTabState,
-  path: string,
-  savedContent: string,
-  savedBase?: string | null,
-): EditorTabState {
-  const draft = state.drafts[path];
-  if (draft && draft.content !== savedContent) {
-    if (savedBase === undefined) return state;
-    return {
-      ...state,
-      drafts: { ...state.drafts, [path]: { ...draft, sourceContent: savedContent, base: savedBase } },
-    };
-  }
-  return clearEditorDraft(state, path);
-}
-
-/**
- * True when the file on disk is not the version the draft was made from: the
- * blob just loaded carries a different `disk_base` than the draft's. Tokens
- * are compared, never text, so a CRLF flip or a same-size rewrite counts and
- * a touch does not. Without a draft, a base on both sides, there is nothing
- * to conflict with.
- */
-export function isEditorDraftConflicted(
-  draft: EditorDraft | undefined,
-  diskBase: string | null | undefined,
-): boolean {
-  return Boolean(draft && draft.base !== null && diskBase != null && diskBase !== draft.base);
-}
-
-/** Called only after the user explicitly confirms discarding this draft. */
-export function discardEditorDraft(state: EditorTabState, path: string): EditorTabState {
-  return clearEditorDraft(state, path);
-}
-
 /** Dirty paths among the exact tabs an operation intends to remove, in tab order. */
 export function dirtyEditorTabPaths(
   state: EditorTabState,
   candidatePaths: readonly string[],
+  isDirty: (path: string) => boolean,
 ): string[] {
   const candidates = new Set(candidatePaths);
   return state.tabs
-    .filter((tab) => candidates.has(tab.path) && isEditorTabDirty(state, tab.path))
+    .filter((tab) => candidates.has(tab.path) && isDirty(tab.path))
     .map((tab) => tab.path);
 }

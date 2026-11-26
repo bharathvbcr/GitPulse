@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { describeError } from "../ui/copy/describeFailure";
   import { isTauri } from "../platform";
@@ -8,11 +8,21 @@
   import { fade, scale } from "svelte/transition";
   import { backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
+  import Logo from "./Logo.svelte";
   import type { Attention, NotificationDelivery, Repository, Task, WorkspaceCard } from "../workbench/client";
-  let current = $state<NotificationDelivery | null>(null), notice = $state<Attention | null>(null), task = $state<Task | null>(null);
+  let {
+    initialCurrent = null,
+    initialNotice = null,
+    initialError = "",
+  }: {
+    initialCurrent?: NotificationDelivery | null;
+    initialNotice?: Attention | null;
+    initialError?: string;
+  } = $props();
+  let current = $state<NotificationDelivery | null>(untrack(() => initialCurrent)), notice = $state<Attention | null>(untrack(() => initialNotice)), task = $state<Task | null>(null);
   let repositories = $state<Repository[]>([]), workspaces = $state<WorkspaceCard[]>([]);
   let Editor = $state<typeof import("./TaskEditor.svelte").default | null>(null);
-  let error = $state(""), busy = $state(false);
+  let error = $state(untrack(() => initialError)), busy = $state(false);
   let disposed = false, loading = false, again = false;
   async function receive() {
     if (disposed || current || !isTauri()) return;
@@ -69,11 +79,11 @@
 
 {#if current}
   <div class="native-activation gp-card gp-glass shadow-float" style:z-index={LAYERS.MODAL} role="dialog" aria-modal="true" aria-label="Notification review" tabindex="-1" use:trapFocus in:scale={cardScale()} out:scale={cardScaleOut()}>
-    <div class="receipt"><strong>{notice?.title ?? "GitPulse activity"}</strong><p>{notice?.target_status === "current" ? "Opened from a desktop notification. Review and task acceptance remain your decision." : notice ? `This notification’s target is ${notice.target_status.replaceAll("_", " ")}. Available task details show the current saved version.` : "Resolving the saved notification…"}</p>{#if error}<p role="alert">{error}</p>{/if}{#if !task}<button type="button" class="gp-btn" onclick={close} disabled={busy}>Close notification</button>{/if}</div>
+    <div class="receipt"><div class="receipt-head"><span class="receipt-logo" aria-hidden="true"><Logo size={20} variant="badge" /></span><strong>{notice?.title || "GitPulse activity"}</strong></div><p>{notice?.target_status === "current" ? "Opened from a desktop notification. Review and task acceptance remain your decision." : notice ? `This notification’s target is ${notice.target_status.replaceAll("_", " ")}. Available task details show the current saved version.` : "Resolving the saved notification…"}</p>{#if error}<p role="alert">{error}</p>{/if}{#if !task}<button type="button" class="gp-btn" onclick={close} disabled={busy}>Close notification</button>{/if}</div>
     {#if Editor && task}<Editor value={task} {repositories} {workspaces} onSaved={(value) => { task = value; }} onClose={() => { void close(); }} />{/if}
   </div>
-{:else if error}<div class="activation-error gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status" out:fade={backdropFadeOut()}>{error} <button type="button" class="gp-btn" onclick={() => { error = ""; }}>Dismiss</button></div>{/if}
+{:else if error}<div class="activation-error gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status" out:fade={backdropFadeOut()}><span class="receipt-logo" aria-hidden="true"><Logo size={16} variant="badge" /></span><span class="activation-error-body">{error}</span> <button type="button" class="gp-btn" onclick={() => { error = ""; }}>Dismiss</button></div>{/if}
 
 <style>
-  .native-activation{position:fixed;top:48px;bottom:24px;left:0;right:0;margin-inline:auto;width:min(620px,calc(100vw - 48px));overflow:hidden;display:flex;flex-direction:column;color:rgb(var(--c-text))}.native-activation :global(.task-editor){width:100%;box-sizing:border-box;border-left:0;flex:1;min-height:0;overflow:hidden}.receipt{flex-shrink:0;padding:16px 20px;font-size: var(--text-xs);border-bottom:1px solid rgb(var(--c-border))}.receipt p{color:rgb(var(--c-text-muted));line-height:1.5}.activation-error{position:fixed;bottom:30px;right:20px;max-width:360px;padding:12px;font-size: var(--text-xs)}[role=alert]{color:rgb(var(--c-danger))}
+  .native-activation{position:fixed;top:48px;bottom:24px;left:0;right:0;margin-inline:auto;width:min(620px,calc(100vw - 48px));overflow:hidden;display:flex;flex-direction:column;color:rgb(var(--c-text))}.native-activation :global(.task-editor){width:100%;box-sizing:border-box;border-left:0;flex:1;min-height:0;overflow:hidden}.receipt{flex-shrink:0;padding:16px 20px;font-size: var(--text-xs);border-bottom:1px solid rgb(var(--c-border))}.receipt-head{display:flex;align-items:center;gap:8px;margin-bottom:4px}.receipt-head strong{min-width:0;overflow-wrap:anywhere}.receipt-logo{display:inline-flex;flex-shrink:0}.receipt p{color:rgb(var(--c-text-muted));line-height:1.5}.activation-error{position:fixed;bottom:30px;right:20px;max-width:360px;padding:12px;font-size: var(--text-xs);display:flex;align-items:center;gap:8px}.activation-error-body{flex:1;min-width:0;overflow-wrap:anywhere}[role=alert]{color:rgb(var(--c-danger))}
 </style>

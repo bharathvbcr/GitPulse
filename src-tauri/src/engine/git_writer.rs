@@ -568,6 +568,24 @@ fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, CommandEr
     Ok(paths)
 }
 
+/// Creates each folder in `levels` (shallowest first) and records the ones this
+/// call made. A level that appeared since the caller looked (a neighbour made
+/// it) is not ours: it is neither recorded, so a failure never removes it, nor
+/// an error, as `create_dir_all` also tolerated it.
+fn create_levels(
+    levels: &[&std::path::Path],
+    created: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for dir in levels {
+        match std::fs::create_dir(dir) {
+            Ok(()) => created.push(dir.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// What [`GitWriter::move_path`] decided to run, handed to its gate before
 /// anything moves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -983,19 +1001,42 @@ impl GitWriter {
             }
         };
         gate(&plan)?;
-        if let Some(parent) = to_abs.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create destination parent: {e}"))?;
-        }
-        match &plan {
-            MovePlan::Git { argv } => {
-                let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
-                git_text(&repo, &args)?;
+        // `git mv` into a missing folder fails, so the folder must exist
+        // first. Which levels this call creates is recorded so a failure
+        // removes exactly those, and never a folder that was already there.
+        let mut created: Vec<std::path::PathBuf> = Vec::new();
+        let moved = (|| -> Result<(), CommandError> {
+            if let Some(parent) = to_abs.parent() {
+                let mut missing: Vec<&std::path::Path> = parent
+                    .ancestors()
+                    .take_while(|dir| std::fs::symlink_metadata(dir).is_err())
+                    .collect();
+                missing.reverse();
+                create_levels(&missing, &mut created)
+                    .map_err(|e| format!("Failed to create destination parent: {e}"))?;
             }
-            MovePlan::Untracked { .. } => {
-                std::fs::rename(&from_abs, &to_abs)
-                    .map_err(|e| format!("Failed to move {from} to {to}: {e}"))?;
+            match &plan {
+                MovePlan::Git { argv } => {
+                    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+                    git_text(&repo, &args)?;
+                }
+                MovePlan::Untracked { .. } => {
+                    std::fs::rename(&from_abs, &to_abs)
+                        .map_err(|e| format!("Failed to move {from} to {to}: {e}"))?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = moved {
+            // Deepest first, plain `remove_dir`: it refuses a non-empty
+            // folder and does not follow a symlink, so anything that appeared
+            // there meanwhile survives.
+            for dir in created.iter().rev() {
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+            }
+            return Err(error);
         }
         Ok(plan)
     }
@@ -5455,6 +5496,11 @@ mod tests {
             git_ok(dir.path(), &full);
         };
         git(&["init", "-q", "-b", "main"]);
+        // In the repository, not only on these commands: the merge each test
+        // then runs, and the rollback, need an identity too, and a CI runner
+        // has no global one (a merge without it fails before it conflicts).
+        git(&["config", "user.name", "Ada"]);
+        git(&["config", "user.email", "ada@gitpulse.dev"]);
         std::fs::write(dir.path().join("f.txt"), "base\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "base"]);
@@ -5484,7 +5530,7 @@ mod tests {
                 &["merge", "--no-edit", "side"]
             };
             assert!(
-                !git_captured(repo, args).unwrap().success,
+                crate::test_support::git_merge_in(repo, args),
                 "{flavour}: the fixture merge should conflict"
             );
             GitWriter::rollback_failed_merge_locked(repo)
@@ -5508,11 +5554,10 @@ mod tests {
     fn rollback_leaves_unmerged_entries_with_no_marker_alone() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
         let before = std::fs::read_to_string(repo.join("f.txt")).unwrap();
         let refused = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
@@ -5532,11 +5577,10 @@ mod tests {
     fn rollback_is_not_run_when_the_gate_refuses_it() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         let mut asked = Vec::new();
         let refused = GitWriter::rollback_failed_merge_gated(
             repo,
@@ -5566,11 +5610,10 @@ mod tests {
     fn rollback_never_aborts_a_merge_it_did_not_start() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         let foreign = "b".repeat(40);
         let mut asked = Vec::new();
         let refused =
@@ -5609,11 +5652,10 @@ mod tests {
     fn rollback_that_cannot_restore_the_checkout_says_so() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         let lock = repo.join(".git/index.lock");
         std::fs::write(&lock, "").unwrap();
         let failed = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
@@ -7788,8 +7830,10 @@ mod tests {
             ];
             for (what, result) in results {
                 let err = result.expect_err(what);
+                // The refusal names the remote Debug-quoted, so a path's
+                // backslashes are doubled on Windows.
                 assert!(
-                    err.contains(target) && err.contains("not a configured remote"),
+                    err.contains(&format!("{target:?}")) && err.contains("not a configured remote"),
                     "{what} {target}: {err}",
                     err = err.message()
                 );
@@ -8341,14 +8385,9 @@ mod tests {
     }
 
     /// Installs an executable `name` hook in `dir`'s default hooks directory.
-    #[cfg(unix)]
     fn install_hook(dir: &std::path::Path, name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let hooks = dir.join(".git/hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        let path = hooks.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join(".git/hooks").join(name);
+        crate::test_support::write_git_script(&path, &format!("#!/bin/sh\n{body}\n"), true);
     }
 
     fn head_oid(dir: &tempfile::TempDir) -> String {
@@ -8360,7 +8399,6 @@ mod tests {
 
     /// A hook that outlives the hook budget is stopped, and the error names
     /// the hook rather than calling it a git hang.
-    #[cfg(unix)]
     #[test]
     fn a_hook_past_its_budget_is_named_in_the_timeout() {
         let dir = init_repo_with_commit();
@@ -8400,7 +8438,6 @@ mod tests {
 
     /// The user can stop a slow hook from the UI; the commit does not land
     /// and the hook's process goes with git's.
-    #[cfg(unix)]
     #[test]
     fn a_running_hook_is_cancelled_on_request() {
         let dir = init_repo_with_commit();
@@ -8408,7 +8445,7 @@ mod tests {
         install_hook(
             dir.path(),
             "pre-commit",
-            &format!("touch '{}'\nsleep 30", marker.display()),
+            &format!("touch {}\nsleep 30", crate::test_support::sh_quote(&marker)),
         );
         std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
         git_in(dir.path(), &["add", "tracked.txt"]);
@@ -9181,18 +9218,12 @@ mod tests {
     #[test]
     fn pull_with_rebase_replays_local_commits_without_a_merge() {
         let (local, _origin) = diverged_clone();
-        // Unset in the repository, so whatever answers comes from outside it:
-        // Git for Windows' installer writes `pull.rebase=false` to the system
-        // config, which a fresh clone there inherits.
-        let inherited = git_text(
-            local.path(),
-            &["config", "--system", "--get", "pull.rebase"],
-        )
-        .ok()
-        .map(|value| value.trim().to_owned());
+        // Unset in the repository. The suite runs git with `GIT_CONFIG_NOSYSTEM`,
+        // so the system config (Git for Windows' installer writes
+        // `pull.rebase=false` there) is not consulted either: nothing answers.
         assert_eq!(
             GitWriter::pull_rebase_config(&repo_path(&local)).unwrap(),
-            inherited
+            None
         );
         GitWriter::pull(&repo_path(&local), None, None, Some(true)).unwrap();
         assert_eq!(parents_of_head(&local), 1, "rebased, not merged");
@@ -9566,7 +9597,8 @@ mod tests {
     fn staging_attributed_treats_exotic_names_literally() {
         let dir = init_repo_with_commit();
         let path = repo_path(&dir);
-        let names = [
+        // Windows cannot hold the names with `:`, `*`, `?`, a newline or a tab.
+        let names: Vec<&str> = [
             "-leading-dash.md",
             ":(top)magic.md",
             ":(glob)**.md",
@@ -9577,7 +9609,10 @@ mod tests {
             "caf\u{e9}-nfc.md",
             "cafe\u{301}-decomposed.md",
             "#hash?query%41.md",
-        ];
+        ]
+        .into_iter()
+        .filter(|name| crate::test_support::platform_can_hold(name))
+        .collect();
         let files: Vec<String> = names.iter().map(|n| n.to_string()).collect();
         for name in &names {
             std::fs::write(dir.path().join(name), "x\n").unwrap();
@@ -10330,6 +10365,109 @@ mod bound_to_checked_state {
             }),
             "the prune failure is recorded on the snapshot's row"
         );
+    }
+}
+
+/// A move that does not happen leaves no new folder behind.
+#[cfg(test)]
+mod move_path_leftovers {
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            crate::test_support::git_in(dir.path(), &args);
+        }
+        std::fs::write(dir.path().join("t.txt"), "x\n").unwrap();
+        crate::test_support::git_in(dir.path(), &["add", "."]);
+        crate::test_support::git_in(dir.path(), &["commit", "-qm", "base"]);
+        dir
+    }
+
+    /// A gate that lets the move through, then takes the index lock so
+    /// `git mv` fails after the destination folders exist.
+    fn lock_gate(dir: &tempfile::TempDir) -> impl FnOnce(&MovePlan) -> Result<(), CommandError> {
+        let lock = dir.path().join(".git/index.lock");
+        move |_| {
+            std::fs::write(&lock, "").unwrap();
+            Ok(())
+        }
+    }
+
+    fn mv(
+        dir: &tempfile::TempDir,
+        to: &str,
+        gate: impl FnOnce(&MovePlan) -> Result<(), CommandError>,
+    ) -> Result<MovePlan, CommandError> {
+        GitWriter::move_path(dir.path().to_str().unwrap(), "t.txt", to, gate)
+    }
+
+    #[test]
+    fn a_gate_refusal_leaves_no_new_folder() {
+        let dir = repo();
+        let result = mv(&dir, "a/b/t.txt", |_| Err("refused".into()));
+        assert!(result.is_err());
+        assert!(!dir.path().join("a").exists());
+        assert!(dir.path().join("t.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_git_mv_removes_every_folder_it_created() {
+        let dir = repo();
+        let result = mv(&dir, "a/b/t.txt", lock_gate(&dir));
+        std::fs::remove_file(dir.path().join(".git/index.lock")).ok();
+        assert!(result.is_err());
+        assert!(!dir.path().join("a").exists(), "a/ left behind");
+        assert!(dir.path().join("t.txt").exists());
+    }
+
+    #[test]
+    fn a_folder_that_existed_before_survives_a_failed_move() {
+        let dir = repo();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        let result = mv(&dir, "a/b/t.txt", lock_gate(&dir));
+        std::fs::remove_file(dir.path().join(".git/index.lock")).ok();
+        assert!(result.is_err());
+        assert!(dir.path().join("a").is_dir(), "pre-existing a/ was removed");
+        assert!(!dir.path().join("a/b").exists(), "a/b/ left behind");
+    }
+
+    #[test]
+    fn a_non_empty_pre_existing_folder_is_never_removed() {
+        let dir = repo();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/keep.txt"), "k").unwrap();
+        let result = mv(&dir, "a/b/t.txt", lock_gate(&dir));
+        std::fs::remove_file(dir.path().join(".git/index.lock")).ok();
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/keep.txt")).unwrap(),
+            "k"
+        );
+    }
+
+    #[test]
+    fn a_level_a_neighbour_created_first_is_not_recorded_as_ours() {
+        let dir = repo();
+        let a = dir.path().join("a");
+        let ab = a.join("b");
+        std::fs::create_dir(&a).unwrap();
+        let mut created = Vec::new();
+        create_levels(&[a.as_path(), ab.as_path()], &mut created).expect("create");
+        assert_eq!(created, vec![ab]);
+        assert!(a.is_dir());
+    }
+
+    #[test]
+    fn a_successful_move_keeps_the_folders_it_created() {
+        let dir = repo();
+        mv(&dir, "a/b/t.txt", |_| Ok(())).expect("move");
+        assert!(dir.path().join("a/b/t.txt").exists());
     }
 }
 

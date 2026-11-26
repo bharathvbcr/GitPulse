@@ -4,6 +4,7 @@ use super::*;
 const NEW_GIT: GitEnv = GitEnv {
     version: Some((2, 54, 0)),
     fsmonitor_measured: true,
+    is_apple_git: false,
 };
 
 fn key(report: &mut RepoTuningReport, lower: &str, value: Option<&str>, scope: ConfigScope) {
@@ -678,5 +679,58 @@ fn a_split_index_refusal_says_what_was_reproduced_and_what_is_inferred() {
     assert!(
         refused.contains("/w/s") && refused.contains("was not isolated"),
         "{refused}"
+    );
+}
+
+#[test]
+fn apple_git_never_offers_or_plans_fsmonitor() {
+    let big = report(100_000, 1, 0);
+    let apple = GitEnv {
+        is_apple_git: true,
+        ..NEW_GIT
+    };
+    assert!(
+        !offered(&big, apple).contains(&TuningChange::Fsmonitor),
+        "Apple Git must not offer core.fsmonitor"
+    );
+    let refused = plan_apply(&big, apple, "/r/.git", &[TuningChange::Fsmonitor]).unwrap_err();
+    assert!(refused.contains("Apple Git"), "{refused}");
+    assert!(refused.contains("deadlock"), "{refused}");
+}
+
+#[test]
+fn warnings_flag_core_fsmonitor_on_small_and_large_repos() {
+    let mut small = report(3_503, 1, 0);
+    key(
+        &mut small,
+        "core.fsmonitor",
+        Some("true"),
+        ConfigScope::Local,
+    );
+    let small_warnings = warnings(&small);
+    assert!(
+        small_warnings
+            .iter()
+            .any(|w| w.contains("10,000") && w.contains("--unset core.fsmonitor")),
+        "expected small-repo fsmonitor warning, got: {small_warnings:?}"
+    );
+
+    let mut large = report(50_000, 1, 0);
+    key(
+        &mut large,
+        "core.fsmonitor",
+        Some("true"),
+        ConfigScope::Local,
+    );
+    let large_warnings = warnings(&large);
+    assert!(
+        large_warnings
+            .iter()
+            .any(|w| w.contains("Apple Git") && w.contains("deadlock")),
+        "expected Apple Git deadlock warning, got: {large_warnings:?}"
+    );
+    assert!(
+        !large_warnings.iter().any(|w| w.contains("10,000")),
+        "large repo must not emit under-10k warning: {large_warnings:?}"
     );
 }

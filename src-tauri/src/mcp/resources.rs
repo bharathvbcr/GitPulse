@@ -37,6 +37,16 @@ pub const MAX_DOCUMENT_BYTES: usize = super::MAX_FRAME_BYTES - 256 * 1024;
 /// Room the notice appended to a cut document may take on the wire.
 const NOTICE_RESERVE_BYTES: usize = 512;
 
+/// The MIME type of a document that was cut at [`MAX_DOCUMENT_BYTES`]: no
+/// longer JSON, so a reader that must tell a cut document from a whole one
+/// (the `gitpulse-mcp read` exit status) keys on it, not on the notice's
+/// wording.
+pub const CUT_DOCUMENT_MIME_TYPE: &str = "text/plain";
+
+/// The member the result budget adds to a payload it had to cut
+/// ([`budget`] is private to `mcp`): the one name, for readers outside it.
+pub const RESULT_TRUNCATION_KEY: &str = super::budget::TRUNCATION_KEY;
+
 /// A repository facet: one `gitpulse://<facet>{+repo_path}` template.
 struct Facet {
     name: &'static str,
@@ -228,7 +238,7 @@ fn text_content(target_uri: &str, payload: Value) -> Value {
         "uri": target_uri,
         // Truncated JSON is no longer JSON, and labelling it as such would make
         // a client's parse failure look like a server bug rather than a cap.
-        "mimeType": if truncated { "text/plain" } else { "application/json" },
+        "mimeType": if truncated { CUT_DOCUMENT_MIME_TYPE } else { "application/json" },
         "text": text,
     })
 }
@@ -255,6 +265,9 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             "dcStoreSchemaVersion": dc_store::SCHEMA_VERSION,
             "workbenchSchemaVersion": dc_store::workbench::WORKBENCH_SCHEMA,
             "extractionSchemaVersion": extraction_schema_version(),
+            // The stack-lease format this build reads and writes, so the parity
+            // check can ask the installed binary (devmap prints it in --version).
+            "stackLeaseFormatVersion": devmap_query::STACK_FORMAT_VERSION,
             "protocolVersion": super::PROTOCOL_VERSION,
             "legacyVersions": super::LEGACY_VERSIONS,
             // Derived from the tool annotations, so it cannot claim "read-only"
@@ -876,6 +889,10 @@ mod tests {
             .parse()
             .expect("the extraction schema is a whole number");
         assert_eq!(parsed["extractionSchemaVersion"], json!(extract));
+        assert_eq!(
+            parsed["stackLeaseFormatVersion"],
+            json!(devmap_query::STACK_FORMAT_VERSION)
+        );
     }
 
     #[test]

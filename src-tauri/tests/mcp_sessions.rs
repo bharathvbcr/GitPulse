@@ -400,7 +400,7 @@ fn gitpulse_sessions_identifies_caller_sources_states_bounds_and_spawns_no_git()
         &home_gitconfig,
         format!(
             "{prior_gitconfig}\n[trace2]\n\teventTarget = {}\n",
-            trace_log.display()
+            common::env::git_config_value(&trace_log.to_string_lossy())
         ),
     )
     .expect("write trace2 gitconfig");

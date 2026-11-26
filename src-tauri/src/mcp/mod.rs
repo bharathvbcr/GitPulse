@@ -309,15 +309,29 @@ impl PruneOutcome {
     }
 }
 
+/// What one `gitpulse_worktree_prune` call reads once for every worktree it
+/// judges: the repository's anchor, its default branch, and its locked-in
+/// branches (or why they could not be read).
+#[derive(Clone, Copy)]
+struct PruneContext<'a> {
+    anchor: &'a std::path::Path,
+    default_base: &'a str,
+    locked: Result<&'a std::collections::HashSet<String>, &'a str>,
+}
+
 fn prune_one(
     repo_path: &str,
-    anchor: &std::path::Path,
-    default_base: &str,
+    ctx: PruneContext<'_>,
     wt: &crate::engine::worktree::WorktreeInfo,
     force: bool,
     dry_run: bool,
     reap: bool,
 ) -> PruneOutcome {
+    let PruneContext {
+        anchor,
+        default_base,
+        locked,
+    } = ctx;
     let skipped = |reason: String| PruneOutcome::new("skipped", Some(reason));
     // First, and whatever `force` says: an agent working in the lane (a lane
     // claim, a live session attributed to it) is not removed over MCP, where
@@ -326,6 +340,20 @@ fn prune_one(
         crate::engine::worktree::agent_hold(repo_path, &wt.path, wt.branch.as_deref(), true)
     {
         return skipped(reason);
+    }
+    // A locked-in branch (`gitpulse.lockedBranch`, `archive/`) keeps its
+    // worktree, `force` or not; when that list cannot be read, every branch does.
+    if let Some(branch) = wt.branch.as_deref() {
+        match locked {
+            Err(e) => return skipped(format!("could not read the locked-in branches: {e}")),
+            Ok(set) if set.contains(&format!("refs/heads/{branch}")) => {
+                return skipped(format!(
+                    "branch {branch} is locked-in ({} or archive/), so it is never pruned",
+                    crate::engine::deadbranch::LOCKED_BRANCH_CONFIG_KEY
+                ))
+            }
+            Ok(_) => {}
+        }
     }
     if !force {
         // A check that could not run is a skip with its error, never a pass.
@@ -1471,8 +1499,13 @@ tool_args! {
             1,
             64,
         ),
+        in_reply_to: Option<String> = Spec::bytes(
+            "msg_id of the bus message this answers (1-64 ASCII letters, digits, '-' or '_'). It must still be on the bus; it supplies thread_key when none is given and sets the hop to its hop + 1",
+            1,
+            64,
+        ),
         hop: Option<u32> = Spec::int(
-            "Explicit hop count (defaults to 1, or previous thread hop + 1; an MCP caller is never below 1, and a 0 is raised to 1)",
+            "Explicit hop count. The count is the highest of this, the in_reply_to message's hop + 1, the thread's last hop + 1 and 1, so an explicit hop can raise it but never lower it (a 0 is raised to 1)",
             0,
             32,
         ),
@@ -1498,7 +1531,12 @@ tool_args! {
             64,
         ),
         since_seq: Option<u64> = Spec::int(
-            "Return bus messages strictly after this sequence number (default 0)",
+            "Return bus messages strictly after this sequence number (default 0). To page, pass the previous result's next_since_seq, not latest_seq",
+            0,
+            MAX_REVISION,
+        ),
+        since_mailbox_ms: Option<u64> = Spec::int(
+            "Skip mailbox-only envelopes (a person's message, or a peer/steward message whose bus row was evicted; they have no bus seq) created at or before this Unix time in milliseconds (default 0, skip none). Pass the previous result's mailbox_cursor_ms",
             0,
             MAX_REVISION,
         ),
@@ -1511,7 +1549,7 @@ tool_args! {
             "Include broadcast coordination messages where to_agent is null (default false)",
         ),
         ack: Option<bool> = Spec::flag(
-            "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+            "Acknowledge returned messages across agent_bus and agent_mailbox (default false: a read only peeks, so reading never consumes the owner's messages)",
         ),
         limit: Option<u32> = Spec::int("Maximum messages to return (default 50)", 1, 256),
     }
@@ -1531,7 +1569,12 @@ tool_args! {
             64,
         ),
         since_seq: Option<u64> = Spec::int(
-            "Wait for bus messages strictly after this sequence number (default 0)",
+            "Wait for bus messages strictly after this sequence number (default 0). To wait without consuming, pass ack=false with the previous result's next_since_seq and mailbox_cursor_ms",
+            0,
+            MAX_REVISION,
+        ),
+        since_mailbox_ms: Option<u64> = Spec::int(
+            "Ignore mailbox-only envelopes (a person's message, or a peer/steward message whose bus row was evicted; they have no bus seq) created at or before this Unix time in milliseconds (default 0, ignore none). Pass the previous result's mailbox_cursor_ms",
             0,
             MAX_REVISION,
         ),
@@ -1549,7 +1592,7 @@ tool_args! {
             60_000,
         ),
         ack: Option<bool> = Spec::flag(
-            "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+            "Acknowledge returned messages across agent_bus and agent_mailbox (default true: a wait consumes what it returns, since a non-acking wait would return the same message again; pass ack=false with since_seq and since_mailbox_ms to wait without consuming)",
         ),
         limit: Option<u32> = Spec::int("Maximum messages to return on wake (default 20)", 1, 256),
     }
@@ -2848,6 +2891,16 @@ fn build_tools() -> Vec<Value> {
                         }
                     },
                     "latest_seq": { "type": "integer", "minimum": 0 },
+                    "next_since_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_seq to continue: the last bus seq returned when the page was cut (has_more), else latest_seq"
+                    },
+                    "mailbox_cursor_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_mailbox_ms to continue past the mailbox-only envelopes already returned"
+                    },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
                     "has_more": { "type": "boolean" }
                 },
@@ -3033,7 +3086,18 @@ fn build_tools() -> Vec<Value> {
                     "msg_id": { "type": "string" },
                     "to_peer": { "type": "string" },
                     "liveness": { "type": "string" },
-                    "delivery_outcome": { "type": "string" },
+                    "delivery_outcome": {
+                        "type": "string",
+                        "description": "What happened to the wake: paused_hop_limit, woken_immediately, queued_for_hook_boundary, requires_resume, bus_only, or already_delivered (an exact retry of a message its recipient has already read, so no second delivery was attempted)"
+                    },
+                    "replayed": {
+                        "type": "boolean",
+                        "description": "True when an exact retry did not deliver again and delivery_outcome is the stored outcome of this process's earlier successful delivery of the same row"
+                    },
+                    "mailbox": {
+                        "type": "object",
+                        "description": "Whether the envelope was deposited in the recipient's mailbox. reason is null when deposited, else one of no_session, unavailable, full, refused, hop_limit (the message is at its hop limit: bus row only, nothing deposited)"
+                    },
                     "hop": { "type": "integer", "minimum": 0 },
                     "max_hops": { "type": "integer", "minimum": 1 },
                     "truncated_in_mailbox": { "type": "boolean" },
@@ -3041,7 +3105,7 @@ fn build_tools() -> Vec<Value> {
                 },
                 "required": [
                     "ok", "repo_path", "msg_id", "to_peer", "liveness",
-                    "delivery_outcome", "hop", "max_hops", "truncated_in_mailbox", "message"
+                    "delivery_outcome", "replayed", "hop", "max_hops", "truncated_in_mailbox", "message"
                 ]
             }),
             false,
@@ -3049,7 +3113,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_agent_inbox",
             "Read and cross-ack deduplicated peer inbox messages",
-            "Read unread peer messages deduplicated by msg_id across agent_bus and agent_mailbox, hydrating > 6 KiB bodies and cross-acknowledging both stores when ack is true",
+            "Read unread peer messages deduplicated by msg_id across agent_bus and agent_mailbox, hydrating > 6 KiB bodies. Peeks by default; cross-acknowledges both stores only when ack is true",
             AgentInboxArgs::properties(),
             &AgentInboxArgs::required(),
             json!({
@@ -3060,8 +3124,23 @@ fn build_tools() -> Vec<Value> {
                     "for_peer": { "type": "string" },
                     "acked": { "type": "boolean" },
                     "acked_count": { "type": "integer", "minimum": 0 },
+                    "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
+                    "next_since_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_seq to continue: the last bus seq returned when the page was cut (has_more), else latest_seq"
+                    },
+                    "mailbox_cursor_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_mailbox_ms to continue past the mailbox-only envelopes already returned"
+                    },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
+                    "pinned_below_dropped_before_seq": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
                     "has_more": { "type": "boolean" },
                     "messages": { "type": "array" }
                 },
@@ -3089,12 +3168,30 @@ fn build_tools() -> Vec<Value> {
                     "effective_timeout_ms": { "type": "integer", "minimum": 0 },
                     "acked": { "type": "boolean" },
                     "acked_count": { "type": "integer", "minimum": 0 },
+                    "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
+                    "next_since_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_seq to continue: the last bus seq returned when the page was cut (has_more), else latest_seq"
+                    },
+                    "mailbox_cursor_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_mailbox_ms to continue past the mailbox-only envelopes already returned"
+                    },
+                    "dropped_before_seq": { "type": "integer", "minimum": 0 },
+                    "pinned_below_dropped_before_seq": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
+                    "has_more": { "type": "boolean" },
                     "messages": { "type": "array" }
                 },
                 "required": [
                     "ok", "repo_path", "for_peer", "timed_out", "waited_ms",
-                    "effective_timeout_ms", "acked", "acked_count", "latest_seq", "messages"
+                    "effective_timeout_ms", "acked", "acked_count", "latest_seq",
+                    "dropped_before_seq", "has_more", "messages"
                 ]
             }),
             false,
@@ -4615,6 +4712,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .unwrap_or_else(|| "main".to_string());
             let worktrees = crate::engine::worktree::list_worktrees(&a.repo_path)
                 .map_err(CommandError::into_message)?;
+            let locked = crate::engine::deadbranch::locked_in_refs(&anchor, &[])
+                .map_err(CommandError::into_message);
             let mut pruned = Vec::new();
             let mut all_reaped = Vec::new();
             let mut outcomes = Vec::new();
@@ -4633,8 +4732,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 }
                 let outcome = prune_one(
                     &a.repo_path,
-                    &anchor,
-                    &default_base,
+                    PruneContext {
+                        anchor: &anchor,
+                        default_base: &default_base,
+                        locked: locked.as_ref().map_err(String::as_str),
+                    },
                     &wt,
                     force,
                     dry_run,
@@ -4756,9 +4858,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_browser_open" => {
             let a: BrowserOpenArgs = parse(name, arguments)?;
-            // Trust first, as every other write tool does: an untrusted
-            // repository gets the trust refusal on every platform, and only a
-            // trusted one learns that browser sessions are macOS-only.
+            // Trust first, as every repository-scoped tool does: an untrusted
+            // repository is refused as untrusted on every platform, never
+            // answered with what this platform lacks.
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
             if !crate::browser::SUPPORTED {
@@ -5248,6 +5350,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_provenance" => {
             let a: ProvenanceArgs = parse(name, arguments)?;
+            // A repository that cannot be examined (untrusted, not a Git
+            // repository) is a tool error. `compute_freshness` would answer it
+            // with an all-null "unexamined" record, which a caller reads as
+            // "looked and found nothing".
+            crate::engine::git_cli::validate_repo(&a.repo_path)
+                .map_err(CommandError::into_message)?;
             Ok(json!(crate::engine::provenance::compute_freshness(
                 &a.repo_path,
                 &a.commit_sha,
@@ -5256,6 +5364,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_landed" => {
             let a: LandedArgs = parse(name, arguments)?;
+            // Same refusal as provenance: an unexaminable repository is a
+            // tool error, not an answer whose only sign of it is `error`.
+            crate::engine::git_cli::validate_repo(&a.repo_path)
+                .map_err(CommandError::into_message)?;
             Ok(json!(crate::engine::provenance::landed(
                 &a.repo_path,
                 &a.commit,
@@ -7218,30 +7330,55 @@ mod tests {
         ("devmap_preview", "one preview verdict, no list"),
     ];
 
-    /// Tools this test can only drive on macOS: the browser session and the
-    /// terminal orchestrator both answer through the desktop mailbox, which
-    /// elsewhere refuses ("available on macOS only for now"; see
-    /// `ask_app_to_orchestrate` and `crate::browser::UNSUPPORTED`), so the block
-    /// that calls them is `#[cfg(target_os = "macos")]`. Off macOS they are left
-    /// out of the probe and validation checks below, which failed on every
-    /// Linux runner for tools that were never called there. On macOS nothing
-    /// here is exempt: each must be probed and validated as before.
-    const EXERCISED_ON_MACOS_ONLY: &[&str] = &[
-        "gitpulse_browser_open",
-        "gitpulse_terminal_close",
-        "gitpulse_terminal_exec",
+    /// Tools whose payload exists only where the desktop mailbox carries
+    /// terminal orchestration (macOS): elsewhere they answer "available on
+    /// macOS only for now", so there is no list to probe. On macOS they are
+    /// probed like any other, and off it the test checks that they do refuse.
+    const PROBED_ON_MACOS_ONLY: &[(&str, &str)] = &[(
         "gitpulse_terminal_list",
-        "gitpulse_terminal_open_file",
-        "gitpulse_terminal_read",
-        "gitpulse_terminal_send",
-        "gitpulse_terminal_spawn",
-        "gitpulse_terminal_wait",
-    ];
+        "terminal orchestration is macOS only for now, so off macOS there is no children list",
+    )];
 
-    /// Whether `name` is one of [`EXERCISED_ON_MACOS_ONLY`] on a platform that
-    /// cannot drive it.
-    fn not_exercised_here(name: &str) -> bool {
-        cfg!(not(target_os = "macos")) && EXERCISED_ON_MACOS_ONLY.contains(&name)
+    /// Tools whose every answer is the desktop app's, reached over its mailbox,
+    /// which carries browser sessions and terminal orchestration on macOS only
+    /// (`crate::browser::SUPPORTED`, `ask_app_to_orchestrate`). Elsewhere each
+    /// refuses with "available on macOS only for now", so there is no result to
+    /// validate. On macOS they are validated like any other; off it the test
+    /// calls each with arguments that parse and a trusted repository, and checks
+    /// it refuses for want of the platform and for nothing else.
+    fn answered_on_macos_only(repo: &str) -> [(&'static str, Value); 9] {
+        [
+            (
+                "gitpulse_browser_open",
+                json!({ "repo_path": repo, "url": "http://localhost:5173/" }),
+            ),
+            ("gitpulse_terminal_spawn", json!({ "repo_path": repo })),
+            (
+                "gitpulse_terminal_exec",
+                json!({ "repo_path": repo, "command": "true" }),
+            ),
+            (
+                "gitpulse_terminal_open_file",
+                json!({ "repo_path": repo, "path": "README.md" }),
+            ),
+            ("gitpulse_terminal_list", json!({ "repo_path": repo })),
+            (
+                "gitpulse_terminal_wait",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
+            ),
+            (
+                "gitpulse_terminal_read",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
+            ),
+            (
+                "gitpulse_terminal_send",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1", "input": "x" }),
+            ),
+            (
+                "gitpulse_terminal_close",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
+            ),
+        ]
     }
 
     /// Tools whose `outputSchema` declares an array that is empty in every
@@ -7863,7 +8000,11 @@ mod tests {
                 &mut validated,
             );
 
-            let _ = crate::terminal::kill_session(&term_state, &child_id);
+            let _ = crate::terminal::kill_session(
+                &term_state,
+                &child_id,
+                crate::terminal::KillOrigin::Unspecified,
+            );
             drop(owner);
             crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
         }
@@ -8093,15 +8234,15 @@ mod tests {
                 let in_list =
                     |list: &[(&str, &str)]| list.iter().any(|(exempt, _)| *exempt == name);
                 let has_array = schema_declares_array(&tool["outputSchema"]);
-                if not_exercised_here(name) {
-                    return None;
-                }
-                let listed = in_list(NO_ARRAY_IN_SCHEMA) || in_list(EMPTY_ON_FIXTURES);
+                let listed = in_list(NO_ARRAY_IN_SCHEMA)
+                    || in_list(EMPTY_ON_FIXTURES)
+                    || (!cfg!(target_os = "macos") && in_list(PROBED_ON_MACOS_ONLY));
                 // The reasons are checked, not just stated: a tool listed as
                 // having no array must declare none, and one listed as empty
-                // on the fixtures must declare one.
+                // on the fixtures (or probed on macOS only) must declare one.
                 let reason_holds = (!in_list(NO_ARRAY_IN_SCHEMA) || !has_array)
-                    && (!in_list(EMPTY_ON_FIXTURES) || has_array);
+                    && (!in_list(EMPTY_ON_FIXTURES) || has_array)
+                    && (!in_list(PROBED_ON_MACOS_ONLY) || has_array);
                 (probed.contains(name) == listed || !reason_holds).then(|| {
                     format!(
                         "{name} (probed={}, listed={listed}, schema declares an array={has_array})",
@@ -8116,6 +8257,26 @@ mod tests {
              EMPTY_ON_FIXTURES with a reason, and not both:\n{}",
             misfiled.join("\n")
         );
+        // Off macOS the exemptions are checked, not just stated: each tool
+        // must refuse for want of the platform, not for anything else.
+        let macos_only = answered_on_macos_only(&wt_repo);
+        assert!(
+            PROBED_ON_MACOS_ONLY
+                .iter()
+                .all(|(name, _)| macos_only.iter().any(|(only, _)| only == name)),
+            "a tool probed on macOS only must be one answered on macOS only"
+        );
+        if !cfg!(target_os = "macos") {
+            for (name, arguments) in &macos_only {
+                let answer = handle_tool_call(name, arguments);
+                assert!(
+                    answer
+                        .as_ref()
+                        .is_err_and(|error| error.contains("macOS only")),
+                    "{name} is exempt off macOS as unavailable here, but answered {answer:?}"
+                );
+            }
+        }
         // Every advertised tool whose result holds a string was run with a
         // long one at the mirror threshold.
         for tool in tools() {
@@ -8132,17 +8293,12 @@ mod tests {
 
         // Every advertised tool is validated or explicitly exempt. A tool whose
         // every call errored was never checked, and says why.
-        // The macOS-only list names advertised tools, so a rename cannot leave
-        // an entry that exempts nothing and says nothing.
-        for name in EXERCISED_ON_MACOS_ONLY {
-            assert!(
-                tools().iter().any(|tool| tool["name"] == *name),
-                "EXERCISED_ON_MACOS_ONLY names {name}, which is not an advertised tool"
-            );
-        }
         for tool in tools() {
             let name = tool["name"].as_str().expect("name");
-            if is_object_only_exempt(name) || not_exercised_here(name) {
+            if is_object_only_exempt(name) {
+                continue;
+            }
+            if !cfg!(target_os = "macos") && macos_only.iter().any(|(only, _)| *only == name) {
                 continue;
             }
             assert!(
@@ -8681,6 +8837,41 @@ mod tests {
         (is_error, body)
     }
 
+    /// A repository the provenance or landed read may not examine (here:
+    /// untrusted) is a tool error naming why, not an all-null "unexamined"
+    /// record or an answer whose only sign of refusal is an `error` field.
+    #[test]
+    fn provenance_and_landed_on_an_untrusted_repository_are_tool_errors() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status_locked()
+            .unwrap()
+            .success());
+        for (tool, arguments) in [
+            (
+                "gitpulse_provenance",
+                json!({
+                    "repo_path": repo.path().to_str().unwrap(),
+                    "commit_sha": "0000000000000000000000000000000000000000",
+                }),
+            ),
+            (
+                "gitpulse_landed",
+                json!({ "repo_path": repo.path().to_str().unwrap(), "commit": "HEAD" }),
+            ),
+        ] {
+            let (is_error, body) = tool_json(tool, arguments);
+            assert!(is_error, "{tool}: {body}");
+            assert!(
+                body.as_str()
+                    .is_some_and(|m| m.contains("REPOSITORY_TRUST_REQUIRED")),
+                "{tool}: {body}"
+            );
+        }
+    }
+
     fn task_fixture() -> (tempfile::TempDir, tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().to_string_lossy().into_owned();
@@ -9117,7 +9308,7 @@ mod tests {
         use crate::tasks::file_tasks as ft;
         let skill = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../plugins/gitpulse/skills/gitpulse-tasks/SKILL.md"),
+                .join("../plugins/gitpulse/skills/tasks/SKILL.md"),
         )
         .unwrap();
         let grouped = |n: usize| {
@@ -12789,13 +12980,18 @@ mod tests {
         );
         let outcome = out["outcomes"]
             .as_array()
-            .and_then(|o| o.iter().find(|o| o["worktree_path"] == wt.as_str()))
+            .and_then(|o| o.iter().find(|o| names_path(o, &wt)))
             .unwrap_or_else(|| panic!("no outcome for the busy worktree: {out}"));
         assert_eq!(outcome["status"], "skipped", "{out}");
+        // Windows has no process scan, so it cannot say which process is in the
+        // worktree; it refuses on the session check instead of a named process.
+        let why = if cfg!(windows) {
+            "could not rule out a live agent session"
+        } else {
+            "process"
+        };
         assert!(
-            outcome["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("process")),
+            outcome["reason"].as_str().is_some_and(|r| r.contains(why)),
             "{out}"
         );
         assert_eq!(out["reaped_pids"], json!([]));
@@ -12831,10 +13027,19 @@ mod tests {
         alive
     }
 
+    /// Whether an outcome's `worktree_path` names `path`. Create answers with
+    /// the path as the platform spells it (`C:\...`) and prune with the one git
+    /// lists (`C:/...`); one directory, so one spelling for the comparison.
+    fn names_path(outcome: &Value, path: &str) -> bool {
+        outcome["worktree_path"]
+            .as_str()
+            .is_some_and(|found| found.replace('\\', "/") == path.replace('\\', "/"))
+    }
+
     fn outcome_for(out: &Value, path: &str) -> Value {
         out["outcomes"]
             .as_array()
-            .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
+            .and_then(|o| o.iter().find(|o| names_path(o, path)))
             .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
             .clone()
     }
@@ -13020,13 +13225,24 @@ mod tests {
         .expect("lock the ref");
         let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
         assert!(!err, "{out}");
-        let find = |path: &str| {
-            out["outcomes"]
-                .as_array()
-                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
-                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
-                .clone()
-        };
+        let find = |path: &str| outcome_for(&out, path);
+        if cfg!(windows) {
+            // No process scan, so no worktree can be shown free of a live agent
+            // session, and prune removes none: there is no branch delete to
+            // fail and nothing to keep going past.
+            for path in [&stuck, &other] {
+                let outcome = find(path);
+                assert_eq!(outcome["status"], "skipped", "{out}");
+                assert!(
+                    outcome["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.contains("could not rule out a live agent session")),
+                    "{out}"
+                );
+                assert!(std::path::Path::new(path).is_dir(), "{out}");
+            }
+            return;
+        }
         let stuck_outcome = find(&stuck);
         assert_eq!(stuck_outcome["status"], "removed_branch_kept", "{out}");
         assert_eq!(stuck_outcome["branch_deleted"], false, "{out}");
@@ -13045,6 +13261,52 @@ mod tests {
     }
 
     #[test]
+    fn prune_never_removes_a_locked_in_branch_even_with_force() {
+        let (_sandbox, repo) = honesty_repo();
+        let kept = create_lane(&repo, "labs/geek");
+        let other = create_lane(&repo, "feat/other");
+        git_ok(&[
+            "-C",
+            &repo,
+            "config",
+            "--local",
+            "--add",
+            "gitpulse.lockedBranch",
+            "labs",
+        ]);
+        let (err, out) = tool_json(
+            "gitpulse_worktree_prune",
+            json!({ "repo_path": repo, "force": true }),
+        );
+        assert!(!err, "{out}");
+        let find = |path: &str| {
+            out["outcomes"]
+                .as_array()
+                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
+                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
+                .clone()
+        };
+        let kept_outcome = find(&kept);
+        assert_eq!(kept_outcome["status"], "skipped", "{out}");
+        assert!(
+            kept_outcome["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("locked-in")),
+            "{out}"
+        );
+        assert!(std::path::Path::new(&kept).is_dir(), "{out}");
+        git_ok(&[
+            "-C",
+            &repo,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/labs/geek",
+        ]);
+        assert_eq!(find(&other)["status"], "removed", "{out}");
+    }
+
+    #[test]
     fn create_with_a_failing_command_still_returns_the_worktree_it_made() {
         let (_sandbox, repo) = honesty_repo();
         let (err, out) = tool_json(
@@ -13053,7 +13315,12 @@ mod tests {
                 "repo_path": repo,
                 "branch": "feat/cmd-fails",
                 "share_cache": false,
-                "execute_command": "echo boom >&2; exit 3"
+                // The command runs under `sh -c` on Unix and `cmd /C` on Windows.
+                "execute_command": if cfg!(windows) {
+                    "echo boom 1>&2 & exit 3"
+                } else {
+                    "echo boom >&2; exit 3"
+                }
             }),
         );
         assert!(
@@ -13091,7 +13358,8 @@ mod tests {
     #[test]
     fn worktree_create_defaults_to_gitpulse_lane_and_allows_explicit_sibling() {
         let (_sandbox, repo) = honesty_repo();
-        let canon_repo = std::path::Path::new(&repo).canonicalize().unwrap();
+        let canon_repo =
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&repo)).unwrap();
 
         // 1. Default invocation places the worktree under <repo>/.gitpulse/worktrees/<slug>,
         //    matches the shared resolver / WorktreeCreate hook plan, and stays out of git status.
@@ -13104,9 +13372,10 @@ mod tests {
             }),
         );
         assert!(!err, "create failed: {created}");
-        let actual = std::path::PathBuf::from(created["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            created["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         let expected = canon_repo.join(".gitpulse/worktrees/feat-auth-lane");
         assert_eq!(actual, expected, "{created}");
         let resolved = crate::engine::worktree::resolve_worktree_path(
@@ -13145,9 +13414,10 @@ mod tests {
             }),
         );
         assert!(!err, "create from inside lane failed: {nested}");
-        let nested_actual = std::path::PathBuf::from(nested["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let nested_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            nested["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             nested_actual,
             canon_repo.join(".gitpulse/worktrees/feat-from-lane"),
@@ -13182,9 +13452,10 @@ mod tests {
             }),
         );
         assert!(!err, "sparse create failed: {sparse}");
-        let sparse_actual = std::path::PathBuf::from(sparse["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let sparse_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            sparse["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             sparse_actual,
             canon_repo.join(".gitpulse/worktrees/feat-sparse-lane"),
@@ -13202,9 +13473,10 @@ mod tests {
             }),
         );
         assert!(!err, "sibling create failed: {sibling}");
-        let sibling_actual = std::path::PathBuf::from(sibling["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let sibling_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            sibling["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         let sibling_expected = crate::engine::worktree::resolve_worktree_path(
             &canon_repo,
             "feat-sibling-opt",

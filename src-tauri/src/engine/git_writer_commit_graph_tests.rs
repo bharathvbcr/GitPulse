@@ -507,7 +507,11 @@ fn no_path_but_the_storage_panel_command_reaches_the_writer() {
     );
     let mut who: Vec<(String, String)> = found
         .into_iter()
-        .map(|(path, needle)| (path.rsplit("src/").next().unwrap().to_string(), needle))
+        .map(|(path, needle)| {
+            // The allow-list spells paths with `/`; Windows walks with `\`.
+            let path = path.replace('\\', "/");
+            (path.rsplit("src/").next().unwrap().to_string(), needle)
+        })
         .collect();
     who.sort();
     who.dedup();

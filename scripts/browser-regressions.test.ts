@@ -4,13 +4,45 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { BROWSER_HARNESSES, DEFAULT_DEADLINE_SECONDS, HARNESS_DEADLINE_SECONDS, chromeBinary, harnessDeadlineSeconds, readBrowserVerdict } from "./browser-regressions.mjs";
+import { BROWSER_HARNESSES, DEFAULT_DEADLINE_SECONDS, HARNESS_DEADLINE_SECONDS, chromeBinary, engineDisplayName, harnessDeadlineSeconds, nativeRunnerBinary, readBrowserVerdict, resolveEngine, waitForProcessClose } from "./browser-regressions.mjs";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 describe("browser regression gate", () => {
   it("keeps the native WebKit entrypoint aligned with every supported harness", () => {
     const native = readFileSync(new URL("./webkit-regressions.swift", import.meta.url), "utf8");
     const paths = [...native.matchAll(/"\/harness\/([^"/]+)\.html"/g)].map(match => match[1]);
     expect(paths.sort()).toEqual([...BROWSER_HARNESSES].sort());
+  });
+  it("keeps the cross-platform Rust tao/wry runner aligned with every supported harness", () => {
+    const runner = readFileSync(new URL("../src-tauri/examples/webview_regressions.rs", import.meta.url), "utf8");
+    const paths = [...runner.matchAll(/"\/harness\/([^"/]+)\.html"/g)].map(match => match[1]);
+    expect(paths.sort()).toEqual([...BROWSER_HARNESSES].sort());
+    expect(runner).toContain("http://127.0.0.1:");
+    expect(runner).toContain("1.0..=600.0");
+    expect(runner).toContain("msSmartScreenProtection");
+    expect(runner).toContain("create_dir_all");
+  });
+  it("selects the native shipping webview engine per OS and rejects conflicting selectors", () => {
+    expect(resolveEngine([], "linux")).toBe("chrome");
+    expect(resolveEngine(["--native"], "darwin")).toBe("webkit");
+    expect(resolveEngine(["--native"], "linux")).toBe("webview");
+    expect(resolveEngine(["--native"], "win32")).toBe("webview");
+    expect(resolveEngine(["--webview"], "darwin")).toBe("webview");
+    expect(resolveEngine(["--engine", "native"], "linux")).toBe("webview");
+    expect(resolveEngine(["--engine", "chrome"], "win32")).toBe("chrome");
+    expect(() => resolveEngine(["--webkit"], "linux")).toThrow(/requires macOS/);
+    expect(() => resolveEngine(["--webkit", "--native"], "darwin")).toThrow(/at most one/);
+    expect(() => resolveEngine(["--engine", "gecko"], "linux")).toThrow(/Unknown browser engine/);
+
+    expect(engineDisplayName("webview", "linux")).toBe("WebKitGTK");
+    expect(engineDisplayName("webview", "win32")).toBe("WebView2");
+    expect(engineDisplayName("webkit", "darwin")).toBe("WebKit");
+    expect(engineDisplayName("chrome", "linux")).toBe("Chrome");
+
+    expect(nativeRunnerBinary("linux", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "examples", "webview_regressions"));
+    expect(nativeRunnerBinary("win32", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "examples", "webview_regressions.exe"));
+    expect(nativeRunnerBinary("linux", { CARGO_TARGET_DIR: "/custom-target" }, "/repo")).toBe(path.join("/custom-target", "debug", "examples", "webview_regressions"));
+    expect(nativeRunnerBinary("linux", { GITPULSE_WEBVIEW_RUNNER_BIN: "/opt/bin/runner" }, "/repo")).toBe(path.resolve("/opt/bin/runner"));
   });
   it("gives a long page its own deadline and keeps the minute for every other page", () => {
     expect(harnessDeadlineSeconds("tasks")).toBe(300);
@@ -24,6 +56,38 @@ describe("browser regression gate", () => {
     const native = readFileSync(new URL("./webkit-regressions.swift", import.meta.url), "utf8");
     expect(native).toContain("withTimeInterval: deadline");
   });
+  it("does not hang on teardown when a grandchild keeps stderr open after the child exits", async () => {
+    let grandchildPid = 0;
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        `const { spawn } = require("node:child_process");
+         const g = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { stdio: ["ignore", "ignore", 2], detached: true });
+         g.unref();
+         process.stdout.write(String(g.pid));
+         process.exit(0);`,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    child.stdout?.on("data", (d: Buffer) => {
+      const n = Number(String(d).trim());
+      if (Number.isInteger(n) && n > 1) grandchildPid = n;
+    });
+    try {
+      // The hard cap sits above the budget, so returning on the cap (the hang
+      // this guards) cannot pass for returning on the child's exit.
+      const budget = wallClockBudget(1_500);
+      const t0 = Date.now();
+      await waitForProcessClose(child, 50, budget * 2);
+      expect(Date.now() - t0).toBeLessThan(budget);
+    } finally {
+      if (grandchildPid > 1) {
+        try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    }
+  });
+
   const html = (rows: unknown[]) => `<html data-gp-result="${encodeURIComponent(JSON.stringify({ results: rows }))}">`;
   it("requires an executed complete verdict", () => {
     expect(() => readBrowserVerdict("<html><pre>Running…</pre></html>")).toThrow();
@@ -56,6 +120,8 @@ describe("failure reporting a CI reader can see", () => {
     const { browserExitMessage } = await import("./browser-regressions.mjs");
     expect(browserExitMessage("WebKit", 3, "This Mac has Reduce Motion on, so ...\n"))
       .toBe("WebKit exited before the verdict (3): This Mac has Reduce Motion on, so ...");
+    expect(browserExitMessage("WebKitGTK", null, "", "SIGSEGV"))
+      .toBe("WebKitGTK exited before the verdict (signal SIGSEGV)");
     expect(browserExitMessage("Chrome", 1, "  \n")).toBe("Chrome exited before the verdict (1)");
   });
 

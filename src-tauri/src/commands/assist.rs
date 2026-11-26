@@ -55,7 +55,63 @@ pub async fn cmd_manvi_use(
         let status =
             crate::harness::manvi_use::write(&mode, model.as_deref(), base_url.as_deref())?;
         workbench.retire_worker();
+        crate::harness::steward::note_manvi_status(&status);
         Ok(status)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_manvi_steward_status(
+    repo_path: Option<String>,
+) -> Result<crate::harness::steward::ManviStewardStatus, IpcError> {
+    off_thread(move || {
+        Ok::<_, String>(crate::harness::steward::status(repo_path.as_deref()))
+            .map_err(CommandError::from)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_manvi_steward_save(
+    settings: crate::tool_config::ManviStewardSettings,
+    repo_path: Option<String>,
+) -> Result<crate::harness::steward::ManviStewardStatus, IpcError> {
+    off_thread(move || {
+        crate::harness::steward::save_settings(settings, repo_path.as_deref())
+            .map_err(CommandError::from)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_manvi_steward_set_repo(
+    repo_path: String,
+    override_policy: Option<crate::tool_config::RepoStewardOverride>,
+) -> Result<crate::harness::steward::ManviStewardStatus, IpcError> {
+    off_thread(move || {
+        crate::harness::steward::save_repo_override(&repo_path, override_policy)
+            .map_err(CommandError::from)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_manvi_steward_run_now(
+    repo_path: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+    watcher: State<'_, crate::watcher::WatcherState>,
+) -> Result<crate::harness::steward::ManviStewardStatus, IpcError> {
+    let workbench = workbench.inner().clone();
+    let watcher = watcher.inner().clone();
+    off_thread(move || {
+        crate::engine::process::with_admission(
+            crate::engine::process::Admission::Interactive,
+            || {
+                crate::harness::steward::run_now(repo_path.as_deref(), &workbench, Some(&watcher))
+                    .map_err(CommandError::from)
+            },
+        )
     })
     .await
 }

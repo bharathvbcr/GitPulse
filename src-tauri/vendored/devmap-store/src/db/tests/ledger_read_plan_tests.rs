@@ -295,13 +295,19 @@ fn every_keyed_read_returns_what_the_statement_it_replaced_returned() {
                     "{name} at generation {generation}, cap {cap}: the store's answer \
                      disagrees with the statement it replaced"
                 );
-                non_empty += oracle.values().filter(|(sites, _)| !sites.is_empty()).count();
+                non_empty += oracle
+                    .values()
+                    .filter(|(sites, _)| !sites.is_empty())
+                    .count();
                 truncated_somewhere += oracle.values().filter(|(_, cut)| *cut).count();
             }
         }
     }
     // A parity test over an empty or never-truncated answer proves nothing.
-    assert!(non_empty >= 40, "the fixture produced almost no rows: {non_empty}");
+    assert!(
+        non_empty >= 40,
+        "the fixture produced almost no rows: {non_empty}"
+    );
     assert!(
         truncated_somewhere >= 8,
         "the fixture never exercised the per-key cap: {truncated_somewhere}"
@@ -377,7 +383,8 @@ fn a_keyed_ledger_read_scans_the_ledger_once_and_not_per_key_and_label() {
             let first_loop = plan
                 .iter()
                 .find(|(_, level, detail)| {
-                    level == parent && (detail.starts_with("SCAN ") || detail.starts_with("SEARCH "))
+                    level == parent
+                        && (detail.starts_with("SCAN ") || detail.starts_with("SEARCH "))
                 })
                 .expect("the scan's own level has a loop");
             assert!(
@@ -387,5 +394,101 @@ fn a_keyed_ledger_read_scans_the_ledger_once_and_not_per_key_and_label() {
                 shown()
             );
         }
+    }
+}
+
+/// A key list is chunked, so a list past SQLite's variable limit is answered
+/// instead of failing to prepare, and a key in a later chunk is read exactly as
+/// it is in a short list. The sizes straddle the chunk size and the limit
+/// itself (32,766 variables, of which the statement spends a handful on the
+/// generation, the labels and the cap).
+#[test]
+fn a_key_list_longer_than_a_statement_can_bind_is_read_whole() {
+    let (store, [first, _]) = two_generations();
+    let wanted = ["hub", "ghost", "other"];
+    let reference = store
+        .unattributed_sites_naming(first, &strings(&wanted), 100)
+        .unwrap()
+        .unwrap();
+    let plain_reference = store
+        .unresolved_sites_naming(first, &strings(&wanted), 100)
+        .unwrap()
+        .unwrap();
+    assert!(
+        wanted
+            .iter()
+            .all(|name| !plain_reference[*name].0.is_empty()),
+        "premise: each wanted key has ledger rows"
+    );
+    for total in [
+        Store::MAX_CALLER_BATCH,
+        Store::MAX_CALLER_BATCH + 1,
+        32_766,
+        32_767,
+        40_000,
+    ] {
+        // `hub` first, `ghost` in a later chunk, `other` last, `hub` again
+        // across the chunk boundary, and filler between.
+        let mut keys = strings(&["hub"]);
+        keys.extend((0..total - 4).map(|n| format!("filler_{n}")));
+        keys.extend(strings(&["ghost", "hub", "other"]));
+        assert_eq!(keys.len(), total);
+        let answer = store
+            .unattributed_sites_naming(first, &keys, 100)
+            .unwrap_or_else(|e| panic!("{total} keys: {e}"))
+            .unwrap();
+        let plain = store
+            .unresolved_sites_naming(first, &keys, 100)
+            .unwrap_or_else(|e| panic!("{total} keys: {e}"))
+            .unwrap();
+        assert_eq!(
+            answer.len(),
+            total - 1,
+            "{total}: every distinct key is answered"
+        );
+        for name in wanted {
+            assert_eq!(answer[name], reference[name], "{total}: {name}");
+            assert_eq!(plain[name], plain_reference[name], "{total}: {name}");
+        }
+        assert!(answer["filler_0"].0.is_empty() && !answer["filler_0"].1);
+    }
+}
+
+/// A generation that is not retained is still `None`, however long the list.
+#[test]
+fn an_unretained_generation_is_none_for_a_long_key_list() {
+    let (store, _) = two_generations();
+    let keys: Vec<String> = (0..1_500).map(|n| format!("k{n}")).collect();
+    assert!(store
+        .unresolved_sites_naming(u32::MAX - 1, &keys, 10)
+        .unwrap()
+        .is_none());
+}
+
+/// No keys is an empty answer for a retained generation, and a list that is one
+/// key repeated past the chunk size is that key once, with its own rows once.
+#[test]
+fn an_empty_key_list_and_a_repeated_key_are_answered_once() {
+    let (store, [first, _]) = two_generations();
+    let none = store
+        .unresolved_sites_naming(first, &[], 100)
+        .unwrap()
+        .expect("a retained generation answers an empty list");
+    assert!(none.is_empty());
+    let reference = store
+        .unresolved_sites_naming(first, &strings(&["hub"]), 100)
+        .unwrap()
+        .unwrap();
+    for total in [Store::MAX_CALLER_BATCH, Store::MAX_CALLER_BATCH + 1, 1_500] {
+        let keys = vec!["hub".to_string(); total];
+        let answer = store
+            .unresolved_sites_naming(first, &keys, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.len(), 1, "{total}");
+        assert_eq!(
+            answer["hub"], reference["hub"],
+            "{total}: rows doubled or lost"
+        );
     }
 }

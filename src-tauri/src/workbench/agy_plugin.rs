@@ -41,18 +41,34 @@ const PLUGIN_JSON: &str = include_str!("../../../plugins/gitpulse/plugin.json");
 #[cfg(unix)]
 const HOOKS_JSON: &str = include_str!("../../../plugins/gitpulse/hooks.json");
 #[cfg(unix)]
-const SKILL_COLLISIONS: &str =
-    include_str!("../../../plugins/gitpulse/skills/gitpulse-collisions/SKILL.md");
+const SKILL_COLLISIONS: &str = include_str!("../../../plugins/gitpulse/skills/collisions/SKILL.md");
 #[cfg(unix)]
-const SKILL_INSIGHTS: &str =
-    include_str!("../../../plugins/gitpulse/skills/gitpulse-insights/SKILL.md");
+const SKILL_COMMIT_AND_MERGE: &str =
+    include_str!("../../../plugins/gitpulse/skills/commit-and-merge/SKILL.md");
 #[cfg(unix)]
-const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-load/SKILL.md");
+const SKILL_INSIGHTS: &str = include_str!("../../../plugins/gitpulse/skills/insights/SKILL.md");
 #[cfg(unix)]
-const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-tasks/SKILL.md");
+const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/load/SKILL.md");
 #[cfg(unix)]
-const SKILL_TERMINAL: &str =
-    include_str!("../../../plugins/gitpulse/skills/gitpulse-terminal/SKILL.md");
+const SKILL_MERGE_PRS: &str = include_str!("../../../plugins/gitpulse/skills/merge-prs/SKILL.md");
+#[cfg(unix)]
+const SKILL_MERGE_TRAIN: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/SKILL.md");
+#[cfg(unix)]
+const MERGE_TRAIN_FAILSET_GO_MOD: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/go.mod");
+#[cfg(unix)]
+const MERGE_TRAIN_FAILSET_MAIN: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/main.go");
+#[cfg(unix)]
+const MERGE_TRAIN_FAILSET_TEST: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/main_test.go");
+#[cfg(unix)]
+const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/tasks/SKILL.md");
+#[cfg(unix)]
+const SKILL_TERMINAL: &str = include_str!("../../../plugins/gitpulse/skills/terminal/SKILL.md");
+#[cfg(unix)]
+const SKILL_WRAP_UP: &str = include_str!("../../../plugins/gitpulse/skills/wrap-up/SKILL.md");
 
 /// Producer marker proving GitPulse created `~/.gemini/config/plugins/gitpulse`.
 #[cfg(unix)]
@@ -60,13 +76,43 @@ pub(crate) const PRODUCER_MARKER: &str = ".gitpulse-managed";
 #[cfg(unix)]
 const PRODUCER_MARKER_BODY: &str = "managed_by=gitpulse\nschema=agent-plugins-1.0.0\n";
 
+/// Antigravity runs a plugin's skill as a bare `/<skill-name>`, with no plugin
+/// namespace, so its copies keep this prefix (`/gitpulse-insights`). Hosts
+/// that namespace by plugin read `plugins/gitpulse/skills/<name>` as it is and
+/// show `gitpulse:insights`.
+pub(crate) const ANTIGRAVITY_SKILL_PREFIX: &str = "gitpulse-";
+
+/// Installed directory name, then the bundled `SKILL.md` it is written from.
 #[cfg(unix)]
-const SKILLS: [(&str, &str); 5] = [
+const SKILLS: [(&str, &str); 9] = [
     ("gitpulse-collisions", SKILL_COLLISIONS),
+    ("gitpulse-commit-and-merge", SKILL_COMMIT_AND_MERGE),
     ("gitpulse-insights", SKILL_INSIGHTS),
     ("gitpulse-load", SKILL_LOAD),
+    ("gitpulse-merge-prs", SKILL_MERGE_PRS),
+    ("gitpulse-merge-train", SKILL_MERGE_TRAIN),
     ("gitpulse-tasks", SKILL_TASKS),
     ("gitpulse-terminal", SKILL_TERMINAL),
+    ("gitpulse-wrap-up", SKILL_WRAP_UP),
+];
+
+#[cfg(unix)]
+const SKILL_SUBFILES: [(&str, &str, &str); 3] = [
+    (
+        "gitpulse-merge-train",
+        "failset/go.mod",
+        MERGE_TRAIN_FAILSET_GO_MOD,
+    ),
+    (
+        "gitpulse-merge-train",
+        "failset/main.go",
+        MERGE_TRAIN_FAILSET_MAIN,
+    ),
+    (
+        "gitpulse-merge-train",
+        "failset/main_test.go",
+        MERGE_TRAIN_FAILSET_TEST,
+    ),
 ];
 
 #[cfg(unix)]
@@ -255,11 +301,55 @@ fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
     }
 }
 
+/// What a skill is called where `provider` runs it: Antigravity has no plugin
+/// namespace, so it gets [`ANTIGRAVITY_SKILL_PREFIX`]; the other hosts
+/// qualify a plugin's skills by the plugin's name.
+pub(crate) fn skill_reference(provider: &str, skill: &str) -> String {
+    if provider == "agy" {
+        format!("{ANTIGRAVITY_SKILL_PREFIX}{skill}")
+    } else {
+        format!("gitpulse:{skill}")
+    }
+}
+
+/// The bundled `SKILL.md` as Antigravity's copy at `installed`: the frontmatter
+/// `name:` becomes the installed directory name, and every `gitpulse:<skill>`
+/// reference to a bundled skill becomes its Antigravity name, so the copy
+/// names skills the way Antigravity runs them.
+#[cfg(unix)]
+fn for_antigravity(installed: &str, body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 64);
+    let mut renamed = false;
+    for line in body.split_inclusive('\n') {
+        if !renamed && line.starts_with("name:") {
+            out.push_str("name: ");
+            out.push_str(installed);
+            out.push('\n');
+            renamed = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    for (other, _) in SKILLS {
+        if let Some(short) = other.strip_prefix(ANTIGRAVITY_SKILL_PREFIX) {
+            out = out.replace(&format!("gitpulse:{short}"), other);
+        }
+    }
+    out
+}
+
 #[cfg(unix)]
 fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
     let exists = verify_owned_or_absent(plugin_dir)?;
     if !exists {
         return Ok(());
+    }
+    for (skill_name, rel_path, _) in SKILL_SUBFILES {
+        let subfile = plugin_dir.join("skills").join(skill_name).join(rel_path);
+        let _ = std::fs::remove_file(&subfile);
+        if let Some(parent) = subfile.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
     for (skill_name, _) in SKILLS {
         let skill_dir = plugin_dir.join("skills").join(skill_name);
@@ -382,7 +472,21 @@ pub(crate) fn sync_under_home(
     for (skill_name, skill_body) in SKILLS {
         let skill_dir = skills_root.join(skill_name);
         ensure_non_symlink_dir(&skill_dir)?;
-        write_regular_file(&skill_dir.join("SKILL.md"), skill_body.as_bytes(), false)?;
+        write_regular_file(
+            &skill_dir.join("SKILL.md"),
+            for_antigravity(skill_name, skill_body).as_bytes(),
+            false,
+        )?;
+    }
+    for (skill_name, rel_path, contents) in SKILL_SUBFILES {
+        let skill_dir = skills_root.join(skill_name);
+        let subfile = skill_dir.join(rel_path);
+        if let Some(parent) = subfile.parent() {
+            if parent != skill_dir {
+                ensure_non_symlink_dir(parent)?;
+            }
+        }
+        write_regular_file(&subfile, contents.as_bytes(), false)?;
     }
 
     Ok(())
@@ -463,6 +567,48 @@ mod tests {
             .join("skills/gitpulse-terminal/SKILL.md")
             .is_file());
         assert!(plugin_dir.join("skills/gitpulse-load/SKILL.md").is_file());
+        assert!(plugin_dir
+            .join("skills/gitpulse-merge-train/SKILL.md")
+            .is_file());
+        assert!(plugin_dir
+            .join("skills/gitpulse-merge-train/failset/go.mod")
+            .is_file());
+        for landing in [
+            "gitpulse-commit-and-merge",
+            "gitpulse-merge-prs",
+            "gitpulse-wrap-up",
+        ] {
+            assert!(
+                plugin_dir
+                    .join("skills")
+                    .join(landing)
+                    .join("SKILL.md")
+                    .is_file(),
+                "{landing}"
+            );
+        }
+        // Antigravity has no plugin namespace: each copy is named for its
+        // directory and names its sibling skills the same way.
+        for (installed, _) in SKILLS {
+            let body =
+                std::fs::read_to_string(plugin_dir.join("skills").join(installed).join("SKILL.md"))
+                    .unwrap();
+            assert!(
+                installed.starts_with(ANTIGRAVITY_SKILL_PREFIX),
+                "{installed}"
+            );
+            assert!(
+                body.contains(&format!("\nname: {installed}\n")),
+                "{installed} frontmatter must carry its installed name"
+            );
+            for (other, _) in SKILLS {
+                let short = other.strip_prefix(ANTIGRAVITY_SKILL_PREFIX).unwrap();
+                assert!(
+                    !body.contains(&format!("gitpulse:{short}")),
+                    "{installed} names gitpulse:{short}, which Antigravity cannot run"
+                );
+            }
+        }
 
         let mcp_json: Value =
             serde_json::from_str(&std::fs::read_to_string(plugin_dir.join("mcp.json")).unwrap())
@@ -488,6 +634,32 @@ mod tests {
             brief_cmd.contains("bin/gitpulse-hook' --host=agy session-brief"),
             "unexpected hook command: {brief_cmd}"
         );
+        let session_inbox_cmd = hooks_json["gitpulse"]["SessionStart"][1]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            session_inbox_cmd.contains("bin/gitpulse-hook' --host=agy peer-inbox"),
+            "missing SessionStart peer-inbox: {session_inbox_cmd}"
+        );
+        assert_eq!(hooks_json["gitpulse"]["PostToolUse"][0]["matcher"], "*");
+        assert!(
+            hooks_json["gitpulse"]["PostToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("bin/gitpulse-hook' --host=agy notify tool_finished")
+        );
+        assert!(hooks_json["gitpulse"]["PreInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("bin/gitpulse-hook' --host=agy peer-inbox"));
+        assert!(hooks_json["gitpulse"]["PostInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("bin/gitpulse-hook' --host=agy peer-inbox"));
+        assert!(hooks_json["gitpulse"]["Stop"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("bin/gitpulse-hook' --host=agy stop-or-notify"));
 
         // If `agy` is installed on the host, run `agy plugin validate --strict --json`.
         use crate::procguard::LockedSpawn;
@@ -530,5 +702,36 @@ mod tests {
         assert!(sync_under_home(&home, true, Some(&mcp), Some(&hook)).is_err());
         assert!(sync_under_home(&home, false, None, None).is_err());
         assert_eq!(std::fs::read_to_string(&custom_file).unwrap(), "user-owned");
+    }
+
+    #[test]
+    fn antigravity_plugin_hooks_match_gitpulse_agy_lifecycle_and_subcommands() {
+        let embedded: Value = serde_json::from_str(HOOKS_JSON).unwrap();
+        let agy_ref: Value =
+            serde_json::from_str(include_str!("../../../plugins/gitpulse-agy/hooks.json")).unwrap();
+
+        let extract = |root: &Value| -> Vec<(String, String, String)> {
+            let mut out = Vec::new();
+            for (event, entries) in root["gitpulse"].as_object().unwrap() {
+                for entry in entries.as_array().unwrap() {
+                    if let Some(nested) = entry.get("hooks").and_then(Value::as_array) {
+                        let matcher = entry["matcher"].as_str().unwrap_or_default().to_owned();
+                        for h in nested {
+                            let cmd = h["command"].as_str().unwrap();
+                            let norm = cmd.replace(" --host=agy ", " ");
+                            out.push((event.clone(), matcher.clone(), norm));
+                        }
+                    } else {
+                        let cmd = entry["command"].as_str().unwrap();
+                        let norm = cmd.replace(" --host=agy ", " ");
+                        out.push((event.clone(), String::new(), norm));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+
+        assert_eq!(extract(&embedded), extract(&agy_ref));
     }
 }

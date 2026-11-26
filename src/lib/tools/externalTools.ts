@@ -258,10 +258,15 @@ export type MapFailureMode = "no_cli" | "no_sqlite_store" | "no_json_artifact" |
  */
 export function classifyMapFailure(input: {
   cliAvailable: boolean | null;
+  /**
+   * The status probe was deferred under load (`DevmapCliStatus.deferral`): it
+   * did not run, so the tool is not known to be absent.
+   */
+  cliDeferred?: boolean;
   mapAvailable: boolean | null;
   mapFailure?: RepoMapFailure | null;
 }): MapFailureMode {
-  if (input.cliAvailable === false) return "no_cli";
+  if (input.cliAvailable === false && input.cliDeferred !== true) return "no_cli";
   if (input.mapAvailable !== false) return "other";
   switch (input.mapFailure) {
     case "no_sqlite_store":

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>GitPulse E2E · Status Popover</title>
+    <style>
+      html, body { margin: 0; min-height: 100%; }
+      .status-popover { width: 360px; margin: 16px auto; }
+      #verdict { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 10px; max-width: 720px; margin: 0 auto; }
+    </style>
+  </head>
+  <body>
+    <div class="status-popover" id="stage"></div>
+    <pre id="verdict">Loading…</pre>
+    <script type="module" src="/tests/e2e-r1-r4/browser/status-popover.ts"></script>
+  </body>
+</html>

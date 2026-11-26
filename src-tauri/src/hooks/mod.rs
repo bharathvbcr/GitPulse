@@ -200,7 +200,14 @@ pub fn read_for(
     argument: Option<&str>,
     reader: impl std::io::Read + Send + 'static,
 ) -> Result<HookInput, String> {
-    if matches!(subcommand, "peer-inbox" | "stop-or-notify") {
+    if subcommand == "stop-or-notify" {
+        return notify_input::read_stop_notify_input_within(
+            reader,
+            notify_input::MAX_READ_BYTES,
+            PEER_INBOX_BUDGET,
+        );
+    }
+    if subcommand == "peer-inbox" {
         return notify_input::read_notify_input_within(
             reader,
             notify_input::MAX_READ_BYTES,
@@ -304,6 +311,10 @@ pub struct HookInput {
     /// host routed through — the argument `notify` is given — and this is only
     /// what the banner adds after it.
     pub message: String,
+    /// `Notification` title, when the host provides one.
+    pub title: String,
+    /// `Notification` type (`permission_prompt`, `idle_prompt`, ...), when provided.
+    pub notification_type: String,
     /// Which tool call a `PermissionRequest` or `PostToolUse` is about, as a
     /// digest of `tool_name` and `tool_input`. Empty without a tool. The same
     /// call digests the same way in both events, which is how the result of
@@ -317,10 +328,12 @@ pub struct HookInput {
     pub incoming: Option<insights::IncomingEdit>,
     /// Set inside a subagent (`agent_id`).
     pub agent_id: String,
-    /// `Stop`'s `last_assistant_message`: what the agent ended its turn on.
+    /// `Stop`'s `last_assistant_message` or Antigravity `finalModelOutput`.
     pub last_assistant_message: String,
-    /// `StopFailure`'s `error`: `rate_limit`, `overloaded`, ….
+    /// `StopFailure`'s `error` (or Antigravity `Stop`'s `error`): `rate_limit`, `overloaded`, ….
     pub error: String,
+    /// `StopFailure`'s `error_details`, when provided.
+    pub error_details: String,
     /// The host's id for one tool call (`tool_use_id` or `toolCall.id`). Two
     /// copies of this hook judging the same call see the same id ([`advisory_once`]).
     pub tool_use_id: String,
@@ -339,6 +352,8 @@ pub struct HookInput {
     pub termination_reason: String,
     /// Antigravity `Stop` payload's `fullyIdle` flag (`true` when quiescent).
     pub fully_idle: Option<bool>,
+    /// Antigravity `Stop` payload's `continuationActive` flag (`true` when continuing).
+    pub continuation_active: bool,
     /// Antigravity `PreInvocation`'s 1-based step index within the current turn.
     pub invocation_num: Option<u64>,
     /// Transcript path (`transcript_path` or Antigravity `transcriptPath`), when provided.
@@ -363,7 +378,7 @@ fn antigravity_event_for(subcommand: &str) -> &'static str {
     match subcommand {
         "collision-guard" | "command-gate" => PRE_TOOL_USE,
         "session-brief" => SESSION_START,
-        "deliver" => "Stop",
+        "deliver" | "stop-or-notify" => "Stop",
         _ => "",
     }
 }
@@ -428,9 +443,10 @@ impl HookInput {
             string_at(tool_args, "CommandLine"),
             string_at(tool_args, "command"),
         ]);
-        let message = first_non_empty([
-            string_at(Some(value), "message"),
-            string_at(Some(value), "lastUserInput"),
+        let message = string_at(Some(value), "message");
+        let last_assistant_message = first_non_empty([
+            string_at(Some(value), "last_assistant_message"),
+            string_at(Some(value), "finalModelOutput"),
         ]);
         let tool_use_id = first_non_empty([
             string_at(Some(value), "tool_use_id"),
@@ -454,11 +470,14 @@ impl HookInput {
             is_agy: host == HostKind::Antigravity,
             artifact_dir: string_at(Some(value), "artifactDirectoryPath"),
             message,
+            title: string_at(Some(value), "title"),
+            notification_type: string_at(Some(value), "notification_type"),
             tool_subject: tool_subject(value),
             tool_summary: tool_summary(value),
             agent_id: string_at(Some(value), "agent_id"),
-            last_assistant_message: string_at(Some(value), "last_assistant_message"),
+            last_assistant_message,
             error: string_at(Some(value), "error"),
+            error_details: string_at(Some(value), "error_details"),
             tool_use_id,
             // Claude spells it `permission_mode`; Grok, whose `--permission-mode`
             // takes the same values, writes camelCase payload fields.
@@ -468,6 +487,8 @@ impl HookInput {
             stop_hook_active: value.get("stop_hook_active").and_then(Value::as_bool) == Some(true),
             termination_reason: string_at(Some(value), "terminationReason"),
             fully_idle: value.get("fullyIdle").and_then(Value::as_bool),
+            continuation_active: value.get("continuationActive").and_then(Value::as_bool)
+                == Some(true),
             invocation_num: value.get("invocationNum").and_then(Value::as_u64),
             transcript_path,
             worktree_name: string_at(Some(value), "name"),
@@ -631,11 +652,16 @@ fn tool_summary(value: &Value) -> String {
         "file_path",
         "Path",
         "TargetFile",
+        "AbsolutePath",
+        "DirectoryPath",
+        "SearchDirectory",
         "notebook_path",
-        "Path",
         "url",
+        "Url",
         "pattern",
+        "Pattern",
         "query",
+        "Query",
         "description",
         "prompt",
     ]
@@ -2195,7 +2221,12 @@ fn command_gate_call(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
-    command_gate_call_with(input, run, || load_gate::gather_live(&input.cwd))
+    command_gate_call_with_steward(
+        input,
+        run,
+        || load_gate::gather_live(&input.cwd),
+        || load_gate::live_steward_throttle(&input.cwd),
+    )
 }
 
 /// [`command_gate_call`] with what the load stage reads from the world
@@ -2207,16 +2238,26 @@ fn command_gate_call(
 /// [`signal_guard::combine`] keeps its first argument's decision, which an
 /// advice-only answer must not displace. Bypass mode does not waive it (see
 /// `load_gate`).
+#[cfg(test)]
 fn command_gate_call_with(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
     gather: impl FnOnce() -> load_gate::Gathered,
 ) -> HookOutput {
+    command_gate_call_with_steward(input, run, gather, || None)
+}
+
+fn command_gate_call_with_steward(
+    input: &HookInput,
+    run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
+    gather: impl FnOnce() -> load_gate::Gathered,
+    unclassified_steward: impl FnOnce() -> Option<crate::harness::steward::ActiveThrottleRecord>,
+) -> HookOutput {
     let guard = under_bypass(input, signal_guard::run(input));
     if signal_guard::refuses(&guard) {
         return guard;
     }
-    let load = load_gate::judge(input, gather);
+    let load = load_gate::judge_with_steward(input, gather, unclassified_steward);
     let gate = command_gate_with(input, run);
     load_gate::fold(signal_guard::combine(guard, gate), load)
 }
@@ -3421,6 +3462,12 @@ fn scratch_build_line(checkout: &str) -> String {
     )
 }
 
+/// Where GitPulse's tools answer when the session's MCP connection does not:
+/// the same binary, one request per command. Only a brief can say this — a
+/// server that never loaded produces no failure for any later hook to see.
+/// Under the header with the scratch line, so the cap never cuts it.
+pub const SHELL_FALLBACK_LINE: &str = "MCP tools missing or failing: gitpulse-mcp call <tool> key=value answers from the shell (gitpulse-mcp tools lists them; a write needs --write)";
+
 /// [`session_brief`] with two more lines right under the header, so they are
 /// never the part [`BRIEF_LIMIT`] cuts: what the published host-load snapshot
 /// says (`load_gate::brief_line_live`), and the running app's fact source and
@@ -3450,6 +3497,8 @@ fn session_brief_with(
         out.push_str(&format!("served by: app (age {age_ms} ms)\n"));
     }
     out.push_str(&scratch_build_line(here));
+    out.push('\n');
+    out.push_str(SHELL_FALLBACK_LINE);
     out.push('\n');
     // Printed first because it qualifies everything under it: past the
     // snapshot deadline the expensive stages stop, and the facets they would
@@ -3955,7 +4004,7 @@ pub fn dispatch(
         "collision-guard" => Ok(run_collision_guard(input)),
         "command-gate" => Ok(run_command_gate(input)),
         "session-brief" => Ok(run_session_brief(input)),
-        "notify" => run_notify(argument, input, notify_send),
+        "notify" => run_notify(argument, input, notify_send, notify_outcome::TRANSPORT_AVAILABLE),
         "deliver" => deliver::run(input),
         "peer-inbox" => Ok(run_peer_inbox(input)),
         "stop-or-notify" => run_stop_or_notify(input),
@@ -4103,16 +4152,21 @@ fn trusted_hook_root(input: &HookInput) -> Option<PathBuf> {
         .filter(|root| crate::repository_trust::require(root).is_ok())
 }
 
+fn is_fresh_untrusted_turn(input: &HookInput) -> bool {
+    match input.hook_event_name.as_str() {
+        "SessionStart" | "UserPromptSubmit" => true,
+        "PreInvocation" => input.invocation_num.unwrap_or(1) <= 1,
+        _ => false,
+    }
+}
+
 /// Advances per-turn epoch and continuation state on hook boundaries, returning
 /// `true` iff this event begins a fresh user turn (so `prompt_submitted` does
 /// not clear `dirtyPrompt` on mid-turn `PreInvocation(invocationNum > 1)` or
 /// `Stop:continue` continuations).
 fn advance_turn_boundary(mailbox: &crate::agent_mailbox::Mailbox, input: &HookInput) -> bool {
     if crate::agent_mailbox::session_key(&input.session_id).is_err() {
-        return matches!(
-            input.hook_event_name.as_str(),
-            "SessionStart" | "UserPromptSubmit"
-        );
+        return is_fresh_untrusted_turn(input);
     }
     match input.hook_event_name.as_str() {
         "SessionStart" => {
@@ -4176,19 +4230,33 @@ fn deliver_within(
 }
 
 fn peer_inbox_in_default(input: &HookInput) -> Option<PeerInboxReady> {
-    trusted_hook_root(input)?;
-    let mailbox = crate::agent_mailbox::Mailbox::at_default().ok()?;
-    let (ready, fresh_user_turn) = peer_inbox_prepare(&mailbox, input, &|| {});
-    if input.is_antigravity() && session_env().is_some() && fresh_user_turn {
-        let mut active = input.clone();
-        active.fully_idle = Some(false);
+    peer_inbox_in_default_with(input, |active| {
         let _ = run_notify_within(
             Some("prompt_submitted"),
-            &active,
+            active,
             notify_send,
             &notify_drops::PROCESS_DROPS,
             Some(Duration::from_millis(300)),
+            notify_outcome::TRANSPORT_AVAILABLE,
         );
+    })
+}
+
+fn peer_inbox_in_default_with(
+    input: &HookInput,
+    notify_prompt: impl FnOnce(&HookInput),
+) -> Option<PeerInboxReady> {
+    let (ready, fresh_user_turn) = match (
+        trusted_hook_root(input),
+        crate::agent_mailbox::Mailbox::at_default(),
+    ) {
+        (Some(_), Ok(mailbox)) => peer_inbox_prepare(&mailbox, input, &|| {}),
+        _ => (None, is_fresh_untrusted_turn(input)),
+    };
+    if input.is_antigravity() && session_env().is_some() && fresh_user_turn {
+        let mut active = input.clone();
+        active.fully_idle = Some(false);
+        notify_prompt(&active);
     }
     ready
 }
@@ -4362,25 +4430,58 @@ fn peer_inbox_commit(input: &HookInput, ready: PeerInboxReady) -> HookOutput {
     }
 }
 
+fn stop_notify_target(input: &HookInput) -> (&'static str, HookInput) {
+    let mut out = input.clone();
+    match input.termination_reason.as_str() {
+        "USER_CANCELED" => {
+            out.error.clear();
+            out.error_details.clear();
+            if out.last_assistant_message.trim().is_empty() && out.message.trim().is_empty() {
+                out.message = "Canceled by user".to_owned();
+            }
+            ("turn_finished", out)
+        }
+        "ERROR" | "MAX_TOKEN_BUDGET_EXCEEDED" => {
+            if out.error.trim().is_empty()
+                && out.error_details.trim().is_empty()
+                && out.message.trim().is_empty()
+            {
+                out.error = if input.termination_reason == "MAX_TOKEN_BUDGET_EXCEEDED" {
+                    "Token budget exceeded".to_owned()
+                } else {
+                    "Stopped on error".to_owned()
+                };
+            }
+            ("error", out)
+        }
+        _ if !input.error.trim().is_empty() || !input.error_details.trim().is_empty() => {
+            ("error", out)
+        }
+        _ => ("turn_finished", out),
+    }
+}
+
 /// Antigravity `Stop` handler: checks the narrow window between `PostInvocation`
 /// and `Stop` when `terminationReason == "NO_TOOL_CALL"` (continuing up to
 /// `MAX_CONTINUATIONS`), and otherwise marks the peer idle + reports
-/// `turn_finished` with `fully_idle` and `provider_session_id`.
+/// `turn_finished` (or `error` on failure terminations) with `fully_idle` and
+/// `provider_session_id`.
 pub fn run_stop_or_notify(input: &HookInput) -> Result<HookOutput, HookError> {
-    if trusted_hook_root(input).is_none() {
-        return Ok(HookOutput::silent());
-    }
-    if let Ok(mailbox) = crate::agent_mailbox::Mailbox::at_default() {
-        if let Some(cont) = stop_continue_in(&mailbox, input) {
-            return Ok(cont);
+    if trusted_hook_root(input).is_some() {
+        if let Ok(mailbox) = crate::agent_mailbox::Mailbox::at_default() {
+            if let Some(cont) = stop_continue_in(&mailbox, input) {
+                return Ok(cont);
+            }
         }
     }
+    let (event, notify_input) = stop_notify_target(input);
     run_notify_within(
-        Some("turn_finished"),
-        input,
+        Some(event),
+        &notify_input,
         notify_send,
         &notify_drops::PROCESS_DROPS,
         Some(Duration::from_millis(800)),
+        notify_outcome::TRANSPORT_AVAILABLE,
     )
 }
 
@@ -4502,6 +4603,7 @@ fn run_notify(
     argument: Option<&str>,
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
+    transport_available: bool,
 ) -> Result<HookOutput, HookError> {
     // A Claude Code `Stop` arrives here as `notify turn_finished`, and never
     // reaches `stop_continue_in` (Antigravity's stop path, which marks the peer
@@ -4511,7 +4613,14 @@ fn run_notify(
             let _ = upsert_hook_peer(&root, input, "idle");
         }
     }
-    let out = run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None);
+    let out = run_notify_within(
+        argument,
+        input,
+        send,
+        &notify_drops::PROCESS_DROPS,
+        None,
+        transport_available,
+    );
     if argument == Some("tool_finished") {
         report_agent_touched_file(input);
     }
@@ -4523,12 +4632,21 @@ fn run_notify(
 /// budget for the event ([`notify_input::budgets_for`]); a test passes a few
 /// milliseconds and a send that waits on a channel, so the give-up path runs
 /// without the suite sitting out a real deadline.
+///
+/// `transport_available` travels with `send` because it is a fact about the
+/// sender. Production passes [`notify_outcome::TRANSPORT_AVAILABLE`] beside
+/// `notify_send` (the platform's socket); a test that injects its own closure
+/// passes `INJECTED_TRANSPORT` (test-only), because that closure *is* a transport on
+/// every platform. Taking the platform constant here instead made every
+/// injected-sender test on Windows answer "unsupported" before reaching the
+/// closure it was written to observe.
 fn run_notify_within(
     argument: Option<&str>,
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
     drops: &NotifyDrops,
     send_budget: Option<Duration>,
+    transport_available: bool,
 ) -> Result<HookOutput, HookError> {
     run_notify_with(
         argument,
@@ -4536,10 +4654,17 @@ fn run_notify_within(
         send,
         drops,
         send_budget,
-        notify_outcome::TRANSPORT_AVAILABLE,
+        transport_available,
         socket_path_from_env,
     )
 }
+
+/// The transport a test's injected sender provides: the closure itself, which
+/// exists on every platform, so it is always available. Passed beside an
+/// injected `send` to [`run_notify`] / [`run_notify_within`]; production passes
+/// [`notify_outcome::TRANSPORT_AVAILABLE`] beside `notify_send` instead.
+#[cfg(test)]
+const INJECTED_TRANSPORT: bool = true;
 
 /// The socket a report goes to: `GITPULSE_NOTIFY_SOCKET` when set, else the
 /// one in GitPulse's configuration directory (`None` with no such directory).
@@ -4825,6 +4950,10 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
             json!(input.session_id.to_ascii_lowercase()),
         );
     }
+    let hook_event = one_bounded_line(&input.hook_event_name, 64);
+    if !hook_event.is_empty() {
+        report.insert("hook_event".into(), json!(hook_event));
+    }
     // What is left once the fixed fields are in: the place and the message
     // share it, the place first because it names the session and the message
     // is the part that can be cut.
@@ -4841,15 +4970,35 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
     }
     // What the agent said with it: the host's notification text, or for an
     // event that has none, the field that says the same thing.
-    let message = [
-        input.message.as_str(),
-        input.tool_summary.as_str(),
-        input.last_assistant_message.as_str(),
-        input.error.as_str(),
-    ]
-    .into_iter()
-    .find(|text| !text.trim().is_empty())
-    .unwrap_or_default();
+    let error_detail = match (input.error.trim(), input.error_details.trim()) {
+        ("", "") => String::new(),
+        (err, "") => err.to_owned(),
+        ("", details) => details.to_owned(),
+        (err, details) if err == details => err.to_owned(),
+        (err, details) => format!("{err}: {details}"),
+    };
+    let message = if event.name == "error" {
+        [
+            error_detail.as_str(),
+            input.message.as_str(),
+            input.title.as_str(),
+            input.last_assistant_message.as_str(),
+        ]
+        .into_iter()
+        .find(|text| !text.trim().is_empty())
+        .unwrap_or_default()
+    } else {
+        [
+            input.message.as_str(),
+            input.title.as_str(),
+            input.tool_summary.as_str(),
+            input.last_assistant_message.as_str(),
+            error_detail.as_str(),
+        ]
+        .into_iter()
+        .find(|text| !text.trim().is_empty())
+        .unwrap_or_default()
+    };
     // A resolution says nothing the board shows.
     if !message.is_empty() && event.role != crate::alerts::bridge::Role::Resolve {
         // `,"message":""` is what the key costs around the text.
@@ -7175,19 +7324,29 @@ done
         collision_guard_with(input, BUDGET, |job| Some(job()))
     }
 
-    /// Where each directory's spawn log stood, to count only what follows.
+    /// Where each directory's spawn log and in-process status log stood, to
+    /// count only what follows.
     #[cfg(unix)]
-    fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<usize> {
+    fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<(usize, usize)> {
         dirs.iter()
-            .map(|dir| crate::engine::process::spawn_log::spawns_in(dir).len())
+            .map(|dir| {
+                (
+                    crate::engine::process::spawn_log::spawns_in(dir).len(),
+                    crate::engine::worktree::status_reads::in_dir(dir).len(),
+                )
+            })
             .collect()
     }
 
-    /// Git children one burst of guarded edits started, by what they ran.
+    /// Git reads one burst of guarded edits made, by what they ran.
     #[cfg(unix)]
     #[derive(Debug)]
     struct SpawnCost {
         worktree_list: usize,
+        /// Status reads by either backend: a `git status` child, or an
+        /// unfiltered read made in-process by `gix` (no child, so the spawn
+        /// log alone would count it as nothing). A read that fell back to git
+        /// is counted once, by its child.
         status: usize,
         /// Everything else: the symbol check's `ls-files`, `rev-parse`, `diff`.
         other: usize,
@@ -7200,23 +7359,31 @@ done
         }
     }
 
-    /// Git children started in `dirs` since `marks`.
+    /// Git children started, and in-process status reads made, in `dirs`
+    /// since `marks`.
     #[cfg(unix)]
-    fn spawn_cost(dirs: &[std::path::PathBuf], marks: &[usize]) -> SpawnCost {
+    fn spawn_cost(dirs: &[std::path::PathBuf], marks: &[(usize, usize)]) -> SpawnCost {
+        use crate::engine::worktree::status_reads::{self, StatusBackend};
         let argvs: Vec<Vec<String>> = dirs
             .iter()
             .zip(marks)
-            .flat_map(|(dir, mark)| {
+            .flat_map(|(dir, (mark, _))| {
                 crate::engine::process::spawn_log::spawns_in(dir)[*mark..].to_vec()
             })
             .collect();
+        let in_process = dirs
+            .iter()
+            .zip(marks)
+            .flat_map(|(dir, (_, mark))| status_reads::in_dir(dir)[*mark..].to_vec())
+            .filter(|(backend, _)| *backend == StatusBackend::Gix)
+            .count();
         let has = |argv: &[String], word: &str| argv.iter().any(|arg| arg == word);
         let worktree_list = argvs.iter().filter(|a| has(a, "worktree")).count();
-        let status = argvs.iter().filter(|a| has(a, "status")).count();
+        let status_children = argvs.iter().filter(|a| has(a, "status")).count();
         SpawnCost {
             worktree_list,
-            status,
-            other: argvs.len() - worktree_list - status,
+            status: status_children + in_process,
+            other: argvs.len() - worktree_list - status_children,
         }
     }
 
@@ -7664,24 +7831,26 @@ done
         );
     }
 
-    /// S3-09. With 40 overlapping files, the repo-wide items cap cuts at 32
-    /// (`truncated: true`), while asking the hook about the 40th file still
-    /// returns `Ask`.
+    /// S3-09. With more overlapping files than `MAX_COLLISION_ITEMS`, the
+    /// repo-wide items cap cuts (`truncated: true`), while asking the hook
+    /// about the last file still returns `Ask`.
     #[cfg(unix)]
     #[test]
     fn forty_overlapping_files_still_ask_for_the_fortieth_in_the_hook() {
+        let total = insights::MAX_COLLISION_ITEMS + 8;
+        let last = format!("f{:03}.txt", total - 1);
         let farm = farm_bound(false, false, 1);
-        for n in 0..40usize {
-            let name = format!("f{n:02}.txt");
+        for n in 0..total {
+            let name = format!("f{n:03}.txt");
             std::fs::write(Path::new(&farm.repo).join(&name), format!("here {n}\n")).unwrap();
             std::fs::write(farm.sibling_dirs[0].join(&name), format!("there {n}\n")).unwrap();
         }
         let risk = insights::collision_risk(&farm.repo);
         assert!(risk.ok, "{}", risk.error);
-        assert_eq!(risk.items.len(), 32);
+        assert_eq!(risk.items.len(), insights::MAX_COLLISION_ITEMS);
         assert!(risk.truncated);
 
-        let output = guard_here(&edit_call(&farm.repo, &format!("{}/f39.txt", farm.repo)));
+        let output = guard_here(&edit_call(&farm.repo, &format!("{}/{last}", farm.repo)));
         assert!(asks(&output), "{:?}", output.render());
         assert!(
             reason_of(&output).contains("sibling-0"),
@@ -7815,14 +7984,15 @@ done
     }
 
     /// The scan cap does apply to the path-limited read: at most
-    /// `MAX_COLLISION_SCANS` (16) worktrees get their status read, the rest are
+    /// `MAX_COLLISION_SCANS` worktrees get their status read, the rest are
     /// counted unscanned and the answer says so. A holder in the unread tail is
     /// therefore reported as a partial scan, not as a finding, and never as
     /// silence; a holder inside the cap is a finding.
     #[cfg(unix)]
     #[test]
     fn the_scan_cap_leaves_a_tail_unread_and_says_so() {
-        let farm = farm_bound(false, false, 18);
+        let siblings = insights::MAX_COLLISION_SCANS + 2;
+        let farm = farm_bound(false, false, siblings);
         let held = |n: usize| {
             std::fs::write(farm.sibling_dirs[n].join("seed.txt"), "theirs").unwrap();
             let output = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
@@ -7832,10 +8002,17 @@ done
         let inside = held(2);
         assert!(asks(&inside), "{:?}", inside.render());
         let risk = insights::scan_holders_of_path(&farm.repo, "seed.txt", None);
-        assert_eq!(risk.scanned_worktrees, 16, "{risk:?}");
         assert_eq!(
-            risk.unscanned_worktrees, 3,
-            "19 worktrees, 16 reads: {risk:?}"
+            risk.scanned_worktrees,
+            insights::MAX_COLLISION_SCANS as u32,
+            "{risk:?}"
+        );
+        assert_eq!(
+            risk.unscanned_worktrees,
+            3,
+            "{} worktrees, {} reads: {risk:?}",
+            siblings + 1,
+            insights::MAX_COLLISION_SCANS
         );
         assert!(risk.truncated);
         // The last worktree in git's listing order is one of the three unread.
@@ -9358,6 +9535,31 @@ done
         assert!(cut.contains(".gitpulse/scratch/target-"), "{cut}");
     }
 
+    /// An agent whose MCP connection never loaded learns the shell path from
+    /// the brief and nowhere else, so the line survives the cap, once.
+    #[test]
+    fn the_brief_names_the_shell_fallback_once_even_when_the_cap_cuts() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.worktrees.items = (0..400)
+            .map(|i| WorktreeSummary {
+                path: format!("/repo/wt/{i}"),
+                name: format!("worktree-with-a-long-name-{i}"),
+                branch: Some(format!("branch/{i}")),
+                dirty_files: Some(9),
+                ..Default::default()
+            })
+            .collect();
+        let cut = session_brief(&snapshot, "/repo", "startup");
+        assert!(cut.ends_with("… truncated"));
+        assert_eq!(
+            cut.lines().filter(|l| *l == SHELL_FALLBACK_LINE).count(),
+            1,
+            "{cut}"
+        );
+        assert!(SHELL_FALLBACK_LINE.contains("gitpulse-mcp call <tool>"));
+        assert!(SHELL_FALLBACK_LINE.len() < 160);
+    }
+
     #[test]
     fn the_brief_is_capped_and_says_so_when_it_cuts() {
         let mut snapshot = snapshot_fixture();
@@ -9992,10 +10194,15 @@ done
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = seen.clone();
-        let result = run_notify(Some(event), input, move |_, payload| {
-            *sink.lock().unwrap() = Some(payload.to_owned());
-            Ok(())
-        });
+        let result = run_notify(
+            Some(event),
+            input,
+            move |_, payload| {
+                *sink.lock().unwrap() = Some(payload.to_owned());
+                Ok(())
+            },
+            INJECTED_TRANSPORT,
+        );
         (result, seen)
     }
 
@@ -10092,15 +10299,18 @@ done
         // The failure this catches is a plugin manifest updated without the
         // binary, which otherwise presents as "notifications stopped working".
         for event in ["", "Notification", "permission-prompt", "agent_completed "] {
-            let result = run_notify(Some(event), &notify_input(), |_, _| {
-                panic!("an unknown event reached the socket")
-            });
+            let result = run_notify(
+                Some(event),
+                &notify_input(),
+                |_, _| panic!("an unknown event reached the socket"),
+                INJECTED_TRANSPORT,
+            );
             let error = result
                 .expect_err(&format!("{event:?} was accepted"))
                 .to_string();
             assert!(error.contains("unknown notify event"), "{error}");
         }
-        assert!(run_notify(None, &notify_input(), |_, _| Ok(())).is_err());
+        assert!(run_notify(None, &notify_input(), |_, _| Ok(()), INJECTED_TRANSPORT).is_err());
     }
 
     #[test]
@@ -10145,10 +10355,15 @@ done
             dir.path().join("hook.sock"),
         );
         let started = std::time::Instant::now();
-        let error = run_notify(Some("idle_prompt"), &notify_input(), |_, _| {
-            thread::sleep(Duration::from_secs(30));
-            Ok(())
-        })
+        let error = run_notify(
+            Some("idle_prompt"),
+            &notify_input(),
+            |_, _| {
+                thread::sleep(Duration::from_secs(30));
+                Ok(())
+            },
+            INJECTED_TRANSPORT,
+        )
         .expect_err("a hung socket must not report success")
         .to_string();
         assert!(error.contains("deadline"), "{error}");
@@ -10187,6 +10402,7 @@ done
             },
             &drops,
             Some(Duration::from_millis(20)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("a reply that never came must not report success");
         assert!(error.to_string().contains("deadline"), "{error}");
@@ -10217,6 +10433,7 @@ done
             |_, _| Ok(()),
             &drops,
             in_time,
+            INJECTED_TRANSPORT,
         );
         assert!(delivered.expect("delivered").is_silent());
         let refused = run_notify_within(
@@ -10225,6 +10442,7 @@ done
             |_, _| Err(SendError::Failed("refused".into())),
             &drops,
             in_time,
+            INJECTED_TRANSPORT,
         )
         .expect_err("a refusal is an error");
         assert!(matches!(refused, HookError::Failed(_)), "{refused:?}");
@@ -10234,6 +10452,7 @@ done
             |_, _| Err(SendError::Unsupported),
             &drops,
             in_time,
+            INJECTED_TRANSPORT,
         )
         .expect_err("an absent transport is not a delivery");
         assert!(
@@ -10259,6 +10478,7 @@ done
             |_, _| Err(SendError::NoReply),
             &drops,
             Some(Duration::from_secs(30)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("no reply is not a delivery");
         assert!(error.to_string().contains("got no reply"), "{error}");
@@ -10273,6 +10493,7 @@ done
             },
             &drops,
             Some(Duration::from_millis(20)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("a reply past the outer budget is not a delivery");
         assert_eq!(drops.snapshot().dropped, 2);
@@ -10295,6 +10516,7 @@ done
             |_, _| panic!("worker fault"),
             &drops,
             Some(Duration::from_secs(30)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("a dead worker did not deliver");
         assert!(
@@ -10628,9 +10850,12 @@ done
             .iter()
             .filter(|e| e.role != crate::alerts::bridge::Role::Banner)
         {
-            let result = run_notify(Some(event.name), &notify_input(), |_, _| {
-                panic!("a state with no session reached the socket")
-            });
+            let result = run_notify(
+                Some(event.name),
+                &notify_input(),
+                |_, _| panic!("a state with no session reached the socket"),
+                INJECTED_TRANSPORT,
+            );
             let output = result.unwrap_or_else(|e| panic!("{}: {e}", event.name));
             assert!(output.is_silent());
         }
@@ -11316,38 +11541,31 @@ done
             );
         }
 
-        /// A case-variant spelling of a file in a sibling that holds it dirty
-        /// (APFS is case-insensitive).
-        ///
-        /// The case is a property of the filesystem, not the platform: on a
-        /// case-sensitive one (ext4 on the Linux runners) `SEED.TXT` is another
-        /// file than the dirty `seed.txt`, so there is no spelling to judge and
-        /// the guard rightly says nothing. There the test holds the premise
-        /// instead, that the two spellings really are different files, which
-        /// is what made the old unconditional assertion fail on every Linux run.
+        /// A case-variant spelling of a file in a sibling that holds it dirty.
+        /// On a volume that folds case (APFS by default) `SEED.TXT` is that
+        /// file and must be judged as it. On one that does not (ext4, as on
+        /// ubuntu-latest) it names another file that no worktree holds, and is
+        /// judged exactly as a fresh name in that sibling is.
         #[test]
         fn case_variant_spelling_of_a_sibling_file_is_still_judged() {
             let farm = farm_bound(true, false, 2);
             let (a, b) = (&farm.sibling_dirs[0], &farm.sibling_dirs[1]);
             let upper = format!("{}/SEED.TXT", b.display());
-            let one_file = Path::new(&upper).exists();
-            assert!(
-                b.join("seed.txt").exists(),
-                "the fixture's dirty file is missing"
-            );
-            if !one_file {
-                // Case-sensitive: the spellings name two files, and only the
-                // lower-case one is dirty in the sibling.
-                assert!(
-                    std::fs::read_dir(b)
-                        .unwrap()
-                        .any(|entry| entry.unwrap().file_name() == "seed.txt"),
-                    "the sibling lists seed.txt under its own spelling"
-                );
-                return;
-            }
             let output = guard_here(&edit_call(a.to_str().unwrap(), &upper));
-            assert!(asks(&output), "{}", rendered(&output));
+            let folds_case = std::fs::metadata(&upper).is_ok();
+            if folds_case {
+                assert!(asks(&output), "{}", rendered(&output));
+            } else {
+                let fresh = format!("{}/never-touched.txt", b.display());
+                let control = guard_here(&edit_call(a.to_str().unwrap(), &fresh));
+                assert_eq!(
+                    asks(&output),
+                    asks(&control),
+                    "on a case-sensitive volume SEED.TXT is a file of its own: {} vs {}",
+                    rendered(&output),
+                    rendered(&control)
+                );
+            }
         }
     }
 
@@ -12336,6 +12554,276 @@ done
                 "Antigravity hook must never emit 0-byte stdout under GITPULSE_HOST=antigravity"
             );
         }
+
+        #[test]
+        fn pre_invocation_clears_only_on_fresh_user_turn_even_in_untrusted_repo() {
+            let serial = crate::test_support::env::env_serial();
+            let (dir, home, trusted_repo) = init_trusted_repo();
+            let untrusted_repo = dir.path().join("untrusted");
+            std::fs::create_dir_all(&untrusted_repo).unwrap();
+            git_in(&untrusted_repo, &["init", "-b", "main"]);
+            crate::repository_trust::revoke(&untrusted_repo.to_string_lossy()).unwrap();
+            let non_git = dir.path().join("plain-dir");
+            std::fs::create_dir_all(&non_git).unwrap();
+
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .set(crate::alerts::bridge::SESSION_ENV, "term-agy-1");
+
+            let pre_for = |cwd: &Path, n: Option<u64>| -> HookInput {
+                let mut map = serde_json::Map::new();
+                map.insert("hookEventName".into(), json!("PreInvocation"));
+                map.insert("conversationId".into(), json!(AGY_SESSION));
+                map.insert("cwd".into(), json!(cwd.to_string_lossy()));
+                if let Some(n) = n {
+                    map.insert("invocationNum".into(), json!(n));
+                }
+                parse_input(&Value::Object(map).to_string()).unwrap()
+            };
+
+            let mut fired = Vec::new();
+            // Trusted repo: PreInvocation(1) emits prompt_submitted.
+            let _ = peer_inbox_in_default_with(&pre_for(&trusted_repo, Some(1)), |active| {
+                fired.push(("trusted-1", active.fully_idle));
+            });
+            // Mid-turn PreInvocation(2) in trusted repo does NOT emit prompt_submitted.
+            let _ = peer_inbox_in_default_with(&pre_for(&trusted_repo, Some(2)), |active| {
+                fired.push(("trusted-2", active.fully_idle));
+            });
+            // Stop:continue follow-up PreInvocation(1) does NOT emit prompt_submitted.
+            let mailbox = Mailbox::at_default().unwrap();
+            mailbox
+                .deposit(AGY_SESSION, "m-stop", "keep going", SystemTime::now())
+                .unwrap();
+            let stop_input = parse_input(
+                &json!({
+                    "hookEventName": "Stop",
+                    "conversationId": AGY_SESSION,
+                    "cwd": trusted_repo.to_string_lossy(),
+                    "terminationReason": "NO_TOOL_CALL",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(stop_continue_in(&mailbox, &stop_input).is_some());
+            let _ = peer_inbox_in_default_with(&pre_for(&trusted_repo, Some(1)), |active| {
+                fired.push(("stop-continue-1", active.fully_idle));
+            });
+
+            // Untrusted repo and non-git dir: PreInvocation(1) still fires prompt_submitted
+            // without touching mailbox; PreInvocation(2) does NOT.
+            let _ = peer_inbox_in_default_with(&pre_for(&untrusted_repo, Some(1)), |active| {
+                fired.push(("untrusted-1", active.fully_idle));
+            });
+            let _ = peer_inbox_in_default_with(&pre_for(&untrusted_repo, Some(2)), |active| {
+                fired.push(("untrusted-2", active.fully_idle));
+            });
+            let _ = peer_inbox_in_default_with(&pre_for(&non_git, Some(1)), |active| {
+                fired.push(("non-git-1", active.fully_idle));
+            });
+
+            assert_eq!(
+                fired,
+                vec![
+                    ("trusted-1", Some(false)),
+                    ("untrusted-1", Some(false)),
+                    ("non-git-1", Some(false)),
+                ]
+            );
+        }
+
+        // Binds a Unix socket, and the notify transport is unix-only.
+        #[cfg(unix)]
+        #[test]
+        fn stop_or_notify_routes_error_user_canceled_and_normal_stops() {
+            let serial = crate::test_support::env::env_serial();
+            let (dir, home, _) = init_trusted_repo();
+            let untrusted = dir.path().join("untrusted");
+            std::fs::create_dir_all(&untrusted).unwrap();
+            git_in(&untrusted, &["init", "-b", "main"]);
+            crate::repository_trust::revoke(&untrusted.to_string_lossy()).unwrap();
+
+            // Set up a mock Unix socket listener to verify run_stop_or_notify end-to-end
+            // in an untrusted directory.
+            let sock_path = dir.path().join("notify.sock");
+            let listener = crate::procguard::with_inheritance_lock(|| {
+                std::os::unix::net::UnixListener::bind(&sock_path)
+            })
+            .unwrap();
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let received_bg = std::sync::Arc::clone(&received);
+            let server = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                for stream in listener.incoming().take(4) {
+                    let mut stream = stream.unwrap();
+                    let mut buf = String::new();
+                    let _ = stream.read_to_string(&mut buf);
+                    let _ = stream.write_all(b"{\"ok\":true}\n");
+                    received_bg.lock().unwrap().push(buf);
+                }
+            });
+
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .set(crate::alerts::bridge::SESSION_ENV, "term-agy-stop")
+                .set(crate::alerts::bridge::SOCKET_ENV, &sock_path);
+
+            // 1. ERROR with lastUserInput: must emit "error" with error detail (never lastUserInput).
+            let err_stop = parse_input(
+                &json!({
+                    "hookEventName": "Stop",
+                    "conversationId": AGY_SESSION,
+                    "cwd": untrusted.to_string_lossy(),
+                    "terminationReason": "ERROR",
+                    "error": "quota exceeded",
+                    "lastUserInput": "fix bug",
+                    "fullyIdle": true,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(err_stop.message, "", "lastUserInput must not shadow error");
+            run_stop_or_notify(&err_stop).unwrap();
+
+            // 2. MAX_TOKEN_BUDGET_EXCEEDED without error string: still emits "error".
+            let budget_stop = parse_input(
+                &json!({
+                    "hookEventName": "Stop",
+                    "conversationId": AGY_SESSION,
+                    "cwd": untrusted.to_string_lossy(),
+                    "terminationReason": "MAX_TOKEN_BUDGET_EXCEEDED",
+                    "lastUserInput": "keep working",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            run_stop_or_notify(&budget_stop).unwrap();
+
+            // 3. USER_CANCELED (even with error: "context canceled"): emits "turn_finished", never "error".
+            let canceled_stop = parse_input(
+                &json!({
+                    "hookEventName": "Stop",
+                    "conversationId": AGY_SESSION,
+                    "cwd": untrusted.to_string_lossy(),
+                    "terminationReason": "USER_CANCELED",
+                    "error": "context canceled",
+                    "lastUserInput": "abort",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            run_stop_or_notify(&canceled_stop).unwrap();
+
+            // 4. Normal NO_TOOL_CALL with finalModelOutput in untrusted repo: emits "turn_finished" with finalModelOutput.
+            let normal_stop = parse_input(
+                &json!({
+                    "hookEventName": "Stop",
+                    "conversationId": AGY_SESSION,
+                    "cwd": untrusted.to_string_lossy(),
+                    "terminationReason": "NO_TOOL_CALL",
+                    "finalModelOutput": "All tests pass",
+                    "lastUserInput": "run tests",
+                    "fullyIdle": true,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            run_stop_or_notify(&normal_stop).unwrap();
+
+            server.join().unwrap();
+            let payloads = received.lock().unwrap();
+            assert_eq!(payloads.len(), 4);
+
+            let n0 = crate::alerts::bridge::parse_report(payloads[0].as_bytes()).unwrap();
+            assert_eq!(n0.event, Some("error"));
+            assert_eq!(n0.detail.as_deref(), Some("quota exceeded"));
+
+            let n1 = crate::alerts::bridge::parse_report(payloads[1].as_bytes()).unwrap();
+            assert_eq!(n1.event, Some("error"));
+            assert_eq!(n1.detail.as_deref(), Some("Token budget exceeded"));
+
+            let n2 = crate::alerts::bridge::parse_report(payloads[2].as_bytes()).unwrap();
+            assert_eq!(n2.event, Some("turn_finished"));
+            assert_eq!(n2.detail.as_deref(), Some("Canceled by user"));
+
+            let n3 = crate::alerts::bridge::parse_report(payloads[3].as_bytes()).unwrap();
+            assert_eq!(n3.event, Some("turn_finished"));
+            assert_eq!(n3.detail.as_deref(), Some("All tests pass"));
+        }
+
+        #[test]
+        fn notify_payload_preserves_title_error_details_and_hook_event() {
+            let serial = crate::test_support::env::env_serial();
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set(crate::alerts::bridge::SESSION_ENV, "term-notify-1")
+                .remove(AGENT_KIND_ENV);
+
+            // Notification with title fallback when message is empty.
+            let notif = parse_input(
+                &json!({
+                    "hook_event_name": "Notification",
+                    "session_id": AGY_SESSION,
+                    "cwd": "/tmp/ws",
+                    "title": "Needs approval",
+                    "notification_type": "permission_prompt",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ev_prompt = crate::alerts::bridge::event("permission_prompt").unwrap();
+            let wire_notif = notify_payload(ev_prompt, &notif);
+            let obj_notif: Value = serde_json::from_str(&wire_notif).unwrap();
+            assert!(obj_notif.as_object().unwrap().len() <= 14);
+            assert_eq!(obj_notif["hook_event"], "Notification");
+            let parsed_notif = crate::alerts::bridge::parse_report(wire_notif.as_bytes()).unwrap();
+            assert_eq!(parsed_notif.detail.as_deref(), Some("Needs approval"));
+
+            // StopFailure with error + error_details.
+            let stop_fail = parse_input(
+                &json!({
+                    "hook_event_name": "StopFailure",
+                    "session_id": AGY_SESSION,
+                    "cwd": "/tmp/ws",
+                    "error": "rate_limit",
+                    "error_details": "429 retry after 30s",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ev_err = crate::alerts::bridge::event("error").unwrap();
+            let wire_err = notify_payload(ev_err, &stop_fail);
+            let obj_err: Value = serde_json::from_str(&wire_err).unwrap();
+            assert!(obj_err.as_object().unwrap().len() <= 14);
+            assert_eq!(obj_err["hook_event"], "StopFailure");
+            let parsed_err = crate::alerts::bridge::parse_report(wire_err.as_bytes()).unwrap();
+            assert_eq!(
+                parsed_err.detail.as_deref(),
+                Some("rate_limit: 429 retry after 30s")
+            );
+
+            // Role::Resolve still omits message even when title/tool_summary/hook_event are present.
+            let resolve_in = parse_input(
+                &json!({
+                    "hook_event_name": "PostToolUse",
+                    "session_id": AGY_SESSION,
+                    "cwd": "/tmp/ws",
+                    "tool_name": "read_file",
+                    "tool_input": {"AbsolutePath": "/tmp/ws/README.md"},
+                    "title": "Read file",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(resolve_in.tool_summary, "read_file: /tmp/ws/README.md");
+            let ev_resolve = crate::alerts::bridge::event("tool_finished").unwrap();
+            let wire_resolve = notify_payload(ev_resolve, &resolve_in);
+            let obj_resolve: Value = serde_json::from_str(&wire_resolve).unwrap();
+            assert!(obj_resolve.get("message").is_none());
+            assert_eq!(obj_resolve["hook_event"], "PostToolUse");
+            assert_eq!(antigravity_event_for("stop-or-notify"), "Stop");
+        }
     }
 
     #[test]
@@ -13022,7 +13510,13 @@ done
             "an empty session mailbox must be answered without the session lock"
         );
 
-        let _ = run_notify(Some("turn_finished"), &stop, |_, _| Ok(())).unwrap();
+        let _ = run_notify(
+            Some("turn_finished"),
+            &stop,
+            |_, _| Ok(()),
+            INJECTED_TRANSPORT,
+        )
+        .unwrap();
         assert_eq!(
             peer_state().as_deref(),
             Some("idle"),

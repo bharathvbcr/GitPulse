@@ -25,7 +25,7 @@ impl Resolver {
         });
         let view = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
             Self::parent_dir(file)
-        } else if hidden_somewhere && Self::visibility_is_enforced(family) {
+        } else if hidden_somewhere && Self::visibility_hides_from_global_rung(family) {
             match family {
                 LangFamily::Rust => self.rust_crate_src_root(file),
                 _ => file.to_string(),
@@ -175,7 +175,19 @@ impl Resolver {
     /// `private`/`fileprivate` declaration is invisible outside its file, a
     /// non-exported TS/JS module binding outside its module, and a non-`pub`
     /// Rust item outside its crate.
+    ///
+    /// Java is recorded too (`unexported_symbols` is filled from this), but
+    /// only the bare member rung reads it: a Java `protected` member is
+    /// `is_exported == false` as well as a `private` one, so hiding them from
+    /// the global rung would drop a subclass's reach to a base declared in
+    /// another file. See [`Self::visibility_hides_from_global_rung`].
     pub(super) fn visibility_is_enforced(family: LangFamily) -> bool {
+        Self::visibility_hides_from_global_rung(family) || family == LangFamily::Java
+    }
+
+    /// Families whose unexported declarations the global rung may not offer to
+    /// another file.
+    pub(super) fn visibility_hides_from_global_rung(family: LangFamily) -> bool {
         matches!(
             family,
             LangFamily::Swift | LangFamily::JsTs | LangFamily::Rust
@@ -207,7 +219,7 @@ impl Resolver {
         identity: &str,
     ) -> bool {
         if path == file
-            || !Self::visibility_is_enforced(family)
+            || !Self::visibility_hides_from_global_rung(family)
             || !self
                 .unexported_symbols
                 .contains(&(path.to_string(), identity.to_string()))
@@ -310,6 +322,121 @@ impl Resolver {
         false
     }
 
+    /// Whether `family` supports unqualified calls on `this`/`self` to member methods.
+    pub(super) fn family_has_implicit_this(family: LangFamily) -> bool {
+        matches!(
+            family,
+            LangFamily::Kotlin
+                | LangFamily::Java
+                | LangFamily::Swift
+                | LangFamily::Ruby
+                | LangFamily::Scala
+                | LangFamily::CSharp
+                | LangFamily::CStyle
+                | LangFamily::Dart
+        )
+    }
+
+    /// Whether the bare-name rung must decline the one namesake it found
+    /// because the call is written in provably plain C and the namesake is a
+    /// method.
+    ///
+    /// C has no methods and no implicit `this`, so a bare `name()` in a `.c`
+    /// file never calls a `SymbolKind::Method` of C++, Objective-C or CUDA,
+    /// although `CStyle` is one family for all four. The caller must be a
+    /// lowercase `.c` file: extraction reads every `.h` as C although a header
+    /// may be C++, and `.C` is C++ by convention, so neither proves the caller
+    /// has no implicit `this` (ft-915ee323, an extractor change, owns that
+    /// residual).
+    ///
+    /// This is a post-lookup refusal, never a change to the candidate set: the
+    /// set is built and charged exactly as before (one cache entry and one
+    /// budget charge per name, whoever calls it), the gate runs only on a set
+    /// that already reduced to one declaration, and so it can only remove an
+    /// edge. The kind is read from `symbol_index`, which carries it per
+    /// declaration. A mixed method-and-function set has two declarations,
+    /// never reaches here, and stays ambiguous as before.
+    pub(super) fn plain_c_caller_declines_method(
+        &self,
+        family: LangFamily,
+        file: &str,
+        name: &str,
+        target_file: &str,
+        target_identity: &str,
+    ) -> bool {
+        if family != LangFamily::CStyle
+            || std::path::Path::new(file)
+                .extension()
+                .is_none_or(|extension| extension != "c")
+        {
+            return false;
+        }
+        let mut kinds = self
+            .symbol_index
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|(path, _, _, identity)| path == target_file && &**identity == target_identity)
+            .map(|(_, kind, _, _)| *kind);
+        kinds.next().is_some_and(|first| {
+            first == SymbolKind::Method && kinds.all(|kind| kind == SymbolKind::Method)
+        })
+    }
+
+    /// Whether `caller_symbol` is inside a type that inherits (directly or
+    /// transitively) from a supertype not declared in the index.
+    pub(super) fn has_external_supertype(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller_symbol: Option<&str>,
+    ) -> bool {
+        let Some(caller) = caller_symbol else {
+            return false;
+        };
+        let Some(enclosing) = self.self_type_at(file, family, caller) else {
+            return false;
+        };
+        let mut frontier = vec![enclosing];
+        let mut visited = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut next = Vec::new();
+            for type_name in frontier {
+                if !visited.insert(type_name.clone()) {
+                    continue;
+                }
+                if let Some(bases) = self.supertypes.get(&(family, type_name)) {
+                    for base in bases {
+                        if !self.declares_type(family, base) {
+                            return true;
+                        }
+                        if !visited.contains(base) {
+                            next.push(base.clone());
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        false
+    }
+
+    /// Whether the package scope containing `file` declares `name`.
+    pub(super) fn package_scope_declares(&self, file: &str, name: &str) -> bool {
+        if let Some(package) = self.jvm_package_by_file.get(file) {
+            if let Some(files) = self
+                .jvm_package_symbols
+                .get(&(package.clone(), name.to_string()))
+            {
+                return !files.is_empty();
+            }
+        }
+        false
+    }
+
     /// Evidence about a bare callee name that outranks its spelling matching a
     /// repository declaration (S2): this file imports the name from a package
     /// or from a repo-relative path that is not indexed, or it is a builtin or
@@ -320,11 +447,15 @@ impl Resolver {
         file: &str,
         family: LangFamily,
         name: &str,
+        caller_symbol: Option<&str>,
     ) -> bool {
         self.file_scope_declares(file, name)
             || self.names_a_non_local_import(file, name)
             || crate::builtins::is_builtin(family, name)
             || crate::builtins::host_global_environment(family, name).is_some()
+            || (Self::family_has_implicit_this(family)
+                && self.has_external_supertype(file, family, caller_symbol)
+                && !self.package_scope_declares(file, name))
     }
 
     /// Whether a declaration of `kind` can never be what a bare call in
@@ -571,5 +702,163 @@ impl Resolver {
             )),
             many => Err(many.len()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn family_has_implicit_this_checks_expected_languages() {
+        assert!(Resolver::family_has_implicit_this(LangFamily::Kotlin));
+        assert!(Resolver::family_has_implicit_this(LangFamily::Java));
+        assert!(Resolver::family_has_implicit_this(LangFamily::Swift));
+        assert!(Resolver::family_has_implicit_this(LangFamily::Ruby));
+        assert!(Resolver::family_has_implicit_this(LangFamily::Scala));
+        assert!(Resolver::family_has_implicit_this(LangFamily::CSharp));
+        assert!(Resolver::family_has_implicit_this(LangFamily::CStyle));
+        assert!(Resolver::family_has_implicit_this(LangFamily::Dart));
+
+        assert!(!Resolver::family_has_implicit_this(LangFamily::Python));
+        assert!(!Resolver::family_has_implicit_this(LangFamily::Go));
+        assert!(!Resolver::family_has_implicit_this(LangFamily::Rust));
+        assert!(!Resolver::family_has_implicit_this(LangFamily::JsTs));
+        assert!(!Resolver::family_has_implicit_this(LangFamily::Shell));
+    }
+
+    #[test]
+    fn has_external_supertype_detects_unindexed_base() {
+        let mut resolver = Resolver::new();
+        resolver.symbol_parents.insert(
+            (
+                "src/Service.kt".to_string(),
+                "src/Service.kt::PollService.label".to_string(),
+            ),
+            "src/Service.kt::PollService".to_string(),
+        );
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "PollService".to_string()),
+            BTreeSet::from(["Service".to_string()]),
+        );
+        assert!(resolver.has_external_supertype(
+            "src/Service.kt",
+            LangFamily::Kotlin,
+            Some("src/Service.kt::PollService.label"),
+        ));
+    }
+
+    #[test]
+    fn has_external_supertype_returns_false_for_indexed_base() {
+        let mut resolver = Resolver::new();
+        resolver.symbol_parents.insert(
+            (
+                "src/Service.kt".to_string(),
+                "src/Service.kt::PollService.label".to_string(),
+            ),
+            "src/Service.kt::PollService".to_string(),
+        );
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "PollService".to_string()),
+            BTreeSet::from(["BaseService".to_string()]),
+        );
+        resolver.symbol_index.insert(
+            "BaseService".to_string(),
+            vec![(
+                "src/Base.kt".to_string(),
+                SymbolKind::Class,
+                LangFamily::Kotlin,
+                Arc::from("src/Base.kt::BaseService"),
+            )],
+        );
+        assert!(!resolver.has_external_supertype(
+            "src/Service.kt",
+            LangFamily::Kotlin,
+            Some("src/Service.kt::PollService.label"),
+        ));
+    }
+
+    #[test]
+    fn has_external_supertype_walks_deep_hierarchy() {
+        let mut resolver = Resolver::new();
+        resolver.symbol_parents.insert(
+            ("src/A.kt".to_string(), "src/A.kt::ClassA.m".to_string()),
+            "src/A.kt::ClassA".to_string(),
+        );
+        // A -> B -> C -> D -> ExternalBase
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "ClassA".to_string()),
+            BTreeSet::from(["ClassB".to_string()]),
+        );
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "ClassB".to_string()),
+            BTreeSet::from(["ClassC".to_string()]),
+        );
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "ClassC".to_string()),
+            BTreeSet::from(["ClassD".to_string()]),
+        );
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "ClassD".to_string()),
+            BTreeSet::from(["ExternalBase".to_string()]),
+        );
+
+        for name in ["ClassB", "ClassC", "ClassD"] {
+            resolver.symbol_index.insert(
+                name.to_string(),
+                vec![(
+                    "src/Lib.kt".to_string(),
+                    SymbolKind::Class,
+                    LangFamily::Kotlin,
+                    Arc::from(format!("src/Lib.kt::{name}")),
+                )],
+            );
+        }
+
+        assert!(resolver.has_external_supertype(
+            "src/A.kt",
+            LangFamily::Kotlin,
+            Some("src/A.kt::ClassA.m"),
+        ));
+    }
+
+    #[test]
+    fn has_external_supertype_handles_cycles_without_overflow() {
+        let mut resolver = Resolver::new();
+        resolver.symbol_parents.insert(
+            ("src/A.kt".to_string(), "src/A.kt::ClassA.m".to_string()),
+            "src/A.kt::ClassA".to_string(),
+        );
+        // Circular: A -> B -> C -> A
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "ClassA".to_string()),
+            BTreeSet::from(["ClassB".to_string()]),
+        );
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "ClassB".to_string()),
+            BTreeSet::from(["ClassC".to_string()]),
+        );
+        resolver.supertypes.insert(
+            (LangFamily::Kotlin, "ClassC".to_string()),
+            BTreeSet::from(["ClassA".to_string()]),
+        );
+
+        for name in ["ClassA", "ClassB", "ClassC"] {
+            resolver.symbol_index.insert(
+                name.to_string(),
+                vec![(
+                    "src/Lib.kt".to_string(),
+                    SymbolKind::Class,
+                    LangFamily::Kotlin,
+                    Arc::from(format!("src/Lib.kt::{name}")),
+                )],
+            );
+        }
+
+        assert!(!resolver.has_external_supertype(
+            "src/A.kt",
+            LangFamily::Kotlin,
+            Some("src/A.kt::ClassA.m"),
+        ));
     }
 }

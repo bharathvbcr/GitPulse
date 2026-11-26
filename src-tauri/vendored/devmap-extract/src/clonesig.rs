@@ -213,6 +213,9 @@ mod parse_impl {
     /// the node from the span keeps this a single owner.
     pub fn stamp_signatures(symbols: &mut [ExtractedSymbol], root: Node, source: &str) {
         for symbol in symbols.iter_mut() {
+            if crate::treesitter::walk_deadline_passed() {
+                break;
+            }
             if !has_comparable_body(symbol.kind) {
                 continue;
             }
@@ -238,6 +241,9 @@ mod parse_impl {
     /// one-line delegate all have declarations that callers bind to.
     pub fn stamp_declaration_hashes(symbols: &mut [ExtractedSymbol], root: Node, source: &str) {
         for symbol in symbols.iter_mut() {
+            if crate::treesitter::walk_deadline_passed() {
+                break;
+            }
             let start = symbol.span.start_byte;
             let end = symbol.span.end_byte;
             if end <= start || end > source.len() {

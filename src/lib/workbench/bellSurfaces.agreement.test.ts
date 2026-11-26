@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { countAgentsWaiting } from "../desktop/menuState";
+import { countAgentsWaiting, projectMenuAgentState } from "../desktop/menuState";
 import { interfaceStore } from "../stores/interfaceStore";
-import { asksForReader as sharedAsks, type AttentionKind, type SessionActivity } from "../terminal/sessionActivity";
+import { asksForReader as sharedAsks, parseAttention, type AttentionKind, type SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
-import { project, task, tasks, terminal } from "../agents/__tests__/fixtures";
+import { planeTerminals, repoAgentPill } from "../agents/repoAttention";
+import { probe, project, task, tasks, terminal } from "../agents/__tests__/fixtures";
 import { asksForReader as paneAsks, attemptStage, monitorAttempt, taskAgentSummaries, type MonitorContext } from "./taskSessions";
 import type { TaskRun } from "./client";
 
@@ -37,14 +38,17 @@ const context = (kind: AttentionKind | null): MonitorContext => ({
 
 const surfaces = (kind: AttentionKind | null) => {
   const monitored = monitorAttempt(attempt, context(kind));
+  const terminalPlane = project({ terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", attention: kind })] });
   return {
     rule: sharedAsks(kind),
     pane: kind === null ? false : paneAsks(kind),
     paneStage: attemptStage(monitored, NOW).stage === "needs-you",
     chip: (taskAgentSummaries([attempt], context(kind)).get("t1")?.asking ?? 0) > 0,
     tray: countAgentsWaiting(new Map([["s", activityFor(kind)]])) > 0,
-    agentsTerminal: project({ terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", attention: kind })] }).attention.needing > 0,
+    trayRequests: projectMenuAgentState(new Map([["s", activityFor(kind)]]), []).agentsWaiting > 0,
+    agentsTerminal: terminalPlane.attention.needing > 0,
     agentsTask: project({ tasks: tasks({ tasks: [task({ tone: kind ?? "quiet" })] }) }).attention.needing > 0,
+    repoPill: repoAgentPill({ plane: terminalPlane, probes: [probe()], repoPath: "/repo", paths: { caseInsensitive: false } }).state === "attention",
   };
 };
 
@@ -64,15 +68,37 @@ describe("every surface counts a waiting agent by the one rule, for every state 
         expect(got.paneStage, "task pane stage").toBe(expected);
         expect(got.chip, "board chip").toBe(expected);
         expect(got.tray, "tray count").toBe(expected);
-        // The Agents view also lists a finished agent as waiting for its next
-        // instruction, which the other surfaces do not chase; every other state
-        // agrees with them.
-        const agents = kind === "finished" ? true : expected;
-        expect(got.agentsTerminal, "Agents view, terminal row").toBe(agents);
-        expect(got.agentsTask, "Agents view, task row").toBe(agents);
+        expect(got.trayRequests, "tray agent requests projection").toBe(expected);
+        expect(got.agentsTerminal, "Agents view, terminal row").toBe(expected);
+        expect(got.agentsTask, "Agents view, task row").toBe(expected);
+        expect(got.repoPill, "repoAgentPill").toBe(expected);
       });
     }
   }
+
+  it("treats idle_prompt as non-asking across every surface", () => {
+    interfaceStore.setBellAsksForReader(false);
+    const parsed = parseAttention({ session: "term-a", channel: "hook", event: "idle_prompt", urgency: "informational" }, NOW)!;
+    const act: SessionActivity = { lastOutputAt: null, title: null, attention: parsed.attention };
+    const ctx: MonitorContext = { ...context(null), activity: () => act };
+    const mapped = planeTerminals(
+      [{ key: "k", repoPath: "/repo", label: "Claude Code", status: "running", sessionId: "term-a" }],
+      new Map([["term-a", act]]),
+      new Map([["term-a", "/repo"]]),
+    );
+    const plane = project({ terminals: mapped });
+    expect(sharedAsks(parsed.attention)).toBe(false);
+    expect(sharedAsks(parsed.attention!.kind)).toBe(false);
+    expect(paneAsks(parsed.attention!.kind)).toBe(false);
+    expect(attemptStage(monitorAttempt(attempt, ctx), NOW).stage === "needs-you").toBe(false);
+    expect((taskAgentSummaries([attempt], ctx).get("t1")?.asking ?? 0) > 0).toBe(false);
+    expect(countAgentsWaiting(new Map([["term-a", act]]))).toBe(0);
+    expect(projectMenuAgentState(new Map([["term-a", act]]), []).agentsWaiting).toBe(0);
+    expect(projectMenuAgentState(new Map([["term-a", act]]), []).agentsInformational).toBe(1);
+    expect(plane.attention.needing).toBe(0);
+    expect(plane.notifications).toBe(1);
+    expect(repoAgentPill({ plane, probes: [probe()], repoPath: "/repo", paths: { caseInsensitive: false } }).state).toBe("active");
+  });
 
   it("a hooked ask and a hook-less bell beside each other: off drops exactly the bell", () => {
     const two = (): number => {

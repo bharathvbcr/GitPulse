@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { untrack } from "svelte";
   import { hostPlatform } from "../../stores/platformStore";
   import { shortcutTextLabel } from "../../ui/platformCopy";
   import { repoStore } from "../../stores/repoStore";
@@ -29,15 +29,33 @@
     Edit3,
     Save,
     RotateCcw,
-    Hash,
     Loader2,
     Send,
+    ChevronDown,
+    ListPlus,
   } from "@lucide/svelte";
+  import { portal } from "../../dom/portal";
+  import { popover, popoverExit, restoreFocusTo, type PopoverOptions } from "../../ui/popover";
+  import { LAYERS } from "../../ui/layers";
+  import { displayName } from "../../repos/paths";
+  import { toastStore } from "../../stores/toastStore";
+  import { chooseRecipient, recipientChoice, recipientDirectory, recipientLabel, recipientOptionLabel, recipientView } from "../../terminal/recipient";
+  import { addToTray, MAX_TRAY_ENTRIES } from "../../terminal/contextTray";
+  import { composeSelectionContent, formatSelectionRef } from "../../terminal/selectionContent";
+  import { clearActiveSelection, setActiveSelection } from "../../terminal/activeSelection";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
   import FindField from "../FindField.svelte";
-  import { pageSearchScope, registerPageSearch } from "../../search/pageSearch.svelte";
-  import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
+  import {
+    buildMatchTicks,
+    findMatches,
+    firstMatchFrom,
+    matchLabel,
+    sliceTokensWithMatches,
+    stepMatch,
+    type LineMatchRange,
+  } from "../../text/lineSearch";
+  import { extractSelectionSeed } from "../../files/fileSearchTarget";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
   import { consumeReveal, goToLineTarget, revealRequest } from "../../files/revealRequests";
@@ -57,6 +75,7 @@
     onRequestDiscard,
     revealTarget = null,
     onSendSelectionToAgent,
+    agentSend,
   }: {
     filePath: string;
     content: string;
@@ -74,13 +93,23 @@
     onRequestDiscard?: () => Promise<boolean>;
     /** Pane-local line reveal target (used by `TerminalFilePane` so split panes never collide on the global `revealRequest` store). */
     revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
-    /** Inserts `@path#Lstart-Lend` into the active agent terminal (`⌘L`). */
-    onSendSelectionToAgent?: (reference: string) => void;
+    /**
+     * Inserts text (`@path#Lstart-Lend` for `⌘L`, a fenced block for `⌘⇧L`) into an
+     * agent terminal, unsubmitted. `checkout` is the checkout of this file, so
+     * the host can prefer a session working in it. A host that can fail reports
+     * it itself; the return value is not read.
+     */
+    onSendSelectionToAgent?: (reference: string, checkout?: string) => unknown;
+    /**
+     * Where this file lives, for the send controls: the repository whose terminal
+     * and context tray it uses, and the checkout the file is in. Absent, both are
+     * the active repository's.
+     */
+    agentSend?: { repoPath: string; checkout: string };
   } = $props();
 
   let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
   let actionBar: HTMLDivElement | undefined = $state();
-  let goToBar: HTMLDivElement | undefined = $state();
   let statusBar: HTMLDivElement | undefined = $state();
   const OVERSCAN = 20;
   const MAX_RENDER_LINES = 80_000;
@@ -91,6 +120,7 @@
   let saveSuccess = $state(false);
   let copied = $state(false);
   let previousFilePath = "";
+  let restoredBefore: string | null = null;
   let editorGeneration = 0;
 
   let wordWrap = $state(false);
@@ -101,23 +131,19 @@
 
   let selectedLine = $state<number | null>(null);
   let selectedLineEnd = $state<number | null>(null);
+  let selectedColumn = $state<number>(1);
+  let codeViewerRoot: HTMLDivElement | undefined = $state();
 
-  // In-file search state
+  // Unified inline find & go-to-line state
   let isSearchOpen = $state(false);
-  /**
-   * Mounted as the Code view's file pane, the view bar's search field is
-   * this file's find: the viewer registers as its provider and draws no Find
-   * of its own. Mounted anywhere else (a stash preview) it keeps its own.
-   */
-  const searchScope = pageSearchScope();
+  let searchMode = $state<"find" | "line">("find");
   let searchQuery = $state("");
   let isCaseSensitive = $state(false);
   let isRegex = $state(false);
   let currentMatchIdx = $state(0);
   let searchInputEl: HTMLInputElement | undefined = $state();
-
-  let goToLineOpen = $state(false);
-  let targetLineInput = $state<number | null>(null);
+  let findFieldRef: ReturnType<typeof FindField> | undefined = $state();
+  let editorTextareaEl: HTMLTextAreaElement | undefined = $state();
 
   let scrollTop = $state(0);
 
@@ -248,50 +274,101 @@
     scrollToMatch(next);
   }
 
-  // A file opened as a page's own pane finds through the view bar's field;
-  // anywhere else (a stash preview) the toolbar Find above stays. Registered
-  // once on mount, as in DiffViewer: the scope is fixed for the viewer's life.
-  onMount(() => {
-    if (!searchScope) return;
-    return registerPageSearch(searchScope, {
-      kind: "find",
-      label: "Find in file",
-      placeholder: "Find in file…",
-      query: () => searchQuery,
-      setQuery: (next) => (searchQuery = next),
-      caseSensitive: () => isCaseSensitive,
-      setCaseSensitive: (next) => (isCaseSensitive = next),
-      regex: () => isRegex,
-      setRegex: (next) => (isRegex = next),
-      status: () => ({
-        text: matchLabel(searchResult, currentMatchIdx),
-        invalid: searchResult.invalid,
-        hasMatches: matchCount > 0,
-      }),
-      step: (delta) => (delta === 1 ? nextMatch() : prevMatch()),
+  let lastSearchSignature = "";
+  $effect(() => {
+    const signature = `${filePath}\u0000${debouncedQuery}\u0000${isCaseSensitive}\u0000${isRegex}\u0000${searchMatches.length}`;
+    if (signature === lastSearchSignature) return;
+    lastSearchSignature = signature;
+    if (searchMatches.length === 0) {
+      untrack(() => {
+        currentMatchIdx = 0;
+      });
+      return;
+    }
+    const anchor = firstMatchFrom(
+      searchMatches,
+      Math.max(0, Math.floor(untrack(() => scrollTop) / Math.max(1, untrack(() => rowPx)))),
+    );
+    const nextIdx = anchor < 0 ? 0 : anchor;
+    untrack(() => {
+      currentMatchIdx = nextIdx;
+      if (debouncedQuery.trim().length > 0) {
+        scrollToMatch(nextIdx);
+      }
     });
   });
+
+  let matchesByLine = $derived.by(() => {
+    const map = new Map<number, LineMatchRange[]>();
+    if (!isSearchOpen || !debouncedQuery.trim()) return map;
+    for (let i = 0; i < searchMatches.length; i += 1) {
+      const m = searchMatches[i];
+      const range: LineMatchRange = {
+        start: m.colStart,
+        end: m.colStart + m.length,
+        active: i === currentMatchIdx,
+      };
+      const bucket = map.get(m.lineIndex);
+      if (bucket) bucket.push(range);
+      else map.set(m.lineIndex, [range]);
+    }
+    return map;
+  });
+
+  let matchTicks = $derived(
+    isSearchOpen && !isEditing && searchMatches.length > 0
+      ? buildMatchTicks(searchMatches, rawLines.length, currentMatchIdx)
+      : [],
+  );
+
+  function clampColumnForLine(lineNum: number, column?: number | null): number {
+    if (column === null || column === undefined || !Number.isInteger(column) || column < 1) {
+      return 1;
+    }
+    const lineLen = rawLines[lineNum - 1]?.length ?? 0;
+    return Math.min(column, lineLen + 1);
+  }
+
+  function focusEditorAt(lineNum: number, column: number, length = 0, shouldFocus = false) {
+    if (!isEditing || !editorTextareaEl) return;
+    let offset = Math.max(0, column - 1);
+    for (let i = 0; i < lineNum - 1; i += 1) {
+      offset += (rawLines[i]?.length ?? 0) + 1;
+    }
+    if (shouldFocus) editorTextareaEl.focus();
+    editorTextareaEl.setSelectionRange(offset, offset + Math.max(0, length));
+    editorTextareaEl.scrollTop = Math.max(0, (lineNum - 1) * Math.max(1, rowPx) - 80);
+  }
 
   function scrollToMatch(idx: number) {
     const match = searchMatches[idx];
     if (!match) return;
     selectedLine = match.lineIndex + 1;
     selectedLineEnd = null;
-    scrollToLine(match.lineIndex);
+    selectedColumn = match.colStart + 1;
+    if (isEditing && editorTextareaEl) {
+      focusEditorAt(match.lineIndex + 1, match.colStart + 1, match.length, false);
+    } else {
+      scrollToLine(match.lineIndex);
+    }
   }
 
   function scrollToLine(lineIdx: number) {
     scrollTop = Math.max(0, lineIdx * rowPx - 80);
   }
 
-  function handleGoToLine() {
-    const num = goToLineTarget(targetLineInput, rawLines.length);
+  function handleGoToLine(targetInput: unknown, column?: number | null) {
+    const num = goToLineTarget(targetInput, rawLines.length);
     if (num === null) return;
+    const col = clampColumnForLine(num, column);
     selectedLine = num;
     selectedLineEnd = null;
-    scrollToLine(num - 1);
-    goToLineOpen = false;
-    targetLineInput = null;
+    selectedColumn = col;
+    if (isEditing && editorTextareaEl) {
+      focusEditorAt(num, col, 0, true);
+    } else {
+      scrollToLine(num - 1);
+    }
   }
 
   function handleLineClick(lineNum: number, event: MouseEvent) {
@@ -300,6 +377,15 @@
     } else {
       selectedLine = lineNum;
       selectedLineEnd = null;
+      selectedColumn = 1;
+    }
+  }
+
+  function handleFindClose() {
+    if (isEditing && editorTextareaEl) {
+      editorTextareaEl.focus({ preventScroll: true });
+    } else if (codeViewerRoot) {
+      codeViewerRoot.focus({ preventScroll: true });
     }
   }
 
@@ -383,36 +469,144 @@
     setTimeout(() => (copied = false), 1800);
   }
 
+  /** The selected range as `lo <= hi`, or null with no line selected. */
+  let selectionRange = $derived(
+    selectedLine === null
+      ? null
+      : { lo: Math.min(selectedLine, selectedLineEnd ?? selectedLine), hi: Math.max(selectedLine, selectedLineEnd ?? selectedLine) },
+  );
+  /** The checkout this file is in, and the repository whose terminal and tray it uses. */
+  let sendCheckout = $derived(agentSend?.checkout ?? $repoStore.currentPath ?? "");
+  let sendRepo = $derived(agentSend?.repoPath ?? $repoStore.currentPath ?? "");
+  /** The one rule (`recipient.ts`) the panel sends by, over the sessions it last published. */
+  let recipients = $derived(
+    recipientView($recipientDirectory[sendRepo] ?? [], { checkout: sendCheckout || null, stickyId: $recipientChoice[sendRepo] }),
+  );
+  let recipientText = $derived(recipients.chosen ? recipientLabel(recipients.chosen) : null);
+  let rangeText = $derived(
+    selectionRange
+      ? `L${selectionRange.lo}${selectionRange.hi !== selectionRange.lo ? `–${selectionRange.hi}` : ""}`
+      : null,
+  );
+  let pickerOpen = $state(false);
+  let pickerAnchor: HTMLElement | undefined = $state();
+  const pickerDismissal = $derived<PopoverOptions>({
+    anchor: { kind: "element", element: pickerAnchor, gap: 4, place: "below", align: "end" },
+    estimate: { width: 220, height: 120 },
+    inset: 8,
+    dismiss: { inside: "[data-agent-recipient-picker], [data-agent-recipient-trigger]", pointer: "pointerdown", escape: "capture" },
+    onDismiss: () => (pickerOpen = false),
+  });
+
+  /** The reference for what is selected, or for the whole file with no line selected. */
   function formatAgentSelectionRef(): string {
-    if (selectedLine === null) return `@${filePath} `;
-    const end = selectedLineEnd ?? selectedLine;
-    const lo = Math.min(selectedLine, end);
-    const hi = Math.max(selectedLine, end);
-    return lo === hi ? `@${filePath}#L${lo} ` : `@${filePath}#L${lo}-L${hi} `;
+    return formatSelectionRef(filePath, selectionRange?.lo ?? null, selectionRange?.hi ?? null);
   }
 
   function sendSelectionToAgent() {
     if (!onSendSelectionToAgent || !filePath) return;
-    onSendSelectionToAgent(formatAgentSelectionRef());
+    onSendSelectionToAgent(formatAgentSelectionRef(), sendCheckout || undefined);
   }
 
+  /** Sends the selected lines themselves: a fenced block, cut at the bound with the cut stated. */
+  function sendSelectionContent() {
+    if (!onSendSelectionToAgent || !filePath) return;
+    if (!selectionRange) {
+      toastStore.error("Select lines first: click a line number, shift-click to extend.");
+      return;
+    }
+    const composed = composeSelectionContent({
+      path: filePath,
+      checkoutName: displayName(sendCheckout || filePath),
+      startLine: selectionRange.lo,
+      lines: rawLines.slice(selectionRange.lo - 1, selectionRange.hi),
+      // The lines are a draft, not the file, only while it differs from what was read. The draft
+      // is the shared one when the host supplies it: another view of this file may be the one
+      // typing, and this viewer's own buffer only follows it.
+      unsaved: draftContent !== null ? draftContent !== editBaseline : isEditing && editDraft !== editBaseline,
+    });
+    if (!composed.text) {
+      toastStore.error("That selection is past the end of the file.");
+      return;
+    }
+    if (composed.omittedLines > 0) {
+      toastStore.warning(`The selection is too long to send whole: ${composed.omittedLines} lines were left out, and the text says so.`);
+    }
+    onSendSelectionToAgent(composed.text, sendCheckout || undefined);
+  }
+
+  function addSelectionToTray() {
+    if (!onSendSelectionToAgent || !filePath) return;
+    if (!selectionRange) {
+      toastStore.error("Select lines first: click a line number, shift-click to extend.");
+      return;
+    }
+    const added = addToTray(sendRepo, {
+      checkout: sendCheckout,
+      path: filePath,
+      startLine: selectionRange.lo,
+      endLine: selectionRange.hi,
+    });
+    if (!added.ok) toastStore.error(added.reason);
+    else if (added.added) toastStore.info(`Added ${rangeText} of ${filePath} to the context tray (up to ${MAX_TRAY_ENTRIES}).`);
+    else toastStore.info("That range is already in the context tray.");
+  }
+
+  // The palette's way to this selection; see `activeSelection.ts`.
+  const selectionOwner = {};
+  $effect(() => {
+    const range = selectionRange;
+    if (!onSendSelectionToAgent || !range || !filePath) return;
+    setActiveSelection(selectionOwner, {
+      path: filePath,
+      startLine: range.lo,
+      endLine: range.hi,
+      sendReference: sendSelectionToAgent,
+      sendContent: sendSelectionContent,
+      addToTray: addSelectionToTray,
+    });
+    return () => clearActiveSelection(selectionOwner);
+  });
+
   function handleKeydown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "l" && onSendSelectionToAgent) {
+    const sendChord = (e.metaKey || e.ctrlKey) && onSendSelectionToAgent;
+    // ⌥ changes `key` on macOS, so the chord with it is matched by the physical key.
+    // Ctrl+Alt is AltGr on some Windows layouts, where it types a character instead.
+    if (sendChord && e.altKey && !e.shiftKey && e.code === "KeyL" && !e.getModifierState("AltGraph")) {
+      e.preventDefault();
+      e.stopPropagation();
+      addSelectionToTray();
+      return;
+    }
+    if (sendChord && !e.altKey && e.shiftKey && e.key.toLowerCase() === "l") {
+      e.preventDefault();
+      e.stopPropagation();
+      sendSelectionContent();
+      return;
+    }
+    if (sendChord && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "l") {
       e.preventDefault();
       e.stopPropagation();
       sendSelectionToAgent();
       return;
     }
-    // As the page's pane, ⌘F is the view bar field's (App routes it there).
-    if (!searchScope && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
       e.preventDefault();
-      isSearchOpen = true;
-      setTimeout(() => searchInputEl?.focus(), 50);
+      e.stopPropagation();
+      void findFieldRef?.openFind(extractSelectionSeed(editorTextareaEl, codeViewerRoot));
       return;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "g") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "g") {
       e.preventDefault();
-      goToLineOpen = true;
+      e.stopPropagation();
+      void findFieldRef?.openLine();
+      return;
+    }
+    if (e.key === "F3" && !e.metaKey && !e.ctrlKey && !e.altKey && isSearchOpen && matchCount > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.shiftKey) prevMatch();
+      else nextMatch();
       return;
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
@@ -423,13 +617,10 @@
       return;
     }
     if (e.key === "Escape") {
-      if (goToLineOpen) {
-        goToLineOpen = false;
-        return;
-      }
-      if (isSearchOpen && !searchScope) {
-        isSearchOpen = false;
-        searchQuery = "";
+      if (isSearchOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        findFieldRef?.close();
         return;
       }
     }
@@ -441,15 +632,21 @@
     const source = editBaseline;
     if (path !== previousFilePath) {
       previousFilePath = path;
+      restoredBefore = restored;
       untrack(() => {
         editorGeneration += 1;
         editDraft = restored ?? source;
         isEditing = restored !== null;
         isSaving = false;
         saveSuccess = false;
+        selectedLine = null;
+        selectedLineEnd = null;
+        selectedColumn = 1;
       });
       return;
     }
+    const droppedDraft = restoredBefore !== null && restored === null;
+    restoredBefore = restored;
     if (restored !== null && !isEditing) {
       untrack(() => {
         editDraft = restored;
@@ -458,6 +655,22 @@
     } else if (restored === null && !isEditing) {
       untrack(() => {
         editDraft = source;
+      });
+    } else if (restored !== null) {
+      // The draft is shared with another view of this file (the Code page and
+      // a terminal split hold one): follow its typing instead of keeping a
+      // textarea that could save over it. Our own input already equals it.
+      untrack(() => {
+        if (editDraft !== restored) editDraft = restored;
+      });
+    } else if (droppedDraft) {
+      // Saved or discarded in the other view. A buffer that now equals the
+      // file stays open, as after an Overwrite from the banner; one that does
+      // not (a discard) has nothing left to keep and goes back to the file.
+      untrack(() => {
+        if (editDraft === source) return;
+        editDraft = source;
+        isEditing = false;
       });
     }
   });
@@ -489,10 +702,16 @@
     // A reference can name a line past the end of the file it was written
     // about; clamp rather than refuse, so the file still opens near the mark.
     const line = Math.min(target.line, lineCount);
+    const col = clampColumnForLine(line, target.column);
     untrack(() => {
       selectedLine = line;
       selectedLineEnd = null;
-      scrollToLine(line - 1);
+      selectedColumn = col;
+      if (isEditing && editorTextareaEl) {
+        focusEditorAt(line, col, 0, false);
+      } else {
+        scrollToLine(line - 1);
+      }
     });
   });
 
@@ -504,10 +723,16 @@
     appliedRevealSeq = target.seq;
     if (!target.line || target.line <= 0) return;
     const line = Math.min(target.line, lineCount);
+    const col = clampColumnForLine(line, target.column);
     untrack(() => {
       selectedLine = line;
       selectedLineEnd = null;
-      scrollToLine(line - 1);
+      selectedColumn = col;
+      if (isEditing && editorTextareaEl) {
+        focusEditorAt(line, col, 0, false);
+      } else {
+        scrollToLine(line - 1);
+      }
     });
   });
 
@@ -528,6 +753,7 @@
 </script>
 
 <div
+  bind:this={codeViewerRoot}
   class="flex flex-col h-full bg-background font-sans text-xs min-h-0 relative overflow-hidden select-text"
   onkeydown={handleKeydown}
   tabindex="0"
@@ -574,34 +800,29 @@
         <span class="text-micro font-semibold text-warn" role="status">Unsaved</span>
       {/if}
 
-      {#if !searchScope}
-      <div class="ml-2 flex min-w-0 items-center">
+      <div class="ml-2 flex min-w-0 items-center gap-1">
         <FindField
+          bind:this={findFieldRef}
           bind:open={isSearchOpen}
+          bind:mode={searchMode}
           bind:query={searchQuery}
           bind:caseSensitive={isCaseSensitive}
           bind:regex={isRegex}
           bind:input={searchInputEl}
+          registerControl
           label="Find in file"
           placeholder="Find in file…"
           shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
-          status={matchLabel(searchResult, currentMatchIdx)}
+          goToShortcut={shortcutTextLabel("⌘G", $hostPlatform.os)}
+          lineCount={rawLines.length}
+          status={matchLabel(linesTruncated ? { ...searchResult, truncated: true } : searchResult, currentMatchIdx)}
           invalid={searchResult.invalid}
           hasMatches={matchCount > 0}
           onstep={(delta) => (delta === 1 ? nextMatch() : prevMatch())}
+          ongotoline={handleGoToLine}
+          onclose={handleFindClose}
         />
       </div>
-      {/if}
-
-      <button
-        type="button"
-        onclick={() => (goToLineOpen = true)}
-        class="gp-btn px-2! flex items-center gap-1 text-meta" data-size="sm"
-      >
-        <Hash size={11} />
-        <span>Go to Line</span>
-        <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘G", $hostPlatform.os)}</span>
-      </button>
 
       {#if onSendSelectionToAgent}
         <button
@@ -609,12 +830,73 @@
           onclick={sendSelectionToAgent}
           data-testid="code-send-to-agent"
           class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta border-accent/35 text-accent"
-          title="Send selected line range as @file#Lstart-Lend to the active terminal"
+          title={recipientText
+            ? `Send ${rangeText ? `${rangeText} of ` : ""}${filePath} as @file#Lstart-Lend to ${recipientText}. ${shortcutTextLabel("⌘⇧L", $hostPlatform.os)} sends the lines themselves.`
+            : $recipientDirectory[sendRepo]
+              ? "No live agent or shell session to send to: open one first"
+              : "No terminal has reported its sessions yet: this opens the terminal, and says so if it has no live agent or shell to send to"}
         >
           <Send size={11} />
-          <span>{selectedLine !== null ? `Send L${Math.min(selectedLine, selectedLineEnd ?? selectedLine)}${selectedLineEnd && selectedLineEnd !== selectedLine ? `–${Math.max(selectedLine, selectedLineEnd)}` : ""}` : "Send @file"}</span>
+          <span>{rangeText ? `Send ${rangeText}` : "Send @file"}{#if recipientText}<span data-testid="code-send-recipient"> → {recipientText}</span>{/if}</span>
           <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘L", $hostPlatform.os)}</span>
         </button>
+        {#if recipients.options.length > 1}
+          <button
+            type="button"
+            bind:this={pickerAnchor}
+            onclick={() => (pickerOpen = !pickerOpen)}
+            data-agent-recipient-trigger
+            data-testid="code-send-recipient-picker"
+            class="gp-icon-btn text-accent"
+            data-size="sm"
+            aria-haspopup="menu"
+            aria-expanded={pickerOpen}
+            aria-label="Choose which session receives sends"
+            title="Choose which session receives sends"
+          >
+            <ChevronDown size={12} />
+          </button>
+        {/if}
+        <button
+          type="button"
+          onclick={addSelectionToTray}
+          data-testid="code-add-to-tray"
+          class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta"
+          title="Set this range aside in the context tray, to insert with others ({shortcutTextLabel('⌥⌘L', $hostPlatform.os)})"
+        >
+          <ListPlus size={11} />
+          <span>Tray</span>
+        </button>
+        {#if pickerOpen && recipients.options.length > 1}
+          <div
+            use:portal={"body"}
+            use:popover={pickerDismissal} out:popoverExit
+            data-agent-recipient-picker
+            class="fixed gp-menu gp-pop p-1 min-w-48 max-w-[calc(100vw-16px)] flex flex-col font-sans"
+            style="z-index: {LAYERS.MENU}"
+            role="menu"
+            aria-label="Session that receives sends"
+            data-testid="code-send-recipient-menu"
+          >
+            {#each recipients.options as option (option.id)}
+              <button
+                type="button"
+                role="menuitemradio"
+                aria-checked={option.id === recipients.chosen?.id}
+                class="gp-menu-item text-meta text-left px-2 py-1 rounded flex items-center gap-2 {option.id === recipients.chosen?.id ? 'text-accent' : 'text-textPrimary'}"
+                data-testid="code-send-recipient-option"
+                onclick={() => {
+                  chooseRecipient(sendRepo, option.id);
+                  pickerOpen = false;
+                  restoreFocusTo(pickerAnchor);
+                }}
+              >
+                <span class="truncate">{recipientOptionLabel(option)}</span>
+                {#if option.id === recipients.chosen?.id}<Check size={11} class="shrink-0" />{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
       {/if}
     </div>
 
@@ -712,31 +994,6 @@
     <ScrollCue target={actionBar} axis="x" />
   </div>
 
-  {#if goToLineOpen}
-    <div class="relative shrink-0 select-none">
-      <div bind:this={goToBar} class="gp-header-scroll">
-        <div class="flex items-center gap-2 px-3 py-2 min-w-max">
-      <span class="text-xs text-textMuted shrink-0">Go to line (1–{rawLines.length}):</span>
-      <input
-        type="number"
-        min="1"
-        max={rawLines.length}
-        bind:value={targetLineInput}
-        onkeydown={(e) => {
-          if (e.key === "Enter") handleGoToLine();
-          if (e.key === "Escape") goToLineOpen = false;
-        }}
-        placeholder="Line number"
-        class="gp-field w-24!"
-      />
-      <button type="button" class="gp-btn-primary px-3! shrink-0" data-size="sm" onclick={handleGoToLine}>Go</button>
-      <button type="button" class="gp-btn px-2! shrink-0" data-size="sm" onclick={() => (goToLineOpen = false)}>Cancel</button>
-        </div>
-      </div>
-      <ScrollCue target={goToBar} axis="x" />
-    </div>
-  {/if}
-
   <!-- Main Code Surface -->
   <div class="flex-1 min-h-0 relative overflow-hidden bg-background flex flex-col">
     {#if linesTruncated && !isEditing}
@@ -747,6 +1004,7 @@
     {#if isEditing}
       <!-- Inline Code Editor Mode -->
       <textarea
+        bind:this={editorTextareaEl}
         value={editDraft}
         oninput={onEditInput}
         disabled={isSaving}
@@ -756,7 +1014,7 @@
       ></textarea>
     {:else}
       <!-- Read-Only Syntax Highlighted View -->
-      <div class="flex-1 w-full min-h-0">
+      <div class="relative flex-1 w-full min-h-0">
         <div
           class="font-mono text-xs min-w-full h-full"
           style="font-size: {0.75 * (zoomPercent / 100)}rem;"
@@ -775,7 +1033,12 @@
                 (selectedLineEnd === null
                   ? selectedLine === lineNum
                   : lineNum >= Math.min(selectedLine, selectedLineEnd) && lineNum <= Math.max(selectedLine, selectedLineEnd))}
-              {@const tokens = tokensForLine(line ?? "", lineIdx)}
+              {@const lineText = line ?? ""}
+              {@const tokens = tokensForLine(lineText, lineIdx)}
+              {@const lineMatches = matchesByLine.get(lineIdx) ?? []}
+              {@const spans = lineMatches.length > 0
+                ? sliceTokensWithMatches(lineText, tokens, lineMatches, (text) => ({ text, type: "text" as const }))
+                : null}
               <div
                 class="relative flex items-center w-max min-w-full overflow-hidden {isHighlighted
                   ? 'bg-accent/15'
@@ -797,6 +1060,22 @@
                 <div class="pr-4 whitespace-pre">
                   {#if tokens.length === 0}
                     <span>&nbsp;</span>
+                  {:else if spans}
+                    {#each spans as span}
+                      <span
+                        class="{tokenClass(span.type)} {span.match === 'active'
+                          ? 'rounded-sm bg-warn text-onWarn'
+                          : span.match === 'match'
+                            ? 'rounded-sm bg-warn/30'
+                            : ''}"
+                      >
+                        {#if showWhitespace}
+                          {span.text.replace(/ /g, '·').replace(/\t/g, '→   ')}
+                        {:else}
+                          {span.text}
+                        {/if}
+                      </span>
+                    {/each}
                   {:else}
                     {#each tokens as token}
                       <span class={tokenClass(token.type)}>
@@ -813,6 +1092,16 @@
             {/snippet}
           </VirtualList>
         </div>
+        {#if matchTicks.length > 0}
+          <div class="pointer-events-none absolute inset-y-1 right-0.5 w-1.5" aria-hidden="true" data-find-overview>
+            {#each matchTicks as tick}
+              <span
+                class="absolute inset-x-0 h-0.5 rounded-full {tick.active ? 'bg-warn' : 'bg-warn/45'}"
+                style:top="{tick.topPercent}%"
+              ></span>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -822,7 +1111,14 @@
     <div bind:this={statusBar} class="gp-header-scroll">
       <div class="flex items-center justify-between gap-3 px-3 py-1 min-w-max w-full">
     <div class="flex items-center gap-3 shrink-0">
-      <span>Ln {selectedLine ?? 1}, Col 1</span>
+      <button
+        type="button"
+        onclick={() => void findFieldRef?.openLine()}
+        disabled={rawLines.length === 0}
+        class="hover:text-textPrimary transition-colors cursor-pointer disabled:cursor-default disabled:hover:text-textMuted"
+        title="Go to line ({shortcutTextLabel('⌘G', $hostPlatform.os)})"
+        data-status-goto-line
+      ><span>Ln {selectedLine ?? 1}, Col {selectedColumn}</span></button>
       <span>•</span>
       <span>{indentInfo}</span>
       <span>•</span>

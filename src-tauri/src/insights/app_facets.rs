@@ -109,7 +109,11 @@ pub fn serve(repo: &str) -> Result<AppFacets, String> {
         .into_owned();
     let reading = canonical.clone();
     let budget = scaled(APP_BUDGET);
+    // The reading runs on a thread of its own, which the request's cancel flag
+    // (thread-local) does not follow, so it is carried in by hand.
+    let cancel = crate::engine::process::read_cancel::current();
     serve_bounded(canonical, scaled(HANDLER_DEADLINE), move || {
+        let _cancellable = crate::engine::process::read_cancel::enter(cancel.as_ref());
         // The class the asker's own scan runs in (`gitpulse-mcp` is a
         // background process), so agents' reads do not compete with the UI's.
         with_admission(Admission::Background, || {
@@ -298,8 +302,13 @@ fn serve_with(
         read.deadline_expired,
     );
 
-    // A positive is read again where it was found before it is believed.
-    let parties = positive_parties(&derived.collisions);
+    // A positive served from memory is read again where it was found before it
+    // is believed. A party that was already read fresh for this ask needs no
+    // duplicate second read.
+    let parties: Vec<String> = positive_parties(&derived.collisions)
+        .into_iter()
+        .filter(|party| stamps.was_from_memory(party))
+        .collect();
     if !parties.is_empty() {
         if let Ok(list) = &mut read.listed {
             let reread = Reread::new(Instant::now(), refresh_budget.min(clock.remaining()));
@@ -452,7 +461,7 @@ mod test_ages {
 /// restamped with the instant their re-read began.
 struct Stamps {
     changes: Instant,
-    worktrees: Vec<(String, Instant)>,
+    worktrees: Vec<(String, Instant, bool)>,
 }
 
 impl Stamps {
@@ -466,29 +475,42 @@ impl Stamps {
         let began = |path: &str| match kept_age(Path::new(path)) {
             // Accepted by a clock that began at `floor`.
             Some(age) if stamped.checked_sub(age).is_some_and(|began| began >= floor) => {
-                stamped.checked_sub(age).unwrap_or(floor)
+                (stamped.checked_sub(age).unwrap_or(floor), true)
             }
-            _ => asked,
+            _ => (asked, false),
         };
         Self {
-            changes: began(repo),
+            changes: began(repo).0,
             worktrees: listed
                 .as_ref()
                 .map(|list| {
                     list.iter()
                         .filter(|info| !info.is_bare)
-                        .map(|info| (info.path.clone(), began(&info.path)))
+                        .map(|info| {
+                            let (at, from_memory) = began(&info.path);
+                            (info.path.clone(), at, from_memory)
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
         }
     }
 
+    /// Whether `path`'s initial read in this ask was satisfied from the kept
+    /// status cell rather than freshly read for this ask.
+    fn was_from_memory(&self, path: &str) -> bool {
+        self.worktrees
+            .iter()
+            .find(|(recorded, _, _)| super::same_path(recorded, path))
+            .is_none_or(|(_, _, from_memory)| *from_memory)
+    }
+
     /// The worktrees in `named` were read again, beginning at `begun`.
     fn reread(&mut self, named: &[String], begun: Instant) {
-        for (path, began) in &mut self.worktrees {
+        for (path, began, from_memory) in &mut self.worktrees {
             if named.contains(path) {
                 *began = begun;
+                *from_memory = false;
             }
         }
     }
@@ -507,7 +529,11 @@ impl Stamps {
                 if !matches!(info.status_read, StatusRead::Read { .. }) {
                     continue;
                 }
-                if let Some((_, at)) = self.worktrees.iter().find(|(path, _)| *path == info.path) {
+                if let Some((_, at, _)) = self
+                    .worktrees
+                    .iter()
+                    .find(|(path, _, _)| *path == info.path)
+                {
                     began = began.min(*at);
                 }
             }

@@ -434,18 +434,24 @@ fn detached_lane(repo: &Repo, parent: &Path, file: &str, content: &str) -> (Path
 #[test]
 fn a_merge_that_conflicts_names_its_paths_once_each() {
     let repo = Repo::new();
+    // The quote survives where the platform can hold it; Windows cannot.
+    let awkward = if cfg!(windows) {
+        "b dir/it's b.txt"
+    } else {
+        "b dir/it's \"b\".txt"
+    };
     std::fs::create_dir(repo.path().join("b dir")).unwrap();
     repo.put("a.txt", "root\n");
-    repo.put("b dir/it's \"b\".txt", "root\n");
+    repo.put(awkward, "root\n");
     repo.git(&["checkout", "-q", "-b", "f"]);
     std::fs::write(repo.path().join("a.txt"), "f\n").unwrap();
-    std::fs::write(repo.path().join("b dir/it's \"b\".txt"), "f\n").unwrap();
+    std::fs::write(repo.path().join(awkward), "f\n").unwrap();
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "-q", "-m", "f"]);
     let f = repo.git(&["rev-parse", "HEAD"]);
     repo.git(&["checkout", "-q", "main"]);
     std::fs::write(repo.path().join("a.txt"), "m\n").unwrap();
-    std::fs::write(repo.path().join("b dir/it's \"b\".txt"), "m\n").unwrap();
+    std::fs::write(repo.path().join(awkward), "m\n").unwrap();
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "-q", "-m", "m"]);
     let main = repo.git(&["rev-parse", "HEAD"]);
@@ -464,7 +470,7 @@ fn a_merge_that_conflicts_names_its_paths_once_each() {
     };
     paths.sort();
     // The quote and the space survive: `-z` output is not escaped.
-    assert_eq!(paths, vec!["a.txt", "b dir/it's \"b\".txt"]);
+    assert_eq!(paths, vec!["a.txt", awkward]);
     assert_eq!(paths_total, 2);
 }
 
@@ -613,6 +619,17 @@ fn alternates_are_joined_with_the_platforms_own_separator() {
         1,
         "{two:?}"
     );
-    let holding = PathBuf::from(format!("/a{separator}b"));
-    assert!(std::env::join_paths([holding]).is_err());
+    if cfg!(windows) {
+        // Windows quotes a path that holds `;` (git reads the quotes back), so
+        // only a `"`, which no Windows path can hold, cannot be joined.
+        let holding = PathBuf::from(r"C:\a;b");
+        assert_eq!(
+            std::env::join_paths([holding]).unwrap(),
+            std::ffi::OsString::from("\"C:\\a;b\"")
+        );
+        assert!(std::env::join_paths([PathBuf::from("C:\\a\"b")]).is_err());
+    } else {
+        let holding = PathBuf::from(format!("/a{separator}b"));
+        assert!(std::env::join_paths([holding]).is_err());
+    }
 }

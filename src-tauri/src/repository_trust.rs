@@ -494,9 +494,16 @@ fn stored<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Comm
 /// Renaming this would orphan the approvals [`legacy_record`] deliberately
 /// still reads, which is the whole of the upgrade path.
 pub(crate) fn persistent_root() -> Result<PathBuf, CommandError> {
-    crate::tool_config::default_config_dir()
-        .map(|dir| dir.join("repository-trust-v1"))
-        .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
+    #[cfg(test)]
+    {
+        Ok(crate::test_support::hermetic_config_dir().join("repository-trust-v1"))
+    }
+    #[cfg(not(test))]
+    {
+        crate::tool_config::default_config_dir()
+            .map(|dir| dir.join("repository-trust-v1"))
+            .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
+    }
 }
 
 /// Whether `grant` reaches `current`: the same repository, and either the
@@ -670,6 +677,90 @@ fn trusted(current: &Identity) -> Result<bool, CommandError> {
 #[cfg(test)]
 pub(crate) fn trusted_by_store_at(root: &Path, repo_path: &str) -> Result<bool, CommandError> {
     read_grant(root, &identity(repo_path)?).map(TrustScope::admits)
+}
+
+/// Enumerates up to 64 existing checkout roots currently covered by persisted
+/// (and, outside `#[cfg(test)]`, in-process session) repository trust grants,
+/// verified against live directory identity and birth time without spawning Git.
+pub(crate) fn approved_checkouts() -> Vec<PathBuf> {
+    let Ok(root) = persistent_root() else {
+        return Vec::new();
+    };
+    approved_checkouts_in(&root, cfg!(not(test)))
+}
+
+pub(crate) fn approved_checkouts_in(root: &Path, include_sessions: bool) -> Vec<PathBuf> {
+    const MAX_APPROVED_CHECKOUTS: usize = 64;
+    fn push_grant(raw_candidates: &mut std::collections::BTreeSet<PathBuf>, grant: &Grant) {
+        if grant.version == GRANT_VERSION {
+            raw_candidates.insert(grant.approved.path.clone());
+            if grant.repository.path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+                if let Some(parent) = grant.repository.path.parent() {
+                    raw_candidates.insert(parent.to_path_buf());
+                }
+            }
+        }
+    }
+
+    let mut raw_candidates = std::collections::BTreeSet::new();
+    if include_sessions {
+        if let Ok(guard) = sessions().lock() {
+            for grant in guard.values() {
+                push_grant(&mut raw_candidates, grant);
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.take(MAX_MIGRATION_ENTRIES).flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') || !name.ends_with(".json") {
+                continue;
+            }
+            if name.ends_with(".repository.json") {
+                if let Ok(Some(grant)) = stored::<Grant>(&path) {
+                    push_grant(&mut raw_candidates, &grant);
+                }
+            } else if let Ok(Some(saved)) = stored::<Identity>(&path) {
+                if saved.version == 1 {
+                    raw_candidates.insert(saved.checkout.path);
+                }
+            }
+        }
+    }
+
+    let mut verified = Vec::new();
+    let mut seen_common = std::collections::BTreeSet::new();
+    for cand in raw_candidates {
+        if verified.len() >= MAX_APPROVED_CHECKOUTS {
+            break;
+        }
+        let Some(cand_str) = cand.to_str() else {
+            continue;
+        };
+        let Ok(current) = identity(cand_str) else {
+            continue;
+        };
+        if current.checkout == current.common_dir {
+            // Bare repository has no working tree to scan for build outputs.
+            continue;
+        }
+        let admitted_by_session = include_sessions
+            && sessions()
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&current.common_dir.path).cloned())
+                .is_some_and(|grant| covers(&grant, &current));
+        let admitted =
+            admitted_by_session || read_grant(root, &current).is_ok_and(TrustScope::admits);
+        if admitted && seen_common.insert(current.common_dir.path) {
+            verified.push(current.checkout.path);
+        }
+    }
+    verified
 }
 
 /// How many working trees this repository has, counted from its own registry.
@@ -3383,5 +3474,94 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn approved_checkouts_in_enumerates_live_repository_and_legacy_grants_and_skips_recreated_or_bare(
+    ) {
+        let base = tempfile::tempdir().unwrap();
+        let store = base.path().join("trust-store");
+        fs::create_dir_all(&store).unwrap();
+
+        let repo_a = base.path().join("repo-a");
+        let repo_legacy = base.path().join("repo-legacy");
+        let repo_replaced = base.path().join("repo-replaced");
+        let bare = base.path().join("bare.git");
+
+        let git = |dir: &Path, args: &[&str]| {
+            fs::create_dir_all(dir).unwrap();
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output_locked()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        git(&repo_a, &["init", "-b", "main"]);
+        git(&repo_legacy, &["init", "-b", "main"]);
+        git(&repo_replaced, &["init", "-b", "main"]);
+        git(&bare, &["init", "--bare"]);
+
+        let id_a = identity(repo_a.to_str().unwrap()).unwrap();
+        let grant_a = Grant {
+            version: GRANT_VERSION,
+            repository: id_a.common_dir.clone(),
+            approved: id_a.checkout.clone(),
+        };
+        fs::write(
+            repository_record(&store, &id_a.common_dir.path),
+            serde_json::to_vec(&grant_a).unwrap(),
+        )
+        .unwrap();
+
+        let id_legacy = identity(repo_legacy.to_str().unwrap()).unwrap();
+        fs::write(
+            legacy_record(&store, &id_legacy.checkout.path),
+            serde_json::to_vec(&id_legacy).unwrap(),
+        )
+        .unwrap();
+
+        let id_replaced = identity(repo_replaced.to_str().unwrap()).unwrap();
+        let grant_replaced = Grant {
+            version: GRANT_VERSION,
+            repository: id_replaced.common_dir.clone(),
+            approved: id_replaced.checkout.clone(),
+        };
+        fs::write(
+            repository_record(&store, &id_replaced.common_dir.path),
+            serde_json::to_vec(&grant_replaced).unwrap(),
+        )
+        .unwrap();
+        // Recreate `repo_replaced` (new inode/birth time): stored grant must NOT admit it!
+        fs::remove_dir_all(&repo_replaced).unwrap();
+        git(&repo_replaced, &["init", "-b", "main"]);
+
+        let id_bare = identity(bare.to_str().unwrap()).unwrap();
+        let grant_bare = Grant {
+            version: GRANT_VERSION,
+            repository: id_bare.common_dir.clone(),
+            approved: id_bare.checkout.clone(),
+        };
+        fs::write(
+            repository_record(&store, &id_bare.common_dir.path),
+            serde_json::to_vec(&grant_bare).unwrap(),
+        )
+        .unwrap();
+
+        let found = approved_checkouts_in(&store, false);
+        assert!(found.contains(&id_a.checkout.path), "{found:?}");
+        assert!(found.contains(&id_legacy.checkout.path), "{found:?}");
+        assert!(
+            !found.contains(&repo_replaced.canonicalize().unwrap()),
+            "recreated repository with different inode/birth time must not be enumerated: {found:?}"
+        );
+        assert!(
+            !found.contains(&id_bare.checkout.path),
+            "bare repository has no working tree and must be skipped: {found:?}"
+        );
     }
 }

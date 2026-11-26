@@ -140,7 +140,7 @@ fn registration_and_tuning_keys_come_from_git_s_own_config() {
     let canonical = std::fs::canonicalize(dir.path()).unwrap();
     let block = format!(
         "\n[maintenance]\n\trepo = {}\n\tstrategy = incremental\n[core]\n\tuntrackedCache = true\n",
-        canonical.display()
+        common::env::git_config_value(&canonical.to_string_lossy())
     );
     let files = [global, home_config];
     let originals: Vec<Option<String>> = files
@@ -190,7 +190,10 @@ fn detection_spawns_no_git_process() {
     let _g = serial();
     let dir = repo_with_files(3);
     let log = dir.path().join("trace2.jsonl");
-    let arm = format!("\n[trace2]\n\teventTarget = {}\n", log.display());
+    let arm = format!(
+        "\n[trace2]\n\teventTarget = {}\n",
+        common::env::git_config_value(&log.to_string_lossy())
+    );
     let files = [
         PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").expect("hermetic config")),
         PathBuf::from(std::env::var_os("HOME").expect("hermetic HOME")).join(".gitconfig"),
@@ -255,6 +258,7 @@ fn a_real_split_index_is_found_in_the_index_file_and_refuses_many_files() {
     let env = GitEnv {
         version: Some((2, 54, 0)),
         fsmonitor_measured: true,
+        is_apple_git: false,
     };
     assert!(recommend(&report, env)
         .iter()
@@ -264,6 +268,36 @@ fn a_real_split_index_is_found_in_the_index_file_and_refuses_many_files() {
     let plain = detect(dir.path());
     assert_eq!(plain.index.split_index, Some(false), "{plain:?}");
     assert_eq!(plain.index.entries, Some(25_000));
+}
+
+/// A split index stores an entry that replaces one in the shared index with an
+/// empty name. Re-adding a changed file that the shared index holds always
+/// writes one, in every index version. The walker refused them as "an entry
+/// has an empty path", so the split-index test above passed or failed on
+/// whether git happened to smudge a racily clean entry.
+#[test]
+fn a_split_index_whose_entries_replace_shared_ones_is_read() {
+    let _g = serial();
+    for version in ["2", "3", "4"] {
+        let dir = repo_with_files(40);
+        run_git(dir.path(), &["config", "index.version", version]);
+        run_git(dir.path(), &["update-index", "--split-index"]);
+        for i in [3, 17, 29] {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "changed\n").unwrap();
+        }
+        run_git(dir.path(), &["add", "f3.txt", "f17.txt", "f29.txt"]);
+        let report = detect(dir.path());
+        assert_eq!(
+            report.index.state,
+            IndexReadState::Present,
+            "v{version}: {report:?}"
+        );
+        assert_eq!(
+            report.index.split_index,
+            Some(true),
+            "v{version}: {report:?}"
+        );
+    }
 }
 
 #[test]

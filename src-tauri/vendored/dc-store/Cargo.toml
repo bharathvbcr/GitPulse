@@ -2,10 +2,11 @@
 name = "dc-store"
 version = "0.2.5"
 edition = "2024"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 description = "DevCouncil state store: tasks and the lease that makes concurrent building safe"
 
 [dependencies]
+dc-proc = { path = "../dc-proc" }
 # "bundled" compiles SQLite from source, which keeps the store independent of
 # whatever libsqlite3 the host has. Pinned with the kernel at workspace level
 # so this crate and `devmap-store` do not carry two SQLite builds.

@@ -22,6 +22,11 @@ addEventListener("error", event => errors.push(event.message));
 addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
 const root = "/fixture/GitPulse";
 const file = "src/app.ts";
+// A second file, open on the Code page and in a terminal split at once: the
+// "one file model" checks at the end of the run.
+const splitFile = "src/split.ts";
+let splitDisk = { text: "alpha\n", base: "6:s000" };
+const splitSaves = [];
 const unexpected = [], saves = [], blobReads = [], searches = [], blameReads = [];
 // While set, a file read answers only once this promise settles.
 let blobGate = null;
@@ -40,6 +45,7 @@ const fileCommits = [
 ];
 const graphReads = [], fileDiffReads = [];
 let historyFails = false;
+const splitBlob = () => ({ path: splitFile, is_binary: false, is_image: false, mime: "application/octet-stream", text: splitDisk.text, base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: splitDisk.base });
 const blob = () => ({ path: file, is_binary: false, is_image: false, mime: "application/octet-stream", text: disk.text, base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: disk.base });
 mockIPC((cmd, args) => {
   switch (cmd) {
@@ -50,8 +56,14 @@ mockIPC((cmd, args) => {
     case "cmd_get_status": return statuses;
     case "cmd_detect_language": return { name: "TypeScript", color_hex: "#3178c6", category: "Programming" };
     case "cmd_syntax_highlight": return [];
-    case "cmd_get_file_blob": blobReads.push(args); if (blobFails) throw new Error("unreadable by fixture"); if (blobGate) return blobGate.then(() => blob()); return blob();
+    case "cmd_get_file_blob": if (args.filePath === splitFile) return splitBlob(); blobReads.push(args); if (blobFails) throw new Error("unreadable by fixture"); if (blobGate) return blobGate.then(() => blob()); return blob();
     case "cmd_write_file_content":
+      if (args.filePath === splitFile) {
+        splitSaves.push(args);
+        if (args.expectedBase !== splitDisk.base) throw { code: "changed_on_disk", message: `'${args.filePath}' changed on disk since it was opened. Nothing was written.`, path: args.filePath, expected: args.expectedBase ?? "", actual: splitDisk.base };
+        splitDisk = { text: args.content, base: `s${splitSaves.length}` };
+        return { policy: null, output: { disk_base: splitDisk.base } };
+      }
       saves.push(args);
       if (args.expectedBase !== disk.base) throw { code: "changed_on_disk", message: `'${args.filePath}' changed on disk since it was opened. Nothing was written.`, path: args.filePath, expected: args.expectedBase ?? "", actual: disk.base };
       disk = { text: args.content, base: nextBase };
@@ -83,7 +95,8 @@ mockIPC((cmd, args) => {
 }, { shouldMockEvents: true });
 // Live pulse visibility is remembered; start each run from the default (shown).
 localStorage.removeItem("gitpulse.explorer.livePulse");
-// The sidebar explorer's open target is remembered too; its default is Code.
+// The sidebar explorer's open target is remembered too; its default is Auto,
+// which opens Code until the terminal has been the last surface used.
 localStorage.removeItem("gitpulse_sidebar_nav");
 const { mount, tick, unmount } = await import("svelte");
 const { get } = await import("svelte/store");
@@ -115,47 +128,102 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await until(() => host.textContent.includes("Ln 2, Col 1"), "the reveal request lands on its line");
   check("a reveal for the file already open lands on the named line", () => host.textContent.includes("Ln 2, Col 1"));
   check("and the request is consumed, not left to replay", () => get(revealRequest) === null);
+  await sendToAgentChecks();
 
-  // Find used to open a second bar under the toolbar, styled unlike the
-  // diff's. It is the same in-place field now: the pill widens where it sat.
+  // Find and Go to line share one inline slot in the file viewer toolbar, with
+  // zero second toolbar row when either opens.
   {
     const trigger = () => host.querySelector("[data-find-trigger]");
+    const goToTrigger = () => host.querySelector("[data-goto-line-trigger]");
     const field = () => host.querySelector("[data-find-field]");
-    check("the file toolbar offers Find as one pill", () => !!trigger() && !field());
+    const findStatus = () => field()?.querySelector("[data-find-status]");
     const slot = trigger().parentElement;
+    const barRow = slot.closest(".gp-section-edge");
+    const closedBarHeight = barRow.getBoundingClientRect().height;
+    check("the file toolbar offers Find and Go to line pills in the same slot", () =>
+      !!trigger() && !!goToTrigger() && goToTrigger().parentElement === slot && !field());
     trigger().click();
-    await until(() => !!field(), "find field");
+    await until(() => field()?.dataset.findMode === "find" && document.activeElement === field()?.querySelector("input"), "find field opens in find mode and focuses input");
     await tick();
-    check("Find opens in place in the toolbar row, focused, with no second bar", () =>
-      field().parentElement === slot && !trigger() && document.activeElement === field().querySelector("input"));
-    const input = field().querySelector("input");
-    input.value = "o";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await until(() => / of /.test(field().querySelector("[data-find-status]")?.textContent ?? ""), "match count");
-    check("a query shows its match count inside the field", () => /^1 of [1-9]/.test(field().querySelector("[data-find-status]").textContent.trim()));
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    await until(() => !field(), "find closed");
-    check("Escape folds it back to the Find pill", () => !!trigger() && !field());
+    check("Find opens in place in the toolbar row, focused, with no second toolbar row", () => {
+      const openH = barRow.getBoundingClientRect().height;
+      if (
+        field().parentElement === slot && !trigger() && !goToTrigger() &&
+        document.activeElement === field().querySelector("input") &&
+        openH - closedBarHeight <= 6
+      ) return true;
+      throw new Error(`sameSlot=${field().parentElement === slot} noTriggers=${!trigger() && !goToTrigger()} focused=${document.activeElement === field().querySelector("input")} closedH=${closedBarHeight} openH=${openH}`);
+    });
+    const input = () => field()?.querySelector("input");
+    const setFind = async value => { const el = input(); el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); await tick(); };
+    await setFind("o");
+    await until(() => / of /.test(findStatus()?.textContent ?? ""), "match count");
+    check("a query shows its match count, inline highlights, and scrollbar overview ticks", () =>
+      /^1 of [1-9]/.test(findStatus().textContent.trim()) &&
+      Boolean(host.querySelector("span.bg-warn")) &&
+      Boolean(host.querySelector("span.bg-warn\\/30")) &&
+      Boolean(host.querySelector("[data-find-overview]")));
+    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await tick();
+    check("Enter in the find field steps to the next match", () => /^2 of /.test(findStatus().textContent.trim()));
+
+    host.querySelector("[data-goto-mode-toggle]").click();
+    await until(() => field()?.dataset.findMode === "line", "switches in place to line mode");
+    check("the # toggle switches in place to Go to line without adding a second row", () =>
+      Boolean(host.querySelector("[data-goto-line-input]")) &&
+      field().parentElement === slot &&
+      barRow.getBoundingClientRect().height - closedBarHeight <= 6);
+    host.querySelector("[data-find-mode-toggle]").click();
+    await until(() => field()?.dataset.findMode === "find", "switches back to find mode");
+
+    // Typing `:1:2` in Find mode previews Line 1, Col 2 and Enter jumps there and folds.
+    await setFind(":1:2");
+    await until(() => findStatus()?.textContent.trim() === "Line 1, Col 2", "colon-line:col preview in find mode");
+    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await until(() => !field() && host.textContent.includes("Ln 1, Col 2"), "colon-line:col jump closes find and lands on line 1 col 2");
+
+    // Clicking `Ln X, Col Y` in the status bar opens inline Go to line in place.
+    host.querySelector("[data-status-goto-line]").click();
+    await until(() => field()?.dataset.findMode === "line" && document.activeElement === host.querySelector("[data-goto-line-input]"), "status bar Ln/Col click opens inline go to line");
+    host.querySelector("[data-goto-line-input]").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await until(() => !field(), "Escape closes status-bar go to line");
+    requestReveal(file, 2, 1);
+    await until(() => host.textContent.includes("Ln 2, Col 1"), "restored to line 2");
   }
 
-  // --- go to line ---------------------------------------------------------------
-  // The field is `type="number"`, so what it binds is a number (or null once
-  // cleared). The handler used to call `.trim()` on it: every Go threw and the
-  // cursor never moved.
+  // --- unified inline go to line ------------------------------------------------
+  // Go to line shares the same inline pill (`data-find-mode="line"`), avoiding any
+  // second bar, accepting numbers or `:line`, and using `goToLineTarget` without `.trim()`.
   {
-    const lineField = () => host.querySelector('input[type="number"][placeholder="Line number"]');
+    const goToTrigger = () => host.querySelector("[data-goto-line-trigger]");
+    const field = () => host.querySelector("[data-find-field]");
+    const lineField = () => host.querySelector("[data-goto-line-input]");
+    const submitBtn = () => host.querySelector("[data-goto-submit]");
+    const lineStatus = () => field()?.querySelector("[data-find-status]");
+    const slot = goToTrigger().parentElement;
+    const barRow = goToTrigger().closest(".gp-section-edge");
+    const closedBarHeight = barRow.getBoundingClientRect().height;
     const setLine = async value => { const input = lineField(); input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); await tick(); };
     const enter = async () => { lineField().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await tick(); };
     const errorsBefore = errors.length;
-    button("Go to Line").click();
-    await until(() => !!lineField(), "the go-to-line field");
+    goToTrigger().click();
+    await until(() => field()?.dataset.findMode === "line" && document.activeElement === lineField(), "inline go-to-line opens and focuses input");
+    check("Go to line opens in the same toolbar row with no second bar and focuses the line input", () =>
+      field().parentElement === slot &&
+      document.activeElement === lineField() &&
+      barRow.getBoundingClientRect().height - closedBarHeight <= 6);
     await setLine("");
     await enter();
-    check("Go on a cleared line field does nothing: the field stays open and the cursor stays put", () => !!lineField() && host.textContent.includes("Ln 2, Col 1"));
+    check("Enter on an empty line field keeps it open and leaves the cursor put", () => Boolean(lineField()) && host.textContent.includes("Ln 2, Col 1"));
+    await setLine("0");
+    await until(() => /^1–\d+$/.test(lineStatus()?.textContent.trim() ?? ""), "bounds status on line 0");
+    check("out-of-range line 0 displays bounds and disables Go without closing", () => submitBtn()?.disabled === true);
+    await enter();
+    check("Enter on an out-of-range line leaves the field open on line 2", () => Boolean(lineField()) && host.textContent.includes("Ln 2, Col 1"));
     await setLine("1");
     await enter();
     await until(() => host.textContent.includes("Ln 1, Col 1"), "go to line 1");
-    check("Go to Line moves the cursor to the typed line and closes the field", () => host.textContent.includes("Ln 1, Col 1") && !lineField());
+    check("valid Go to line moves to line 1 and folds the inline pill back", () => host.textContent.includes("Ln 1, Col 1") && !field());
     check("and going to a line throws nothing (no 'trim is not a function')", () => {
       const raised = errors.slice(errorsBefore);
       if (raised.length === 0) return true;
@@ -163,33 +231,40 @@ const type = async value => { const area = textarea(); area.value = value; area.
     });
   }
 
-  // --- find through the view bar ----------------------------------------------
-  // As the Code view's file pane the viewer has no Find of its own: the view
-  // bar's one search field becomes this file's find.
+  // --- Code > Explorer keeps inline file search and chords while PageSearch stays palette ---
   {
     await unmount(app); await tick();
     repoStore.setActiveTab("code", "explorer");
     const ScopedSearchHost = (await import("./ScopedSearchHost.svelte")).default;
     app = mount(ScopedSearchHost, { target: host, props: { scope: "code:explorer", viewer: Viewer } });
-    await until(() => !!host.querySelector("[data-scoped-bar] [data-page-search=find]"), "the scoped file registers its find");
+    await until(() => Boolean(button("Edit")) && Boolean(host.querySelector("[data-scoped-bar] [data-page-search]")), "Code Explorer viewer and view bar mounted");
     const bar = host.querySelector("[data-scoped-bar]");
     const pill = () => bar.querySelector("[data-page-search]");
-    const input = () => bar.querySelector("#gitpulse-page-search");
-    const status = () => bar.querySelector("[data-find-status]")?.textContent.trim() ?? "";
-    await until(() => pill()?.dataset.pageSearch === "find", "the field becomes the file's find");
-    check("as Code's file pane the viewer draws no Find of its own, and the view bar's field is its find", () => {
-      const own = host.querySelectorAll("[data-find-trigger],[data-find-field]").length;
-      if (own === 0 && input().placeholder === "Find in file…") return true;
-      throw new Error(`own find controls ${own}, placeholder ${input()?.placeholder}`);
-    });
-    input().focus(); input().value = "o"; input().dispatchEvent(new Event("input", { bubbles: true }));
-    await until(() => / of /.test(status()), "match count in the field");
-    check("a query typed in the field reaches the file: its match count shows in the field", () => /^1 of [1-9]/.test(status()));
-    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await tick();
-    check("Enter in the field steps to the file's next match", () => /^2 of /.test(status()));
-    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await tick();
-    check("Escape clears the file's find and leaves the field", () => input().value === "" && document.activeElement !== input() && !bar.querySelector("[data-find-status]"));
-    // Back to the viewer on its own, on the line the checks below start from.
+    const pageInput = () => bar.querySelector("#gitpulse-page-search");
+    check("in Code > Explorer the file viewer keeps its inline Find + Go to line controls while the view bar stays palette", () =>
+      pill()?.dataset.pageSearch === "palette" &&
+      Boolean(host.querySelector("[data-find-trigger]")) &&
+      Boolean(host.querySelector("[data-goto-line-trigger]")));
+
+    const chordHost = host.querySelector('[role="tab"]') ?? button("Edit");
+    chordHost.focus();
+    const findChord = new KeyboardEvent("keydown", { key: "f", metaKey: true, bubbles: true, cancelable: true });
+    chordHost.dispatchEvent(findChord);
+    await until(() => host.querySelector("[data-find-field]")?.dataset.findMode === "find" && document.activeElement === host.querySelector("[data-find-field] input"), "Cmd+F focuses inline file search");
+    check("Cmd+F outside the editor toolbar opens and focuses the open file's Find box instead of PageSearch", () =>
+      findChord.defaultPrevented &&
+      document.activeElement !== pageInput());
+
+    const findInputEl = document.activeElement;
+    const lineChord = new KeyboardEvent("keydown", { key: "g", metaKey: true, bubbles: true, cancelable: true });
+    findInputEl.dispatchEvent(lineChord);
+    await until(() => host.querySelector("[data-find-field]")?.dataset.findMode === "line" && document.activeElement === host.querySelector("[data-goto-line-input]"), "Cmd+G switches in place to Go to line");
+    check("Cmd+G switches the inline pill to Go to line and focuses the line box", () => lineChord.defaultPrevented);
+
+    host.querySelector("[data-goto-line-input]").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await until(() => !host.querySelector("[data-find-field]") && Boolean(host.querySelector("[data-find-trigger]")), "Escape folds unified pill");
+
+    // Back to the plain viewer on line 2 for downstream checks.
     await unmount(app); await tick();
     app = mount(Viewer, { target: host });
     await until(() => button("Edit"), "the plain viewer is back");
@@ -227,10 +302,29 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await repoStore.refresh(root);
   await wait(300);
 
+  // Lines 1-2 selected before editing: the editor has no line numbers to select by, so a selection made now is what a send from the draft uses.
+  {
+    const lineButton = n => [...host.querySelectorAll("button")].find(b => b.textContent.trim() === String(n) && b.className.includes("w-12"));
+    await until(() => lineButton(1) && lineButton(2), "line numbers to select by");
+    lineButton(1).click(); lineButton(2).dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })); await tick();
+  }
   button("Edit").click();
   await until(textarea, "the editor opens");
   await type("one\ntwo\nmine\n");
   check("a clean file shows no conflict banner", () => banner() === null);
+
+  // With a draft in the editor the lines sent are the draft's, and the header says so.
+  {
+    const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+    await type("draft one\ntwo\nmine\n");
+    textarea().dispatchEvent(new KeyboardEvent("keydown", { key: "L", code: "KeyL", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    await until(() => get(terminalLaunchRequests), "the draft's content request reaches the launch channel");
+    check("⌘⇧L over an unsaved draft sends the draft's lines and labels the block as an unsaved buffer", () =>
+      get(terminalLaunchRequests).reference === `File: ${file}, lines 1-2, checkout GitPulse (unsaved buffer)\n\`\`\`typescript\ndraft one\ntwo\n\`\`\``);
+    terminalLaunchRequests.take(root).complete();
+    await tick(); await wait(40);
+    await type("one\ntwo\nmine\n");
+  }
 
   // The agent rewrites the file while the draft is open.
   disk = { text: "agent one\nagent two\n", base: "20:bbbb" };
@@ -370,6 +464,24 @@ const type = async value => { const area = textarea(); area.value = value; area.
   check("Blame reads the open file in place of the editor", () =>
     blameReads.at(-1)?.filePath === file && !editorShown() && blameToggle().getAttribute("aria-pressed") === "true");
   check("beside Explorer's tree, with no second tree of its own", () => host.querySelectorAll('[role="tree"]').length === 1);
+  check("Blame's toolbar offers inline Find and Go to line pills in the same slot", () => {
+    const findBtn = host.querySelector("[data-find-trigger]");
+    const lineBtn = host.querySelector("[data-goto-line-trigger]");
+    return Boolean(findBtn && lineBtn && findBtn.parentElement === lineBtn.parentElement);
+  });
+  host.querySelector("[data-goto-line-trigger]").click();
+  await until(() => Boolean(host.querySelector("[data-goto-line-input]")), "Blame go-to-line opens");
+  {
+    const blameLineInput = host.querySelector("[data-goto-line-input]");
+    blameLineInput.value = "2";
+    blameLineInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await tick();
+    blameLineInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await until(() => Boolean(host.querySelector('[data-blame-line="2"][data-blame-target-line="true"]')), "Blame highlights jumped target line");
+    check("Blame Go to line highlights the jumped row and folds the inline pill", () =>
+      Boolean(host.querySelector('[data-blame-line="2"][data-blame-target-line="true"]')) &&
+      !host.querySelector("[data-find-field]"));
+  }
   blameToggle().click(); await tick();
   await until(() => editorShown(), "the editor returns");
   check("toggling Blame off returns to the editor", () => !host.querySelector("[data-blame-line]") && editorShown());
@@ -514,6 +626,24 @@ const type = async value => { const area = textarea(); area.value = value; area.
     const tabFor = path => [...host.querySelectorAll('[role="tab"]')].find(el => (el.getAttribute("title") ?? "").startsWith(path));
     const isPreview = path => (tabFor(path)?.getAttribute("title") ?? "").includes("(preview");
     await until(() => Boolean(row("third.ts")), "the sidebar tree lists the widened fixture");
+    // The palette's "Reveal active file in explorer" posts a tree reveal request: a folded folder
+    // opens to the file, and the selection is not touched (clearing it can release the document).
+    {
+      const { requestTreeReveal } = await import("../src/lib/files/revealRequests");
+      const openFolder = () => [...side.querySelectorAll('[role="treeitem"][aria-expanded="true"]')].find(el => el.textContent.includes("src"));
+      const selectedBefore = get(repoStore).selectedFilePath;
+      openFolder().click(); await tick();
+      await until(() => !row("third.ts"), "the folder folds");
+      requestTreeReveal(third);
+      await until(() => Boolean(row("third.ts")), "the tree request opens the folder to the file");
+      check("a tree reveal request opens a folded folder down to the file, in the sidebar tree", () => Boolean(row("third.ts")));
+      check("and leaves the selection as it was", () => get(repoStore).selectedFilePath === selectedBefore);
+      openFolder().click(); await tick();
+      await until(() => !row("third.ts"), "the folder folds again");
+      requestTreeReveal(third);
+      await until(() => Boolean(row("third.ts")), "a repeat request for the same file is acted on");
+      check("a repeat request for the same file is a new request", () => Boolean(row("third.ts")));
+    }
     const doubleClick = async el => {
       el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 })); await tick();
       el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 2 })); await tick();
@@ -582,6 +712,262 @@ const type = async value => { const area = textarea(); area.value = value; area.
     check("and Try again reads it again", () => items().length === 2);
     menu().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick(); await wait(120);
     check("Escape closes the menu", () => !menu());
+  }
+
+  // --- Send to an agent from the Code page: ⌘L, the recipient on the button, the picker, content and tray ---
+  // Declared here, run early (above): the editor checks below leave a draft open, which has no line numbers to select.
+  async function sendToAgentChecks() {
+    const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+    const { toastStore } = await import("../src/lib/stores/toastStore");
+    const { publishRecipients, forgetRecipients } = await import("../src/lib/terminal/recipient");
+    const { trayFor, clearTray } = await import("../src/lib/terminal/contextTray");
+    repoStore.setActiveTab("code"); repoStore.selectFilePath(file); await tick(); await wait(120);
+    const send = () => host.querySelector('[data-testid="code-send-to-agent"]');
+    const recipient = () => host.querySelector('[data-testid="code-send-recipient"]');
+    const lineButton = n => [...host.querySelectorAll("button")].find(b => b.textContent.trim() === String(n) && b.className.includes("w-12"));
+    const viewer = () => host.querySelector('[aria-label="Code viewer"]');
+    const chord = init => viewer().dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+    const toasts = () => get(toastStore).map(t => t.message);
+    await until(() => Boolean(send()) && Boolean(lineButton(1)) && Boolean(lineButton(2)), "the Code page offers Send and line numbers");
+    check("the Code page's file viewer offers Send (it was given no handler before)", () => Boolean(send()));
+    lineButton(1).click(); lineButton(2).dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })); await tick();
+    check("Send names the selected range", () => send().textContent.includes("Send L1–2"));
+    check("and names no recipient while no live session has been published", () => !recipient());
+
+    const claude = { id: "t1", launcher: "claude", checkout: root, live: true, visible: true };
+    const shell = { id: "t2", launcher: "shell", checkout: root, live: true, visible: false };
+    publishRecipients(root, [claude]); await tick(); await wait(40);
+    check("a published session is named on the button, with its checkout", () => recipient()?.textContent.includes("claude · GitPulse"));
+    check("one eligible session offers no picker", () => !host.querySelector('[data-testid="code-send-recipient-picker"]'));
+
+    publishRecipients(root, [claude, shell]); await tick(); await wait(40);
+    const picker = () => host.querySelector('[data-testid="code-send-recipient-picker"]');
+    check("two eligible sessions offer a picker", () => Boolean(picker()));
+    picker().click(); await tick();
+    await until(() => document.querySelector('[data-testid="code-send-recipient-menu"]'), "the picker menu opens");
+    const options = () => [...document.querySelectorAll('[data-testid="code-send-recipient-option"]')];
+    check("the picker lists both sessions and marks the one sends go to", () =>
+      options().length === 2 && options()[0].getAttribute("aria-checked") === "true" && options()[1].getAttribute("aria-checked") === "false");
+    options()[1].click(); await tick(); await wait(80);
+    check("choosing a session puts it on the button", () => recipient()?.textContent.includes("shell · GitPulse"));
+    publishRecipients(root, [claude, { ...shell, live: false }]); await tick(); await wait(40);
+    check("the choice is dropped when that session ends, and the rule picks again", () => recipient()?.textContent.includes("claude · GitPulse") && !picker());
+
+    // ⌘L from the Code page: a request the panel would claim, never a silent no-op.
+    const pendingRequest = () => get(terminalLaunchRequests);
+    chord({ key: "l", code: "KeyL", metaKey: true });
+    await until(() => pendingRequest(), "the reference request reaches the launch channel");
+    check("⌘L from the Code page requests a reference for the selected range, naming the file's checkout", () =>
+      pendingRequest().launcher === "reference" && pendingRequest().reference === `@${file}#L1-L2 ` && pendingRequest().referenceCheckout === root);
+    terminalLaunchRequests.take(root).complete("Open an agent or shell session first to send a reference.");
+    await until(() => toasts().some(m => m.includes("Open an agent or shell session first")), "the refusal is reported");
+    check("a refusal from the panel is an error toast, not silence", () => toasts().some(m => m.startsWith("Not sent to an agent:")));
+
+    // ⌘⇧L sends the lines themselves, fenced, with the checkout in the header.
+    chord({ key: "L", code: "KeyL", metaKey: true, shiftKey: true });
+    await until(() => pendingRequest(), "the content request reaches the launch channel");
+    check("⌘⇧L requests the selected lines in a fenced block under a header", () =>
+      pendingRequest().reference === `File: ${file}, lines 1-2, checkout GitPulse\n\`\`\`typescript\none\ntwo\n\`\`\``);
+    terminalLaunchRequests.take(root).complete();
+    await tick(); await wait(40);
+
+    // ⌥⌘L sets the range aside; ⌥ changes `key` on macOS, so the chord is the physical key.
+    chord({ key: "¬", code: "KeyL", metaKey: true, altKey: true });
+    await tick();
+    check("⌥⌘L adds the range to the repository's context tray", () => trayFor(root).length === 1 && trayFor(root)[0].startLine === 1 && trayFor(root)[0].endLine === 2);
+    chord({ key: "¬", code: "KeyL", metaKey: true, altKey: true });
+    await tick();
+    check("and the same range is not added twice", () => trayFor(root).length === 1);
+    clearTray(root); forgetRecipients(root);
+    // Selecting lines moved the cursor; put it back where the checks after this expect it.
+    requestReveal(file, 2, 1);
+    await until(() => host.textContent.includes("Ln 2, Col 1"), "the cursor is back on line 2");
+  }
+
+  // --- One file model: the same file on the Code page and in a terminal split ---
+  // The two hosts used to load, draft and save a file each, so one file open in
+  // both held two drafts that could diverge and be saved over each other. It is
+  // one document now: a draft typed in either shows in the other, one save
+  // writes it, and one refusal is answered once.
+  {
+    const splitHost = document.createElement("div");
+    splitHost.style.cssText = "position:fixed;right:0;top:0;width:520px;height:420px;display:flex;flex-direction:column;background:#0b0f19";
+    document.body.append(splitHost);
+    const Pane = (await import("../src/lib/components/TerminalFilePane.svelte")).default;
+    const { openDocuments } = await import("../src/lib/files/openDocuments");
+    const { unsavedEditorDrafts } = await import("../src/lib/files/editorDraftRegistry");
+    const inSplit = label => [...splitHost.querySelectorAll("button")].find(el => el.textContent.trim().startsWith(label));
+    const splitArea = () => splitHost.querySelector("textarea");
+    const splitBanner = () => splitHost.querySelector('[data-testid="editor-conflict"]');
+    const typeIn = async (area, value) => { area.value = value; area.dispatchEvent(new Event("input", { bubbles: true })); await tick(); };
+    const splitTab = () => [...host.querySelectorAll('[role="tab"]')].find(el => (el.getAttribute("title") ?? "").startsWith(splitFile));
+    const tabDirty = () => Boolean(splitTab()?.getAttribute("title")?.includes("Unsaved"));
+    const draftPathsNow = () => unsavedEditorDrafts().filter(r => r.repo === root).flatMap(r => r.paths).filter(p => p === splitFile);
+    // A window for a thing that must NOT happen; waiting on it would never end.
+    const settle = () => wait(250);
+    const docs = () => [...get(openDocuments).values()].filter(d => d.repo === root && d.path === splitFile);
+
+    repoStore.selectFilePath(splitFile); await tick();
+    await until(() => button("Edit"), "the file is open on the Code page");
+    const pane = mount(Pane, { target: splitHost, props: { tabId: "split-1", repoPath: root, filePath: splitFile, onscreen: true, defaultExplorerOpen: false } });
+    await until(() => inSplit("Edit"), "the file is open in the split");
+    check("one file open in both hosts is one document", () => docs().length === 1);
+
+    button("Edit").click();
+    await until(textarea, "the Code page editor opens");
+    await type("alpha\nbeta\n");
+    await until(() => /Unsaved/.test(splitHost.textContent), "the split shows the draft as unsaved").catch(() => {});
+    check("a draft typed on the Code page shows in the split as unsaved", () => /Unsaved/.test(splitHost.textContent));
+    await until(() => splitArea()?.value === "alpha\nbeta\n", "the split's editor holds the draft").catch(() => {});
+    check("and the split's editor holds that same text", () => splitArea()?.value === "alpha\nbeta\n");
+    check("with one dirty entry for the quit guard", () => draftPathsNow().length === 1);
+
+    if (!splitArea()) { inSplit("Edit")?.click(); await settle(); }
+    if (splitArea()) await typeIn(splitArea(), "alpha\nbeta\ngamma\n");
+    await until(() => textarea()?.value === "alpha\nbeta\ngamma\n", "the Code page follows the split's typing").catch(() => {});
+    check("typing in the split shows in the Code page's editor: one draft, not two", () => textarea()?.value === "alpha\nbeta\ngamma\n");
+
+    // Sending lines from a draft the OTHER host typed: the text is that shared draft, and
+    // the header says it is an unsaved buffer.
+    {
+      const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+      requestReveal(splitFile, 3, 1);
+      await until(() => host.textContent.includes("Ln 3, Col 1"), "the Code page selects line 3 of the shared draft");
+      textarea().dispatchEvent(new KeyboardEvent("keydown", { key: "L", code: "KeyL", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+      await until(() => get(terminalLaunchRequests), "the shared draft's content request reaches the launch channel");
+      check("⌘⇧L sends a draft typed in the other host, labelled as an unsaved buffer", () =>
+        get(terminalLaunchRequests).reference === `File: ${splitFile}, line 3, checkout GitPulse (unsaved buffer)\n\`\`\`typescript\ngamma\n\`\`\``);
+      terminalLaunchRequests.take(root).complete();
+      await tick(); await wait(40);
+    }
+
+    // A draft lives in the document, not in a host: the Code page unmounted
+    // (another view on screen) and remounted still has it.
+    await unmount(app); await tick();
+    check("the draft survives the Code page leaving the screen", () => docs()[0]?.draft?.content === "alpha\nbeta\ngamma\n");
+    // The split closing while the Code page still has the file open as a tab
+    // must not offer to throw away work the Code page owns.
+    const closing = await Promise.race([pane.confirmClose(), wait(400).then(() => "asked")]);
+    check("closing the split asks nothing while the Code page still has the file open, even off screen", () => closing === true && get(promptState) === null);
+    if (get(promptState)) completePrompt(false);
+    check("and leaves the draft where it is", () => docs()[0]?.draft?.content === "alpha\nbeta\ngamma\n");
+    app = mount(Viewer, { target: host });
+    await until(() => textarea()?.value === "alpha\nbeta\ngamma\n", "the remounted Code page restores the draft");
+    check("the remounted Code page restores the draft in its editor, still the one draft", () => textarea().value === "alpha\nbeta\ngamma\n" && draftPathsNow().length === 1 && tabDirty());
+
+    // Closing the Code page's tab while the split shows the file: the draft is
+    // the split's now, so nothing is asked and nothing is lost.
+    splitTab().querySelector('button[aria-label^="Close"]').click();
+    await settle();
+    check("closing the Code tab asks nothing while a split shows the file", () => get(promptState) === null && !splitTab());
+    if (get(promptState)) completePrompt(false);
+    check("and the split keeps the draft", () => splitArea()?.value === "alpha\nbeta\ngamma\n" && /Unsaved/.test(splitHost.textContent) && draftPathsNow().length === 1);
+    // With no Code tab left the split is the draft's last owner and must ask.
+    const lastClose = pane.confirmClose();
+    await until(() => get(promptState), "the last owner is asked");
+    check("closing the split that is the draft's last owner asks, naming the file", () => get(promptState).options.message.includes(splitFile));
+    completePrompt(false);
+    const keptOpen = await lastClose;
+    check("and Keep open keeps it", () => keptOpen === false && draftPathsNow().length === 1);
+    const closeAgain = pane.confirmClose();
+    await until(() => get(promptState), "asked again");
+    completePrompt(true);
+    const mayClose = await closeAgain;
+    check("Discard and close lets the split close", () => mayClose === true);
+    await pane.close();
+    check("and drops the draft, once", () => draftPathsNow().length === 0 && docs().length === 1 && docs()[0].draft === null);
+    await unmount(pane); await tick();
+    check("a document nothing shows and no draft owes is unloaded", () => docs().length === 0);
+
+    // A read-only snippet never becomes a document.
+    const before = get(openDocuments).size;
+    const snippetHost = document.createElement("div");
+    snippetHost.style.cssText = "position:fixed;left:0;top:0;width:480px;height:300px;display:flex;flex-direction:column";
+    document.body.append(snippetHost);
+    const snippetPane = mount(Pane, { target: snippetHost, props: { tabId: "snippet-1", repoPath: root, snippet: { title: "git log output", content: "commit abc\n" }, onscreen: true, defaultExplorerOpen: false } });
+    await until(() => snippetHost.textContent.includes("commit abc"), "the snippet shows");
+    check("a snippet's command output never enters the store", () => get(openDocuments).size === before && [...get(openDocuments).values()].every(d => d.path !== "git log output"));
+    await unmount(snippetPane); snippetHost.remove();
+
+    // Back to two hosts for the save and conflict paths.
+    repoStore.selectFilePath(splitFile); await tick();
+    await until(() => button("Edit"), "the file is open on the Code page again");
+    const pane2 = mount(Pane, { target: splitHost, props: { tabId: "split-2", repoPath: root, filePath: splitFile, onscreen: true, defaultExplorerOpen: false } });
+    await until(() => inSplit("Edit"), "the file is open in the second split");
+    button("Edit").click();
+    await until(textarea, "the Code page editor opens again");
+    await type("alpha\nbeta\ngamma\n");
+    await until(() => splitArea()?.value === "alpha\nbeta\ngamma\n", "the split follows");
+
+    const writesBefore = splitSaves.length;
+    inSplit("Save")?.click();
+    await until(() => splitSaves.length > writesBefore && !/Unsaved/.test(splitHost.textContent), "the split's save lands");
+    check("saving from the split writes once, with that draft", () => splitSaves.length === writesBefore + 1 && splitSaves.at(-1)?.content === "alpha\nbeta\ngamma\n" && splitDisk.text === "alpha\nbeta\ngamma\n");
+    // The Code page's editor may stay open on the text it now matches, as it does after the banner's Overwrite.
+    check("and leaves neither host with a draft", () => !tabDirty() && !/Unsaved/.test(splitHost.textContent) && !splitArea() && (!textarea() || textarea().value === "alpha\nbeta\ngamma\n") && draftPathsNow().length === 0);
+
+    // A refusal is one conflict, answered from either host.
+    if (button("Edit")) { button("Edit").click(); await until(textarea, "the Code page editor opens a third time"); }
+    await type("alpha\nbeta\ngamma\ndelta\n");
+    await until(() => /Unsaved/.test(splitHost.textContent), "the split sees the new draft");
+    splitDisk = { text: "agent\n", base: "6:s999" };
+    inSplit("Save")?.click();
+    await until(() => banner() && splitBanner(), "the conflict banner in both hosts").catch(() => {});
+    check("a refused save raises the conflict banner in both hosts", () => Boolean(banner()) && Boolean(splitBanner()));
+    const overwriteBase = splitDisk.base;
+    [...(banner()?.querySelectorAll("button") ?? [])].find(el => el.textContent.trim() === "Overwrite")?.click();
+    await until(() => !banner() && !splitBanner(), "the banner goes in both hosts").catch(() => {});
+    check("Overwrite from the Code page saves the one draft over the version the refusal saw", () => splitSaves.at(-1)?.expectedBase === overwriteBase && splitDisk.text === "alpha\nbeta\ngamma\ndelta\n");
+    check("and clears the banner in both hosts", () => !banner() && !splitBanner());
+
+    await unmount(pane2); splitHost.remove(); await tick();
+  }
+
+  // --- Raster MediaViewer zoomed overflow: top-left reachable without clipping ---
+  {
+    const MediaViewer = (await import("../src/lib/components/files/MediaViewer.svelte")).default;
+    const rasterCanvas = document.createElement("canvas");
+    rasterCanvas.width = 2000;
+    rasterCanvas.height = 2000;
+    const rctx = rasterCanvas.getContext("2d");
+    rctx.fillStyle = "#2563eb";
+    rctx.fillRect(0, 0, 2000, 2000);
+    rctx.fillStyle = "#f97316";
+    rctx.fillRect(0, 0, 120, 120);
+    const bigPngBase64 = rasterCanvas.toDataURL("image/png").split(",")[1];
+    const rasterHost = document.createElement("div");
+    rasterHost.style.cssText = "position:fixed;left:0;top:0;width:520px;height:420px;display:flex;flex-direction:column;background:#0b0f19;z-index:200";
+    document.body.append(rasterHost);
+    const rasterApp = mount(MediaViewer, {
+      target: rasterHost,
+      props: {
+        filePath: "assets/big-2000.png",
+        repoPath: root,
+        blob: { path: "assets/big-2000.png", is_binary: true, is_image: true, mime: "image/png", text: null, base64: bigPngBase64, invalid_utf8_bytes: 0 },
+      },
+    });
+    const rasterImg = () => rasterHost.querySelector("[data-raster-stage] img");
+    await until(() => Boolean(rasterImg()?.complete && rasterImg().naturalWidth === 2000), "2000x2000 raster image loaded");
+    const zoomInBtn = rasterHost.querySelector('button[aria-label="Zoom in"]');
+    const actualBtn = [...rasterHost.querySelectorAll("button")].find(b => b.textContent.trim() === "1:1 actual");
+    actualBtn.click(); await tick();
+    for (let i = 0; i < 4; i++) { zoomInBtn.click(); await tick(); }
+    await wait(60);
+    const stage = rasterHost.querySelector("[data-raster-stage]");
+    stage.scrollLeft = 0;
+    stage.scrollTop = 0;
+    await wait(40);
+    const stageRect = stage.getBoundingClientRect();
+    const imgRect = rasterImg().getBoundingClientRect();
+    check("zoomed 2000x2000 raster PNG at 200% renders full 4000px width and keeps top-left reachable at scroll (0,0)", () =>
+      imgRect.width >= 3990 &&
+      stage.scrollWidth > stage.clientWidth &&
+      stage.scrollHeight > stage.clientHeight &&
+      imgRect.left >= stageRect.left &&
+      imgRect.top >= stageRect.top);
+    await unmount(rasterApp);
+    rasterHost.remove();
+    await tick();
   }
 
   check("No unexpected commands", () => unexpected.length === 0);

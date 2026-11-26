@@ -43,7 +43,10 @@ fn fnv1a(text: &str) -> u64 {
 /// own path made constant, in sorted order.
 fn claude_rows_digest() -> (String, u64) {
     let repo_dir = tempfile::tempdir().unwrap();
-    let repo = repo_dir.path().to_str().unwrap();
+    // Spelled with `/`, so the path reads the same through `{:?}` and JSON,
+    // which double a backslash, and the `<repo>` replacement finds it.
+    let repo = crate::test_support::canonical_slash_path(repo_dir.path()).unwrap();
+    let repo = repo.to_str().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let slug = corpus.path().join("slug");
     std::fs::create_dir_all(&slug).unwrap();

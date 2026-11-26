@@ -369,9 +369,9 @@ struct Pair {
 impl Pair {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let base = root.path().canonicalize().unwrap();
+        let base = crate::test_support::canonical_slash_path(root.path()).unwrap();
         let wt = ["w1", "w2"].map(|name| {
-            let path = base.join(name);
+            let path = std::path::PathBuf::from(format!("{}/{name}", base.display()));
             std::fs::create_dir_all(&path).unwrap();
             path.to_string_lossy().into_owned()
         });

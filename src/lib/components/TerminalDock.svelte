@@ -254,6 +254,11 @@
     repoStore.setActiveTab("code");
   }
 
+  /** The docked Explorer's way to the full Explorer page. */
+  function openExplorerPage() {
+    repoStore.setActiveTab("code", "explorer");
+  }
+
   async function addAgentWorktree(
     target: MutationTarget,
     targetPath: string,
@@ -476,6 +481,7 @@
               onToggleDockMode: () => panelModes.toggle("dock"),
               onGoToSession: goToSession,
               onOpenInCodeView: openInCodeView,
+              onOpenExplorerPage: openExplorerPage,
               onCreateAgentWorktree: (targetPath: string, newBranch: string) =>
                 addAgentWorktree({ tabId: tab.id, path: tab.path }, targetPath, newBranch),
               checkouts: $repoStore.openTabs,

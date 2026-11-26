@@ -1089,8 +1089,13 @@ mod tests {
             .collect();
         for (index, probe) in PROBE_ORDER.iter().enumerate() {
             let path = &paths[index];
-            if *probe == "rebase-merge" || *probe == "rebase-apply" {
+            if *probe == "rebase-merge" || *probe == "rebase-apply" || *probe == "sequencer" {
                 std::fs::create_dir_all(path).unwrap();
+                if *probe == "sequencer" {
+                    // A directory in git too: a file there reads as "no todo"
+                    // on Windows, which is not a classification.
+                    std::fs::write(path.join("todo"), "pick deadbeef one\n").unwrap();
+                }
             } else {
                 std::fs::write(path, "deadbeef\n").unwrap();
             }

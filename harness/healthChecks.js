@@ -22,6 +22,8 @@ import { formatSectionCount } from "../src/lib/health/counts";
 import { formatDeadCodeStatus, coverageGap } from "../src/lib/health/report";
 import { hostLoadStatusFixture, idleReportFixture, leaseStatusFixture, previousBootFixture, procViewFixture } from "./hostLoadFixture.ts";
 import { refreshHostLoad } from "../src/lib/stores/hostLoadStore";
+import { DEFAULT_MANVI_STEWARD_SETTINGS, refreshManviSteward, resolveEffectiveStewardPolicy } from "../src/lib/stores/stewardStore";
+import { manviFocusRequest, takeManviFocus } from "../src/lib/ui/manviFocus";
 import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/format";
 
 const REPO = "/fixture/GitPulse";
@@ -554,7 +556,7 @@ export async function runHealthChecks(ctx) {
  * card's own timer makes, called here so a scenario does not wait four seconds.
  */
 export async function runHostLoadChecks(ctx) {
-  const { check, root, section, has, flat, wait, until, tick, knobs } = ctx;
+  const { check, root, section, has, flat, wait, until, tick, knobs, remount } = ctx;
   const DROP_TEXT = "dropped while the trace write was blocked or failing, so this history has gaps";
   const previous = () => root.querySelector('[data-testid="host-load-previous-boot"]');
   const card = () => section("host-load");
@@ -670,9 +672,138 @@ export async function runHostLoadChecks(ctx) {
       !fastest() && !has(card(), "at least") && !/NaN|undefined/.test(card().textContent));
     await show(withProcs([rate(0), rate(4096), rate(0)]));
     check("when nobody writes above the threshold no session is named", () => !fastest());
+
+    // Manvi system steward block inside Health > Host load: live critical slowdown,
+    // latest directive/reclaimed bytes, Run check action, and Open Settings deep link.
+    let stewardRunCalls = 0;
+    const stewardFixture = () => ({
+      settings: { ...DEFAULT_MANVI_STEWARD_SETTINGS },
+      effective: resolveEffectiveStewardPolicy(DEFAULT_MANVI_STEWARD_SETTINGS, null, null),
+      repo_common_dir: null,
+      env_override: null,
+      env_forced: null,
+      manvi_state: "ready",
+      manvi_mode: "cloud",
+      manvi_model: "claude-sonnet-4-6",
+      manvi_detail: "Claude API via Manvi",
+      running: false,
+      critical_throttle_active: true,
+      throttled_count: 2,
+      last_check_ms: 1_763_550_000_000,
+      next_check_ms: 1_763_550_180_000,
+      history: [{
+        id: "steward-live-check",
+        trigger: stewardRunCalls > 0 ? "manual" : "critical_wake",
+        ran_at_ms: 1_763_550_000_000,
+        outcome: "acted",
+        tier: "severe",
+        binding: "low_disk",
+        manvi_mode: "cloud",
+        manvi_model: "claude-sonnet-4-6",
+        model_generated: true,
+        summary: "Host severe (free disk space); reclaimed eligible caches and messaged sessions.",
+        directive: "Pause heavy builds until free disk recovers above the configured floor.",
+        messaged_sessions: 2,
+        messaged_repositories: 1,
+        skipped_untrusted_repositories: 0,
+        throttled_processes: 2,
+        restored_processes: 0,
+        reclaimed_bytes: 2 * 1024 * 1024 * 1024,
+        cleaned_items: [],
+        warnings: [],
+      }],
+    });
+    knobs.manviSteward = cmd => {
+      if (cmd === "cmd_manvi_steward_run_now") stewardRunCalls += 1;
+      return stewardFixture();
+    };
+    await refreshManviSteward(null);
+    await tick();
+    await wait(80);
+    const stewardBlock = () => root.querySelector('[data-testid="host-load-steward"]');
+    check("Health > Host load renders the Manvi system steward status block", () =>
+      !!stewardBlock()
+        && has(stewardBlock(), "Active (cloud · claude-sonnet-4-6) · checks every 3 min")
+        && has(stewardBlock(), "Critical slowdown active · 2 agent worker processes throttled")
+        && has(stewardBlock(), "Pause heavy builds until free disk recovers"));
+    const runBtn = root.querySelector('[data-testid="host-load-steward-run"]');
+    await until(() => !!runBtn && !runBtn.disabled);
+    runBtn.click();
+    await until(() => stewardRunCalls === 1 && !runBtn.disabled);
+    check("Run check on Health > Host load invokes cmd_manvi_steward_run_now", () => stewardRunCalls === 1);
+    takeManviFocus();
+    let settingsEvents = 0;
+    const onSettings = () => { settingsEvents += 1; };
+    window.addEventListener("gitpulse:settings", onSettings);
+    root.querySelector('[data-testid="host-load-steward-configure"]').click();
+    await tick();
+    window.removeEventListener("gitpulse:settings", onSettings);
+    check("Open Settings on the steward block deep-links to Settings → Agents → Manvi system steward", () =>
+      get(manviFocusRequest) === "steward" && settingsEvents === 1);
+    takeManviFocus();
+
+    // A slow read must not stack: the mounted card's own adaptive timer keeps
+    // ticking while one status read is pending, and none of those ticks may
+    // issue a second cmd_host_load_status or blank the card. The card's
+    // 4 s cadence is shortened to 100 ms for this remount only, so several ticks
+    // fit in well under a second. Cost: about 1.5 s. The shim rewrites every arm
+    // in [CARD_REFRESH_MS, 8 x CARD_REFRESH_MS): the adaptive timer stretches its
+    // delay under event-loop lag (default ceiling 8 x base, loadCadence.ts), so a
+    // loaded host arms 4800 ms, not 4000 ms, and an exact match would see too few
+    // arms. Unrelated short timers (under 4 s) are untouched; the card's lease
+    // block, whose own timer has a 10 s base, falls in the range and is shortened
+    // too, which only makes it read its own endpoint more often.
+    // CARD_REFRESH_MS mirrors REFRESH_MS in HostLoadSection.svelte, which is a
+    // private constant of the component and is not exported.
+    const calm = { ...hostLoadStatusFixture(), previous_boot: null, problems: [] };
+    await show(calm);
+    let started = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const pending = [];
+    knobs.hostLoad = () => {
+      started += 1;
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      return new Promise(resolve => pending.push(() => { inFlight -= 1; resolve(calm); }));
+    };
+    const CARD_REFRESH_MS = 4000;
+    const realSetTimeout = window.setTimeout;
+    let timerArms = 0;
+    window.setTimeout = (handler, ms, ...rest) => {
+      if (typeof ms === "number" && ms >= CARD_REFRESH_MS && ms < CARD_REFRESH_MS * 8) { timerArms += 1; return realSetTimeout(handler, 100, ...rest); }
+      return realSetTimeout(handler, ms, ...rest);
+    };
+    // The timer pauses while the document is not focused, and headless WebKit
+    // never reports focus; record it as focused for this scenario only.
+    const { noteForegroundFocus, resetForegroundFocus } = await import("../src/lib/runtime/foreground.ts");
+    noteForegroundFocus(true);
+    try {
+      await remount();
+      await until(() => !!card() && started >= 1 && has(card(), "Memory pressure"));
+      // Taken after the remount, which starts clean on the store's snapshot. The
+      // lease and idle blocks arrive later, so the card may only grow from here.
+      const shown = flat(card());
+      await until(() => timerArms >= 4);
+      await wait(150);
+      check(`while a read is pending the card's timer ticked (${timerArms} arms) and still only one read is in flight (started ${started}, peak ${peak})`, () =>
+        timerArms >= 4 && started === 1 && peak === 1);
+      check("and the card keeps showing the previous snapshot, with no blank, no read error and no alert", () =>
+        !!card() && has(card(), "Memory pressure") && flat(card()).length >= shown.length && !has(card(), "Couldn't read")
+        && !card().querySelector('[role="alert"]'));
+      pending.splice(0).forEach(release => release());
+      await until(() => started >= 2);
+      check("once the slow read settles the next tick reads again", () => started === 2 && peak === 1);
+    } finally {
+      window.setTimeout = realSetTimeout;
+      resetForegroundFocus();
+      knobs.hostLoad = () => calm;
+      pending.splice(0).forEach(release => release());
+    }
   } finally {
     knobs.hostLoad = null;
     knobs.hostLoadLeases = null;
     knobs.hostLoadIdle = null;
+    knobs.manviSteward = null;
   }
 }

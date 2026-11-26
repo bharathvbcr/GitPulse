@@ -137,6 +137,82 @@ impl AdmittedPair {
         &self.common
     }
 
+    /// Best-effort zero-spawn list of *registered* checkouts sharing [`Self::common_dir`],
+    /// excluding unverified caller inputs so a hand-written gitfile cannot claim
+    /// membership when `git worktree list` is shed under severe host load.
+    pub(crate) fn best_effort_registered_checkouts(&self) -> Vec<PathBuf> {
+        let raw = match self.registered_checkouts() {
+            Some(paths) => paths,
+            None => {
+                let mut paths = Vec::new();
+                let primary = if self.common.file_name() == Some(std::ffi::OsStr::new(".git")) {
+                    self.common.parent().map(Path::to_path_buf)
+                } else {
+                    Some(self.common.clone())
+                };
+                if let Some(primary) = primary {
+                    if matches!(
+                        crate::repository_trust::git_directories(&primary),
+                        Ok((private, common)) if private == self.common && common == self.common
+                    ) {
+                        paths.push(primary);
+                    }
+                }
+                if let Ok(entries) = std::fs::read_dir(self.common.join("worktrees")) {
+                    for entry in entries.take(MAX_REGISTRY_ENTRIES).flatten() {
+                        let entry_dir = entry.path();
+                        let Ok(Some(pointer)) = read_registry_pointer(&entry_dir.join("gitdir"))
+                        else {
+                            continue;
+                        };
+                        let Some(checkout) =
+                            entry_dir.join(pointer).parent().map(Path::to_path_buf)
+                        else {
+                            continue;
+                        };
+                        let Ok(canonical) = std::fs::canonicalize(checkout) else {
+                            continue;
+                        };
+                        if matches!(
+                            crate::repository_trust::git_directories(&canonical),
+                            Ok((_, common)) if common == self.common
+                        ) {
+                            paths.push(canonical);
+                        }
+                    }
+                }
+                paths
+            }
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut deduped = Vec::with_capacity(raw.len());
+        for path in raw {
+            if seen.insert(path.clone()) {
+                deduped.push(path);
+            }
+        }
+        deduped
+    }
+
+    /// Best-effort zero-spawn list of checkouts sharing [`Self::common_dir`],
+    /// used when `git worktree list` is shed under severe host load.
+    ///
+    /// Prefers [`Self::metadata_checkouts`] when complete; when an `[include]`
+    /// stanza or unreadable entry prevents a proven-complete metadata view,
+    /// still collects the primary working tree (when its metadata proves this
+    /// common directory), the admitted pair, and every readable
+    /// `<common>/worktrees/<entry>/gitdir` checkout whose own Git metadata points
+    /// back to [`Self::common_dir`].
+    pub(crate) fn best_effort_checkouts(&self) -> Vec<PathBuf> {
+        let mut out = self.best_effort_registered_checkouts();
+        for extra in [&self.repo, &self.worktree] {
+            if !out.contains(extra) {
+                out.push(extra.clone());
+            }
+        }
+        out
+    }
+
     fn scan_checkouts(&self, with_pair: bool) -> Option<Vec<PathBuf>> {
         // Git lists the primary working tree first: the directory holding
         // `.git`, or the repository itself when it is bare. The candidate is
@@ -530,10 +606,23 @@ fn read_registry_pointer(path: &Path) -> Result<Option<PathBuf>, ()> {
     Ok(Some(PathBuf::from(pointer)))
 }
 
+/// Reads the checked-out local branch name (`refs/heads/<branch>`) of `checkout`
+/// directly from its private `HEAD` file without spawning `git`. Returns `None`
+/// for detached `HEAD`, unborn/corrupt `HEAD`, or unreadable metadata.
+pub(crate) fn head_branch_from_metadata(checkout: &Path) -> Option<String> {
+    let (private, _) = crate::repository_trust::git_directories(checkout).ok()?;
+    let head = crate::repository_trust::bounded_text(&private.join("HEAD"), 512).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?.trim();
+    if branch.is_empty() || branch.contains('\0') {
+        return None;
+    }
+    Some(branch.to_string())
+}
+
 /// How many worktrees get a dirty-file scan when listing. Worktrees number in
-/// the low dozens even under heavy agent use; this cap keeps a pathological
-/// tree from turning one listing call into hundreds of subprocess spawns.
-const MAX_DIRTY_SCANS: usize = 32;
+/// the several dozens under heavy multi-agent use; this cap matches the
+/// snapshot/collision scan ceilings while keeping pathological repos bounded.
+const MAX_DIRTY_SCANS: usize = 64;
 
 /// Worktrees one listing scans at a time. A full scan is one to three git
 /// children (status; a diff when status found changes; a `rev-list` when the
@@ -659,7 +748,7 @@ impl ScanDeadline {
 /// passed. Cutting a status that is a few milliseconds from finishing would
 /// report a reachable worktree as unreadable; this is the most a pass
 /// overruns its deadline by, apart from the process-exit grace.
-const STATUS_GRACE: Duration = Duration::from_millis(500);
+pub(super) const STATUS_GRACE: Duration = Duration::from_millis(500);
 
 /// One parsed block of `worktree list --porcelain -z`, before dirty counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -976,9 +1065,10 @@ pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), CommandError
 }
 
 /// Ceiling on paths returned by [`changed_paths`]. Collision detection only
-/// needs identity, and a worktree that dirtied tens of thousands of files
-/// must not turn one insights call into an unbounded allocation.
-pub const MAX_CHANGED_PATHS: usize = 256;
+/// needs identity; large active checkouts routinely touch several hundred
+/// files, while a worktree that dirtied tens of thousands of files must still
+/// stay bounded.
+pub const MAX_CHANGED_PATHS: usize = 2048;
 
 /// The spawn behind every `git status --porcelain -z` read of a worktree.
 /// An unfiltered read is made only by [`status_cell`], which is the one owner
@@ -1006,6 +1096,29 @@ fn spawn_porcelain(
         // Stands in for a hung git ending at its own time limit.
         if only.is_none() && status_probes::forced_timeout(dir) {
             return Err("git status timed out after 0.3s".to_string().into());
+        }
+    }
+    if only.is_none() {
+        if crate::engine::process::read_cancel::current()
+            .as_ref()
+            .is_some_and(crate::engine::process::read_cancel::ReadCancel::is_cancelled)
+        {
+            return Err(crate::engine::process::read_cancel::cancelled());
+        }
+        if deadline.is_some_and(ScanDeadline::expired) {
+            return Err(DEADLINE_PASSED.to_string().into());
+        }
+        crate::engine::process::check_in_process_admission("git status")?;
+        match crate::engine::gix_status::porcelain_v1_z(dir, deadline)? {
+            crate::engine::gix_status::GixStatus::Porcelain(text) => {
+                #[cfg(test)]
+                status_reads::record(dir, status_reads::StatusBackend::Gix);
+                return Ok(text);
+            }
+            crate::engine::gix_status::GixStatus::Fallback(_) => {
+                #[cfg(test)]
+                status_reads::record(dir, status_reads::StatusBackend::GitCli);
+            }
         }
     }
     let magic = match only {
@@ -1087,7 +1200,11 @@ pub(crate) const STATUS_CELL_CAP: usize = status_cell::MAX_CELLS;
 /// - Trust is checked before the cell is consulted, as at the spawn.
 mod status_cell {
     use super::{spawn_porcelain, ScanDeadline, DEADLINE_PASSED};
-    use crate::engine::process::{current_admission, is_timed_out, Admission};
+    use crate::engine::process::{
+        current_admission, is_timed_out,
+        read_cancel::{self, ReadCancel},
+        Admission, DEFAULT_TIMEOUT, TIMEOUT_MARKER,
+    };
     use crate::ipc_error::CommandError;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1207,10 +1324,13 @@ mod status_cell {
         state.held.as_ref().map(|held| held.started.elapsed())
     }
 
-    /// Whether an error is this caller's or somebody's clock running out,
-    /// which no other caller should inherit.
+    /// Whether an error is this caller's or somebody's clock running out, or
+    /// its asker leaving (a read cancelled for one caller), which no other
+    /// caller should inherit.
     fn is_a_cut(error: &CommandError) -> bool {
-        error.message() == DEADLINE_PASSED || is_timed_out(error.message())
+        error.message() == DEADLINE_PASSED
+            || is_timed_out(error.message())
+            || crate::engine::process::read_cancel::is_cancelled_error(error)
     }
 
     /// A read that ran out of git's own time limit, as opposed to a deadline
@@ -1292,8 +1412,13 @@ mod status_cell {
         deadline: Option<&ScanDeadline>,
         not_before: Instant,
     ) -> Result<PorcelainRead, CommandError> {
+        let cancel = read_cancel::current();
+        let wait_started = Instant::now();
         let mut state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
         let fill = loop {
+            if cancel.as_ref().is_some_and(ReadCancel::is_cancelled) {
+                return Err(read_cancel::cancelled());
+            }
             if let Some(held) = &state.held {
                 if held.started >= not_before {
                     return Ok(held.clone());
@@ -1309,21 +1434,54 @@ mod status_cell {
                 break fill;
             };
             while running.result.get().is_none() {
+                if cancel.as_ref().is_some_and(ReadCancel::is_cancelled) {
+                    return Err(read_cancel::cancelled());
+                }
                 state = match deadline {
-                    None => cell
-                        .done
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner),
+                    None => {
+                        let remaining = DEFAULT_TIMEOUT.saturating_sub(wait_started.elapsed());
+                        if remaining.is_zero() {
+                            return Err(format!(
+                                "git status{TIMEOUT_MARKER}{}s",
+                                DEFAULT_TIMEOUT.as_secs()
+                            )
+                            .into());
+                        }
+                        let slice = if cancel.is_some() {
+                            remaining.min(Duration::from_millis(50))
+                        } else {
+                            remaining
+                        };
+                        cell.done
+                            .wait_timeout(state, slice)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
                     Some(deadline) => {
                         if deadline.expired() {
                             return Err(DEADLINE_PASSED.to_string().into());
                         }
+                        let remaining = deadline.remaining();
+                        let slice = if cancel.is_some() {
+                            remaining.min(Duration::from_millis(50))
+                        } else {
+                            remaining
+                        };
                         cell.done
-                            .wait_timeout(state, deadline.remaining())
+                            .wait_timeout(state, slice)
                             .unwrap_or_else(PoisonError::into_inner)
                             .0
                     }
                 };
+            }
+            // A hung git ends every waiter at the same moment it ends the
+            // leader, not one 90 s after another — even when the waiter's
+            // `not_before` arrived after the leader started. Only a cut that
+            // was a caller's deadline or cancellation is retried.
+            if let Some(Err(error)) = running.result.get() {
+                if !running.deadline_bound && is_a_hang(error) {
+                    return Err(error.clone());
+                }
             }
             // Only a read that began late enough for this caller is its
             // answer; otherwise the cell is free for it to read after.
@@ -1331,12 +1489,6 @@ mod status_cell {
                 match running.result.get() {
                     Some(Ok(read)) => return Ok(read.clone()),
                     Some(Err(error)) if !is_a_cut(error) => return Err(error.clone()),
-                    // A hung git ends every waiter at the same moment it ends
-                    // the leader, not one 90 s after another. Only a cut that
-                    // was a caller's deadline is retried.
-                    Some(Err(error)) if !running.deadline_bound && is_a_hang(error) => {
-                        return Err(error.clone());
-                    }
                     _ => {}
                 }
             }
@@ -1355,6 +1507,31 @@ mod status_cell {
         });
         settle.finish(outcome.clone());
         outcome.map(|read| PorcelainRead { led: true, ..read })
+    }
+
+    #[cfg(test)]
+    mod cut_tests {
+        use super::is_a_cut;
+
+        /// A read stopped because its asker left is that asker's, as a deadline
+        /// is: a waiter on the same cell must read for itself, and what the cell
+        /// holds is not thrown away for it.
+        #[test]
+        fn a_cancelled_read_is_a_cut_no_other_caller_inherits() {
+            assert!(is_a_cut(&crate::engine::process::read_cancel::cancelled()));
+            assert!(!is_a_cut(&"git status failed".to_string().into()));
+            // By kind, not words: git's own text that happens to match is no
+            // cancellation, and a wrapped cancellation still is one.
+            assert!(!is_a_cut(
+                &crate::engine::process::read_cancel::CANCELLED_MESSAGE
+                    .to_string()
+                    .into()
+            ));
+            assert!(is_a_cut(
+                &crate::engine::process::read_cancel::cancelled()
+                    .wrap(|e| format!("git status failed: {e}"))
+            ));
+        }
     }
 }
 
@@ -1460,7 +1637,49 @@ pub(crate) fn fold_status_paths_for_focus(repo: &Path, focus: &str, paths: &mut 
 }
 
 /// Why a status that never started did not.
-const DEADLINE_PASSED: &str = "the deadline passed before this worktree's status was read";
+pub(super) const DEADLINE_PASSED: &str =
+    "the deadline passed before this worktree's status was read";
+
+/// Test seam: records each unfiltered status read executed by [`spawn_porcelain`]
+/// along with its backend (`Gix` vs `GitCli`) and caller [`Admission`], keyed by
+/// canonical worktree path.
+#[cfg(test)]
+pub(crate) mod status_reads {
+    use crate::engine::process::{canonicalize_plain, current_admission, Admission};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum StatusBackend {
+        Gix,
+        GitCli,
+    }
+
+    type Entry = (StatusBackend, Admission);
+
+    fn log() -> &'static Mutex<HashMap<PathBuf, Vec<Entry>>> {
+        static LOG: OnceLock<Mutex<HashMap<PathBuf, Vec<Entry>>>> = OnceLock::new();
+        LOG.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn key(dir: &Path) -> PathBuf {
+        canonicalize_plain(dir).unwrap_or_else(|_| dir.to_path_buf())
+    }
+
+    pub(super) fn record(dir: &Path, backend: StatusBackend) {
+        let mut guard = log().lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .entry(key(dir))
+            .or_default()
+            .push((backend, current_admission()));
+    }
+
+    pub(crate) fn in_dir(dir: &Path) -> Vec<Entry> {
+        let guard = log().lock().unwrap_or_else(PoisonError::into_inner);
+        guard.get(&key(dir)).cloned().unwrap_or_default()
+    }
+}
 
 /// Test seam: runs a closure just before the status read of chosen worktrees,
 /// so a test can make a read slow, or edit a worktree at a known moment,
@@ -1860,9 +2079,11 @@ pub struct HeadDivergence {
     pub behind: u32,
 }
 
-/// Most `rev-list` reads (cache misses) one [`measure_head_divergence`] pass
-/// makes. A HEAD past it is reported unmeasured, not read.
-pub const MAX_HEAD_DIVERGENCE_MISSES: usize = 8;
+/// Most per-HEAD `rev-list` reads (cache misses for detached or fallback
+/// commits) one [`measure_head_divergence`] pass makes. Branch-backed worktrees
+/// resolve together in one `for-each-ref` call; a detached HEAD past this cap
+/// is reported unmeasured, not read.
+pub const MAX_HEAD_DIVERGENCE_MISSES: usize = 16;
 
 /// Most `(repository, head, base)` answers remembered. The key is immutable (a
 /// commit's ancestry never changes), so an entry is never stale; the bound
@@ -1924,26 +2145,60 @@ pub struct HeadDivergences {
 /// list measures against.
 ///
 /// An answer already known for the immutable `(head, base)` pair costs no
-/// process. A miss is one `rev-list --left-right --count` through the shared
-/// spawn gate (so it spends the same budget as every other read), at most
-/// [`MAX_HEAD_DIVERGENCE_MISSES`] per pass and each given what the deadline
-/// has left; every HEAD past either limit is unmeasured.
+/// process, and a HEAD equal to the base is `(0, 0)` without spawning. When
+/// more than one HEAD misses the cache, a single `for-each-ref` resolves every
+/// branch-backed HEAD together; remaining detached (or git < 2.42 fallback)
+/// misses run `rev-list --left-right --count` through the shared spawn gate, at
+/// most [`MAX_HEAD_DIVERGENCE_MISSES`] per pass and each bounded by what the
+/// deadline has left. Every HEAD past either limit is unmeasured.
 pub fn measure_head_divergence(
     repo: &Path,
     heads: &[&str],
     deadline: &ScanDeadline,
 ) -> HeadDivergences {
-    measure_head_divergence_capped(repo, heads, deadline, MAX_HEAD_DIVERGENCE_MISSES)
+    measure_head_divergence_inner(repo, heads, None, deadline, MAX_HEAD_DIVERGENCE_MISSES)
+}
+
+/// [`measure_head_divergence`] scoped to the worktrees' checked-out branches so
+/// the batched `for-each-ref` touches only the uncached worktrees' branch refs
+/// rather than every branch in the repository (and skips `for-each-ref`
+/// completely when every uncached worktree is detached).
+pub(crate) fn measure_head_divergence_for_worktrees(
+    repo: &Path,
+    worktrees: &[(&str, Option<&str>)],
+    deadline: &ScanDeadline,
+) -> HeadDivergences {
+    let heads: Vec<&str> = worktrees.iter().map(|(head, _)| *head).collect();
+    measure_head_divergence_inner(
+        repo,
+        &heads,
+        Some(worktrees),
+        deadline,
+        MAX_HEAD_DIVERGENCE_MISSES,
+    )
 }
 
 /// [`measure_head_divergence`] with the per-pass miss cap as an argument, so
-/// the cold-cache-over-cap case is reachable without nine worktrees.
+/// the cold-cache-over-cap case is reachable without seventeen worktrees.
+#[cfg(test)]
 pub(crate) fn measure_head_divergence_capped(
     repo: &Path,
     heads: &[&str],
     deadline: &ScanDeadline,
     max_misses: usize,
 ) -> HeadDivergences {
+    measure_head_divergence_inner(repo, heads, None, deadline, max_misses)
+}
+
+fn measure_head_divergence_inner(
+    repo: &Path,
+    heads: &[&str],
+    worktree_branches: Option<&[(&str, Option<&str>)]>,
+    deadline: &ScanDeadline,
+    max_misses: usize,
+) -> HeadDivergences {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     let mut out = HeadDivergences::default();
     let mut distinct: Vec<&str> = Vec::new();
     for head in heads.iter().copied().filter(|h| is_full_oid(h)) {
@@ -1969,54 +2224,244 @@ pub(crate) fn measure_head_divergence_capped(
             return out;
         }
     };
-    let mut misses = 0usize;
-    let mut unread = 0usize;
-    let mut first_reason = None;
     let boundary = shallow_token(repo);
     out.shallow = boundary.as_ref().is_some_and(|(_, shallow)| *shallow);
-    for head in &distinct {
-        let key = boundary.as_ref().map(|(token, _)| {
+    let make_key = |head: &str| -> Option<DivergenceKey> {
+        boundary.as_ref().map(|(token, _)| {
             (
                 repo.to_path_buf(),
                 token.clone(),
-                (*head).to_string(),
+                head.to_string(),
                 base_oid.clone(),
             )
-        });
-        let cached = key.as_ref().and_then(|key| {
+        })
+    };
+    let cache_insert = |head: &str, counts: HeadDivergence| {
+        if let Some(key) = make_key(head) {
             head_divergence_cache()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .get(key)
-                .copied()
-        });
-        if let Some(known) = cached {
-            out.by_head.insert((*head).to_string(), known);
-            continue;
+                .insert(key, counts);
         }
-        let reason = if misses >= max_misses {
-            format!("past the per-pass limit of {max_misses} reads")
-        } else if deadline.expired() {
-            "the deadline passed".to_string()
-        } else {
-            misses += 1;
-            match left_right_counts(repo, &base_oid, head, deadline.remaining()) {
-                Ok(counts) => {
-                    if let Some(key) = key {
-                        head_divergence_cache()
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(key, counts);
+    };
+
+    let mut uncached: Vec<&str> = Vec::new();
+    {
+        let mut cache = head_divergence_cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for &head in &distinct {
+            if let Some(known) = make_key(head).and_then(|key| cache.get(&key).copied()) {
+                out.by_head.insert(head.to_string(), known);
+            } else if head == base_oid && !deadline.expired() {
+                let zero = HeadDivergence {
+                    ahead: 0,
+                    behind: 0,
+                };
+                if let Some(key) = make_key(head) {
+                    cache.insert(key, zero);
+                }
+                out.by_head.insert(head.to_string(), zero);
+            } else {
+                uncached.push(head);
+            }
+        }
+    }
+    if uncached.is_empty() {
+        return out;
+    }
+
+    let mut unread = 0usize;
+    let mut first_reason: Option<String> = None;
+
+    // When multiple HEADs missed the cache, resolve all branch-backed HEADs in
+    // one `for-each-ref` call instead of spawning one `rev-list` per worktree.
+    let uncached_branches: Option<Vec<&str>> = worktree_branches.map(|pairs| {
+        let uncached_set: std::collections::HashSet<&str> = uncached.iter().copied().collect();
+        pairs
+            .iter()
+            .filter_map(|(head, branch)| {
+                if uncached_set.contains(head) {
+                    branch.filter(|b| !b.is_empty())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    });
+    let should_batch = uncached.len() > 1
+        && max_misses > 0
+        && !deadline.expired()
+        && uncached_branches
+            .as_deref()
+            .is_none_or(|list| !list.is_empty());
+    let mut aborted_reason: Option<String> = None;
+    if should_batch {
+        match batch_head_divergence(
+            repo,
+            &base_oid,
+            uncached_branches.as_deref().unwrap_or(&[]),
+            deadline.remaining().max(STATUS_GRACE),
+        ) {
+            Ok(batched) => {
+                let mut still_uncached = Vec::new();
+                for head in uncached {
+                    if let Some(&counts) = batched.get(head) {
+                        cache_insert(head, counts);
+                        out.by_head.insert(head.to_string(), counts);
+                    } else {
+                        still_uncached.push(head);
                     }
-                    out.by_head.insert((*head).to_string(), counts);
+                }
+                uncached = still_uncached;
+            }
+            Err(err)
+                if crate::engine::process::is_deferred_under_load(err.message())
+                    || crate::engine::process::read_cancel::is_cancelled_error(&err) =>
+            {
+                aborted_reason = Some(err.into_message());
+            }
+            Err(_) => {
+                // Git < 2.42 lacks `%(ahead-behind:...)` or declined the ref
+                // query; fall back to bounded per-HEAD `rev-list`.
+            }
+        }
+    }
+
+    if let Some(reason) = aborted_reason {
+        unread = uncached.len();
+        first_reason = Some(reason);
+    } else if !uncached.is_empty() {
+        let to_run = uncached.len().min(max_misses);
+        let overflow = uncached.len() - to_run;
+        let run_targets = &uncached[..to_run];
+
+        #[cfg(test)]
+        let serial = crate::engine::process::forced_failure_active();
+        #[cfg(not(test))]
+        let serial = false;
+
+        let results: Vec<(&str, Result<HeadDivergence, String>)> = if to_run <= 1 || serial {
+            let mut res = Vec::with_capacity(to_run);
+            let mut halted: Option<String> = None;
+            for &head in run_targets {
+                if let Some(ref reason) = halted {
+                    res.push((head, Err(reason.clone())));
                     continue;
                 }
-                Err(reason) => reason.into_message(),
+                if deadline.expired() {
+                    res.push((head, Err("the deadline passed".to_string())));
+                    continue;
+                }
+                match left_right_counts(repo, &base_oid, head, deadline.remaining()) {
+                    Ok(counts) => res.push((head, Ok(counts))),
+                    Err(err) => {
+                        let stop = crate::engine::process::is_deferred_under_load(err.message())
+                            || crate::engine::process::read_cancel::is_cancelled_error(&err);
+                        let msg = err.into_message();
+                        if stop {
+                            halted = Some(msg.clone());
+                        }
+                        res.push((head, Err(msg)));
+                    }
+                }
             }
+            res
+        } else {
+            let caller = crate::engine::process::read_cancel::CallerScope::capture();
+            let workers = DIRTY_SCAN_FAN_OUT.min(to_run);
+            let next = AtomicUsize::new(0);
+            let stop = AtomicBool::new(false);
+            let stop_reason: Mutex<Option<String>> = Mutex::new(None);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let next = &next;
+                        let stop = &stop;
+                        let stop_reason = &stop_reason;
+                        let base_oid = base_oid.as_str();
+                        let caller = &caller;
+                        scope.spawn(move || {
+                            caller.run(|| {
+                                let mut local = Vec::new();
+                                loop {
+                                    let pos = next.fetch_add(1, Ordering::Relaxed);
+                                    let Some(&head) = run_targets.get(pos) else {
+                                        break;
+                                    };
+                                    if stop.load(Ordering::Acquire) {
+                                        let reason = stop_reason
+                                            .lock()
+                                            .unwrap_or_else(PoisonError::into_inner)
+                                            .clone()
+                                            .unwrap_or_else(|| "stopped under load".to_string());
+                                        local.push((head, Err(reason)));
+                                        continue;
+                                    }
+                                    if deadline.expired() {
+                                        local.push((head, Err("the deadline passed".to_string())));
+                                        continue;
+                                    }
+                                    match left_right_counts(
+                                        repo,
+                                        base_oid,
+                                        head,
+                                        deadline.remaining(),
+                                    ) {
+                                        Ok(counts) => local.push((head, Ok(counts))),
+                                        Err(err) => {
+                                            let halt =
+                                                crate::engine::process::is_deferred_under_load(
+                                                    err.message(),
+                                                ) || crate::engine::process::read_cancel::is_cancelled_error(
+                                                    &err,
+                                                );
+                                            let msg = err.into_message();
+                                            if halt {
+                                                let mut slot = stop_reason
+                                                    .lock()
+                                                    .unwrap_or_else(PoisonError::into_inner);
+                                                slot.get_or_insert_with(|| msg.clone());
+                                                stop.store(true, Ordering::Release);
+                                            }
+                                            local.push((head, Err(msg)));
+                                        }
+                                    }
+                                }
+                                local
+                            })
+                        })
+                    })
+                    .collect();
+                let mut combined = Vec::with_capacity(to_run);
+                for handle in handles {
+                    if let Ok(local) = handle.join() {
+                        combined.extend(local);
+                    }
+                }
+                combined
+            })
         };
-        unread += 1;
-        first_reason.get_or_insert(reason);
+
+        for (head, result) in results {
+            match result {
+                Ok(counts) => {
+                    cache_insert(head, counts);
+                    out.by_head.insert(head.to_string(), counts);
+                }
+                Err(reason) => {
+                    unread += 1;
+                    first_reason.get_or_insert(reason);
+                }
+            }
+        }
+        if overflow > 0 {
+            unread += overflow;
+            first_reason
+                .get_or_insert_with(|| format!("past the per-pass limit of {max_misses} reads"));
+        }
     }
+
     if let Some(reason) = first_reason {
         out.unread = Some(format!(
             "unmeasured: {unread} of {} distinct HEAD commits not measured: {reason}",
@@ -2024,6 +2469,51 @@ pub(crate) fn measure_head_divergence_capped(
         ));
     }
     out
+}
+
+/// Measures every named branch's (or every local branch's, when `branches` is
+/// empty) HEAD commit against `base_oid` in one `for-each-ref` call bounded by
+/// `timeout`.
+fn batch_head_divergence(
+    repo: &Path,
+    base_oid: &str,
+    branches: &[&str],
+    timeout: Duration,
+) -> Result<HashMap<String, HeadDivergence>, CommandError> {
+    let format_arg = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
+    let patterns: Vec<String> = if branches.is_empty() {
+        vec!["refs/heads".to_string()]
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        branches
+            .iter()
+            .filter(|b| !b.is_empty() && seen.insert(**b))
+            .map(|b| format!("refs/heads/{b}"))
+            .collect()
+    };
+    let mut args: Vec<&str> = Vec::with_capacity(2 + patterns.len());
+    args.push("for-each-ref");
+    args.push(&format_arg);
+    for pat in &patterns {
+        args.push(pat.as_str());
+    }
+    let stdout = git_text_with_timeout(repo, &args, timeout)?;
+    let mut out = HashMap::new();
+    for line in stdout.lines() {
+        let Some((oid, counts)) = line.split_once('\0') else {
+            continue;
+        };
+        if !is_full_oid(oid) {
+            continue;
+        }
+        let mut parts = counts.split_whitespace();
+        let ahead = parts.next().and_then(|n| n.parse::<u32>().ok());
+        let behind = parts.next().and_then(|n| n.parse::<u32>().ok());
+        if let (Some(ahead), Some(behind)) = (ahead, behind) {
+            out.insert(oid.to_string(), HeadDivergence { ahead, behind });
+        }
+    }
+    Ok(out)
 }
 
 fn left_right_counts(
@@ -2163,6 +2653,17 @@ pub fn list_worktrees_scanned(
     };
     // Every caller sharing this listing had arrived by `latest_arrival`, so a
     // status read begun after it is no older than any of their questions.
+    //
+    // A leader whose asker left (its `read_cancel` flag set) must not publish
+    // that cancellation to the callers that joined it: they never left, and
+    // the status cell's `is_a_cut` does this for its own single flight, which
+    // this one has no equivalent of. It is safe today because no caller that
+    // can carry a cancel flag lists through here: the cancellable asks (the
+    // gate, the scan and the insights read in `desktop::instance`, the
+    // commit-graph walk) list through the collision memo's `list_worktrees_lite`
+    // or not at all, and `cmd_list_worktrees` names no request id. Whoever
+    // makes this listing cancellable must make a cancelled leader hand its
+    // joiners a follow-up scan instead of its error.
     let outcome = scan_listing(repo_path, depth, latest_arrival);
     #[cfg(test)]
     before_publish_hook();
@@ -2300,7 +2801,7 @@ fn scan_listing(
         .take(MAX_DIRTY_SCANS)
         .collect();
 
-    let class = crate::engine::process::current_admission();
+    let caller = crate::engine::process::read_cancel::CallerScope::capture();
     // Asked once for the whole listing, whenever any scanned worktree is on a
     // branch: without the base no branch is known to be it, so even a lone
     // checkout of the default needs the answer to be called "no divergence".
@@ -2332,7 +2833,7 @@ fn scan_listing(
     if depth == ScanDepth::Full {
         base.routes = Some(PortlessSnapshot::load());
     }
-    let mut metrics = scan_in_waves(&scan_targets, class, None, |idx| {
+    let mut metrics = scan_in_waves(&scan_targets, &caller, None, |idx| {
         scan_worktree(&repo, &parsed[idx], depth, &base, None, &pass)
     });
 
@@ -2354,50 +2855,85 @@ fn scan_listing(
 }
 
 /// Runs `scan` for each of `targets`, [`DIRTY_SCAN_FAN_OUT`] at a time, each
-/// in `class`.
+/// under `caller`'s admission class and cancel flag.
 ///
-/// Scoped threads in bounded waves rather than rayon's pool: a pool thread
-/// starts in the default admission class, so the scans of a listing asked for
-/// as background work were promoted to refresh traffic.
+/// Scoped worker pool with bounded concurrency (`DIRTY_SCAN_FAN_OUT`) rather
+/// than rayon's pool or chunk barriers: pool threads start in the default
+/// admission class, whereas scoped workers put back `caller`'s admission class
+/// and cancel flag and pull targets continuously from an atomic index so one
+/// slow worktree never stalls the other workers.
 ///
-/// With a `deadline`, no wave starts once it has passed. A target that was
-/// never started has no entry in the result, which is how a caller tells "cut
-/// off" from "scanned and found nothing"; the ones already running are bounded
-/// by the same deadline inside their own status read.
+/// With a `deadline`, no new target starts once it has passed or the caller
+/// cancelled. A target that was never started has no entry in the result, which
+/// is how a caller tells "cut off" from "scanned and found nothing"; the ones
+/// already running are bounded by the same deadline inside their own status
+/// read.
 fn scan_in_waves<F>(
     targets: &[usize],
-    class: crate::engine::process::Admission,
+    caller: &crate::engine::process::read_cancel::CallerScope,
     deadline: Option<&ScanDeadline>,
     scan: F,
 ) -> HashMap<usize, WorktreeScan>
 where
     F: Fn(usize) -> WorktreeScan + Sync,
 {
-    let mut metrics: HashMap<usize, WorktreeScan> = HashMap::new();
-    for wave in targets.chunks(DIRTY_SCAN_FAN_OUT) {
-        if deadline.is_some_and(ScanDeadline::expired) {
-            break;
-        }
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = wave
-                .iter()
-                .map(|&idx| {
-                    let scan = &scan;
-                    let handle = scope
-                        .spawn(move || crate::engine::process::with_admission(class, || scan(idx)));
-                    (idx, handle)
-                })
-                .collect();
-            for (idx, handle) in handles {
-                let scan = handle.join().unwrap_or_else(|_| WorktreeScan {
-                    note: Some("the scan panicked; nothing was measured".into()),
-                    ..WorktreeScan::default()
-                });
-                metrics.insert(idx, scan);
-            }
-        });
+    use crate::engine::process::read_cancel::{self, ReadCancel};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if targets.is_empty() || deadline.is_some_and(ScanDeadline::expired) {
+        return HashMap::new();
     }
-    metrics
+    let workers = DIRTY_SCAN_FAN_OUT.min(targets.len());
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let scan = &scan;
+                let next = &next;
+                scope.spawn(move || {
+                    caller.run(|| {
+                        let mut local = Vec::new();
+                        loop {
+                            if deadline.is_some_and(ScanDeadline::expired)
+                                || read_cancel::current()
+                                    .as_ref()
+                                    .is_some_and(ReadCancel::is_cancelled)
+                            {
+                                break;
+                            }
+                            let pos = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&idx) = targets.get(pos) else {
+                                break;
+                            };
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    scan(idx)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    WorktreeScan {
+                                        note: Some(
+                                            "the scan panicked; nothing was measured".into(),
+                                        ),
+                                        ..WorktreeScan::default()
+                                    }
+                                });
+                            local.push((idx, result));
+                        }
+                        local
+                    })
+                })
+            })
+            .collect();
+        let mut metrics = HashMap::with_capacity(targets.len());
+        for handle in handles {
+            if let Ok(local) = handle.join() {
+                for (idx, result) in local {
+                    metrics.insert(idx, result);
+                }
+            }
+        }
+        metrics
+    })
 }
 
 fn info_from(idx: usize, entry: ParsedWorktree, scan: WorktreeScan) -> WorktreeInfo {
@@ -2479,11 +3015,11 @@ pub fn read_dirty(list: &mut [WorktreeInfo], deadline: &ScanDeadline) -> usize {
             ..ParsedWorktree::default()
         })
         .collect();
-    let class = crate::engine::process::current_admission();
+    let caller = crate::engine::process::read_cancel::CallerScope::capture();
     // The pass began when its clock did, so a status any stage of it read since
     // (the main checkout's, for one) is this stage's answer too.
     let pass = ScanPass::asked_at(deadline.started());
-    let mut scans = scan_in_waves(&targets, class, Some(deadline), |idx| {
+    let mut scans = scan_in_waves(&targets, &caller, Some(deadline), |idx| {
         // The repository path is read only at `Full` depth.
         scan_worktree(
             Path::new(&entries[idx].path),
@@ -4083,8 +4619,12 @@ pub fn add_worktree_with_devmap(
     if let Some(selection) = caches {
         let repo = validate_repo(repo_path)?;
         let (cache_outcome, devmap_outcome) = std::thread::scope(|scope| {
-            let cache_task = scope.spawn(|| clone_ignored_caches(&repo, target, selection));
-            let devmap_task = scope.spawn(provision);
+            // A new thread starts in the process default class; both tasks are
+            // part of the creation that asked for them.
+            let cache_task = scope.spawn(crate::engine::process::carry_admission(|| {
+                clone_ignored_caches(&repo, target, selection)
+            }));
+            let devmap_task = scope.spawn(crate::engine::process::carry_admission(provision));
             let devmap_outcome = devmap_task
                 .join()
                 .unwrap_or_else(|_| DevmapOutcome::Failed {
@@ -6118,7 +6658,9 @@ fn path_is_gone(path: &Path) -> bool {
 /// the tree is gone it is done, and if it is not the walk is run again over
 /// what is left. Every other error is returned as it came, and a NotFound
 /// that persists past [`VANISHED_WALK_RETRIES`] with the tree still there is
-/// returned too.
+/// returned too. On Windows an access denial counts as that too, since it is
+/// how a tree another delete is finishing answers; a denial that outlasts the
+/// retries is returned as it came.
 fn delete_dir_tree_with(
     path: &Path,
     remove_once: &dyn Fn(&Path) -> std::io::Result<()>,
@@ -6126,7 +6668,7 @@ fn delete_dir_tree_with(
     let mut attempt = 0;
     loop {
         match remove_once(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if is_vanishing_walk(&e) => {
                 if path_is_gone(path) {
                     return Ok(());
                 }
@@ -6134,10 +6676,35 @@ fn delete_dir_tree_with(
                 if attempt > VANISHED_WALK_RETRIES {
                     return Err(e);
                 }
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    std::thread::sleep(DELETE_PENDING_BACKOFF);
+                }
             }
             other => return other,
         }
     }
+}
+
+/// How long to wait before walking again a tree Windows refused access to
+/// because another delete has not finished with it.
+const DELETE_PENDING_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Whether a failed delete may only be another delete of the same tree
+/// finishing. Unix says so with NotFound. Windows keeps a deleted entry in a
+/// delete-pending state until its last handle closes, and says "Access is
+/// denied" to anything that touches it meanwhile, "directory not empty" when
+/// the other delete is still removing children, or a sharing violation
+/// (resource busy) while it holds a handle; the tree is then gone a
+/// moment later, which the caller confirms before calling it done.
+fn is_vanishing_walk(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || (cfg!(windows)
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::DirectoryNotEmpty
+                    | std::io::ErrorKind::ResourceBusy
+            ))
 }
 
 /// Deletes the files [`remove_worktree_split`] moved aside, with the lock
@@ -8253,14 +8820,16 @@ fn add_sparse_worktree_zero_copy_optional_branch(
 
     let ((caches_cloned, cache_error), devmap_outcome, overlay_path) =
         std::thread::scope(|scope| {
-            let cache_task = scope.spawn(|| {
+            // A new thread starts in the process default class; both tasks are
+            // part of the creation that asked for them.
+            let cache_task = scope.spawn(crate::engine::process::carry_admission(|| {
                 if selective_cache {
                     clone_scoped_caches_for_cone(&anchor, target, &cone_dirs)
                 } else {
                     (Vec::new(), None)
                 }
-            });
-            let devmap_task = scope.spawn(|| {
+            }));
+            let devmap_task = scope.spawn(crate::engine::process::carry_admission(|| {
                 if zero_copy_devmap {
                     Some(crate::codeintel::provision_worktree_devmap_zero_copy(
                         &anchor, target,
@@ -8270,7 +8839,7 @@ fn add_sparse_worktree_zero_copy_optional_branch(
                 } else {
                     None
                 }
-            });
+            }));
             let c = cache_task
                 .join()
                 .unwrap_or_else(|_| (Vec::new(), Some("selective cache worker panicked".into())));
@@ -8561,7 +9130,21 @@ mod tests {
         )
         .unwrap();
         assert!(merged.ok);
-        assert!(merged.worktree_removed);
+        if cfg!(windows) {
+            // Windows has no process scan, and two agent kinds keep no
+            // registry there, so the merge cannot rule out a live session in
+            // the lane. It keeps the worktree and its branch rather than
+            // remove files from under one, and says why.
+            assert!(!merged.worktree_removed, "{merged:?}");
+            let reason = merged.worktree_kept_reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains("agent session") || reason.contains("process"),
+                "{merged:?}"
+            );
+            assert!(wt_clean.exists(), "the lane must be kept");
+        } else {
+            assert!(merged.worktree_removed);
+        }
         assert!(merged.squashed_commit.is_some());
         assert_eq!(
             std::fs::read_to_string(repo.join("main_progress.txt")).unwrap(),
@@ -9212,7 +9795,7 @@ some-future-field whatever
         assert_eq!(last.dirty_files, None);
         assert_eq!(
             last.scan_note.as_deref(),
-            Some("not scanned: past the 32-worktree scan limit")
+            Some(format!("not scanned: past the {MAX_DIRTY_SCANS}-worktree scan limit").as_str())
         );
     }
 
@@ -9242,6 +9825,7 @@ some-future-field whatever
         dirs.sort();
         dirs.dedup();
         let mut checked = 0;
+        let mut status_subprocesses = 0;
         for dir in &dirs {
             for (argv, class) in spawn_log::classed_spawns_in(dir) {
                 assert_eq!(
@@ -9250,12 +9834,37 @@ some-future-field whatever
                     "{argv:?} in {}",
                     dir.display()
                 );
+                if argv.iter().any(|arg| arg == "status") {
+                    status_subprocesses += 1;
+                }
                 checked += 1;
             }
         }
+        assert_eq!(
+            status_subprocesses, 0,
+            "happy path must use in-process gix status instead of spawning git status"
+        );
+        let mut gix_reads = 0;
+        for dir in &linked {
+            let reads = status_reads::in_dir(dir);
+            for (backend, class) in &reads {
+                assert_eq!(
+                    *class,
+                    Admission::Background,
+                    "status read in {} left background class",
+                    dir.display()
+                );
+                assert_eq!(*backend, status_reads::StatusBackend::Gix);
+                gix_reads += 1;
+            }
+        }
         assert!(
-            checked >= linked.len() * 2,
-            "only {checked} scan spawns recorded"
+            gix_reads >= linked.len(),
+            "only {gix_reads} in-process status reads recorded"
+        );
+        assert!(
+            checked >= linked.len(),
+            "only {checked} diff scan spawns recorded"
         );
     }
 
@@ -9666,7 +10275,7 @@ some-future-field whatever
         assert!(WorktreeLayout::parse(Some("elsewhere")).is_err());
 
         let repo = dirty_repo();
-        let canon = repo.path().canonicalize().unwrap();
+        let canon = plain(repo.path());
         let canon_str = canon.to_str().unwrap();
 
         for bad in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
@@ -10121,12 +10730,7 @@ some-future-field whatever
     fn teardown_asks_the_gate_about_each_command_it_runs() {
         let (dir, wt) = teardown_fixture(None);
         let repo = dir.path();
-        let wt_path = wt
-            .path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let wt_path = plain(wt.path()).to_string_lossy().to_string();
         let mut asked = Vec::new();
         merge_and_teardown_worktree(
             repo.to_str().unwrap(),
@@ -11052,12 +11656,7 @@ some-future-field whatever
         let (dir, wt) = teardown_fixture(None);
         let repo = dir.path();
         diverge_main(&dir);
-        let wt_path = wt
-            .path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let wt_path = plain(wt.path()).to_string_lossy().to_string();
         let branch_tip = rev(wt.path(), "HEAD");
         let mut asked = Vec::new();
         let result = merge_and_teardown_worktree(
@@ -11808,6 +12407,19 @@ some-future-field whatever
             .count()
     }
 
+    /// Unfiltered status reads of `cwds` by either backend: a `git status`
+    /// child, or an in-process `gix` read ([`status_reads`]). Counting only
+    /// children reads zero once the read moved in-process; a read that fell
+    /// back to git is counted once, by its child.
+    fn status_reads_with(cwds: &[PathBuf]) -> usize {
+        let in_process = cwds
+            .iter()
+            .flat_map(|cwd| status_reads::in_dir(cwd))
+            .filter(|(backend, _)| *backend == status_reads::StatusBackend::Gix)
+            .count();
+        spawned_with(cwds, "status") + in_process
+    }
+
     /// The default-base lookup is a property of the repository: one per
     /// listing, not two processes for every worktree.
     #[test]
@@ -11946,14 +12558,14 @@ some-future-field whatever
 
         let listing = list_worktrees_scanned(root.to_str().unwrap(), ScanDepth::Listing).unwrap();
         assert!(listing.iter().all(|w| w.dirty_files.is_none()));
-        assert_eq!(spawned_with(&cwds, "status"), 0);
+        assert_eq!(status_reads_with(&cwds), 0);
 
         let dirty = list_worktrees_scanned(root.to_str().unwrap(), ScanDepth::Dirty).unwrap();
         assert!(dirty.iter().all(|w| w.dirty_files == Some(0)));
         assert!(dirty
             .iter()
             .all(|w| w.diff_stat.is_none() && w.main_divergence.is_none()));
-        assert_eq!(spawned_with(&cwds, "status"), 4);
+        assert_eq!(status_reads_with(&cwds), 4);
         assert_eq!(spawned_with(&cwds, "--shortstat"), 0);
         assert_eq!(spawned_with(&cwds, "rev-list"), 0);
         assert_eq!(spawned_with(&cwds, "for-each-ref"), 0);
@@ -12023,7 +12635,8 @@ some-future-field whatever
         assert_eq!(target.dirty_files, Some(1));
         assert_eq!(target.scan_note, None);
         let others = [plain(main.path()), linked[0].clone()];
-        assert_eq!(spawned_with(&others, "status"), 0);
+        assert_eq!(status_reads_with(&others), 0);
+        assert_eq!(status_reads_with(std::slice::from_ref(&linked[1])), 1);
     }
 
     /// The wire names are the variant names in lowercase, and nothing else:
@@ -12127,7 +12740,7 @@ some-future-field whatever
         let mut cwds = linked.clone();
         cwds.push(root.clone());
         assert_eq!(
-            spawned_with(&cwds, "status"),
+            status_reads_with(&cwds),
             linked.len() + 1,
             "one status per worktree"
         );
@@ -13582,6 +14195,9 @@ some-future-field whatever
     }
 
     /// Entries in `<common>/gitpulse-teardown`, or none when it does not exist.
+    /// An aside beside the old place (every aside where the two are not known
+    /// to share a device, as on Windows) is listed by its marker, named
+    /// `<aside name>.sibling`.
     fn teardown_entries(repo: &Path) -> Vec<String> {
         std::fs::read_dir(teardown_holding_dir(repo))
             .map(|listing| {
@@ -13591,6 +14207,24 @@ some-future-field whatever
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The name of the aside a [`teardown_entries`] entry stands for: the
+    /// entry itself, or the marker's name without its `.sibling`.
+    fn aside_name(entry: &str) -> &str {
+        entry.strip_suffix(".sibling").unwrap_or(entry)
+    }
+
+    /// The directory holding the files of the aside a [`teardown_entries`]
+    /// entry stands for: the entry itself under the holding directory, or the
+    /// place its marker names when it was put beside the old one.
+    fn teardown_aside_dir(repo: &Path, entry: &str) -> PathBuf {
+        let holding = teardown_holding_dir(repo);
+        std::fs::read_to_string(holding.join(entry))
+            .ok()
+            .filter(|_| entry.ends_with(".sibling"))
+            .and_then(|text| text.lines().next().map(PathBuf::from))
+            .unwrap_or_else(|| holding.join(entry))
     }
 
     /// A planted leftover named like ours, old enough that no sweep treats it
@@ -13704,7 +14338,7 @@ some-future-field whatever
         let left = teardown_entries(dir.path());
         assert_eq!(left.len(), 1, "{left:?}");
         assert!(
-            reported.contains(&left[0]),
+            reported.contains(aside_name(&left[0])),
             "the report does not name the aside {}: {reported}",
             left[0]
         );
@@ -14011,7 +14645,7 @@ some-future-field whatever
         );
         let entries = teardown_entries(repo);
         assert_eq!(entries.len(), 1, "{entries:?}");
-        let aside = teardown_holding_dir(repo).join(&entries[0]);
+        let aside = teardown_aside_dir(repo, &entries[0]);
         assert!(aside.join("feature.txt").exists(), "the files were lost");
         assert!(aside.join(HOLD_FILE).exists());
         // Old enough that nothing but the hold file protects it.
@@ -14331,6 +14965,28 @@ some-future-field whatever
         assert!(!aside.exists());
     }
 
+    /// A delete another delete is finishing answers NotFound on unix and, on
+    /// Windows, "access denied" or "directory not empty" until the tree is
+    /// gone. Anything else is the caller's error as it came.
+    #[test]
+    fn only_the_answers_of_a_tree_another_delete_is_finishing_are_waited_out() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_vanishing_walk(&Error::from(ErrorKind::NotFound)));
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::DirectoryNotEmpty,
+            ErrorKind::ResourceBusy,
+        ] {
+            assert_eq!(
+                is_vanishing_walk(&Error::from(kind)),
+                cfg!(windows),
+                "{kind:?}"
+            );
+        }
+        assert!(!is_vanishing_walk(&Error::other("disk on fire")));
+        assert!(!is_vanishing_walk(&Error::from(ErrorKind::TimedOut)));
+    }
+
     /// 1. The other sweep deletes children while this one walks the tree, so
     ///    NotFound surfaces from inside the recursive delete.
     #[test]
@@ -14446,7 +15102,14 @@ some-future-field whatever
     fn adv_a_very_long_worktree_name_takes_the_split() {
         let (dir, _wt) = teardown_fixture(None);
         let parent = tempfile::tempdir().unwrap();
-        let lane = parent.path().join("l".repeat(240));
+        // Windows refuses a path past MAX_PATH (260), and git's own
+        // `.git/worktrees/<name>` record is named after the final component
+        // too, so 240 characters under a temp directory cannot be created
+        // there at all: git stops at "Filename too long" before the removal
+        // this test is about. 100 is the longest name that leaves the record,
+        // and the sibling aside Windows moves a lane to, inside the limit.
+        let name_len = if cfg!(windows) { 100 } else { 240 };
+        let lane = parent.path().join("l".repeat(name_len));
         add_lane_at(dir.path(), &lane, "long-lane");
         let (result, asides) = remove_recording(dir.path(), &lane, true);
         assert_eq!(result.unwrap(), WorktreeRemoval::default());
@@ -14735,7 +15398,7 @@ some-future-field whatever
         let left = teardown_entries(dir.path());
         let reported = removal.cleanup_error.expect("reported");
         assert!(
-            reported.contains("disk on fire") && reported.contains(&left[0]),
+            reported.contains("disk on fire") && reported.contains(aside_name(&left[0])),
             "{reported}"
         );
         assert!(!is_listed(dir.path(), wt.path()) && !wt.path().exists());
@@ -14769,10 +15432,14 @@ some-future-field whatever
     fn adv_lock_released_before_delete_branch_deleted_under_it_hooks_after() {
         let marker_dir = tempfile::tempdir().unwrap();
         let ran = marker_dir.path().join("hook-ran");
-        let hooks = format!(
-            r#"{{"worktree":{{"post_merge":["touch {}"]}}}}"#,
-            ran.display()
-        );
+        // Hooks run through `sh -c`, or `cmd /C` on Windows, which has no
+        // `touch` and whose paths hold backslashes the JSON must escape.
+        let command = if cfg!(windows) {
+            format!("type nul > {}", ran.display())
+        } else {
+            format!("touch {}", ran.display())
+        };
+        let hooks = serde_json::json!({"worktree": {"post_merge": [command]}}).to_string();
         let (dir, wt) = teardown_fixture(Some(&hooks));
         let other = second_lane(dir.path());
         let mut observed = None;
@@ -16600,6 +17267,13 @@ mod scan_once_tests {
         lanes.get(&key).is_some_and(|lane| lane.open.is_some())
     }
 
+    fn gix_reads(cwds: &[PathBuf]) -> usize {
+        cwds.iter()
+            .flat_map(|cwd| status_reads::in_dir(cwd))
+            .inspect(|(backend, _)| assert_eq!(*backend, status_reads::StatusBackend::Gix))
+            .count()
+    }
+
     /// The snapshot's main-checkout status, its rows and its collision scan are
     /// one read of each worktree: N worktrees, N statuses (it was N + 1, the
     /// main checkout twice).
@@ -16610,12 +17284,18 @@ mod scan_once_tests {
         change_every_worktree(&linked);
         let cwds = everywhere(&root, &linked);
         let before = spawned(&cwds, "status");
+        let before_reads = gix_reads(&cwds);
         let snapshot = crate::insights::snapshot(root.to_str().unwrap());
         assert!(snapshot.collisions.ok, "{:?}", snapshot.collisions);
         assert_eq!(
             spawned(&cwds, "status") - before,
+            0,
+            "happy path must use in-process gix status without spawning git status"
+        );
+        assert_eq!(
+            gix_reads(&cwds) - before_reads,
             cwds.len(),
-            "one status per worktree"
+            "one status read per worktree"
         );
     }
 
@@ -16629,6 +17309,7 @@ mod scan_once_tests {
         change_every_worktree(&linked);
         let cwds = everywhere(&root, &linked);
         let before = spawned(&cwds, "status");
+        let before_reads = gix_reads(&cwds);
         let path = root.to_str().unwrap().to_string();
         let listing = std::thread::spawn(move || {
             GATHER_OVERRIDE.with(|cell| cell.set(Some(Duration::from_millis(400))));
@@ -16651,6 +17332,11 @@ mod scan_once_tests {
         );
         assert_eq!(
             spawned(&cwds, "status") - before,
+            0,
+            "happy path must use in-process gix status without spawning git status"
+        );
+        assert_eq!(
+            gix_reads(&cwds) - before_reads,
             cwds.len(),
             "one status per worktree between the two"
         );
@@ -16672,9 +17358,16 @@ mod scan_once_tests {
         assert_eq!(spawned(&linked, "--shortstat"), linked.len());
         clock.advance(crate::engine::ref_cache::racy_window() + Duration::from_secs(1));
         let second = list_worktrees(root.to_str().unwrap()).expect("second");
+        // Only unix can prove a stamp (`diff_stamp`); elsewhere every listing
+        // measures, which is the honest answer to a stamp that cannot be proven.
+        let expected = if cfg!(unix) {
+            linked.len()
+        } else {
+            linked.len() * 2
+        };
         assert_eq!(
             spawned(&linked, "--shortstat"),
-            linked.len(),
+            expected,
             "the second listing diffed again"
         );
         assert_eq!(
@@ -16767,10 +17460,19 @@ mod scan_once_tests {
                 skipped += 1;
             }
         }
-        assert!(
-            skipped >= 1,
-            "the stamp never skipped: the test proves nothing ({trace:?})"
-        );
+        if cfg!(unix) {
+            assert!(
+                skipped >= 1,
+                "the stamp never skipped: the test proves nothing ({trace:?})"
+            );
+        } else {
+            // No stamp can be proven off unix, so no step may be skipped; the
+            // agreement with a fresh measurement above is the whole claim.
+            assert_eq!(
+                skipped, 0,
+                "a stamp skipped where none can exist ({trace:?})"
+            );
+        }
     }
 
     /// A stamp that cannot be proven never skips and is never kept.
@@ -16801,7 +17503,8 @@ mod scan_once_tests {
         {
             let clock = ManualClock::install();
             let _ = clock.now();
-            assert_eq!(measures(&status, &dir, 2), 1, "control");
+            let control = if cfg!(unix) { 1 } else { 2 };
+            assert_eq!(measures(&status, &dir, 2), control, "control");
         }
         // Racy: a file written inside the window cannot be told from a later
         // write in the same tick.
@@ -16849,7 +17552,12 @@ mod scan_once_tests {
         // A deletion explains an absent path; nothing else does.
         std::fs::remove_file(dir.join("sub").join("f.txt")).unwrap();
         let deleted: Arc<str> = Arc::from(" D sub/f.txt\0");
-        assert_eq!(measures(&deleted, &dir, 2), 1, "a deleted path is provable");
+        let provable = if cfg!(unix) { 1 } else { 2 };
+        assert_eq!(
+            measures(&deleted, &dir, 2),
+            provable,
+            "a deleted path is provable"
+        );
         let vanished: Arc<str> = Arc::from(" M sub/f.txt\0");
         assert_eq!(
             measures(&vanished, &dir, 2),
@@ -16871,6 +17579,14 @@ mod scan_once_tests {
         let status: Arc<str> = Arc::from(" M seed.txt\0");
         let capture = || diff_stamp::DiffStamp::capture(&dir, &status, &ScanPass::now());
 
+        if !cfg!(unix) {
+            assert_eq!(
+                capture(),
+                None,
+                "a platform with no change time proves no stamp"
+            );
+            return;
+        }
         let base = capture().expect("a provable stamp");
         assert_eq!(capture().as_ref(), Some(&base), "stable while untouched");
 
@@ -16924,7 +17640,8 @@ mod scan_once_tests {
             later.led,
             "a read that began before the ask is not its answer"
         );
-        assert_eq!(spawned(std::slice::from_ref(&dir), "status"), 2);
+        assert_eq!(spawned(std::slice::from_ref(&dir), "status"), 0);
+        assert_eq!(gix_reads(std::slice::from_ref(&dir)), 2);
     }
 
     /// A failure is not kept: once the worktree is back the next ask reads it.
@@ -16983,6 +17700,100 @@ mod scan_once_tests {
             took < crate::test_support::coverage_relaxed(hang * 3),
             "six waiters took {took:?} for a {hang:?} hang: they retried one at a time"
         );
+    }
+
+    /// A caller arriving after a hung leader started (`not_before > leader.started`)
+    /// must still inherit the unbounded timeout instead of launching a second
+    /// 90 s hang behind it.
+    #[test]
+    fn a_later_caller_waiting_on_a_hung_read_fails_with_it_without_retrying() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        let early = Instant::now();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let calls_in_probe = Arc::clone(&calls);
+        let (leader_res, waiter_res) = status_probes::with_probe(
+            std::slice::from_ref(&dir),
+            move |_| {
+                calls_in_probe.fetch_add(1, Ordering::AcqRel);
+                let _ = entered_tx.send(());
+                std::thread::sleep(Duration::from_millis(250));
+            },
+            || {
+                let dir_ref = &dir;
+                let dir_waiter = dir.clone();
+                status_probes::with_forced_timeout(dir_ref, || {
+                    std::thread::scope(|scope| {
+                        let leader = scope.spawn(|| read_status_since(dir_ref, None, early));
+                        entered_rx.recv().expect("leader entered probe");
+                        let later = Instant::now();
+                        let waiter =
+                            scope.spawn(move || read_status_since(&dir_waiter, None, later));
+                        (leader.join().unwrap(), waiter.join().unwrap())
+                    })
+                })
+            },
+        );
+        assert!(leader_res.is_err());
+        let waiter_err = waiter_res.expect_err("later waiter must inherit the hang");
+        assert!(waiter_err.message().contains("timed out"), "{waiter_err:?}");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "later waiter must not retry after leader hung"
+        );
+    }
+
+    /// Cancelling one waiter on a shared cell releases that waiter promptly
+    /// without poisoning the leader for non-cancelled waiters.
+    #[test]
+    fn a_cancelled_waiter_leaves_promptly_while_the_leader_continues_for_others() {
+        use crate::engine::process::read_cancel::{enter, is_cancelled_error, ReadCancel};
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        let early = Instant::now();
+        let (in_probe_tx, in_probe_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let cancel = ReadCancel::new();
+
+        let (leader_res, cancelled_res, bystander_res) = status_probes::with_probe(
+            std::slice::from_ref(&dir),
+            move |_| {
+                let _ = in_probe_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+            },
+            || {
+                let dir_ref = &dir;
+                let dir_cancel = dir.clone();
+                std::thread::scope(|scope| {
+                    let leader = scope.spawn(|| read_status_since(dir_ref, None, early));
+                    in_probe_rx.recv().expect("leader entered probe");
+                    let cancel_waiter = cancel.clone();
+                    let cancelled = scope.spawn(move || {
+                        let _guard = enter(Some(&cancel_waiter));
+                        read_status_since(&dir_cancel, None, early)
+                    });
+                    let bystander = scope.spawn(|| read_status_since(dir_ref, None, early));
+                    std::thread::sleep(Duration::from_millis(150));
+                    cancel.cancel();
+                    let cancelled_res = cancelled.join().unwrap();
+                    let _ = release_tx.send(());
+                    (
+                        leader.join().unwrap(),
+                        cancelled_res,
+                        bystander.join().unwrap(),
+                    )
+                })
+            },
+        );
+
+        let err = cancelled_res.expect_err("cancelled waiter must fail");
+        assert!(is_cancelled_error(&err), "{err:?}");
+        assert!(leader_res.is_ok(), "{leader_res:?}");
+        assert!(bystander_res.is_ok(), "{bystander_res:?}");
     }
 }
 

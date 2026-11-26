@@ -127,10 +127,26 @@ fn only_a_change_of_state_is_told_and_each_is_told_with_its_event() {
 fn a_different_event_that_leaves_the_same_state_is_not_a_change() {
     let mut rig = Rig::new();
     rig.say("permission_request", S);
-    // The banner that follows the request six seconds later says the same thing.
+    // The banner that follows the request six seconds later says the same thing,
+    // and `agent_needs_input` also keeps the session in `waiting_you`.
     rig.say("permission_prompt", S);
-    rig.say("idle_prompt", S);
+    rig.say("agent_needs_input", S);
     assert_eq!(rig.told().len(), 1);
+
+    // `idle_prompt` transitions from `waiting_you` to `idle`, then `turn_finished`
+    // coalesces within `idle`.
+    rig.say("idle_prompt", S);
+    rig.say("turn_finished", S);
+    assert_eq!(
+        rig.told()
+            .into_iter()
+            .map(|(_, e, s)| (e, s))
+            .collect::<Vec<_>>(),
+        vec![
+            ("permission_request", "waiting_you"),
+            ("idle_prompt", "idle"),
+        ]
+    );
 }
 
 #[test]

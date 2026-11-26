@@ -1546,7 +1546,14 @@ pub(super) fn arguments(
     } else {
         COMPLETION
     };
-    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. In this GitPulse terminal, the gitpulse-terminal skill covers spawning and orchestrating child terminals or split file panes, the gitpulse-load skill covers checking host load before a heavy build or test and what a refusal for load means, and the gitpulse-merge-train skill covers verifying several finished branches together with one full gate run. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
+    let skill = |name: &str| super::agy_plugin::skill_reference(provider, name);
+    let (terminal, load, merge_train) = (skill("terminal"), skill("load"), skill("merge-train"));
+    let (commit_and_merge, merge_prs, wrap_up) = (
+        skill("commit-and-merge"),
+        skill("merge-prs"),
+        skill("wrap-up"),
+    );
+    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. In this GitPulse terminal, the {terminal} skill covers spawning and orchestrating child terminals or split file panes, the {load} skill covers checking host load before a heavy build or test and what a refusal for load means, and the {merge_train} skill covers verifying several finished branches together with one full gate run. When the user asks you to land work, the {commit_and_merge} skill commits and merges finished branches while keeping locked-in ones, the {merge_prs} skill merges pull requests, and the {wrap_up} skill winds agents down and lands everything; run those three only on the user's request. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
     if args.iter().any(|a| a.len() > 16 * 1024 || a.contains('\0')) {
         return Err(error(
             "invalid_input",
@@ -2546,6 +2553,43 @@ mod tests {
                 .unwrap();
             assert!(!inspect.contains("gitpulse_complete_task"), "{provider}");
             assert!(inspect.contains("change the task's status"), "{provider}");
+        }
+    }
+    /// Antigravity runs a plugin skill as a bare `/<name>`, so it is told the
+    /// prefixed names its copies carry; the hosts that namespace by plugin are
+    /// told `gitpulse:<name>`. Naming one host's spelling to the other names a
+    /// skill that agent cannot find.
+    #[test]
+    fn the_launch_prompt_names_skills_the_way_that_agent_runs_them() {
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        for provider in ["codex", "claude", "grok", "agy"] {
+            let prompt = arguments(provider, "edit", false, "/checkout", &brief.path)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let (want, other) = if provider == "agy" {
+                ("gitpulse-", "gitpulse:")
+            } else {
+                ("gitpulse:", "gitpulse-")
+            };
+            for skill in [
+                "terminal",
+                "load",
+                "merge-train",
+                "commit-and-merge",
+                "merge-prs",
+                "wrap-up",
+            ] {
+                assert!(
+                    prompt.contains(&format!("the {want}{skill} skill")),
+                    "{provider}: {prompt}"
+                );
+                assert!(
+                    !prompt.contains(&format!("{other}{skill} skill")),
+                    "{provider}: {prompt}"
+                );
+            }
         }
     }
     #[test]
@@ -3560,7 +3604,7 @@ mod hook_launch_tests {
         assert_eq!(
             argv.iter().filter(|a| *a == "--settings").count(),
             1,
-            "{argv:?}"
+            "expected exactly one --settings flag"
         );
         serde_json::from_str(&argv[at + 1]).expect("settings JSON")
     }
@@ -3572,15 +3616,22 @@ mod hook_launch_tests {
         let mut keys: Vec<_> = settings.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["hooks", "preferredNotifChannel"]);
-        let commands: Vec<String> = settings["hooks"]["PreToolUse"]
+        let handlers: Vec<&Value> = settings["hooks"]["PreToolUse"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|group| group["hooks"][0]["command"].as_str().unwrap().to_owned())
+            .map(|group| &group["hooks"][0])
             .collect();
-        assert_eq!(commands.len(), 2);
-        for command in commands {
-            assert!(command.starts_with(&format!("'{HOOK}' ")), "{command}");
+        assert_eq!(handlers.len(), 2);
+        for handler in handlers {
+            let command = handler["command"].as_str().unwrap();
+            if cfg!(windows) {
+                // The exec form: the bare path, the words in `args`.
+                assert_eq!(command, HOOK);
+                assert!(handler["args"][0].is_string(), "{handler}");
+            } else {
+                assert!(command.starts_with(&format!("'{HOOK}' ")), "{command}");
+            }
         }
     }
 
@@ -3907,5 +3958,9 @@ mod hook_launch_tests {
             .unwrap();
         assert!(prompt_pos + 1 < argv.len());
         assert!(argv[prompt_pos + 1].contains("Read the UTF-8 task brief at"));
+        assert!(!argv.iter().any(|a| a == "--settings"));
+        assert!(super::super::claude_hook::for_launch("agy")
+            .binary()
+            .is_none());
     }
 }

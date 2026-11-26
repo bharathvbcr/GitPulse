@@ -1,4 +1,4 @@
-import type { MenuLabel, MenuState } from "./menuState";
+import type { MenuAgentRequest, MenuLabel, MenuState } from "./menuState";
 import { REGISTERED_VIEWS } from "../views/viewRegistry";
 
 /**
@@ -58,10 +58,17 @@ export const MENU_LIMITS = {
    * defect upstream, and the tray only ever says whether and roughly how many.
    */
   agentsWaiting: 999,
+  /** Maximum surfaced `agentRequests` entries (`MAX_MENU_AGENT_REQUESTS`). */
+  agentRequests: 8,
+  /** Maximum UTF-8 bytes for an agent request id (`MAX_AGENT_REQUEST_ID_BYTES`). */
+  agentRequestIdBytes: 256,
 } as const;
 
 export const MENU_TONES = ["neutral", "warning", "busy", "changed", "clean"] as const;
 export const MENU_WATCH_STATUSES = ["unknown", "watching", "degraded"] as const;
+export const MENU_AGENT_SOURCES = ["terminal", "managed", "inbox", "external"] as const;
+export const MENU_AGENT_PROVIDERS = ["claude", "agy", "codex", "manvi", "grok", "shell", "other"] as const;
+export const MENU_AGENT_URGENCIES = ["blocking", "error", "informational"] as const;
 /** The only actions the tray summary row may invoke. */
 export const TRAY_SUMMARY_IDS = [
   "open",
@@ -72,6 +79,7 @@ export const TRAY_SUMMARY_IDS = [
 
 export const REPOSITORY_PREFIX = "activate-repo:";
 export const RECENT_PREFIX = "open-recent:";
+export const FOCUS_AGENT_PREFIX = "focus-agent:";
 
 /**
  * Every id `NativeAction::parse` resolves to an action that carries no path.
@@ -156,7 +164,12 @@ export function menuStateProblem(state: MenuState): string | null {
     !Number.isInteger(state.repositoriesHidden) ||
     state.repositoriesHidden < 0 ||
     state.repositoriesHidden > MENU_LIMITS.count ||
-    (state.repositoriesHidden > 0 && state.repositories.length < MENU_LIMITS.repositories)
+    (state.repositoriesHidden > 0 && state.repositories.length < MENU_LIMITS.repositories) ||
+    state.agentRequests.length > MENU_LIMITS.agentRequests ||
+    !Number.isInteger(state.agentRequestsHidden) ||
+    state.agentRequestsHidden < 0 ||
+    state.agentRequestsHidden > MENU_LIMITS.agentsWaiting ||
+    (state.agentRequestsHidden > 0 && state.agentRequests.length < MENU_LIMITS.agentRequests)
   ) {
     return "Native menu state exceeds its entry limit";
   }
@@ -209,8 +222,34 @@ export function menuStateProblem(state: MenuState): string | null {
   ) {
     return "Native menu text exceeds its limit";
   }
-  if (state.agentsWaiting > MENU_LIMITS.agentsWaiting) {
+  if (
+    state.agentsWaiting > MENU_LIMITS.agentsWaiting ||
+    state.agentsRunning > MENU_LIMITS.agentsWaiting ||
+    state.agentsInformational > MENU_LIMITS.agentsWaiting
+  ) {
     return "Native menu agent count exceeds its limit";
+  }
+  const requestIds = new Set<string>();
+  for (const req of state.agentRequests) {
+    if (
+      !req.id ||
+      byteLength(req.id) > MENU_LIMITS.agentRequestIdBytes ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(req.id) ||
+      requestIds.has(req.id) ||
+      !(MENU_AGENT_SOURCES as readonly string[]).includes(req.source) ||
+      !(MENU_AGENT_PROVIDERS as readonly string[]).includes(req.provider) ||
+      !(MENU_AGENT_URGENCIES as readonly string[]).includes(req.urgency) ||
+      !req.agentLabel ||
+      over(req.agentLabel) ||
+      over(req.repoLabel) ||
+      (req.repoPath !== null && (!req.repoPath || byteLength(req.repoPath) > MENU_LIMITS.path)) ||
+      !req.reason ||
+      over(req.reason) ||
+      (req.detail !== null && over(req.detail))
+    ) {
+      return "Native menu state contains an invalid agent request";
+    }
+    requestIds.add(req.id);
   }
   return null;
 }
@@ -237,6 +276,9 @@ export function menuStateWireProblem(state: MenuState): string | null {
     [card.stashes, "status.stashes"],
     [card.elsewhere, "status.elsewhere"],
     [state.agentsWaiting, "agentsWaiting"],
+    [state.agentRequestsHidden, "agentRequestsHidden"],
+    [state.agentsRunning, "agentsRunning"],
+    [state.agentsInformational, "agentsInformational"],
     ...state.repositories.flatMap<[number | null, string]>((repo) => [
       [repo.changed, `repositories[${repo.path}].changed`],
       [repo.conflicts, `repositories[${repo.path}].conflicts`],
@@ -249,6 +291,11 @@ export function menuStateWireProblem(state: MenuState): string | null {
   const fetched = card.fetchedAt;
   if (fetched !== null && !Number.isSafeInteger(fetched)) {
     return `status.fetchedAt is not an i64: ${fetched}`;
+  }
+  for (const req of state.agentRequests) {
+    if (req.atMs !== null && !Number.isSafeInteger(req.atMs)) {
+      return `agentRequests[${req.id}].atMs is not an i64: ${req.atMs}`;
+    }
   }
   return null;
 }
@@ -323,6 +370,40 @@ export function sendableMenuState(state: MenuState): { state: MenuState; problem
     labels.push({ id: label.id, text: clampText(label.text, MENU_LIMITS.text) });
   }
   const card = state.status;
+  const agentRequests: MenuAgentRequest[] = [];
+  const seenRequests = new Set<string>();
+  for (const req of state.agentRequests) {
+    const cleanId = req.id.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+    if (!cleanId || byteLength(cleanId) > MENU_LIMITS.agentRequestIdBytes || seenRequests.has(cleanId)) {
+      continue;
+    }
+    if (agentRequests.length >= MENU_LIMITS.agentRequests) break;
+    seenRequests.add(cleanId);
+    const agentLabel = clampText(req.agentLabel, MENU_LIMITS.text) || "Agent";
+    const reason = clampText(req.reason, MENU_LIMITS.text) || "Needs attention";
+    const repoPath =
+      req.repoPath !== null && req.repoPath.length > 0 && byteLength(req.repoPath) <= MENU_LIMITS.path
+        ? req.repoPath
+        : null;
+    agentRequests.push({
+      id: cleanId,
+      source: (MENU_AGENT_SOURCES as readonly string[]).includes(req.source)
+        ? req.source
+        : "terminal",
+      provider: (MENU_AGENT_PROVIDERS as readonly string[]).includes(req.provider)
+        ? req.provider
+        : "other",
+      agentLabel,
+      repoLabel: clampText(req.repoLabel, MENU_LIMITS.text),
+      repoPath,
+      urgency: (MENU_AGENT_URGENCIES as readonly string[]).includes(req.urgency)
+        ? req.urgency
+        : "blocking",
+      reason,
+      detail: req.detail === null ? null : clampText(req.detail, MENU_LIMITS.text),
+      atMs: req.atMs !== null && Number.isSafeInteger(req.atMs) ? req.atMs : null,
+    });
+  }
   const repaired: MenuState = {
     ...state,
     enabled: state.enabled.filter(isKnownAction).slice(0, MENU_LIMITS.enabled),
@@ -344,6 +425,13 @@ export function sendableMenuState(state: MenuState): { state: MenuState; problem
     },
     trayDetail: clampText(state.trayDetail, MENU_LIMITS.text),
     agentsWaiting: clampCount(state.agentsWaiting, MENU_LIMITS.agentsWaiting) ?? 0,
+    agentRequests,
+    agentRequestsHidden:
+      agentRequests.length < MENU_LIMITS.agentRequests
+        ? 0
+        : (clampCount(state.agentRequestsHidden, MENU_LIMITS.agentsWaiting) ?? 0),
+    agentsRunning: clampCount(state.agentsRunning, MENU_LIMITS.agentsWaiting) ?? 0,
+    agentsInformational: clampCount(state.agentsInformational, MENU_LIMITS.agentsWaiting) ?? 0,
     trayTitle:
       state.trayTitle === null
         ? null
@@ -400,6 +488,10 @@ export function fallbackMenuState(state: MenuState): MenuState {
     // Startup knows of no agent. Unlike the two preferences above, a count from
     // a payload that could not be repaired is not one to trust.
     agentsWaiting: 0,
+    agentRequests: [],
+    agentRequestsHidden: 0,
+    agentsRunning: 0,
+    agentsInformational: 0,
     status: {
       repository: "GitPulse",
       branch: "",

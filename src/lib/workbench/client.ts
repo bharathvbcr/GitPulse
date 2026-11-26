@@ -692,6 +692,15 @@ export async function listTaskRuns(taskID: string, cursor?: string): Promise<Pag
   return result.items.every((run) => run.task_id === taskID) ? result : invalid();
 }
 /**
+ * The newest `exited` attempts across tasks, for finding the ones a reconciler
+ * released without an observed exit. `complete` is false when more exist than
+ * one page shows: a reader must not treat the list as every uncertain run.
+ */
+export async function listRecentExitedRuns(): Promise<{ runs: TaskRun[]; complete: boolean }> {
+  const result = page(await request("runs.list", { state: "exited", limit: 100, newest: true }), taskRun);
+  return result.items.every((run) => run.state === "exited") ? { runs: result.items, complete: !result.has_more } : invalid();
+}
+/**
  * Every attempt in one repository, across tasks, in a state that can hold a
  * checkout — what the handoff form needs to see which checkouts already have
  * an agent. Asked per state, newest first, so a long-running agent can never

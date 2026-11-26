@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { createRawSnippet } from "svelte";
 import { render } from "svelte/server";
 import { describe, expect, it } from "vitest";
+import { stripMarkupComments } from "../dom/markupText";
 import PageHeader from "./PageHeader.svelte";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -51,8 +52,10 @@ describe("PageHeader", () => {
   });
 
   it("renders the actions slot right-aligned in gp-header-actions, and nothing when absent", () => {
-    const body = bar({ actions: snippet('<button aria-label="Rescan" data-x="1">Rescan</button>') });
-    const plain = body.replace(/<!--.*?-->/g, "");
+    const body = bar({
+      actions: snippet('<!-- multi\nline --><!<!---->--><button aria-label="Rescan" data-x="1">Rescan</button>'),
+    });
+    const plain = stripMarkupComments(body);
     expect(plain).toMatch(/<div class="gp-header-actions"[^>]*>\s*<button aria-label="Rescan" data-x="1">Rescan<\/button>\s*<\/div>/);
     expect(bar({})).not.toContain("gp-header-actions");
   });

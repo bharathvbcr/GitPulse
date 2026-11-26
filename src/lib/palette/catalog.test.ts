@@ -117,6 +117,29 @@ describe("command catalog and context", () => {
     expect(navigate).toHaveBeenLastCalledWith("work", "overview");
   });
 
+  it("gates work:conflicts only when closed, loading, or bare, allowing clean non-bare repos", async () => {
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+
+    const closed = buildCommands(snapshot({ currentPath: null, isLoading: false, isBare: false }), () => {})
+      .find(command => command.id === "work:conflicts");
+    expect(closed?.disabledReason).toBe("Open a repository first.");
+
+    const loading = buildCommands(snapshot({ currentPath: "/repo", isLoading: true, isBare: false }), () => {})
+      .find(command => command.id === "work:conflicts");
+    expect(loading?.disabledReason).toBe("Wait for the repository to finish loading.");
+
+    const bare = buildCommands(snapshot({ currentPath: "/repo.git", isLoading: false, isBare: true }), () => {})
+      .find(command => command.id === "work:conflicts");
+    expect(bare?.disabledReason).toBe("This bare repository has no working tree.");
+
+    const clean = buildCommands(ready(), () => {}).find(command => command.id === "work:conflicts");
+    expect(clean?.disabledReason).toBeUndefined();
+    await clean?.action();
+    expect(surface).toHaveBeenCalledWith("repository");
+    expect(navigate).toHaveBeenLastCalledWith("work", "overview");
+  });
+
   it("does not offer Policy activity when Overview would not render it", () => {
     // Manvi absent and nothing journaled: Overview hides the card, so a door
     // to it would land on nothing. Disabled with the reason instead.
@@ -143,6 +166,7 @@ describe("command catalog and context", () => {
       expect(rankItems(views, "policy")[0]?.id).toMatch(/^manvi:/);
       expect(rankItems(views, "branch cleanup")[0]?.id).toBe("manvi:cleanup");
       expect(rankItems(views, "model servers")[0]?.id).toBe("manvi:model");
+      expect(rankItems(views, "system steward")[0]?.id).toBe("manvi:steward");
       await commands.find(command => command.id === "manvi:cleanup")?.action();
       expect(navigate).toHaveBeenLastCalledWith("work", "overview");
       expect(takeManviFocus()).toBe("cleanup");
@@ -152,6 +176,9 @@ describe("command catalog and context", () => {
       expect(dispatchEvent).toHaveBeenCalledTimes(1);
       expect(dispatchEvent.mock.lastCall?.[0].type).toBe("gitpulse:settings");
       expect(takeManviFocus()).toBe("harness");
+      await commands.find(command => command.id === "manvi:steward")?.action();
+      expect(dispatchEvent).toHaveBeenCalledTimes(2);
+      expect(takeManviFocus()).toBe("steward");
     } finally {
       vi.unstubAllGlobals();
     }

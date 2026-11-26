@@ -340,13 +340,25 @@ impl Observed {
 }
 
 /// The site of the directory at `path`, where the platform has inodes.
+///
+/// Read here rather than through the database's `file_id`, which also answers
+/// on Windows: a site is part of the repository's recorded identity, and giving
+/// Windows one is a change to what an anchor matches, not to how a database
+/// file is recognised.
+#[cfg(unix)]
 fn site_of(path: &Path) -> Option<Site> {
-    let id = super::file_id(path)?;
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
     Some(Site {
-        dev: id.0,
-        ino: id.1,
+        dev: meta.dev(),
+        ino: meta.ino(),
         volume: volume_uuid(path),
     })
+}
+
+#[cfg(not(unix))]
+fn site_of(_path: &Path) -> Option<Site> {
+    None
 }
 
 /// The persistent UUID of the volume holding `path`, as `getattrlist(2)` names
@@ -392,7 +404,7 @@ fn volume_uuid(path: &Path) -> Option<String> {
     Some(hyphenated(&reply.uuid))
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn volume_uuid(_path: &Path) -> Option<String> {
     None
 }
@@ -1306,12 +1318,15 @@ mod tests {
         }
     }
 
+    /// An absolute path no directory holds, in the spelling of this platform.
+    fn gone(unix: &str) -> String {
+        crate::test_support::absent_absolute_path(unix)
+    }
+
     /// A fresh repository directory name and the open ledger of it.
     fn home() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .canonicalize()
+        let path = crate::engine::process::canonicalize_plain(dir.path())
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -1387,9 +1402,9 @@ mod tests {
     fn a_re_anchor_naming_thousands_of_paths_is_refused_as_foreign() {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
-            let from: Vec<String> = (0..10_000).map(|i| format!("/gone/{i}")).collect();
+            let from: Vec<String> = (0..10_000).map(|i| gone(&format!("/gone/{i}"))).collect();
             reanchor_to(conn, &repo, &from);
-            row_of(conn, "/gone/0");
+            row_of(conn, &gone("/gone/0"));
             assert_eq!(refusal(conn, &repo).as_deref(), Some("repository_mismatch"));
             Ok(())
         })
@@ -1401,10 +1416,10 @@ mod tests {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
             let from: Vec<String> = (0..=MAX_PRIOR_PATHS)
-                .map(|i| format!("/gone/{i}"))
+                .map(|i| gone(&format!("/gone/{i}")))
                 .collect();
             reanchor_to(conn, &repo, &from);
-            row_of(conn, "/gone/0");
+            row_of(conn, &gone("/gone/0"));
             assert_eq!(refusal(conn, &repo).as_deref(), Some("repository_mismatch"));
             Ok(())
         })
@@ -1416,9 +1431,9 @@ mod tests {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
             for i in 0..(2 * MAX_ALIAS_ROWS) {
-                reanchor_to(conn, &repo, &[format!("/gone/{i}")]);
+                reanchor_to(conn, &repo, &[gone(&format!("/gone/{i}"))]);
             }
-            row_of(conn, "/gone/0");
+            row_of(conn, &gone("/gone/0"));
             assert_eq!(refusal(conn, &repo).as_deref(), Some("repository_mismatch"));
             Ok(())
         })
@@ -1454,7 +1469,7 @@ mod tests {
     fn a_re_anchor_with_unreadable_detail_grants_nothing() {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
-            row_of(conn, "/gone");
+            row_of(conn, &gone("/gone"));
             let details: [&str; 4] = [
                 "CAST(x'ff66' AS TEXT)",
                 "'{\"from\": \"/gone\"}'",
@@ -1609,7 +1624,7 @@ mod tests {
         let recorded = identity(&["r1"], &["https://h/a"]);
         super::super::with_conn(&repo, |conn| {
             record(conn, &repo, ANCHOR, recorded.to_detail(&[], None)).unwrap();
-            row_of(conn, "/gone");
+            row_of(conn, &gone("/gone"));
             Ok(())
         })
         .unwrap();
@@ -1620,7 +1635,7 @@ mod tests {
         let prober = real_prober();
         assert_eq!(
             judge(&first, &repo, &current, &prober).unwrap(),
-            Some(vec!["/gone".to_string()])
+            Some(vec![gone("/gone")])
         );
         assert_eq!(judge(&second, &repo, &current, &prober).unwrap(), None);
         let count: i64 = first
@@ -1804,7 +1819,7 @@ mod tests {
     /// another connection and through the registry's own, from the probe thread.
     #[test]
     fn the_probe_runs_with_no_ledger_lock_held() {
-        let (_dir, repo) = moved_legacy_ledger("/gone/before");
+        let (_dir, repo) = moved_legacy_ledger(&gone("/gone/before"));
         let write_lock_free = Arc::new(Mutex::new(None));
         let registry_free = Arc::new(Mutex::new(None));
         let (db, probed_repo) = (super::super::ledger_path(&repo), repo.clone());
@@ -1828,7 +1843,7 @@ mod tests {
         );
         assert_eq!(
             settle_with(&repo, &prober).unwrap(),
-            Some(vec!["/gone/before".to_string()])
+            Some(vec![gone("/gone/before")])
         );
         assert_eq!(
             *locked(&write_lock_free),
@@ -1846,15 +1861,15 @@ mod tests {
     /// never probed: it is not taken on trust, and a fresh settle covers it.
     #[test]
     fn a_prior_path_the_probe_did_not_cover_is_not_taken_on_trust() {
-        let (_dir, repo) = moved_legacy_ledger("/gone/one");
+        let (_dir, repo) = moved_legacy_ledger(&gone("/gone/one"));
         super::super::with_conn(&repo, |conn| {
-            row_of(conn, "/gone/two");
+            row_of(conn, &gone("/gone/two"));
             Ok(())
         })
         .unwrap();
         let out = super::super::with_conn(&repo, |conn| {
             let probed = Probed {
-                checked: ["/gone/one".to_string()].into(),
+                checked: [gone("/gone/one")].into(),
                 verdict: Ok(None),
             };
             settle_in(conn, &repo, &Observed::read(&repo), &probed, &real_prober())
@@ -1862,7 +1877,7 @@ mod tests {
         assert_eq!(out.unwrap_err().code, STALE_PROBE);
         assert_eq!(
             settle_with(&repo, &real_prober()).unwrap(),
-            Some(vec!["/gone/one".to_string(), "/gone/two".to_string()])
+            Some(vec![gone("/gone/one"), gone("/gone/two")])
         );
     }
 
@@ -1931,10 +1946,10 @@ mod tests {
             let (_dir, repo) = home();
             super::super::with_conn(&repo, |conn| {
                 record(conn, &repo, ANCHOR, bound(Some(Site::new(1, 2)))).unwrap();
-                row_of(conn, "/gone");
+                row_of(conn, &gone("/gone"));
                 let out = judge(conn, &repo, &observed_at(here.clone()), &real_prober());
                 match outcome {
-                    Ok(()) => assert_eq!(out.unwrap(), Some(vec!["/gone".to_string()])),
+                    Ok(()) => assert_eq!(out.unwrap(), Some(vec![gone("/gone")])),
                     Err(why) => {
                         let e = out.unwrap_err();
                         assert!(e.message.contains(why), "{here:?}: {e:?}");
@@ -1953,8 +1968,8 @@ mod tests {
     fn a_re_anchor_carries_the_lineage_and_the_new_site() {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
-            record(conn, "/gone", ANCHOR, bound(Some(Site::new(1, 2)))).unwrap();
-            row_of(conn, "/gone");
+            record(conn, &gone("/gone"), ANCHOR, bound(Some(Site::new(1, 2)))).unwrap();
+            row_of(conn, &gone("/gone"));
             judge(
                 conn,
                 &repo,
@@ -2192,7 +2207,7 @@ mod tests {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
             old_binary_anchor(conn, &repo, &identity(&["r1"], &[]));
-            row_of(conn, "/gone");
+            row_of(conn, &gone("/gone"));
             // Nothing is anchored, so the roots decide, and a directory of any site passes.
             judge(
                 conn,
@@ -2204,7 +2219,7 @@ mod tests {
             let stamped = latest_identity(conn).unwrap().unwrap().binding.unwrap();
             assert_eq!(stamped.site, Some(Site::new(4, 5)));
             // From then on another directory with the same roots is refused.
-            row_of(conn, "/gone-too");
+            row_of(conn, &gone("/gone-too"));
             let other = judge(
                 conn,
                 &repo,
@@ -2221,7 +2236,7 @@ mod tests {
     /// answered by then is a refusal, not a long wait under the write lock.
     #[test]
     fn a_recheck_that_cannot_answer_in_time_is_a_refusal() {
-        let (_dir, repo) = moved_legacy_ledger("/gone/slow");
+        let (_dir, repo) = moved_legacy_ledger(&gone("/gone/slow"));
         let (release, hold) = std::sync::mpsc::channel::<()>();
         let hold = Mutex::new(hold);
         let slow = Prober::new(
@@ -2232,7 +2247,7 @@ mod tests {
             }),
         );
         let probed = Probed {
-            checked: ["/gone/slow".to_string()].into(),
+            checked: [gone("/gone/slow")].into(),
             verdict: Ok(None),
         };
         let started = Instant::now();
@@ -2293,7 +2308,7 @@ mod tests {
     /// actor and the time, and the ledger then records.
     #[test]
     fn an_adopted_ledger_heals_and_the_adoption_is_an_audit_row() {
-        let (_dir, repo) = anchored_elsewhere("/gone/before");
+        let (_dir, repo) = anchored_elsewhere(&gone("/gone/before"));
         let prober = real_prober();
         let refused = settle_with(&repo, &prober).unwrap_err();
         assert_eq!(refused.code, "repository_mismatch");
@@ -2310,14 +2325,17 @@ mod tests {
             &prober,
         )
         .unwrap();
-        assert_eq!(adopted, vec!["/gone/before".to_string()]);
-        assert_eq!(*locked(&asked), vec!["/gone/before".to_string()]);
+        assert_eq!(adopted, vec![gone("/gone/before")]);
+        assert_eq!(*locked(&asked), vec![gone("/gone/before")]);
 
         let events = adopt_events(&repo);
         assert_eq!(events.len(), 1, "{events:?}");
         let audit = &events[0];
         let here = site_of(Path::new(&canonical_repo(&repo))).unwrap();
-        assert_eq!(audit["from_paths"], serde_json::json!(["/gone/before"]));
+        assert_eq!(
+            audit["from_paths"],
+            serde_json::json!([gone("/gone/before")])
+        );
         assert_eq!(audit["to_path"], canonical_repo(&repo));
         assert_eq!(audit["old_site"], Site::new(u64::MAX, u64::MAX).to_json());
         assert_eq!(audit["new_site"], here.to_json());
@@ -2344,7 +2362,7 @@ mod tests {
 
     #[test]
     fn a_declined_adoption_changes_nothing() {
-        let (_dir, repo) = anchored_elsewhere("/gone/before");
+        let (_dir, repo) = anchored_elsewhere(&gone("/gone/before"));
         let prober = real_prober();
         let declined = adopt_with(&repo, "user:test", &|_| false, &prober).unwrap_err();
         assert_eq!(declined.code, "adoption_declined");
@@ -2366,10 +2384,10 @@ mod tests {
     /// asked of the person for them.
     #[test]
     fn an_adoption_still_needs_the_roots_and_a_vacated_location() {
-        let (_dir, repo) = anchored_elsewhere("/gone/live");
+        let (_dir, repo) = anchored_elsewhere(&gone("/gone/live"));
         let live = Prober::new(
             Duration::from_secs(5),
-            Arc::new(|path: &str| (path == "/gone/live").then(|| PathBuf::from(path))),
+            Arc::new(|path: &str| (path == gone("/gone/live")).then(|| PathBuf::from(path))),
         );
         let asked = std::cell::Cell::new(false);
         let out = adopt_with(
@@ -2384,12 +2402,12 @@ mod tests {
         assert!(out.unwrap_err().message.contains("still a Git repository"));
         assert!(!asked.get());
 
-        let (_other, foreign) = anchored_elsewhere("/gone/before");
+        let (_other, foreign) = anchored_elsewhere(&gone("/gone/before"));
         super::super::with_conn(&foreign, |conn| {
             // The ledger was anchored under a root this repository does not have.
             record(
                 conn,
-                "/gone/before",
+                &gone("/gone/before"),
                 ANCHOR,
                 identity(&["not-a-root-of-this-repository"], &[]).to_detail(
                     &[],
@@ -2415,7 +2433,7 @@ mod tests {
     /// session leaves it. Returns the canonical spelling.
     fn real_repo_at(path: &Path) -> String {
         std::fs::create_dir_all(path).unwrap();
-        let canonical = path.canonicalize().unwrap();
+        let canonical = crate::engine::process::canonicalize_plain(path).unwrap();
         crate::test_support::git_in(&canonical, &["init", "-b", "main"]);
         std::fs::write(canonical.join("seed.txt"), "seed").unwrap();
         crate::test_support::git_in(&canonical, &["add", "seed.txt"]);
@@ -2446,7 +2464,7 @@ mod tests {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
             record(conn, &repo, ANCHOR, bound(Some(Site::new(16777231, 42)))).unwrap();
-            row_of(conn, "/gone");
+            row_of(conn, &gone("/gone"));
             let out = judge(
                 conn,
                 &repo,
@@ -2457,7 +2475,7 @@ mod tests {
                 // Where the device number is stable it is part of the identity.
                 assert_eq!(out.unwrap_err().code, "repository_mismatch");
             } else {
-                assert_eq!(out.unwrap(), Some(vec!["/gone".to_string()]));
+                assert_eq!(out.unwrap(), Some(vec![gone("/gone")]));
                 // The new device number is what the ledger now records.
                 let now = latest_identity(conn).unwrap().unwrap().binding.unwrap();
                 assert_eq!(now.site, Some(Site::new(16777234, 42)));
@@ -2540,7 +2558,7 @@ mod tests {
         super::super::with_conn(&repo, |conn| {
             record(conn, &repo, ANCHOR, bound(Some(Site::new(1, 2)))).unwrap();
             old_binary_anchor(conn, &repo, &identity(&["r1"], &["h:a/b"]));
-            row_of(conn, "/gone");
+            row_of(conn, &gone("/gone"));
             let copy = Observed {
                 identity: Ok(identity(&["r1"], &["h:a/b"])),
                 site: Some(Site::new(1, 99)),
@@ -2666,9 +2684,9 @@ mod tests {
             Duration::from_secs(2),
             Arc::new(|_: &str| -> Option<PathBuf> { panic!("adv probe panic") }),
         );
-        let out = prober.first_occupied(&["/x".to_string()], Path::new("/home"));
+        let out = prober.first_occupied(&[gone("/x")], Path::new("/home"));
         assert!(out.is_err(), "{out:?}");
-        let again = prober.probe(vec!["/x".to_string()], Path::new("/home"));
+        let again = prober.probe(vec![gone("/x")], Path::new("/home"));
         assert!(again.verdict.is_err(), "{:?}", again.verdict);
     }
 
@@ -2722,8 +2740,11 @@ mod tests {
         mover: impl FnOnce(),
     ) -> (String, Result<Option<Vec<String>>, LedgerError>) {
         let before = real_repo_at(old);
+        // Windows cannot rename a directory holding an open file; the move
+        // happens with the app closed, as a restart leaves no connection.
+        super::super::tests_support::reset_registry_for(&before);
         mover();
-        crate::test_support::trust_repo(&new.canonicalize().unwrap());
+        crate::test_support::trust_repo(&crate::engine::process::canonicalize_plain(new).unwrap());
         (before, settle(&new.to_string_lossy()))
     }
 
@@ -2773,19 +2794,23 @@ mod tests {
         let _ = real_repo_at(&main);
         let (old, new) = (parent.path().join("wt"), parent.path().join("wt-moved"));
         crate::test_support::git_in(
-            &main.canonicalize().unwrap(),
+            &crate::engine::process::canonicalize_plain(&main).unwrap(),
             &["worktree", "add", "-q", &old.to_string_lossy(), "-b", "wt"],
         );
-        let wt = old.canonicalize().unwrap().to_string_lossy().into_owned();
-        crate::test_support::trust_repo(&old.canonicalize().unwrap());
+        let wt = crate::engine::process::canonicalize_plain(&old)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::test_support::trust_repo(&crate::engine::process::canonicalize_plain(&old).unwrap());
         settle(&wt).unwrap();
         super::super::with_conn(&wt, |conn| {
             row_of(conn, &wt);
             Ok(())
         })
         .unwrap();
+        super::super::tests_support::reset_registry_for(&wt);
         crate::test_support::git_in(
-            &main.canonicalize().unwrap(),
+            &crate::engine::process::canonicalize_plain(&main).unwrap(),
             &[
                 "worktree",
                 "move",
@@ -2793,7 +2818,7 @@ mod tests {
                 &new.to_string_lossy(),
             ],
         );
-        crate::test_support::trust_repo(&new.canonicalize().unwrap());
+        crate::test_support::trust_repo(&crate::engine::process::canonicalize_plain(&new).unwrap());
         let out = settle(&new.to_string_lossy());
         assert_eq!(out.unwrap(), Some(vec![wt]));
     }

@@ -128,3 +128,37 @@ describe("ft-038e6ba5 a failed diff read", () => {
     }
   });
 });
+
+describe("tab switching clears stale background hydration errors", () => {
+  it("clears a prior error stored on an inactive tab on activateTab instead of surfacing it as fresh", async () => {
+    let failA = false;
+    const { store } = makeStore((cmd, args) => {
+      if (cmd === "cmd_branch_stats") {
+        return { compared_to: "main", updates: [], computed: 0, cached: 0, capped: false, compute_failures: 0 };
+      }
+      if (cmd === "cmd_list_branches") {
+        if (failA && args?.repoPath === "/r/tab-a") {
+          throw new Error("git status timed out after 90s");
+        }
+        return [branch("main", "m1", { is_current: true, is_default: true })];
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+
+    await store.openRepo("/r/tab-a");
+    const tabAId = get(store).openTabs.find((tab) => tab.path === "/r/tab-a")!.id;
+    await store.openRepo("/r/tab-b");
+    expect(get(store).currentPath).toBe("/r/tab-b");
+
+    // Simulate a background watcher refresh failing on inactive /r/tab-a.
+    failA = true;
+    await store.refresh("/r/tab-a", "branches");
+    expect(get(store).error).toBeNull();
+
+    // Switching back to /r/tab-a must clear the stale background error while re-hydrating cleanly.
+    failA = false;
+    await store.activateTab(tabAId);
+    expect(get(store).currentPath).toBe("/r/tab-a");
+    expect(get(store).error).toBeNull();
+  });
+});

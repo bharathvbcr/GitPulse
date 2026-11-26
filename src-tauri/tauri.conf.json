@@ -3,7 +3,7 @@
   "productName": "GitPulse",
   "version": "0.2.0-beta.1",
   "mainBinaryName": "gitpulse",
-  "identifier": "com.gitpulse.desktop",
+  "identifier": "dev.vbcr.gitpulse",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -15,6 +15,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "GitPulse",
         "width": 1280,
         "height": 850,
@@ -66,7 +67,14 @@
         "version": "0.2.0.1"
       }
     },
-    "targets": "all",
+    "targets": [
+      "app",
+      "dmg",
+      "deb",
+      "appimage",
+      "nsis",
+      "msi"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

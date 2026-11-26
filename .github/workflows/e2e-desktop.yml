@@ -1,0 +1,577 @@
+name: Desktop E2E & Native Webview
+
+# Real-binary desktop verification on Linux (Ubuntu 22.04 floor, X11 + headless
+# Wayland) and Windows (WebView2 / Edge):
+#   1. Native runtime smoke (`gtk_runtime` on Linux X11+Wayland, `windows_runtime` on Windows)
+#   2. Native-engine UI harness runner (`webview_regressions` via scripts/browser-regressions.mjs --native)
+#   3. Real-binary `tauri-driver` E2E smoke + PNG screenshot artifacts
+#      (cold start, real Git repo + watcher + diff, PTY/ConPTY round-trip,
+#      single-instance handoff, clean shutdown).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly, off the hour (offset from test-parallel.yml).
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+    inputs:
+      harnesses:
+        description: 'Native UI harness scope (all = full registered suite, smoke = diagnostics)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - smoke
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TAURI_DRIVER_VERSION: "2.0.5"
+
+jobs:
+  e2e-linux:
+    name: Desktop E2E & Native WebKitGTK (ubuntu-22.04, X11 + Wayland)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux Display, WebKitGTK, and Driver Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            webkit2gtk-driver \
+            libgtk-3-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            pkg-config \
+            xvfb \
+            xauth \
+            weston \
+            dbus-x11 \
+            libgl1-mesa-dri \
+            libegl1 \
+            libgles2 \
+            libgbm1 \
+            fonts-dejavu-core \
+            fonts-liberation
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: e2e-desktop-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      - name: Cache tauri-driver
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/tauri-driver
+          key: tauri-driver-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_DRIVER_VERSION }}
+
+      - name: Install tauri-driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/tauri-driver"
+          if [ ! -x "$root/bin/tauri-driver" ]; then
+            cargo install tauri-driver --version "$TAURI_DRIVER_VERSION" --locked --root "$root"
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/tauri-driver" --help >/dev/null
+          command -v WebKitWebDriver
+          WebKitWebDriver --help >/dev/null
+
+      - name: Keep tauri-driver build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/tauri-driver
+          key: tauri-driver-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_DRIVER_VERSION }}
+
+      - name: Build Desktop App, Terminal Host, and Test Helpers
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --locked \
+            --features tauri/custom-protocol \
+            --bin gitpulse --bin gitpulse-ptyd \
+            --example webview_regressions --example e2e_seed_trust
+
+      - name: Native GTK/WebKit Runtime Smoke (X11)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset WAYLAND_DISPLAY
+          export GDK_BACKEND=x11
+          export NO_AT_BRIDGE=1
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1440x960x24" dbus-run-session -- \
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --test gtk_runtime -- --nocapture
+
+      - name: Native GTK/WebKit Runtime Smoke (Headless Wayland)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .gitpulse/scratch/e2e-linux-wayland
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export WAYLAND_DISPLAY="wayland-gitpulse-gtk"
+          export GDK_BACKEND=wayland
+          export NO_AT_BRIDGE=1
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+          unset DISPLAY
+          weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --width=1440 --height=960 --idle-time=0 >"$XDG_RUNTIME_DIR/weston.log" 2>&1 &
+          wpid=$!
+          cleanup() {
+            rc=$?
+            cp "$XDG_RUNTIME_DIR/weston.log" .gitpulse/scratch/e2e-linux-wayland/weston-gtk.log 2>/dev/null || true
+            if [ "$rc" -ne 0 ] && [ -s "$XDG_RUNTIME_DIR/weston.log" ]; then
+              echo "::group::Weston log (gtk_runtime)" >&2
+              tail -n 60 "$XDG_RUNTIME_DIR/weston.log" >&2 || true
+              echo "::endgroup::" >&2
+            fi
+            kill "$wpid" 2>/dev/null || true
+            wait "$wpid" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR"
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break
+            kill -0 "$wpid" 2>/dev/null || break
+            sleep 0.1
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+            echo "::error::Headless Weston did not create $WAYLAND_DISPLAY" >&2
+            cat "$XDG_RUNTIME_DIR/weston.log" >&2 || true
+            exit 1
+          fi
+          dbus-run-session -- \
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --test gtk_runtime -- --nocapture
+
+      - name: Native WebKitGTK UI Regressions (X11)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          # Run the full 47-harness native suite on pushes to main, nightly schedules,
+          # and manual dispatches; keep PR feedback fast with smoke unless overridden.
+          HARNESS_SCOPE: ${{ inputs.harnesses || (github.event_name == 'pull_request' && 'smoke' || 'all') }}
+        run: |
+          set -euo pipefail
+          unset WAYLAND_DISPLAY
+          export GDK_BACKEND=x11
+          export NO_AT_BRIDGE=1
+          # WebKitGTK 2.50.4 (Ubuntu 22.04) SIGSEGVs inside AcceleratedBackingStore
+          # on complex harnesses when WEBKIT_DISABLE_DMABUF_RENDERER=1, while setting
+          # =0 alone without a hardware DRM node causes GBM/Skia stalls. Pairing =0
+          # with FORCE_SHM=1, SKIA CPU rendering, and software Mesa GL avoids both.
+          export WEBKIT_DISABLE_DMABUF_RENDERER=0
+          export WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
+          export WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+          if [ "$HARNESS_SCOPE" = "all" ]; then
+            xvfb-run -a -s "-screen 0 1440x960x24" dbus-run-session -- \
+              node scripts/browser-regressions.mjs --native --all
+          else
+            xvfb-run -a -s "-screen 0 1440x960x24" dbus-run-session -- \
+              node scripts/browser-regressions.mjs --native --harness diagnostics
+          fi
+
+      - name: Native WebKitGTK UI Regression Smoke (Headless Wayland)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .gitpulse/scratch/e2e-linux-wayland
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export WAYLAND_DISPLAY="wayland-gitpulse-ui"
+          export GDK_BACKEND=wayland
+          export NO_AT_BRIDGE=1
+          # Pair DMABUF=0 with FORCE_SHM=1, Skia CPU rendering, and software Mesa GL
+          # to avoid both the AcceleratedBackingStore SIGSEGV (=1) and headless
+          # GBM/Skia stalls (=0 without DRM node) on WebKitGTK 2.50.4.
+          export WEBKIT_DISABLE_DMABUF_RENDERER=0
+          export WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
+          export WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+          unset DISPLAY
+          weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --width=1440 --height=960 --idle-time=0 >"$XDG_RUNTIME_DIR/weston.log" 2>&1 &
+          wpid=$!
+          cleanup() {
+            rc=$?
+            cp "$XDG_RUNTIME_DIR/weston.log" .gitpulse/scratch/e2e-linux-wayland/weston-webview.log 2>/dev/null || true
+            if [ "$rc" -ne 0 ] && [ -s "$XDG_RUNTIME_DIR/weston.log" ]; then
+              echo "::group::Weston log (webview)" >&2
+              tail -n 60 "$XDG_RUNTIME_DIR/weston.log" >&2 || true
+              echo "::endgroup::" >&2
+            fi
+            kill "$wpid" 2>/dev/null || true
+            wait "$wpid" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR"
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break
+            kill -0 "$wpid" 2>/dev/null || break
+            sleep 0.1
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+            echo "::error::Headless Weston did not create $WAYLAND_DISPLAY" >&2
+            cat "$XDG_RUNTIME_DIR/weston.log" >&2 || true
+            exit 1
+          fi
+          dbus-run-session -- \
+            node scripts/browser-regressions.mjs --native --harness diagnostics
+
+      - name: Real-Binary tauri-driver E2E Smoke (X11)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset WAYLAND_DISPLAY
+          export NO_AT_BRIDGE=1
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+          export GDK_BACKEND=x11
+          xvfb-run -a -s "-screen 0 1440x960x24" dbus-run-session -- \
+            node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-linux-x11
+
+      - name: Real-Binary tauri-driver E2E Smoke (Headless Wayland)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .gitpulse/scratch/e2e-linux-wayland
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export WAYLAND_DISPLAY="wayland-gitpulse-e2e"
+          export GDK_BACKEND=wayland
+          export NO_AT_BRIDGE=1
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+          unset DISPLAY
+          weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --width=1440 --height=960 --idle-time=0 >"$XDG_RUNTIME_DIR/weston.log" 2>&1 &
+          wpid=$!
+          cleanup() {
+            rc=$?
+            cp "$XDG_RUNTIME_DIR/weston.log" .gitpulse/scratch/e2e-linux-wayland/weston.log 2>/dev/null || true
+            if [ "$rc" -ne 0 ] && [ -s "$XDG_RUNTIME_DIR/weston.log" ]; then
+              echo "::group::Weston log (e2e)" >&2
+              tail -n 60 "$XDG_RUNTIME_DIR/weston.log" >&2 || true
+              echo "::endgroup::" >&2
+            fi
+            kill "$wpid" 2>/dev/null || true
+            wait "$wpid" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR"
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break
+            kill -0 "$wpid" 2>/dev/null || break
+            sleep 0.1
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+            echo "::error::Headless Weston did not create $WAYLAND_DISPLAY" >&2
+            cat "$XDG_RUNTIME_DIR/weston.log" >&2 || true
+            exit 1
+          fi
+          dbus-run-session -- \
+            node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-linux-wayland
+
+      - name: Publish Linux E2E Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+          const out = ["### Linux Desktop E2E Summary", ""];
+          for (const [label, file] of [
+            ["Linux X11", ".gitpulse/scratch/e2e-linux-x11/summary.json"],
+            ["Linux Wayland (headless Weston)", ".gitpulse/scratch/e2e-linux-wayland/summary.json"],
+          ]) {
+            out.push(`#### ${label}`);
+            if (!fs.existsSync(file)) {
+              out.push("_No summary.json produced (step did not run or failed before writing summary)._", "");
+              continue;
+            }
+            try {
+              const s = JSON.parse(fs.readFileSync(file, "utf8"));
+              const rows = Array.isArray(s.scenarios) ? s.scenarios : [];
+              out.push("| Scenario | Status | Duration | Detail |", "| --- | --- | ---: | --- |");
+              for (const r of rows) {
+                const detail = String(r.error || r.detail || "").replace(/\r?\n/g, " ").replace(/\|/g, "\\|").slice(0, 140);
+                out.push(`| ${r.name} | ${r.ok ? "PASS" : "FAIL"} | ${r.ms ?? "-"} ms | ${detail} |`);
+              }
+              out.push("", `Screenshots: ${Array.isArray(s.screenshots) ? s.screenshots.length : 0}`, "");
+            } catch (err) {
+              out.push(`_Could not parse ${file}: ${err instanceof Error ? err.message : String(err)}_`, "");
+            }
+          }
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${out.join("\n")}\n`);
+          }
+          EOF
+
+      - name: Upload Linux E2E Screenshots And Summaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: e2e-desktop-linux
+          path: |
+            .gitpulse/scratch/e2e-linux-x11
+            .gitpulse/scratch/e2e-linux-wayland
+          retention-days: 14
+          if-no-files-found: warn
+
+  e2e-windows:
+    name: Desktop E2E & Native WebView2 (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: e2e-desktop-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      - name: Cache tauri-driver
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/tauri-driver
+          key: tauri-driver-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_DRIVER_VERSION }}
+
+      - name: Install tauri-driver and Match Edge WebDriver to WebView2
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/tauri-driver"
+          if [ ! -x "$root/bin/tauri-driver.exe" ]; then
+            cargo install tauri-driver --version "$TAURI_DRIVER_VERSION" --locked --root "$root"
+          fi
+          cygpath -w "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/tauri-driver.exe" --help >/dev/null
+
+          # Query the installed Microsoft Edge WebView2 Runtime version so
+          # msedgedriver matches its major version instead of failing /session
+          # when the runner's preinstalled driver drifts behind WebView2.
+          wv2_version=""
+          for key in \
+            'HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' \
+            'HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' \
+            'HKCU\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'; do
+            if out="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' reg.exe query "$key" /v pv 2>/dev/null)"; then
+              wv2_version="$(printf '%s\n' "$out" | awk '/REG_SZ/ { print $NF; exit }' | tr -d '\r')"
+              [ -n "$wv2_version" ] && break
+            fi
+          done
+          if [ -z "$wv2_version" ]; then
+            echo "::error::Microsoft Edge WebView2 Runtime version not found in registry" >&2
+            exit 1
+          fi
+          wv2_major="${wv2_version%%.*}"
+          echo "Installed WebView2 Runtime: $wv2_version (major $wv2_major)"
+
+          if [ -n "${EDGEWEBDRIVER:-}" ] && [ -d "$EDGEWEBDRIVER" ]; then
+            edge_posix="$(cygpath -u "$EDGEWEBDRIVER")"
+            export PATH="$edge_posix:$PATH"
+          fi
+          driver_bin="$(command -v msedgedriver.exe || command -v msedgedriver || true)"
+          if [ -n "$driver_bin" ] && [[ "${driver_bin,,}" != *.exe ]] && [ -f "${driver_bin}.exe" ]; then
+            driver_bin="${driver_bin}.exe"
+          fi
+          driver_major=""
+          if [ -n "$driver_bin" ] && [ -f "$driver_bin" ]; then
+            driver_ver="$("$driver_bin" --version | grep -Eo '[0-9]+(\.[0-9]+){3}' | head -n 1 || true)"
+            driver_major="${driver_ver%%.*}"
+            echo "Preinstalled msedgedriver: ${driver_ver:-unknown} (major ${driver_major:-unknown}) at $driver_bin"
+          fi
+
+          if [ "$driver_major" = "$wv2_major" ] && [ -n "$driver_major" ] && [ -f "$driver_bin" ]; then
+            if [ -n "${EDGEWEBDRIVER:-}" ] && [ -d "$EDGEWEBDRIVER" ]; then
+              cygpath -w "$EDGEWEBDRIVER" >> "$GITHUB_PATH"
+            fi
+            matched_exe="$(cygpath -w "$driver_bin")"
+            echo "TAURI_NATIVE_DRIVER_BIN=$matched_exe" >> "$GITHUB_ENV"
+          else
+            echo "Fetching msedgedriver matching WebView2 major $wv2_major..."
+            driver_dir="$RUNNER_TEMP/msedgedriver"
+            mkdir -p "$driver_dir"
+            zip_path="$driver_dir/edgedriver_win64.zip"
+            if ! curl -fsSL -o "$zip_path" "https://msedgedriver.microsoft.com/${wv2_version}/edgedriver_win64.zip"; then
+              latest_ver="$(curl -fsSL "https://msedgedriver.microsoft.com/LATEST_RELEASE_${wv2_major}_WINDOWS" | LC_ALL=C tr -d '\r\n\377\376\000')"
+              if ! [[ "$latest_ver" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+                echo "::error::Unexpected LATEST_RELEASE_${wv2_major}_WINDOWS version: $latest_ver" >&2
+                exit 1
+              fi
+              curl -fsSL -o "$zip_path" "https://msedgedriver.microsoft.com/${latest_ver}/edgedriver_win64.zip"
+            fi
+            unzip -oq "$zip_path" msedgedriver.exe -d "$driver_dir"
+            rm -f "$zip_path"
+            matched_ver="$("$driver_dir/msedgedriver.exe" --version | grep -Eo '[0-9]+(\.[0-9]+){3}' | head -n 1 || true)"
+            matched_major="${matched_ver%%.*}"
+            echo "Downloaded msedgedriver: ${matched_ver:-unknown} (major ${matched_major:-unknown})"
+            if [ "$matched_major" != "$wv2_major" ]; then
+              echo "::error::Downloaded msedgedriver major ${matched_major:-unknown} does not match WebView2 major $wv2_major" >&2
+              exit 1
+            fi
+            cygpath -w "$driver_dir" >> "$GITHUB_PATH"
+            matched_exe="$(cygpath -w "$driver_dir/msedgedriver.exe")"
+            echo "TAURI_NATIVE_DRIVER_BIN=$matched_exe" >> "$GITHUB_ENV"
+          fi
+
+      - name: Keep tauri-driver build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/tauri-driver
+          key: tauri-driver-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_DRIVER_VERSION }}
+
+      - name: Build Desktop App, Terminal Host, and Test Helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path src-tauri/Cargo.toml --locked \
+            --features tauri/custom-protocol \
+            --bin gitpulse --bin gitpulse-ptyd \
+            --example webview_regressions --example e2e_seed_trust
+
+      - name: Native Windows WebView2 Runtime Smoke
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --test windows_runtime -- --nocapture --test-threads=1
+
+      - name: Native WebView2 UI Regressions
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          # Run the full 47-harness native suite on pushes to main, nightly schedules,
+          # and manual dispatches; keep PR feedback fast with smoke unless overridden.
+          HARNESS_SCOPE: ${{ inputs.harnesses || (github.event_name == 'pull_request' && 'smoke' || 'all') }}
+        run: |
+          set -euo pipefail
+          if [ "$HARNESS_SCOPE" = "all" ]; then
+            node scripts/browser-regressions.mjs --native --all
+          else
+            node scripts/browser-regressions.mjs --native --harness diagnostics
+          fi
+
+      - name: Real-Binary tauri-driver E2E Smoke (Windows)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows
+
+      - name: Publish Windows E2E Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+          const file = ".gitpulse/scratch/e2e-windows/summary.json";
+          const out = ["### Windows Desktop E2E Summary", ""];
+          if (!fs.existsSync(file)) {
+            out.push("_No summary.json produced (step did not run or failed before writing summary)._", "");
+          } else {
+            try {
+              const s = JSON.parse(fs.readFileSync(file, "utf8"));
+              const rows = Array.isArray(s.scenarios) ? s.scenarios : [];
+              out.push("| Scenario | Status | Duration | Detail |", "| --- | --- | ---: | --- |");
+              for (const r of rows) {
+                const detail = String(r.error || r.detail || "").replace(/\r?\n/g, " ").replace(/\|/g, "\\|").slice(0, 140);
+                out.push(`| ${r.name} | ${r.ok ? "PASS" : "FAIL"} | ${r.ms ?? "-"} ms | ${detail} |`);
+              }
+              out.push("", `Screenshots: ${Array.isArray(s.screenshots) ? s.screenshots.length : 0}`, "");
+            } catch (err) {
+              out.push(`_Could not parse ${file}: ${err instanceof Error ? err.message : String(err)}_`, "");
+            }
+          }
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${out.join("\n")}\n`);
+          }
+          EOF
+
+      - name: Upload Windows E2E Screenshots And Summaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: e2e-desktop-windows
+          path: .gitpulse/scratch/e2e-windows
+          retention-days: 14
+          if-no-files-found: warn

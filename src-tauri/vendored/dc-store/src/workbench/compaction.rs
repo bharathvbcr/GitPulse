@@ -170,7 +170,7 @@ struct VacuumReport {
     checkpoint: &'static str,
 }
 
-struct Checkpoint {
+pub(super) struct Checkpoint {
     busy: i64,
     log: i64,
     checkpointed: i64,
@@ -179,7 +179,7 @@ struct Checkpoint {
 impl Checkpoint {
     /// Every frame was copied and the checkpoint was not blocked. `busy != 0`
     /// means a reader stopped the reset, so the WAL can still hold the pages.
-    fn cleared(&self) -> bool {
+    pub(super) fn cleared(&self) -> bool {
         self.busy == 0 && self.checkpointed == self.log
     }
 }
@@ -236,7 +236,7 @@ fn reclaim(conn: &Connection, limit: i64) -> Result<VacuumReport> {
     })
 }
 
-fn checkpoint_wal(conn: &Connection) -> Result<Checkpoint> {
+pub(super) fn checkpoint_wal(conn: &Connection) -> Result<Checkpoint> {
     let previous: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
     let previous_ms = u64::try_from(previous)
         .map_err(|_| Error::invalid("SQLite returned a negative busy_timeout"))?;
@@ -303,15 +303,67 @@ fn main_file_freelist(conn: &Connection) -> Result<i64> {
             "WAL checkpoint has no main database file to read",
         ));
     }
-    let bytes = std::fs::read(&path).map_err(|error| {
-        Error::invalid(format!("reading the main database header failed: {error}"))
-    })?;
-    if bytes.len() < 40 {
-        return Err(Error::invalid(
-            "main database header is shorter than 40 bytes",
-        ));
-    }
+    header_freelist(std::path::Path::new(&path))
+}
+
+/// Reads the freelist count from the first 40 bytes of the database file at
+/// `path`. Only the header is read: this runs whenever a checkpoint is blocked,
+/// which is when the profile is busiest, and the file it is asked about can be
+/// several gigabytes.
+fn header_freelist(path: &std::path::Path) -> Result<i64> {
+    use std::io::Read;
+    let mut header = [0u8; 40];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::invalid("main database header is shorter than 40 bytes")
+            } else {
+                Error::invalid(format!("reading the main database header failed: {error}"))
+            }
+        })?;
     let mut raw = [0u8; 4];
-    raw.copy_from_slice(&bytes[36..40]);
+    raw.copy_from_slice(&header[36..40]);
     Ok(i64::from(u32::from_be_bytes(raw)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dc-store-header-{}-{name}", std::process::id()))
+    }
+
+    fn header_with_freelist(freelist: u32) -> Vec<u8> {
+        let mut header = vec![0u8; 100];
+        header[36..40].copy_from_slice(&freelist.to_be_bytes());
+        header
+    }
+
+    #[test]
+    fn the_freelist_is_read_from_the_header() {
+        let path = scratch("small");
+        std::fs::write(&path, header_with_freelist(827_504)).unwrap();
+        assert_eq!(header_freelist(&path).unwrap(), 827_504);
+        std::fs::write(&path, &header_with_freelist(1)[..39]).unwrap();
+        let error = header_freelist(&path).unwrap_err();
+        assert!(error.message.contains("shorter than 40 bytes"), "{error}");
+        let _ = std::fs::remove_file(&path);
+        assert!(header_freelist(&path).is_err());
+    }
+
+    /// The file is a sparse terabyte: any read of the whole file would need a
+    /// terabyte of memory, so this finishes only if just the header is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_huge_profile_costs_one_header_read() {
+        let path = scratch("sparse");
+        let file = std::fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut &file, &header_with_freelist(42)).unwrap();
+        file.set_len(1 << 40).unwrap();
+        let answer = header_freelist(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(answer.unwrap(), 42);
+    }
 }

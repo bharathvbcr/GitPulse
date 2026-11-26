@@ -114,7 +114,12 @@ fn plan(anchor: &Path, worktree: &Path) -> Result<Option<Vec<String>>, String> {
     let include_text = include
         .to_str()
         .ok_or("the .worktreeinclude path is not UTF-8")?;
-    let exclude_from = format!("--exclude-from={include_text}");
+    // The anchor is spelled \\?\C:\... on Windows and git refuses that
+    // form as an exclude file, so the argument takes the plain spelling.
+    let exclude_from = format!(
+        "--exclude-from={}",
+        crate::engine::process::plain_path_text(include_text)
+    );
     let listed = nul_list(git(
         anchor,
         &[

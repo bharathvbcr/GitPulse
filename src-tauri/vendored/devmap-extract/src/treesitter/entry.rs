@@ -12,16 +12,26 @@ pub(super) fn is_metal_path(path: &str) -> bool {
 
 /// How long one file may spend inside tree-sitter before the parse is abandoned.
 ///
-/// Measured, not guessed. A 4,000-byte C++ source consisting of 2,000 nested
-/// braces takes **131 seconds** to parse (`tree-sitter-cpp` 0.23, release
-/// build); the same input costs Ruby 8.8 s and Python 58 ms. Generated,
-/// minified and machine-emitted sources hit exactly this shape, and until now a
-/// single such file stalled the whole build with no diagnostic — a `dev map` on
-/// a repository containing one would look like a hang, and a daemon rebuild
-/// would hold its lock for the duration.
+/// The shape that is pathological has moved. A 4,000-byte C++ source of 2,000
+/// nested braces once took **131 s** to parse on an earlier `tree-sitter-cpp`;
+/// on 0.23.4 (`rust/Cargo.lock`) it parses in about 6 ms (release) / 50 ms
+/// (debug) — attacker-measured, not re-measured here. What is still
+/// superlinear is a long chain or a deep nest of calls. Measured here
+/// (release, `tree-sitter-cpp` 0.23.4, load average about 50, min of 3 runs,
+/// one source file parsed with a 120 s budget): a method chain `a.b().b()...`
+/// takes **3.1 s** at 2,000 calls (8 KB), **12.1 s** at 4,000 (16 KB) and
+/// **107 s** at 8,000 (32 KB); one of three 8,000-call runs hit the 120 s
+/// budget and was refused. Attacker-measured, same conditions and not
+/// re-measured here: 8,000 nested calls `f(f(f(...)))` (24 KB) 47.8 s, an
+/// `A<A<...int>>` nest of 8,000 (24 KB) 27.9 s, an 8,000-link ternary chain
+/// 21.1 s. Generated, minified and machine-emitted sources hit these shapes,
+/// and without a bound a single such file stalls the whole build with no
+/// diagnostic: a `dev map` on a repository containing one would look like a
+/// hang, and a daemon rebuild would hold its lock for the duration.
 ///
 /// Five seconds is far above what a legitimate file costs on an idle machine
-/// and far below the pathological case. Measured on the real corpora: the
+/// and far below the pathological shapes above. Measured on the real corpora
+/// (`benchmarks/results/map/20260902T173948Z.md`, not re-measured here): the
 /// largest source seen (624 KB, 12,353 lines) takes **875 ms** standalone at a
 /// load average of 85, and most files take single-digit milliseconds.
 ///
@@ -40,9 +50,18 @@ pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_
 ///
 /// Five: enough to absorb the 6x contention stretch measured on the 875 ms
 /// file's worst case once the contention within the process is gone, while
-/// keeping the retry bounded at 25 s per file against the 131 s pathological
-/// C++ input.
+/// keeping the retry bounded at 25 s per file against the pathological shapes
+/// above, which cost tens of seconds to minutes unbounded.
 pub const RETRY_BUDGET_FACTOR: u32 = 5;
+
+/// Maximum declared symbols permitted for a single file before extraction is refused.
+pub const MAX_FILE_SYMBOLS: usize = 20_000;
+
+/// Maximum calls retained for a single file.
+pub const MAX_FILE_CALLS: usize = 30_000;
+
+/// Maximum references retained for a single file.
+pub const MAX_FILE_REFERENCES: usize = 40_000;
 
 /// How long the serial retry phase may run in total, measured from its first
 /// file. Once it has run this long, the files still waiting stay refused, are
@@ -601,9 +620,26 @@ pub(super) fn extract_treesitter_before_deadline(
                         ParseAttempt::Parsed(repaired.tree),
                         Vec::new(),
                         Some(format!(
-                            "svelte template text: {} bare `&`/`>` character(s) written over \
+                            "svelte template repair: {} construct(s) written over \
                              so the file parses; offsets are the file's own",
                             repaired.edits
+                        )),
+                    ),
+                    None => (ParseAttempt::Parsed(tree), Vec::new(), None),
+                }
+            }
+            ParseAttempt::Parsed(tree)
+                if matches!(lang, "typescript" | "tsx" | "rust" | "shell")
+                    && tree.root_node().has_error() =>
+            {
+                match crate::parse_repair::repair(lang, &mut parser, &tree, source, deadline) {
+                    Some(repaired) => (
+                        ParseAttempt::Parsed(repaired.tree),
+                        Vec::new(),
+                        Some(format!(
+                            "{}: {} site(s) repaired same-width so the file parses; offsets are \
+                             the file's own",
+                            repaired.kind, repaired.edits
                         )),
                     ),
                     None => (ParseAttempt::Parsed(tree), Vec::new(), None),
@@ -617,7 +653,7 @@ pub(super) fn extract_treesitter_before_deadline(
                 // Measured: a 4,000-byte C++ file of 2,000 nested braces parses
                 // in 3 ms and then spends 199 s in the walk, so bounding the
                 // parse alone bounds nothing that actually hurts.
-                let content_hash = content_hash(source);
+                let content_hash = source_identity(source);
 
                 let root = tree.root_node();
                 // Kotlin only: statements the grammar read as expressions,
@@ -637,7 +673,7 @@ pub(super) fn extract_treesitter_before_deadline(
                         .map(|region| (region.range.start_byte, region.range.end_byte))
                         .collect(),
                 );
-                let parse_outcome = parse_outcome_of(
+                let mut parse_outcome = parse_outcome_of(
                     root,
                     source,
                     is_metal_path(path),
@@ -698,6 +734,17 @@ pub(super) fn extract_treesitter_before_deadline(
                     deadline,
                 );
                 if !walk_completed {
+                    if symbols.len().saturating_sub(1) > MAX_FILE_SYMBOLS {
+                        return refused_extraction(
+                            path,
+                            lang,
+                            source,
+                            budget_refusal_reason(format!(
+                                "file declares {} symbols, exceeding the {MAX_FILE_SYMBOLS} single-file ceiling; no symbols are claimed for this file",
+                                symbols.len().saturating_sub(1)
+                            )),
+                        );
+                    }
                     // The partial `symbols`/`calls` collected so far describe a
                     // prefix of the tree. Publishing them would be a truncated
                     // extraction wearing a clean outcome, and every consumer
@@ -738,6 +785,17 @@ pub(super) fn extract_treesitter_before_deadline(
                         &symbols,
                     );
                     symbols.extend(attributes);
+                }
+                if symbols.len().saturating_sub(1) > MAX_FILE_SYMBOLS {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        budget_refusal_reason(format!(
+                            "file declares {} symbols, exceeding the {MAX_FILE_SYMBOLS} single-file ceiling; no symbols are claimed for this file",
+                            symbols.len().saturating_sub(1)
+                        )),
+                    );
                 }
                 if !crate::entry_names::collect(
                     root,
@@ -893,6 +951,17 @@ pub(super) fn extract_treesitter_before_deadline(
                     );
                     rust_calls_through_fn_pointer_items(root, source, &mut calls);
                 }
+                if symbols.len().saturating_sub(1) > MAX_FILE_SYMBOLS {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        budget_refusal_reason(format!(
+                            "file declares {} symbols, exceeding the {MAX_FILE_SYMBOLS} single-file ceiling; no symbols are claimed for this file",
+                            symbols.len().saturating_sub(1)
+                        )),
+                    );
+                }
                 // Ties on a span break by name, except for a Python base: its
                 // segments share the base's one span and their emission order
                 // (member, then the qualifier from the root down) is what says which
@@ -911,6 +980,20 @@ pub(super) fn extract_treesitter_before_deadline(
                         tie_name(lang, b),
                     ))
                 });
+                // The ceilings cut AFTER the sort, so what is kept is a byte
+                // prefix of the file and the cut is one offset. References used to
+                // be cut first and sorted second, which kept an arbitrary subset.
+                // The earliest cut, to the end of the file, is the region nobody
+                // read; it is carried on `parse_outcome` below.
+                let mut unread_from: Option<usize> = None;
+                let dropped_references = if references.len() > MAX_FILE_REFERENCES {
+                    let dropped = references.len() - MAX_FILE_REFERENCES;
+                    unread_from = Some(references[MAX_FILE_REFERENCES].span.start_byte);
+                    references.truncate(MAX_FILE_REFERENCES);
+                    dropped
+                } else {
+                    0
+                };
 
                 // Framework matching is an auxiliary extractor. A matcher
                 // failure cannot retroactively turn a successful grammar
@@ -921,6 +1004,28 @@ pub(super) fn extract_treesitter_before_deadline(
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
                 diagnostics.extend(semi_note);
+                if dropped_references > 0 {
+                    diagnostics.push(format!(
+                        "references dropped at the single-file ceiling: {dropped_references} reference(s) exceeded the {MAX_FILE_REFERENCES} ceiling"
+                    ));
+                }
+                if calls.len() > MAX_FILE_CALLS {
+                    let dropped = calls.len() - MAX_FILE_CALLS;
+                    // Only a file over the ceiling is reordered, so every other
+                    // file's output is unchanged. A stable sort keeps the
+                    // emission order of calls that share a span.
+                    calls.sort_by_key(|call| (call.span.start_byte, call.span.end_byte));
+                    let cut = calls[MAX_FILE_CALLS].span.start_byte;
+                    unread_from = Some(unread_from.map_or(cut, |from| from.min(cut)));
+                    calls.truncate(MAX_FILE_CALLS);
+                    diagnostics.push(format!(
+                        "{}{dropped} call site(s) were dropped at the single-file ceiling of {MAX_FILE_CALLS}",
+                        crate::model::CALLS_DROPPED_PREFIX
+                    ));
+                }
+                if let Some(start) = unread_from {
+                    parse_outcome = with_unread_tail(parse_outcome, start, source.len());
+                }
                 if lang == "hcl" && calls.len() > crate::model::MAX_CALL_BLIND_SITES {
                     let dropped = calls.len() - crate::model::MAX_CALL_BLIND_SITES;
                     calls.truncate(crate::model::MAX_CALL_BLIND_SITES);
@@ -1290,6 +1395,42 @@ pub(crate) fn publish_exports(symbols: &[ExtractedSymbol], exports: &mut Vec<Ext
             b.span.start_byte,
         ))
     });
+}
+
+/// The outcome with one more region nobody read: the tail of a file cut at a
+/// single-file ceiling, from the first dropped item to the end.
+///
+/// A cut noted only in `diagnostics` is gone once stored, because
+/// `Extraction::for_durable_store` clears them, so a build that re-resolves from
+/// cached payloads reads the file as `Clean`. The notebook and embedded
+/// extractors carry theirs on the outcome for exactly this reason. `Clean`
+/// becomes `Partial` over the tail; a `Partial` gains it; an outcome that is
+/// already a failure, a fallback or a skip already says the file was not read in
+/// full and is left alone.
+fn with_unread_tail(outcome: ParseOutcome, start_byte: usize, end_byte: usize) -> ParseOutcome {
+    let tail = TextRange {
+        start_byte,
+        end_byte,
+    };
+    match outcome {
+        ParseOutcome::Clean => ParseOutcome::Partial {
+            error_ranges: vec![tail],
+            nameless_ranges: Vec::new(),
+        },
+        ParseOutcome::Partial {
+            mut error_ranges,
+            nameless_ranges,
+        } => {
+            error_ranges.push(tail);
+            error_ranges.sort();
+            error_ranges.dedup();
+            ParseOutcome::Partial {
+                error_ranges,
+                nameless_ranges,
+            }
+        }
+        other => other,
+    }
 }
 
 /// The outcome of a parse: `Clean`, or `Partial` with the ranges that are not

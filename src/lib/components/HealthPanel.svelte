@@ -339,6 +339,23 @@
   );
 
   /**
+   * The report the page may render: `report`, but only while it belongs to the
+   * repository open now. The view's branches are gated on this, not on
+   * `report`.
+   *
+   * `report` is reset by the repository-switch `$effect`, a write made while
+   * effects are flushing. Since Svelte 5.58.1 (sveltejs/svelte#19030) a block
+   * that re-runs during a flush applies its branch change only when that
+   * batch commits, so the report branch outlived `report = null` and its
+   * children read `null.tone` and `null.npm_cli_present`. The crash aborted
+   * the flush, and the secrets scan the switch should have scheduled never
+   * started ("rapid A to B to A" in the health harness). This value changes
+   * with the store write itself, so the branch is torn down before the effect
+   * runs.
+   */
+  let shownReport = $derived(report && reportPath === $currentRepoPath ? report : null);
+
+  /**
    * The verdict, derived once and read by the header chip, the summary card
    * and every section's tone chip.
    *
@@ -1478,7 +1495,7 @@
   {/snippet}
 
   <PageBody>
-    {#if !report}
+    {#if !shownReport}
       {@render githubFreshness()}
     {/if}
     <!-- Non-fatal action failures render ahead of the state chain so they stay
@@ -1489,7 +1506,7 @@
         <div class="min-w-0 flex-1">{actionError}</div>
       </div>
     {/if}
-    {#if (loading || pending) && !report}
+    {#if (loading || pending) && !shownReport}
       <div class="space-y-4">
         <div class="grid grid-cols-1 @2xl:grid-cols-3 gap-3">
           <Skeleton variant="card" count={3} />
@@ -1499,11 +1516,11 @@
         </div>
       </div>
       {@render secretsSection()}
-    {:else if errorMsg && !report}
+    {:else if errorMsg && !shownReport}
       {@render scanFailureBanner()}
       {@render githubSections()}
       {@render secretsSection()}
-    {:else if report}
+    {:else if shownReport}
       {#if errorMsg}
         {@render scanFailureBanner()}
       {/if}
@@ -1693,12 +1710,12 @@
         {#if auditCensus}
           <p class="text-textMuted" data-testid="audit-coverage">{auditCensus}.</p>
         {/if}
-        {#if !report.npm_cli_present && report.manifests.length > 0}
+        {#if !shownReport.npm_cli_present && shownReport.manifests.length > 0}
           <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</div>
           </div>
         {:else if visibleVulns.length === 0}
-          {#if report.audit.total !== 0}
+          {#if shownReport.audit.total !== 0}
             <p class="text-textMuted">{vulnerabilityEmptyMessage(filter, vulnerabilitiesCapped)}</p>
           {:else if auditComplete}
             <EmptyState icon={ShieldCheck} title="No vulnerabilities found by completed local audits." compact />
@@ -1751,11 +1768,11 @@
       {@render secretsSection()}
 
       <HealthSection id="issues" count={issuesCount} tone={facetTone("issues")}>
-        {#if report.issues.length === 0}
+        {#if shownReport.issues.length === 0}
           <EmptyState icon={ShieldCheck} title="No repository configuration issues were reported by this scan." compact />
         {:else}
           <div class="space-y-1.5">
-            {#each keyedList(previewed("issues", report.issues), (issue) => `${issue.code}:${issue.path ?? ""}:${issue.message}`) as { item: issue, key } (key)}
+            {#each keyedList(previewed("issues", shownReport.issues), (issue) => `${issue.code}:${issue.path ?? ""}:${issue.message}`) as { item: issue, key } (key)}
               <div class="gp-notice flex-col" data-tone={issueNoticeTone(issue.severity)}>
                 <div class="flex items-center gap-2 min-w-0 w-full">
                   <AlertTriangle size={12} class="shrink-0" style="color: var(--gp-notice-ink)" aria-hidden="true" />
@@ -1771,13 +1788,13 @@
               </div>
             {/each}
           </div>
-          <ListPreviewToggle total={report.issues.length} noun="issues" bind:expanded={expandedLists.issues} />
+          <ListPreviewToggle total={shownReport.issues.length} noun="issues" bind:expanded={expandedLists.issues} />
         {/if}
       </HealthSection>
 
       <HealthSection id="outdated" count={outdatedCount} tone={facetTone("outdated")}>
-        {#if report.outdated.length === 0}
-          {#if report.npm_cli_present}
+        {#if shownReport.outdated.length === 0}
+          {#if shownReport.npm_cli_present}
             <EmptyState icon={Package} title="No outdated npm packages reported." compact />
           {:else}
             <div role="status" class="gp-notice" data-tone="unknown">
@@ -1786,7 +1803,7 @@
           {/if}
         {:else}
           <HealthTable caption="npm packages behind their latest published release" columns={OUTDATED_COLUMNS}>
-            {#each keyedList(previewed("outdated", report.outdated), (pkg) => `${pkg.location}:${pkg.name}:${pkg.current}`) as { item: pkg, key } (key)}
+            {#each keyedList(previewed("outdated", shownReport.outdated), (pkg) => `${pkg.location}:${pkg.name}:${pkg.current}`) as { item: pkg, key } (key)}
               {@const kind = updateKind(pkg.current, pkg.latest)}
               <tr>
                 <td class="px-3 py-1.5 font-mono text-textPrimary truncate" title={pkg.name}>{pkg.name}</td>
@@ -1801,7 +1818,7 @@
             {/each}
           </HealthTable>
           <ListPreviewToggle
-            total={report.outdated.length}
+            total={shownReport.outdated.length}
             noun="outdated packages"
             bind:expanded={expandedLists.outdated}
           />
@@ -1818,12 +1835,12 @@
                compiled as its own function, so `report` is not narrowed here
                even though the branch that declares it has checked. -->
           <span class="text-meta text-textMuted font-mono">
-            {report?.node_version ? `node ${report.node_version}` : "node —"}
+            {shownReport?.node_version ? `node ${shownReport.node_version}` : "node —"}
             ·
-            {report?.npm_version ? `npm ${report.npm_version}` : "npm —"}
+            {shownReport?.npm_version ? `npm ${shownReport.npm_version}` : "npm —"}
           </span>
         {/snippet}
-        {#if report.manifests.length === 0}
+        {#if shownReport.manifests.length === 0}
           <EmptyState
             icon={Package}
             title="No package.json found"
@@ -1832,7 +1849,7 @@
           />
         {:else}
           <div class="grid gap-2 @2xl:grid-cols-2">
-            {#each keyedList(previewed("packages", report.manifests), (pkg) => pkg.path) as { item: pkg, key } (key)}
+            {#each keyedList(previewed("packages", shownReport.manifests), (pkg) => pkg.path) as { item: pkg, key } (key)}
               <!-- Grid items default to `min-width: auto`, so a long manifest
                    path widens its column instead of wrapping inside it. -->
               <div class="p-3.5 rounded-2xl border border-edge bg-surface shadow-card min-w-0 [overflow-wrap:anywhere]">
@@ -1864,19 +1881,19 @@
             {/each}
           </div>
           <ListPreviewToggle
-            total={report.manifests.length}
+            total={shownReport.manifests.length}
             noun="package manifests"
             bind:expanded={expandedLists.packages}
           />
         {/if}
-        {#if report.ecosystems.length > 0}
+        {#if shownReport.ecosystems.length > 0}
           <!-- One row per family, as a definition list rather than a prose run.
                These used to render as family + note + a comma-joined path list
                in a single wrapping paragraph, so a repository with four Rust
                crates produced three lines of run-together file paths with no
                structure to scan. -->
           <dl class="pt-1 space-y-1.5">
-            {#each keyedList(previewed("ecosystems", report.ecosystems), (eco) => eco.family) as { item: eco, key } (key)}
+            {#each keyedList(previewed("ecosystems", shownReport.ecosystems), (eco) => eco.family) as { item: eco, key } (key)}
               {@const shown = eco.manifests.slice(0, 4)}
               {@const seen = ecosystemArtifactTotal(eco)}
               <!-- `minmax(0,1fr)`, not `1fr`: a grid track's default minimum is
@@ -1899,7 +1916,7 @@
             {/each}
           </dl>
           <ListPreviewToggle
-            total={report.ecosystems.length}
+            total={shownReport.ecosystems.length}
             noun="ecosystems"
             bind:expanded={expandedLists.ecosystems}
           />

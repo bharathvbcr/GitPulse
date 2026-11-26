@@ -34,7 +34,7 @@ const SCANS_ON_KILL_PATH = 4;
 const SWEEP_AND_REAP_MS = 2 * 20 + 4 * 50;
 
 function killSleepsMs(): number {
-  const facade = item("pub fn kill_session(");
+  const facade = item("pub fn kill_session_as(");
   expect(facade).toContain("state.host.kill(session_id)");
   expect(facade).toContain("engine_kill_session(&state.engine, session_id)");
   const grace = /pub\(crate\) const HANGUP_GRACE: Duration = Duration::from_millis\((\d+)\);/.exec(rust);

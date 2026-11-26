@@ -69,16 +69,24 @@ export function expectedTests(document) {
   return expected;
 }
 
+const XML_ENTITIES = /** @type {Record<string, string>} */ ({
+  quot: '"',
+  apos: "'",
+  lt: "<",
+  gt: ">",
+  amp: "&",
+});
+
 /** @param {string} text */
 function unescapeXml(text) {
-  return text
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)))
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
+  return text.replace(/&(?:#x([0-9a-fA-F]+)|#(\d+)|(quot|apos|lt|gt|amp));/g, (_, hex, dec, named) => {
+    if (named) return XML_ENTITIES[named];
+    const cp = hex !== undefined ? Number.parseInt(hex, 16) : Number(dec);
+    if (!Number.isInteger(cp) || cp < 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) {
+      throw new CouldNotRun(`invalid XML character reference in JUnit report: ${hex ?? dec}`);
+    }
+    return String.fromCodePoint(cp);
+  });
 }
 
 /**
@@ -119,7 +127,7 @@ export function compare(expected, shards) {
   /** @type {Map<string, number>} */
   const seen = new Map();
   for (const shard of shards) for (const id of shard) seen.set(id, (seen.get(id) ?? 0) + 1);
-  const readable = (/** @type {string} */ id) => id.replace("\t", " ");
+  const readable = (/** @type {string} */ id) => id.replaceAll("\t", " ");
   return {
     missing: [...expected].filter((id) => !seen.has(id)).map(readable).sort(),
     unlisted: [...seen.keys()].filter((id) => !expected.has(id)).map(readable).sort(),

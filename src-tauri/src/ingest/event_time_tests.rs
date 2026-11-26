@@ -45,7 +45,7 @@ pub(super) fn write_corpus(corpus: &std::path::Path, lines: &[String]) {
 /// A git checkout with one commit, canonical path.
 pub(super) fn git_repo() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().canonicalize().unwrap();
+    let path = crate::test_support::canonical_slash_path(dir.path()).unwrap();
     git_in(&path, &["init", "-b", "main"]);
     std::fs::write(path.join("seed.txt"), "seed").unwrap();
     git_in(&path, &["add", "seed.txt"]);
@@ -94,7 +94,7 @@ fn run_git_at(dir: &std::path::Path, epoch: i64, args: &[&str]) {
 #[test]
 fn a_transcript_call_carries_the_time_it_happened() {
     let repo_dir = tempfile::tempdir().unwrap();
-    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo = crate::test_support::canonical_slash_path(repo_dir.path()).unwrap();
     let repo = repo.to_str().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let file = format!("{repo}/a.rs");
@@ -120,7 +120,7 @@ fn a_transcript_call_carries_the_time_it_happened() {
 #[test]
 fn an_offset_timestamp_is_converted_to_utc() {
     let repo_dir = tempfile::tempdir().unwrap();
-    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo = crate::test_support::canonical_slash_path(repo_dir.path()).unwrap();
     let repo = repo.to_str().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let file = format!("{repo}/a.rs");
@@ -219,7 +219,7 @@ fn a_call_carries_the_task_that_was_bound_when_it_happened() {
 #[test]
 fn a_reflog_entry_carries_the_time_of_the_move_not_the_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().canonicalize().unwrap();
+    let path = crate::test_support::canonical_slash_path(dir.path()).unwrap();
     let repo = path.to_str().unwrap();
     // Commits authored long ago; the checkout that moved HEAD happened later.
     let (t0, t1) = (1_780_000_000i64, 1_785_000_000i64);
@@ -251,7 +251,7 @@ fn retention_stays_on_the_append_clock() {
     // the stored rows. Pruning by `occurred_at` would delete a row git still
     // holds, and the next catch-up would record it again, for ever.
     let repo_dir = tempfile::tempdir().unwrap();
-    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo = crate::test_support::canonical_slash_path(repo_dir.path()).unwrap();
     let repo = repo.to_str().unwrap();
     for n in 0..3 {
         ledger::append(ledger::Draft {
@@ -633,7 +633,10 @@ fn a_ledger_carried_to_a_new_path_keeps_recording() {
     assert_eq!(out.recorded, 1, "{out:?}");
     raw_conn(&repo, |conn| {
         conn.execute(
-            "UPDATE events SET repo_path = '/old/location/of/the/repo'",
+            &format!(
+                "UPDATE events SET repo_path = '{}'",
+                crate::test_support::absent_absolute_path("/old/location/of/the/repo")
+            ),
             [],
         )
         .map_err(|e| ledger::LedgerError::new("update", e.to_string()))?;
@@ -668,7 +671,7 @@ fn every_reflog_selector_resolves_to_its_own_commit_and_the_cap_holds() {
     // reflog expiry (90 days), which cut this fixture to 7 entries at 2026-05.
     let base = i64::try_from(ids::now_millis() / 1000).unwrap() - 100_000;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().canonicalize().unwrap();
+    let path = crate::test_support::canonical_slash_path(dir.path()).unwrap();
     let repo = path.to_str().unwrap();
     git_in(&path, &["init", "-b", "main"]);
     for n in 0..205 {
@@ -707,7 +710,7 @@ fn every_reflog_selector_resolves_to_its_own_commit_and_the_cap_holds() {
 #[test]
 fn a_reflog_entry_a_hundred_days_old_is_still_read() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().canonicalize().unwrap();
+    let path = crate::test_support::canonical_slash_path(dir.path()).unwrap();
     let repo = path.to_str().unwrap();
     let old = i64::try_from(ids::now_millis() / 1000).unwrap() - 100 * 86_400;
     git_in(&path, &["init", "-b", "main"]);

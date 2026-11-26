@@ -116,6 +116,106 @@ fn hub_state_transitions_preserve_age_across_restatements_and_clear_on_end() {
     assert!(snapshot_of(&tracked, 42, 100, 6000).sessions.is_empty());
 }
 
+fn terminal_signal(key: &str, channel: &'static str, detail: Option<&str>) -> Notice {
+    Notice {
+        key: key.to_owned(),
+        origin: Origin::Terminal,
+        label: "Claude Code".into(),
+        place: Some("/repo".into()),
+        event: None,
+        detail: detail.map(str::to_owned),
+        is_agent: true,
+        channel,
+        subject: None,
+        subagent: false,
+        agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
+    }
+}
+
+#[test]
+fn mapped_standing_state_separates_error_idle_and_informational_signals_from_blocked() {
+    let mut tracked: HashMap<String, Tracked> = HashMap::new();
+    let counters = Counters::default();
+    let t0 = Instant::now();
+
+    // Hook `error` maps to `"blocked"` (valid `gitpulse_sessions` enum) while
+    // keeping `event: Some("error")` to distinguish it from permission prompts.
+    let _ = admit_at(
+        hook_notice("term-err", Some("error"), None, None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    // Bare BEL and informational OSC map to `"idle"` (never `"blocked"`).
+    let _ = admit_at(
+        terminal_signal("term-bell", "bell", None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    let _ = admit_at(
+        terminal_signal("term-osc", "osc9", Some("Build done")),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    // Hook `idle_prompt` maps to `"idle"`, while `agent_needs_input` maps to `"blocked"`.
+    let _ = admit_at(
+        hook_notice("term-idle", Some("idle_prompt"), None, None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    let _ = admit_at(
+        hook_notice("term-ask", Some("agent_needs_input"), None, None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+
+    // Post-HOOK_SHADOW bare BEL and OSC 9 must never clobber `"blocked"` hook state.
+    let later = t0 + HOOK_SHADOW + Duration::from_secs(5);
+    let _ = admit_at(
+        terminal_signal("term-ask", "bell", None),
+        later,
+        20_000,
+        &mut tracked,
+        &counters,
+    );
+    let _ = admit_at(
+        terminal_signal("term-ask", "osc9", Some("FYI")),
+        later + Duration::from_secs(1),
+        21_000,
+        &mut tracked,
+        &counters,
+    );
+
+    let snap = snapshot_of(&tracked, 42, 100, 22_000);
+    let states: HashMap<&str, (&str, Option<&str>)> = snap
+        .sessions
+        .iter()
+        .map(|s| (s.key.as_str(), (s.state.as_str(), s.event.as_deref())))
+        .collect();
+    assert_eq!(states.get("term-err"), Some(&("blocked", Some("error"))));
+    assert_eq!(states.get("term-bell"), Some(&("idle", None)));
+    assert_eq!(states.get("term-osc"), Some(&("idle", None)));
+    assert_eq!(
+        states.get("term-idle"),
+        Some(&("idle", Some("idle_prompt")))
+    );
+    assert_eq!(
+        states.get("term-ask"),
+        Some(&("blocked", Some("agent_needs_input")))
+    );
+}
+
 #[test]
 fn snapshot_reader_rejects_missing_dead_and_reused_writers_and_sets_0600() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -127,7 +227,31 @@ fn snapshot_reader_rejects_missing_dead_and_reused_writers_and_sets_0600() {
     ));
 
     let me = std::process::id();
-    let my_start = crate::sysload::process_start_us(me).unwrap();
+    // A platform that cannot read a process's start time (Windows has no
+    // process scan) cannot tell a live writer from a reused pid, so the reader
+    // refuses every snapshot there rather than trusting one it cannot check.
+    let Some(my_start) = crate::sysload::process_start_us(me) else {
+        let unverifiable = HubStateSnapshot {
+            version: STATE_SNAPSHOT_VERSION,
+            writer_pid: me,
+            writer_start_us: 1,
+            updated_ms: 1234,
+            sessions: Vec::new(),
+        };
+        write_state_snapshot_atomic(&path, &unverifiable).unwrap();
+        match read_state_snapshot_at(Some(&path)) {
+            HubStateRead::Unavailable(reason) => {
+                // The reason is not echoed: an open refusal names the owner's
+                // uid, which has no place in test output.
+                assert!(
+                    reason.contains("is no longer running"),
+                    "an unidentifiable writer is refused as not running"
+                )
+            }
+            HubStateRead::Ok(_) => panic!("a writer that cannot be identified must be refused"),
+        }
+        return;
+    };
     let snap = HubStateSnapshot {
         version: STATE_SNAPSHOT_VERSION,
         writer_pid: me,
@@ -229,15 +353,26 @@ fn worker_writes_initial_snapshot_debounced_updates_and_removes_on_exit() {
     ))
     .unwrap();
 
+    // Where the writer's start time cannot be read, the reader refuses every
+    // snapshot, so the file is read as the worker wrote it.
+    let reader_can_identify_the_writer =
+        crate::sysload::process_start_us(std::process::id()).is_some();
     let saw_done = crate::test_support::wait_until(Duration::from_secs(2), || {
-        matches!(
-            read_state_snapshot_at(Some(&path)),
-            HubStateRead::Ok(snap)
-                if snap
-                    .sessions
-                    .iter()
-                    .any(|s| s.key == "term-live" && s.state == "done")
-        )
+        let snap = if reader_can_identify_the_writer {
+            match read_state_snapshot_at(Some(&path)) {
+                HubStateRead::Ok(snap) => Some(snap),
+                HubStateRead::Unavailable(_) => None,
+            }
+        } else {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<HubStateSnapshot>(&bytes).ok())
+        };
+        snap.is_some_and(|snap| {
+            snap.sessions
+                .iter()
+                .any(|s| s.key == "term-live" && s.state == "done")
+        })
     });
     assert!(
         saw_done,

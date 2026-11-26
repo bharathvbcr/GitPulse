@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { Columns2, FileCode, FileText, SquareTerminal } from "@lucide/svelte";
+  import { Columns2, FileCode, FileText, Maximize2, SquareTerminal, Sparkles } from "@lucide/svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
+  import { opensExplorerPage } from "../files/explorerPageGesture";
   import { requestPin } from "../files/pinRequests";
-  import { requestReveal } from "../files/revealRequests";
+  import { requestReveal, treeRevealRequest } from "../files/revealRequests";
   import {
-    resolveSidebarOpen,
+    resolveFileOpen,
     sidebarNavStore,
     type SidebarFileOpenTarget,
     type SidebarLastOpen,
@@ -15,6 +16,7 @@
   import { terminalExplorerSidebar } from "../terminal/explorerSidebar";
   import { TERMINAL_SESSION_CANCELED, terminalLaunchRequests } from "../terminal/launchRequests";
   import { describeError } from "../ui/copy/describeFailure";
+  import { lastSurface } from "../ui/lastSurface";
   import { platformChord } from "../ui/platformCopy";
   import { hostPlatform } from "../stores/platformStore";
 
@@ -29,7 +31,7 @@
   const openTarget = $derived($sidebarNavStore.openTarget);
   const dockedInTerminal = $derived($terminalExplorerSidebar.open && $repoStore.terminalOpen);
   let lastClickMods = { altKey: false, metaOrCtrlKey: false };
-  /** Where the last click on a file sent it; a double-click follows it (`resolveSidebarOpen`). */
+  /** Where the last click on a file sent it; a double-click follows it (`resolveFileOpen`). */
   let lastOpen: SidebarLastOpen | null = null;
   let inflightOpen: { key: string; controller: AbortController } | null = null;
 
@@ -40,6 +42,11 @@
 
   function setTarget(target: SidebarFileOpenTarget) {
     sidebarNavStore.setOpenTarget(target);
+  }
+
+  /** The full Explorer page, through the page owner every Explorer entry uses. */
+  function openExplorerPage() {
+    repoStore.setActiveTab("code", "explorer");
   }
 
   function dockExplorerInTerminal() {
@@ -63,12 +70,15 @@
     const mods = lastClickMods;
     lastClickMods = { altKey: false, metaOrCtrlKey: false };
     const now = Date.now();
-    const action = resolveSidebarOpen({
+    const action = resolveFileOpen({
       path,
       pin,
       lastOpen,
       now,
       defaultTarget: openTarget,
+      // A click here is on the sidebar, which `lastSurface` ignores, so this
+      // is where the user was before it; the dock must also be showing.
+      terminalActive: $lastSurface === "terminal" && $repoStore.terminalOpen,
       altKey: mods.altKey,
       metaOrCtrlKey: mods.metaOrCtrlKey,
     });
@@ -111,6 +121,9 @@
   }
 </script>
 
+<!-- The double-click is a mouse shortcut for the "Open the Explorer page"
+     button in the strip below, which is the keyboard's way to the same place;
+     `opensExplorerPage` leaves rows, fields and controls their own. -->
 <!-- Justified: the capture-phase pointerdown only records which modifier keys
      a click on a file row carried (Alt, ⌘/Ctrl); it handles nothing itself,
      and every row and button inside keeps its own keyboard handling. -->
@@ -118,6 +131,9 @@
 <div
   class="flex-1 min-h-0 flex flex-col overflow-hidden"
   data-testid="sidebar-explorer-pane"
+  ondblclick={(event) => {
+    if (opensExplorerPage(event)) openExplorerPage();
+  }}
   onpointerdowncapture={(event) => {
     lastClickMods = {
       altKey: event.altKey,
@@ -131,6 +147,19 @@
       role="group"
       aria-label="Open clicked files in"
     >
+      <button
+        type="button"
+        data-testid="sidebar-explorer-target-auto"
+        aria-pressed={openTarget === "auto"}
+        class="inline-flex flex-1 justify-center items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {openTarget === 'auto'
+          ? 'bg-accent/15 text-accent font-medium'
+          : 'text-textMuted hover:text-textPrimary'}"
+        title="Open clicked files beside the terminal when it was the last thing you used, otherwise in Code view"
+        onclick={() => setTarget("auto")}
+      >
+        <Sparkles size={11} class="shrink-0" />
+        <span>Auto</span>
+      </button>
       <button
         type="button"
         data-testid="sidebar-explorer-target-code"
@@ -173,6 +202,17 @@
     </div>
     <button
       type="button"
+      class="gp-icon-btn shrink-0 hover:text-accent"
+      data-size="sm"
+      data-testid="sidebar-explorer-open-page"
+      aria-label="Open the Explorer page"
+      title="Open the Explorer page · or double-click empty space in this pane"
+      onclick={openExplorerPage}
+    >
+      <Maximize2 size={13} />
+    </button>
+    <button
+      type="button"
       class="gp-icon-btn shrink-0 {dockedInTerminal ? 'text-accent bg-accent/15' : 'hover:text-accent'}"
       data-size="sm"
       data-testid="sidebar-explorer-dock-terminal"
@@ -190,6 +230,7 @@
     <ExplorerRail
       repoPath={effectiveRepoPath}
       selectedFile={$repoStore.selectedFilePath}
+      revealRequest={$treeRevealRequest}
       onSelectFile={(path) => void handleOpenFile(path, null, null)}
       onPinFile={(path) => void handleOpenFile(path, null, null, true)}
       onSelectMatch={(path, line, col) => void handleOpenFile(path, line, col)}

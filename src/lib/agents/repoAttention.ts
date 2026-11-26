@@ -14,7 +14,7 @@
  */
 
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
-import type { AttentionKind } from "../terminal/sessionActivity";
+import type { AttentionKind, SessionAttentionUrgency } from "../terminal/sessionActivity";
 import type { AgentRepoTarget } from "./store";
 import {
   ATTENTION_REASONS,
@@ -33,7 +33,6 @@ const ASKS: ReadonlySet<AttentionReason> = new Set([
   "pending",
   "blocked",
   "signalled",
-  "finished",
 ]);
 
 /** Reasons that mean the plane could not say, rather than that nothing is wrong. */
@@ -69,12 +68,10 @@ const PHRASE: Partial<Record<AttentionReason, string>> = {
   pending: "Waiting",
   blocked: "Blocked",
   signalled: "Asked",
-  finished: "Finished",
 };
 
 function toneOf(reason: AttentionReason): RepoAgentTone {
   if (reason === "error") return "danger";
-  if (reason === "finished") return "info";
   return "warn";
 }
 
@@ -84,21 +81,40 @@ export function planeTerminals(
     key: string;
     repoPath: string;
     label: string;
+    launcher?: string | null;
     title?: string;
     status: string;
     sessionId?: string | null;
     taskRunId?: string | null;
     continuesRunId?: string | null;
   }[],
-  activity: ReadonlyMap<string, { title: string | null; attention: { kind: AttentionKind } | null }>,
+  activity: ReadonlyMap<
+    string,
+    {
+      title: string | null;
+      fullyIdle?: boolean;
+      providerSessionId?: string | null;
+      attention: {
+        kind: AttentionKind;
+        urgency?: SessionAttentionUrgency;
+        event?: string | null;
+        channel?: string;
+        label?: string;
+        detail?: string | null;
+        at?: number;
+      } | null;
+    }
+  >,
   directories: ReadonlyMap<string, string>,
 ): PlaneTerminal[] {
   return records.map((record) => {
     const seen = record.sessionId ? activity.get(record.sessionId) : undefined;
+    const attention = seen?.attention ?? null;
     return {
       key: record.key,
       repoPath: record.repoPath,
       label: record.label,
+      launcher: record.launcher ?? null,
       title: seen?.title || record.title || record.label,
       status: record.status,
       sessionId: record.sessionId ?? "",
@@ -106,7 +122,15 @@ export function planeTerminals(
       continuesRunId: record.continuesRunId ?? "",
       // Unknown stays unknown: no directory is not the repository root.
       cwd: record.sessionId ? directories.get(record.sessionId) ?? null : null,
-      attention: seen?.attention?.kind ?? null,
+      attention: attention?.kind ?? null,
+      attentionUrgency: attention?.urgency ?? null,
+      attentionEvent: attention?.event ?? null,
+      attentionChannel: attention?.channel ?? null,
+      attentionLabel: attention?.label ?? null,
+      attentionDetail: attention?.detail ?? null,
+      attentionAt: attention?.at ?? null,
+      fullyIdle: seen?.fullyIdle ?? false,
+      providerSessionId: seen?.providerSessionId ?? null,
     };
   });
 }
@@ -124,7 +148,7 @@ function mostUrgent(rows: readonly AgentRow[], pick: ReadonlySet<AttentionReason
 function countLive(rows: readonly AgentRow[]): number {
   let live = 0;
   const walk = (row: AgentRow) => {
-    if (row.origin === "terminal" && row.presence === "live") live += 1;
+    if (row.origin !== "session" && row.presence === "live") live += 1;
     for (const child of row.children) walk(child);
   };
   for (const row of rows) walk(row);

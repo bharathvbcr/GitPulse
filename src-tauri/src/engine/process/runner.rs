@@ -404,7 +404,7 @@ pub fn found_but_failed_detail(program: &str, out: &CapturedOutput) -> String {
 /// becomes error text, and a line of it that matched a marker must not pass for
 /// a cancel. The kind survives a layer that wraps the message.
 pub(super) fn is_cancellation(error: &CommandError) -> bool {
-    error.origin() == Some(crate::ipc_error::IpcErrorKind::ReadCancelled)
+    super::read_cancel::is_cancelled_error(error)
 }
 
 /// First sleep between `try_wait` polls, and the ceiling it grows to.
@@ -1115,6 +1115,11 @@ pub(crate) fn forced_failure_active() -> bool {
 }
 
 #[cfg(test)]
+pub(super) fn forced_deferral_active() -> bool {
+    FORCE_DEFERRAL.get()
+}
+
+#[cfg(test)]
 fn forced_failure_matches(cmd: &Command) -> bool {
     FORCED_FAILURE_ARG.with(|slot| {
         slot.borrow()
@@ -1422,8 +1427,11 @@ fn run_admitted_inner(
     let mut cursors = [0; 2];
     enum Halt {
         Exited(std::process::ExitStatus, bool),
-        /// Runtime deadline. The child has been reaped. `message` is the
-        /// timeout sentence callers that cannot keep a prefix still return.
+        /// Runtime deadline. The child was asked to stop, then killed and
+        /// reaped; if the signal guard refused the kill, it is instead left
+        /// registered with procguard after a bounded wait (REAP_BOUND) and
+        /// is not reaped. `message` is the timeout sentence callers that
+        /// cannot keep a prefix still return.
         Deadline(String),
         Failed(String),
     }
@@ -1507,8 +1515,11 @@ fn run_admitted_inner(
     // `procguard::with_inheritance_lock` — any sibling spawned inside
     // this pipe's pre-`FD_CLOEXEC` window, which on macOS `std` cannot
     // close atomically. Do not read this reason as the first cause
-    // alone. A deadline already reaped the child, so there is no grace
-    // left to spend: the bytes in the buffer are the prefix.
+    // alone. A deadline spends no grace on the pipes, whether the child
+    // was reaped or, after a refused kill, left registered with procguard
+    // after its bounded wait (REAP_BOUND): the finish deadline is zero, so
+    // a still-live child holding the pipes cannot hang the read, and the
+    // bytes in the buffer are the prefix.
     let (mut stdout, mut stderr) = output.finish(
         Instant::now()
             + if cancelled || deadline_message.is_some() {

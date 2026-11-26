@@ -5,7 +5,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
-    acknowledge_output, kill_session, resize_session, spawn_session, write_to_session,
+    acknowledge_output, kill_session, resize_session, spawn_session, write_to_session, KillOrigin,
     TerminalSessions,
 };
 use std::sync::{mpsc, Arc, Mutex};
@@ -315,8 +315,8 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     )
     .unwrap();
     resize_session(&state, &b.id, 40, 120).unwrap();
-    kill_session(&state, &a.id).unwrap();
-    kill_session(&state, &b.id).unwrap();
+    kill_session(&state, &a.id, KillOrigin::Unspecified).unwrap();
+    kill_session(&state, &b.id, KillOrigin::Unspecified).unwrap();
     assert!(start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     assert!(written_receive
         .recv_timeout(Duration::from_secs(3))
@@ -364,7 +364,7 @@ fn a_nonreading_terminal_bounds_input_wait_without_requiring_close() {
         .expect("input must have its own deadline");
     assert!(result.unwrap_err().contains("Terminal input timed out"));
     thread.join().unwrap();
-    kill_session(&state, &session.id).unwrap();
+    kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
 }
 
 #[test]
@@ -399,9 +399,9 @@ fn close_terminates_a_hup_ignoring_foreground_process_and_is_idempotent() {
     )
     .unwrap();
     receive.recv_timeout(Duration::from_secs(5)).unwrap();
-    kill_session(&state, &session.id).unwrap();
+    kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
     exit_receive.recv_timeout(Duration::from_secs(5)).unwrap();
-    kill_session(&state, &session.id).unwrap();
+    kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
 }
 
 #[test]
@@ -431,11 +431,11 @@ fn full_capacity_can_close_and_immediately_replace_without_a_false_limit() {
     }
     assert!(launch().is_err());
     for index in 0..state.session_limit() {
-        kill_session(&state, &sessions[index].id).unwrap();
+        kill_session(&state, &sessions[index].id, KillOrigin::Unspecified).unwrap();
         let replacement = launch();
         if replacement.is_err() {
             for session in &sessions {
-                let _ = kill_session(&state, &session.id);
+                let _ = kill_session(&state, &session.id, KillOrigin::Unspecified);
             }
         }
         sessions[index] = replacement.expect("a completed close must release native capacity");
@@ -465,7 +465,7 @@ fn closing_after_stdio_eof_still_reaps_the_live_child() {
     .unwrap();
     std::thread::sleep(Duration::from_millis(100));
     let start = Instant::now();
-    kill_session(&state, &session.id).unwrap();
+    kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
     assert!(start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
 }
@@ -580,7 +580,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     std::thread::sleep(Duration::from_millis(50));
     let pending = total.load(std::sync::atomic::Ordering::SeqCst);
     assert!((NEAR_FULL..=512 * 1024).contains(&pending));
-    kill_session(&state, &session.id).unwrap();
+    kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
     gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
 }
 

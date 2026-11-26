@@ -28,6 +28,11 @@
  *   GitPulse keeps a copy it builds its side of the seam against. That row
  *   compares the two files byte for byte.
  *
+ * - GitPulse serves 11 `devmap_*` tools through gitpulse-mcp without vendoring
+ *   devmap-serve, so no Rust test can see upstream's `TOOL_NAMES`. That row
+ *   asserts GitPulse's names are a subset of devmap-serve's at the vendored
+ *   DevCouncil commit.
+ *
  * Source parity alone is not enough. On 2026-10-11 the vendored copy said 27
  * while the installed `gitpulse-mcp` still read 26. This check exists so the
  * installed readers are asked as well as the source.
@@ -257,6 +262,120 @@ export function schemasAt(devcouncil, rev, run = spawnSync) {
   return out;
 }
 
+export const TOOL_NAMES_READER = "GitPulse devmap tools (vs devmap-serve TOOL_NAMES)";
+const UPSTREAM_TOOLS_FILE = "devmap-serve/src/mcp.rs";
+const GITPULSE_TOOLS_FILE = path.join("src-tauri", "src", "mcp", "devmap_parity.rs");
+
+/**
+ * The quoted strings in the `[...]` that follows `declaration`, or null when
+ * the declaration is absent or its list is empty or unterminated. Comments are
+ * blanked first, so a commented-out entry is not a tool.
+ *
+ * @param {string} text
+ * @param {RegExp} declaration matches up to and including the opening `[`
+ * @param {RegExp} entry captures one name per match
+ * @returns {string[] | null}
+ */
+function rustListNames(text, declaration, entry) {
+  const code = withoutComments(text);
+  const open = declaration.exec(code);
+  if (open === null) return null;
+  const start = open.index + open[0].length;
+  const end = code.indexOf("]", start);
+  if (end === -1) return null;
+  const names = [...code.slice(start, end).matchAll(entry)].map((m) => m[1]);
+  return names.length > 0 ? names : null;
+}
+
+/**
+ * The tool names devmap-serve publishes, from its `TOOLS` table of
+ * `("devmap_x", "cli_name")` pairs (`TOOL_NAMES` is built from it).
+ *
+ * @param {string} source
+ * @returns {string[] | null}
+ */
+export function upstreamToolNames(source) {
+  return rustListNames(source, /\bconst\s+TOOLS\b[^=]*=\s*&\[/, /\(\s*"([^"]+)"/g);
+}
+
+/**
+ * The tool names GitPulse serves, from `TOOL_NAMES` in devmap_parity.rs.
+ *
+ * @param {string} source
+ * @returns {string[] | null}
+ */
+export function gitpulseToolNames(source) {
+  return rustListNames(source, /\bconst\s+TOOL_NAMES\b[^=]*=\s*&\[/, /"([^"]+)"/g);
+}
+
+/**
+ * Is every tool GitPulse serves one devmap-serve publishes? A subset, not
+ * equality: GitPulse serves 11 of upstream's tools by design. Order is not
+ * compared: a `tools/list` client looks tools up by name and `tools/call`
+ * dispatches by name, so order carries no behavior.
+ *
+ * A side that could not be read is `unverifiable`, never a match: a check that
+ * could not run must not read as one that passed.
+ *
+ * @param {string[] | null} gitpulse
+ * @param {{ names: string[] } | { error: string }} upstream
+ * @returns {Row}
+ */
+export function toolNamesRow(gitpulse, upstream) {
+  const reader = TOOL_NAMES_READER;
+  if (gitpulse === null) return { reader, verdict: "unverifiable", detail: `no tool list in ${GITPULSE_TOOLS_FILE}` };
+  if ("error" in upstream) return { reader, verdict: "unverifiable", detail: `upstream tool list unreadable: ${upstream.error}` };
+  const published = new Set(upstream.names);
+  const missing = gitpulse.filter((name) => !published.has(name));
+  if (missing.length > 0) {
+    return { reader, verdict: "stale", detail: `${missing.join(", ")} not in devmap-serve TOOL_NAMES; GitPulse serves a tool upstream does not` };
+  }
+  return { reader, verdict: "match", detail: `${gitpulse.length} of upstream's ${upstream.names.length} tools` };
+}
+
+/**
+ * The tool-list row for a DevCouncil checkout: GitPulse's names against
+ * devmap-serve's at `rev`, read from DevCouncil's object store.
+ *
+ * @param {string} devcouncil
+ * @param {string | null} rev the DevCouncil commit GitPulse vendored
+ * @param {typeof spawnSync} [run]
+ * @returns {Row}
+ */
+export function toolNamesRowAt(devcouncil, rev, run = spawnSync) {
+  /** @type {string | null} */
+  let gitpulse = null;
+  try {
+    gitpulse = readFileSync(path.join(REPO_ROOT, GITPULSE_TOOLS_FILE), "utf8");
+  } catch {
+    // reported by toolNamesRow as an unreadable GitPulse list
+  }
+  const ours = gitpulse === null ? null : gitpulseToolNames(gitpulse);
+  if (rev === null) return toolNamesRow(ours, { error: "VENDOR.json names no DevCouncil commit for devmap-query" });
+  const shown = run("git", ["show", `${rev}:${OWNER_PREFIX}/${UPSTREAM_TOOLS_FILE}`], { cwd: devcouncil, encoding: "utf8", timeout: 15_000 });
+  if (shown.error || shown.status !== 0) {
+    return toolNamesRow(ours, { error: `git show ${rev}:${OWNER_PREFIX}/${UPSTREAM_TOOLS_FILE} failed: ${(shown.error?.message || String(shown.stderr)).trim()}` });
+  }
+  const names = upstreamToolNames(String(shown.stdout));
+  return toolNamesRow(ours, names === null ? { error: `no TOOLS table in ${UPSTREAM_TOOLS_FILE} at ${rev.slice(0, 8)}` } : { names });
+}
+
+/**
+ * The DevCouncil commit GitPulse vendored devmap-query at: devmap-serve is not
+ * vendored, and devmap-query is the crate its tools call into.
+ *
+ * @returns {string | null}
+ */
+export function vendoredDevmapRev() {
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(REPO_ROOT, VENDORED_PREFIX, "VENDOR.json"), "utf8"));
+    const commit = manifest?.crates?.find((/** @type {{ name?: string }} */ c) => c?.name === "devmap-query")?.origin?.commit;
+    return typeof commit === "string" && /^[0-9a-f]{40}$/.test(commit) ? commit : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The verdict for one reading against the owner's constants.
  *
@@ -396,9 +515,12 @@ async function serverReading(reader, bin, absent, timeoutMs) {
   if (probe.dcStoreSchema !== null) schemas.dcStore = probe.dcStoreSchema;
   if (probe.workbenchSchema !== null) schemas.workbench = probe.workbenchSchema;
   if (probe.extractSchema !== null) schemas.extract = probe.extractSchema;
-  // The manifest names no lease format yet, so this row is unverifiable for it
-  // until gitpulse-mcp's manifest reports `STACK_FORMAT_VERSION`.
-  return { reader, keys: ALL_KEYS, schemas, note: "the gitpulse-mcp manifest does not name its stack lease format" };
+  if (probe.leaseSchema !== null) schemas.lease = probe.leaseSchema;
+  // A binary built before the manifest named `stackLeaseFormatVersion` is
+  // unverifiable for the lease format, never assumed to match.
+  return schemas.lease === undefined
+    ? { reader, keys: ALL_KEYS, schemas, note: "the gitpulse-mcp manifest does not name its stack lease format" }
+    : { reader, keys: ALL_KEYS, schemas };
 }
 
 /**
@@ -507,6 +629,7 @@ export async function collect({ app, timeoutMs, env = process.env }) {
 
   const rows = readings.map((reading) => judge(owner, reading));
   rows.push(contractRow("GitPulse copy of Manvi's serve contract", path.join(REPO_ROOT, SERVE_CONTRACT), manvi));
+  rows.push(toolNamesRowAt(devcouncil, vendoredDevmapRev()));
   return { owner, ownerError: null, devcouncil, rows };
 }
 

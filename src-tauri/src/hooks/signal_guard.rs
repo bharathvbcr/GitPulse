@@ -1688,42 +1688,90 @@ fn could_name_tool(text: &str) -> bool {
     })
 }
 
-/// A shell glob (`*`, `?`, `[…]`) against `name`.
-fn glob_matches(pattern: &str, name: &str) -> bool {
-    fn go(p: &[char], n: &[char]) -> bool {
-        match p.first() {
-            None => n.is_empty(),
-            Some('*') => (0..=n.len()).any(|k| go(&p[1..], &n[k..])),
-            Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
-            Some('[') => {
-                let Some(close) = p.iter().skip(2).position(|c| *c == ']').map(|k| k + 2) else {
-                    return !n.is_empty() && n[0] == '[' && go(&p[1..], &n[1..]);
-                };
-                let class = &p[1..close];
-                let (negate, class) = match class.first() {
-                    Some('!' | '^') => (true, &class[1..]),
-                    _ => (false, class),
-                };
-                let Some(&c) = n.first() else { return false };
-                let mut hit = false;
-                let mut k = 0;
-                while k < class.len() {
-                    if class.get(k + 1) == Some(&'-') && k + 2 < class.len() {
-                        hit |= class[k] <= c && c <= class[k + 2];
-                        k += 3;
-                    } else {
-                        hit |= class[k] == c;
-                        k += 1;
-                    }
-                }
-                hit != negate && go(&p[close + 1..], &n[1..])
-            }
-            Some(&c) => n.first() == Some(&c) && go(&p[1..], &n[1..]),
+/// The longest glob, in characters, that is matched exactly. A program word
+/// longer than this is not matched at all: it is taken to possibly name a
+/// gating tool, because "could not tell" must never read as "does not match".
+/// No real tool path needs a pattern this long, and the bound caps the work.
+const MAX_GLOB_PATTERN_CHARS: usize = 256;
+
+/// Where a class opened at `p[0] == '['` ends: the index of its `]`. The
+/// first two characters cannot close it, so `[]]` and `[!]]` hold a literal `]`.
+/// `None` for an unclosed `[`, which matches a literal `[`.
+fn class_end(p: &[char]) -> Option<usize> {
+    p.iter().skip(2).position(|c| *c == ']').map(|k| k + 2)
+}
+
+/// Whether `c` is in the class `p[1..close]`, honouring `!`/`^` negation and
+/// `a-z` ranges.
+fn class_has(class: &[char], c: char) -> bool {
+    let (negate, class) = match class.first() {
+        Some('!' | '^') => (true, &class[1..]),
+        _ => (false, class),
+    };
+    let mut hit = false;
+    let mut k = 0;
+    while k < class.len() {
+        if class.get(k + 1) == Some(&'-') && k + 2 < class.len() {
+            hit |= class[k] <= c && c <= class[k + 2];
+            k += 3;
+        } else {
+            hit |= class[k] == c;
+            k += 1;
         }
     }
+    hit != negate
+}
+
+/// A shell glob (`*`, `?`, `[…]`) against `name`, in time linear in the name
+/// for each pattern character: the classic two-pointer match that remembers
+/// only the last `*` (consecutive stars are one), never a backtracking stack.
+/// A pattern over [`MAX_GLOB_PATTERN_CHARS`] matches, so the caller errs toward
+/// asking.
+fn glob_matches(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
+    if p.len() > MAX_GLOB_PATTERN_CHARS {
+        return true;
+    }
     let n: Vec<char> = name.chars().collect();
-    go(&p, &n)
+    let (mut pi, mut ni) = (0, 0);
+    // The pattern index after the last `*`, and the name index it resumes at.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        // The pattern width consumed when this single-character item matches
+        // `n[ni]`, or `None` when it does not (or there is no item).
+        let step = match p.get(pi) {
+            Some('*') => {
+                while p.get(pi) == Some(&'*') {
+                    pi += 1;
+                }
+                star = Some((pi, ni));
+                continue;
+            }
+            Some('?') => Some(1),
+            Some('[') => match class_end(&p[pi..]) {
+                Some(close) => class_has(&p[pi + 1..pi + close], n[ni]).then_some(close + 1),
+                None => (n[ni] == '[').then_some(1),
+            },
+            Some(&c) => (c == n[ni]).then_some(1),
+            None => None,
+        };
+        match (step, star) {
+            (Some(width), _) => {
+                pi += width;
+                ni += 1;
+            }
+            (None, Some((resume_p, resume_n))) => {
+                pi = resume_p;
+                ni = resume_n + 1;
+                star = Some((resume_p, resume_n + 1));
+            }
+            (None, None) => return false,
+        }
+    }
+    while p.get(pi) == Some(&'*') {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn base_name(path: &str) -> &str {
@@ -1907,17 +1955,20 @@ fn resolve<'a>(words: &'a [Word], binds: &Binds) -> Result<Resolved<'a>, Unresol
                 k
             }
             "sudo" | "doas" => {
-                let other_user = words[i + 1..]
+                // The options are scanned once, and `-u` is looked for only among
+                // them, so a chain of wrappers is read in linear time.
+                let k = skip_options(
+                    words,
+                    i + 1,
+                    &["-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t", "-T", "-U"],
+                );
+                let other_user = words[i + 1..k.min(words.len())]
                     .iter()
                     .position(|w| w.text == "-u")
                     .and_then(|p| words.get(i + 2 + p))
                     .is_some_and(|w| w.text != "root");
                 elevated = elevated || !other_user;
-                skip_options(
-                    words,
-                    i + 1,
-                    &["-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t", "-T", "-U"],
-                )
+                k
             }
             "command" => {
                 if words
@@ -5144,23 +5195,50 @@ fn unread(plan: &Plan, why: &str) -> HookOutput {
     finish(plan, verdicts)
 }
 
-/// The signal guard for one hook call, under one deadline.
+/// The signal guard for one hook call, under one deadline that covers
+/// planning as well as deciding: the host's own hook timeout is longer than
+/// this, and a host that times a guard out runs the command unguarded.
 pub(crate) fn run(input: &HookInput) -> HookOutput {
-    if input.command.is_empty() {
+    guarded(&input.command, GUARD_BUDGET, plan, answer)
+}
+
+/// [`run`] with its budget, planner and answerer named. One deadline spans
+/// both steps. Planning that does not finish is a question, because there is
+/// no plan to judge. A plan that needs no process table is answered inline (it
+/// is pure). One that does is answered on a worker with what is left of the
+/// budget, and a worker that does not finish falls back to [`unread`], which
+/// still refuses what needs no table (`kill -1`) rather than turning it into
+/// a question.
+fn guarded(
+    command: &str,
+    budget: Duration,
+    planner: impl FnOnce(&str) -> Plan + Send + 'static,
+    answerer: impl FnOnce(&Plan) -> HookOutput + Send + 'static,
+) -> HookOutput {
+    if command.is_empty() {
         return HookOutput::silent();
     }
-    let plan = plan(&input.command);
+    let deadline = std::time::Instant::now() + budget;
+    let owned = command.to_string();
+    let Some(plan) = super::within_budget(budget, move || planner(&owned)) else {
+        return question(format!(
+            "GitPulse could not finish reading this command within {}s, so it could not tell \
+             which processes it would signal. Confirm before it runs.",
+            budget.as_secs_f32()
+        ));
+    };
     if plan.is_empty() {
         return HookOutput::silent();
     }
     if !plan.needs_table() {
-        return answer(&plan);
+        return answerer(&plan);
     }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     let job_plan = plan.clone();
-    super::within_budget(GUARD_BUDGET, move || answer(&job_plan)).unwrap_or_else(|| {
+    super::within_budget(remaining, move || answerer(&job_plan)).unwrap_or_else(|| {
         unread(
             &plan,
-            &format!("it did not finish within {}s", GUARD_BUDGET.as_secs()),
+            &format!("it did not finish within {}s", budget.as_secs()),
         )
     })
 }
@@ -8054,6 +8132,279 @@ mod tests {
             "/lib/ld-linux-aarch64.so.1",
         );
         assert!(is_gitpulse(&through));
+    }
+
+    /* ── glob matcher: linear, bounded, and the same as the recursive one ── */
+
+    fn glob_oracle(pattern: &str, name: &str) -> bool {
+        fn go(p: &[char], n: &[char]) -> bool {
+            match p.first() {
+                None => n.is_empty(),
+                Some('*') => (0..=n.len()).any(|k| go(&p[1..], &n[k..])),
+                Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
+                Some('[') => {
+                    let Some(close) = p.iter().skip(2).position(|c| *c == ']').map(|k| k + 2)
+                    else {
+                        return !n.is_empty() && n[0] == '[' && go(&p[1..], &n[1..]);
+                    };
+                    let class = &p[1..close];
+                    let (negate, class) = match class.first() {
+                        Some('!' | '^') => (true, &class[1..]),
+                        _ => (false, class),
+                    };
+                    let Some(&c) = n.first() else { return false };
+                    let mut hit = false;
+                    let mut k = 0;
+                    while k < class.len() {
+                        if class.get(k + 1) == Some(&'-') && k + 2 < class.len() {
+                            hit |= class[k] <= c && c <= class[k + 2];
+                            k += 3;
+                        } else {
+                            hit |= class[k] == c;
+                            k += 1;
+                        }
+                    }
+                    hit != negate && go(&p[close + 1..], &n[1..])
+                }
+                Some(&c) => n.first() == Some(&c) && go(&p[1..], &n[1..]),
+            }
+        }
+        let p: Vec<char> = pattern.chars().collect();
+        let n: Vec<char> = name.chars().collect();
+        go(&p, &n)
+    }
+
+    #[test]
+    fn plan_of_sixty_stars_is_not_exponential() {
+        let command = format!("{}x; true", "*".repeat(60));
+        let started = std::time::Instant::now();
+        let _ = super::plan(&command);
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(50)),
+            "planning took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Planning is bounded by the guard budget, so a plan that is merely slow
+    /// is answered with a question. But in the long-lived app
+    /// (`gate_child_command`) the abandoned worker keeps running, so the planner
+    /// itself must be linear in the command: a wrapper chain at the size cap
+    /// must not cost seconds. `sudo`/`doas` rescan every later word for `-u`
+    /// at each wrapper, which is quadratic in the chain length.
+    #[test]
+    fn plan_of_a_wrapper_chain_at_the_size_cap_is_linear() {
+        for wrapper in ["sudo -E ", "sudo env ", "doas "] {
+            let command = format!(
+                "{}ls",
+                wrapper.repeat(MAX_COMMAND_BYTES * 95 / 100 / wrapper.len())
+            );
+            let started = std::time::Instant::now();
+            let _ = super::plan(&command);
+            assert!(
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+                "planning {} bytes of {wrapper:?} took {:?}",
+                command.len(),
+                started.elapsed()
+            );
+        }
+    }
+
+    /// `kill -1` is refused with no process table at all, so a table read
+    /// that times out must still refuse it, not ask.
+    #[test]
+    fn a_timed_out_table_read_still_refuses_what_needs_no_table() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let output = guarded(
+            "kill -1; pkill -f sleep",
+            Duration::from_millis(300),
+            plan,
+            move |_| {
+                let _ = held.recv();
+                HookOutput::silent()
+            },
+        );
+        drop(release);
+        assert!(refuses(&output), "{:?}", output.render());
+    }
+
+    #[test]
+    fn sudo_user_option_is_read_from_its_own_options_only() {
+        let elevated = |command: &str| {
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            let w = words(&parts);
+            resolve(&w).expect("resolves").elevated
+        };
+        let table = [
+            ("sudo -u root kill 1", true),
+            ("sudo -E -u x kill 1", false),
+            ("sudo -- kill 1", true),
+            ("sudo -E sudo -u x kill 1", true),
+            ("sudo -u x sudo kill 1", true),
+            ("doas -u x kill 1", false),
+            ("sudo kill 1 -u x", true),
+        ];
+        for (command, want) in table {
+            assert_eq!(elevated(command), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn plan_of_an_eval_chain_at_the_size_cap_is_linear() {
+        let command = format!("{}ls", "eval ".repeat(MAX_COMMAND_BYTES * 95 / 100 / 5));
+        let started = std::time::Instant::now();
+        let _ = super::plan(&command);
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+            "planning {} bytes of eval took {:?}",
+            command.len(),
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_on_a_star_bomb_answers_within_the_budget_and_never_allows() {
+        let command = format!("{}x; true", "*".repeat(60));
+        let started = std::time::Instant::now();
+        let output = run(&HookInput {
+            command,
+            ..HookInput::default()
+        });
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(GUARD_BUDGET + Duration::from_secs(3))
+        );
+        let json = output.render().unwrap_or_default();
+        assert!(!json.contains("\"allow\""), "{json}");
+    }
+
+    #[test]
+    fn a_planner_that_does_not_finish_is_a_question() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let output = guarded(
+            "kill 1",
+            Duration::from_millis(100),
+            move |_| {
+                let _ = held.recv();
+                Plan::default()
+            },
+            answer,
+        );
+        drop(release);
+        let json = output.render().unwrap_or_default();
+        assert!(json.contains("\"ask\""), "{json}");
+        assert!(json.contains("could not finish reading"), "{json}");
+    }
+
+    #[test]
+    fn an_empty_command_is_silent_without_a_planner() {
+        let output = guarded(
+            "",
+            Duration::from_millis(100),
+            |_| -> Plan { panic!("an empty command is never planned") },
+            answer,
+        );
+        assert!(output.is_silent());
+    }
+
+    #[test]
+    fn a_pattern_over_the_bound_fails_closed() {
+        let long = "x".repeat(MAX_GLOB_PATTERN_CHARS + 1);
+        assert!(glob_matches(&long, "kill"));
+        assert!(could_name_tool(&long));
+        let ok = "x".repeat(MAX_GLOB_PATTERN_CHARS);
+        assert!(!glob_matches(&ok, "kill"));
+    }
+
+    #[test]
+    fn the_matcher_agrees_with_the_recursive_one_on_a_table() {
+        let patterns = [
+            "",
+            "*",
+            "**",
+            "***k***",
+            "k*",
+            "*l",
+            "k?ll",
+            "?",
+            "????",
+            "?????",
+            "kill",
+            "kil",
+            "[k]ill",
+            "[a-z]ill",
+            "[!k]ill",
+            "[^k]ill",
+            "[!a-j]ill",
+            "[a-jl-z]ill",
+            "[",
+            "[k",
+            "[ki",
+            "[]",
+            "[]]",
+            "[!]",
+            "[!]]",
+            "k[",
+            "[[]ill",
+            "[a-]ill",
+            "[-a]ill",
+            "[z-a]ill",
+            "p*ll",
+            "p*kill",
+            "*k*i*l*l*",
+            "*ll",
+            "*a*",
+            "k*i*l*l*x",
+            "é",
+            "?é",
+            "*é*",
+            "[é-ü]",
+            "[!é]",
+            "pk[a-z]*",
+            "pg?ep",
+            "*p*g*r*e*p*",
+            "ki[ll",
+            "k\\ill",
+            "a*b*c*d*e*f",
+        ];
+        let names = [
+            "", "kill", "pkill", "killall", "killall5", "pgrep", "pidof", "k", "[", "[ill", "]",
+            "é", "ü", "aé", "kill[", "ki]ll", "-", "a-", "x",
+        ];
+        for pattern in patterns {
+            for name in names {
+                assert_eq!(
+                    glob_matches(pattern, name),
+                    glob_oracle(pattern, name),
+                    "pattern {pattern:?} against {name:?}"
+                );
+            }
+        }
+    }
+
+    mod glob_parity {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 3000,
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn matcher_agrees_with_the_recursive_one(
+                pattern in "[*?\\[\\]!^a-d\\-é]{0,12}",
+                name in "[a-d\\[\\]!^\\-é]{0,8}",
+            ) {
+                prop_assert_eq!(
+                    glob_matches(&pattern, &name),
+                    glob_oracle(&pattern, &name),
+                    "pattern {:?} against {:?}", pattern, name
+                );
+            }
+        }
     }
 
     /* ── property: nothing panics, everything is bounded ── */

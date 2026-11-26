@@ -12,7 +12,6 @@ in §10 as "must land before recording", may appear on screen.
 |---|---|
 | **Shipped** | Committed on `main` at `16eba11f3`, with source evidence |
 | **In flight** | Exists only as uncommitted work on `main` or on an unmerged branch (another session owns it) |
-| **Labs** | Built on the `labs` branch behind the `cloud-labs` Cargo feature; no release build enables it |
 | **Not found** | Asked for or documented, but no code was found |
 
 Evidence came from four passes: a code inventory of HEAD, a Labs/roadmap pass over `labs` and
@@ -454,33 +453,29 @@ These are roadmap slides only. Never present them as shipped.
 
 ## 5. GitPulse Labs (future paid features)
 
-All of these are built on the `labs` branch (114 commits ahead of `main`). Each sits behind the
-`cloud-labs` Cargo feature, a per-feature entry in `labs.json`, and "Show Labs features" in
-Settings → Features. **No release build enables them.**
+**Superseded on 2026-11-23 by the Labs plan in the private Labs repository**, which is the canonical split. In
+summary:
 
-**Pricing rule (your decision, 2026-11-17, refined the same day):** you charge **only where GitPulse
-carries an ongoing infrastructure cost**: relay traffic and storage (device and settings sync, team
-pause and presence), hosted compute (future hosted runners), and a few other non-local
-integrations (Jira, Trello and others). Everything local or on the user's own systems is free, and
-so is signing in. The account is only an identity, and the cost sits in the features that move
-data through the relay. This matches the `labs` branch's tier notes (sync is Pro, team is Team,
-runners and the vault are free). Prices are still to be set.
+- **Primary (free):** GitHub sign-in, with Google sign-in planned but not built. Everything
+  local: vault, snapshot import, email, Jira/Trello sources. **BYOK** compute: remote runners,
+  cloud VMs, and future CI on the user's own machines or cloud account.
+- **Labs (paid, relay-backed):** **Labs Geek** (individual) is device sync, settings sync and
+  limited task sharing. **Labs Geek Squad** (team) adds the team kill switch, team presence and
+  full task sharing. **Enterprise** adds policy bundles and audit export.
 
-| Labs feature | What the user gets | Maturity | Tier |
-|---|---|---|---|
-| Remote runners | Run an agent or a task attempt on **your own** Mac mini or Linux box over ssh + tmux; bring the work back | Built with tests; provisioned runners not built; **sessions run ungated** | **Free** (your own machines) |
-| Secrets vault | Per-repo encrypted `.env`/keys, sealed by the Secure Enclave, injected only into launches you start, `op://` support | Built with tests; some hardware behaviour unverified | **Free** (local) |
-| Snapshot import | Import a branch bundle into quarantine, review risks and diff, accept or reject | Built with tests | **Free** (local); it is also the receiving end of paid sync |
-| Sign in with GitHub (account) | Identity on the GitPulse relay; required by the relay-backed features | Built with tests; needs the relay | **Free**: sign-in alone costs nothing to run; only the features that move data through the relay are paid |
-| Device sync | End-to-end-encrypted branch snapshots between your devices; safety-code pairing; recovery key | Built with tests, including against a real relay; custom crypto needing external review | **Paid: Pro** |
-| Settings sync | Preferences follow you; risky changes need a native confirm on the receiving device | Built; rides on device sync | **Paid: Pro** |
-| Team kill switch | An admin pauses every agent across a team's repos | Built with tests; a member from another account cannot clear a pause yet | **Paid: Team** |
-| Team presence | n/a | Design only | **Paid: Team** |
-| Hosted runners | Compute GitPulse would operate | Design seam only (`runner/provision.rs`) | **Paid** (future) |
-| **Issue-tracker integrations: Jira, Trello and more** | One issue inbox across trackers; start a task or an agent attempt from any tracker's issue; status written back | **Coming soon** (not built; GitHub issues → tasks already ship free in core) | **Paid** (third-party hosted services) |
+What changed from 2026-11-17:
 
-Free Labs features (runners, vault, snapshot import) can graduate into the free app once they pass
-review. Paid ones need the relay, the account and external crypto review first.
+- Hosted runners, previously "Paid (future)", are now BYOK and free.
+- Jira/Trello, previously "Paid", are now in free Primary, because they run on the user's own
+  credentials.
+- Pro/Team are renamed Geek/Geek Squad (display names only; the relay keeps the `pro`/`team` ids).
+
+Facts on this section's old table that are now stale:
+
+- No `cloud-labs` Cargo feature exists there. Gating is per feature, by sign-in and relay tier.
+- Team presence is built, not "design only".
+
+Paid features still need the relay, the account and an external crypto review before launch.
 
 **How to present Labs:** one slide, labelled "Labs preview — not in this release". In the video, a
 10-second teaser at most, showing only screens from a Labs build that was actually recorded. Never
@@ -707,7 +702,6 @@ You said: commit and merge everything, then launch a live preview and record. Th
    - the explorer sidebar, `dcgrep` search, wallpaper motion and agent shell reads
    
    Leases, parking and the resource profile have already landed.
-2. **Land or drop `land/commit-model`** (`16eba11f3`). Keep `labs` separate.
 3. **Go green:** `bun run ci:local` and `bun run check`. Then `bun run mcp:install` and
    `bun run mcp:doctor` (all OK), and `bun run check:schema-parity`. Build the app with
    `bun run tauri build` and install it, then relaunch GitPulse into it. Record from the installed

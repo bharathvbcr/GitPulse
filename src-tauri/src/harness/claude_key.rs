@@ -24,7 +24,10 @@ use crate::engine::process::run_bounded_capped;
 /// the spawned harness must promise to withhold from its own children.
 pub(crate) const CLAUDE_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
-const SERVICE: &str = "com.gitpulse.desktop.anthropic-api-key";
+const SERVICE: &str = "dev.vbcr.gitpulse.anthropic-api-key";
+/// The service the key was saved under before the VBCR Dev rename. Read as a
+/// fallback and moved to [`SERVICE`] on first use; see [`Keychain::load`].
+const LEGACY_SERVICE: &str = "com.gitpulse.desktop.anthropic-api-key";
 const ACCOUNT: &str = "manvi";
 /// `security`'s exit status for "no such item".
 const NOT_FOUND: i32 = 44;
@@ -70,29 +73,45 @@ impl Keychain {
     /// other platform every operation is refused rather than silently storing
     /// nothing.
     pub(crate) fn system() -> Result<Self, String> {
-        if cfg!(target_os = "macos") {
-            Ok(Self {
-                program: PathBuf::from("/usr/bin/security"),
-            })
-        } else {
-            Err("Saving a Claude API key needs the macOS Keychain.".into())
+        if !cfg!(target_os = "macos") {
+            return Err("Saving a Claude API key needs the macOS Keychain.".into());
         }
+        if let Some(why) = super::login_keychain::refusal() {
+            return Err(format!(
+                "The Claude API key cannot use the login Keychain: {why}"
+            ));
+        }
+        Ok(Self {
+            program: PathBuf::from("/usr/bin/security"),
+        })
     }
 
     #[cfg(all(test, unix))]
-    fn at(program: PathBuf) -> Self {
+    pub(crate) fn at(program: PathBuf) -> Self {
         Self { program }
     }
 
     /// Stores `raw` (validated first), replacing any key already saved.
     pub(crate) fn save(&self, raw: &str) -> Result<(), CommandError> {
         let key = validate(raw)?;
-        let script = format!("add-generic-password -U -s {SERVICE} -a {ACCOUNT} -w {key}\n");
+        self.store(SERVICE, key)?;
+        // The new item wins over the old one on every read, so a leftover
+        // old item is stale, not wrong; it is removed so that Remove cannot be
+        // undone by it. Failing to remove it does not fail the save.
+        if let Err(error) = self.remove(LEGACY_SERVICE) {
+            log::warn!(target: "harness", "the pre-rename Claude API key item was not removed: {error}", error = error.message());
+        }
+        Ok(())
+    }
+
+    /// Writes `key` under `service` and confirms it by reading it back.
+    fn store(&self, service: &str, key: &str) -> Result<(), CommandError> {
+        let script = format!("add-generic-password -U -s {service} -a {ACCOUNT} -w {key}\n");
         let (ok, _, stderr, _) = self.run_with_code(&["-i"], Some(script.as_bytes()), key)?;
         if !ok {
             return Err(format!("The Keychain refused the key: {stderr}").into());
         }
-        match self.load()? {
+        match self.load_service(service)? {
             Some(stored) if stored == key => Ok(()),
             _ => Err("The Keychain did not keep the key: reading it back found a different value or none.".into()),
         }
@@ -100,9 +119,35 @@ impl Keychain {
 
     /// The saved key, or `None` when there is none. A stored value that is not
     /// a key is an error, not a key: it would only fail later as a 401.
+    ///
+    /// A key saved before the rename lives under the old service name. It is
+    /// found there, copied to the new service, and the old item is deleted
+    /// only once the copy reads back. Any step of that move can fail (a locked
+    /// keychain, a refused write) without losing the key: the old item stays
+    /// and the key is still returned, and the next read tries again.
     pub(crate) fn load(&self) -> Result<Option<String>, CommandError> {
+        if let Some(key) = self.load_service(SERVICE)? {
+            return Ok(Some(key));
+        }
+        let Some(key) = self.load_service(LEGACY_SERVICE)? else {
+            return Ok(None);
+        };
+        match self.store(SERVICE, &key) {
+            Ok(()) => {
+                if let Err(error) = self.remove(LEGACY_SERVICE) {
+                    log::warn!(target: "harness", "the pre-rename Claude API key item was not removed: {error}", error = error.message());
+                }
+            }
+            Err(error) => {
+                log::warn!(target: "harness", "the Claude API key was not moved to its new Keychain item: {error}", error = error.message());
+            }
+        }
+        Ok(Some(key))
+    }
+
+    fn load_service(&self, service: &str) -> Result<Option<String>, CommandError> {
         let (ok, stdout, stderr, code) = self.run_with_code(
-            &["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"],
+            &["find-generic-password", "-s", service, "-a", ACCOUNT, "-w"],
             None,
             "",
         )?;
@@ -126,10 +171,45 @@ impl Keychain {
         self.load().map(|key| key.is_some())
     }
 
-    /// Removes the saved key. Removing a key that is not there succeeds.
-    pub(crate) fn delete(&self) -> Result<(), CommandError> {
+    /// Whether the Keychain holds an item for GitPulse's Claude key, checked
+    /// from its unencrypted attributes (`find-generic-password` without `-w`)
+    /// so periodic background checks never decrypt the secret into memory or
+    /// trigger a macOS login-Keychain unlock prompt while the screen is locked.
+    pub(crate) fn item_exists(&self) -> Result<bool, CommandError> {
+        // A key not yet moved to the new service still counts: the check must
+        // not report a saved key missing just because nothing has read it yet.
+        Ok(self.item_exists_in(SERVICE)? || self.item_exists_in(LEGACY_SERVICE)?)
+    }
+
+    fn item_exists_in(&self, service: &str) -> Result<bool, CommandError> {
         let (ok, _, stderr, code) = self.run_with_code(
-            &["delete-generic-password", "-s", SERVICE, "-a", ACCOUNT],
+            &["find-generic-password", "-s", service, "-a", ACCOUNT],
+            None,
+            "",
+        )?;
+        if code == NOT_FOUND {
+            return Ok(false);
+        }
+        if !ok {
+            return Err(
+                format!("Could not check the Claude API key in the Keychain: {stderr}").into(),
+            );
+        }
+        Ok(true)
+    }
+
+    /// Removes the saved key, under both service names: a key removed from the
+    /// new item alone would come back from the old one. Removing a key that is
+    /// not there succeeds.
+    pub(crate) fn delete(&self) -> Result<(), CommandError> {
+        let new = self.remove(SERVICE);
+        let old = self.remove(LEGACY_SERVICE);
+        new.and(old)
+    }
+
+    fn remove(&self, service: &str) -> Result<(), CommandError> {
+        let (ok, _, stderr, code) = self.run_with_code(
+            &["delete-generic-password", "-s", service, "-a", ACCOUNT],
             None,
             "",
         )?;
@@ -188,33 +268,63 @@ mod tests {
     /// the real tool's exit statuses. `-i` reads its command from stdin, as
     /// the real one does, and like the real one exits 0 whatever happens.
     fn fake_security(dir: &std::path::Path, drop_writes: bool) -> Keychain {
-        let item = dir.join("item");
+        fake_security_with(dir, drop_writes, false)
+    }
+
+    /// Items are kept per service: `item` for the current service name and
+    /// `item-legacy` for the pre-rename one, which is also the only name
+    /// `protect_legacy` refuses to delete.
+    fn fake_security_with(
+        dir: &std::path::Path,
+        drop_writes: bool,
+        protect_legacy: bool,
+    ) -> Keychain {
         let argv = dir.join("argv");
+        let new = dir.join("item");
+        let legacy = dir.join("item-legacy");
         let write = if drop_writes {
             ":".to_string()
         } else {
-            format!("printf '%s' \"$key\" > '{}'", item.display())
+            "printf '%s' \"$key\" > \"$item\"".to_string()
+        };
+        let refuse = if protect_legacy {
+            r#"[ "$item" = '{legacy}' ] && exit 1"#
+                .replace("{legacy}", &legacy.display().to_string())
+        } else {
+            ":".to_string()
         };
         let script = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{argv}'
+pick() {{
+  case "$1" in
+    com.gitpulse.desktop*) item='{legacy}' ;;
+    *) item='{new}' ;;
+  esac
+}}
 case "$1" in
   -i)
     read -r line
     key=${{line##* -w }}
+    svc=${{line#* -s }}; svc=${{svc%% *}}
+    pick "$svc"
     {write}
     exit 0 ;;
   find-generic-password)
-    [ -f '{item}' ] || {{ echo "could not be found" >&2; exit 44; }}
-    cat '{item}'; echo; exit 0 ;;
+    pick "$3"
+    [ -f "$item" ] || {{ echo "could not be found" >&2; exit 44; }}
+    cat "$item"; echo; exit 0 ;;
   delete-generic-password)
-    [ -f '{item}' ] || exit 44
-    rm '{item}'; exit 0 ;;
+    pick "$3"
+    [ -f "$item" ] || exit 44
+    {refuse}
+    rm "$item"; exit 0 ;;
 esac
 exit 2
 "#,
             argv = argv.display(),
-            item = item.display(),
+            new = new.display(),
+            legacy = legacy.display(),
         );
         let program = dir.join("security");
         std::fs::write(&program, script).unwrap();
@@ -271,6 +381,17 @@ exit 2
         );
     }
 
+    /// Lib tests run under the hermetic `HOME`, which has no login Keychain:
+    /// asking `security` there puts a "Keychain Not Found" dialog on screen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_keychain_is_refused_under_a_home_that_is_not_the_accounts() {
+        let error = Keychain::system()
+            .err()
+            .expect("the login Keychain must not be asked under a foreign HOME");
+        assert!(error.contains("not the account's home"), "{error}");
+    }
+
     #[test]
     fn save_refuses_an_invalid_key_before_running_anything() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -295,5 +416,138 @@ exit 2
             "the stored value must not be echoed: {error}",
             error = error.message()
         );
+    }
+
+    #[test]
+    fn item_exists_checks_metadata_without_passing_password_decrypt_flags() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), false);
+        assert_eq!(keychain.item_exists(), Ok(false));
+        std::fs::write(dir.path().join("item"), KEY).unwrap();
+        assert_eq!(keychain.item_exists(), Ok(true));
+        let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+        for line in argv.lines() {
+            assert!(
+                !line
+                    .split_whitespace()
+                    .any(|arg| arg == "-w" || arg == "-g"),
+                "item_exists must never pass -w or -g: {line}"
+            );
+        }
+    }
+
+    fn argv(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("argv")).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_service_is_under_the_vbcr_namespace() {
+        assert_eq!(SERVICE, "dev.vbcr.gitpulse.anthropic-api-key");
+        assert_eq!(LEGACY_SERVICE, "com.gitpulse.desktop.anthropic-api-key");
+    }
+
+    #[test]
+    fn a_key_saved_before_the_rename_is_found_and_moved_to_the_new_service() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), false);
+        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("item")).unwrap(),
+            KEY,
+            "the key must now live under the new service"
+        );
+        assert!(
+            !dir.path().join("item-legacy").exists(),
+            "the old item goes only after the copy read back"
+        );
+        // Idempotent: the second read is served by the new item alone.
+        let before = argv(dir.path());
+        assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
+        let after = argv(dir.path());
+        assert!(
+            !after[before.len()..].contains("com.gitpulse.desktop"),
+            "a migrated key must not consult the old service: {after}"
+        );
+        assert!(
+            !argv(dir.path()).contains(KEY),
+            "the key must stay off argv"
+        );
+    }
+
+    #[test]
+    fn a_failed_copy_keeps_the_old_item_and_still_returns_the_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), true);
+        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("item-legacy")).unwrap(),
+            KEY,
+            "an unconfirmed copy must never cost the only copy"
+        );
+        assert!(!dir.path().join("item").exists());
+    }
+
+    #[test]
+    fn a_failed_delete_of_the_old_item_does_not_lose_or_hide_the_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security_with(dir.path(), false, true);
+        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("item")).unwrap(),
+            KEY
+        );
+        // The new item answers from now on.
+        assert_eq!(keychain.load(), Ok(Some(KEY.to_string())));
+    }
+
+    #[test]
+    fn the_new_item_wins_over_a_stale_old_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), false);
+        let newer = "sk-ant-api03-Newer_key-0123456789abcdef";
+        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        std::fs::write(dir.path().join("item"), newer).unwrap();
+        assert_eq!(keychain.load(), Ok(Some(newer.to_string())));
+    }
+
+    #[test]
+    fn saving_replaces_the_old_item_and_deleting_removes_both() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), false);
+        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        let newer = "sk-ant-api03-Newer_key-0123456789abcdef";
+        keychain.save(newer).unwrap();
+        assert!(!dir.path().join("item-legacy").exists());
+        assert_eq!(keychain.load(), Ok(Some(newer.to_string())));
+
+        // A removed key must not come back out of the pre-rename item.
+        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        keychain.delete().unwrap();
+        assert_eq!(keychain.load(), Ok(None));
+        assert_eq!(keychain.present(), Ok(false));
+    }
+
+    #[test]
+    fn item_exists_counts_an_unmigrated_key_without_decrypting_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), false);
+        assert_eq!(keychain.item_exists(), Ok(false));
+        std::fs::write(dir.path().join("item-legacy"), KEY).unwrap();
+        assert_eq!(keychain.item_exists(), Ok(true));
+        assert!(
+            dir.path().join("item-legacy").exists() && !dir.path().join("item").exists(),
+            "the metadata check must not migrate, which would need the secret"
+        );
+        for line in argv(dir.path()).lines() {
+            assert!(
+                !line
+                    .split_whitespace()
+                    .any(|arg| arg == "-w" || arg == "-g"),
+                "{line}"
+            );
+        }
     }
 }

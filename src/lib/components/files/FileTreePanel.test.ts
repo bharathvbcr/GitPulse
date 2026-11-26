@@ -38,6 +38,18 @@ describe("FileTreePanel source contracts", () => {
   });
 
   /**
+   * The external editor goes through the preference helper and Rust's gate,
+   * and the in-app viewer keeps its own, differently named, row: two rows both
+   * called "Open in editor" would be one the user cannot tell apart.
+   */
+  it("offers the external editor beside the in-app viewer under distinct names", () => {
+    expect(source).toContain("openInPreferredEditor(repo, filePath)");
+    expect(source).toContain("reportEditorFailure(err)");
+    expect(source.match(/<span>Open in editor<\/span>/g)).toHaveLength(1);
+    expect(source.match(/<span>Open in viewer<\/span>/g)).toHaveLength(1);
+  });
+
+  /**
    * New File and New Folder's `.gitkeep` used to go through the editor's
    * overwrite command with empty content, which truncated an existing file.
    * The rendered behaviour (existing name refused, nothing written) is the
@@ -159,5 +171,27 @@ describe("FileTreePanel source contracts", () => {
     expect(dragBlock).not.toContain("$currentRepoPath");
     expect(source).not.toContain("if ($currentRepoPath) void loadFiles($currentRepoPath, true)");
     expect(source).not.toContain("copyPath(`${$repoStore.currentPath}/${row.path}`)");
+  });
+
+  it("offers Open as Preview and Open Code & Preview in the right-click context menu for HTML files", () => {
+    expect(source).toContain("isHtmlFile(row.path)");
+    expect(source).toContain('data-testid="file-ctx-html-preview"');
+    expect(source).toContain('data-testid="file-ctx-html-split"');
+    expect(source).toContain('data-testid="file-ctx-html-code"');
+    expect(source).toContain("Open as Preview");
+    expect(source).toContain("Open Code &amp; Preview");
+    const helper = functionBody(source, "openHtmlInMode");
+    expect(helper).toContain("requestHtmlViewMode(effectiveRepoPath, path, mode)");
+    expect(helper).toContain("onSelectFile(path)");
+  });
+
+  it("offers Open as Preview and Open Code & Preview in the right-click context menu for SVG files", () => {
+    expect(source).toContain("isSvgFile(row.path)");
+    expect(source).toContain('data-testid="file-ctx-svg-preview"');
+    expect(source).toContain('data-testid="file-ctx-svg-split"');
+    expect(source).toContain('data-testid="file-ctx-svg-code"');
+    const helper = functionBody(source, "openSvgInMode");
+    expect(helper).toContain("requestSvgViewMode(effectiveRepoPath, path, mode)");
+    expect(helper).toContain("onSelectFile(path)");
   });
 });

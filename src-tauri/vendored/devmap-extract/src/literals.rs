@@ -503,7 +503,24 @@ fn decode_escapes(inner: &str, escape: Escape) -> Option<String> {
                 let hex = take_hex(&mut chars, 8)?;
                 char::from_u32(hex)?
             }
-            '\n' if matches!(escape, Escape::Rust | Escape::Python) => continue,
+            '\n' if matches!(escape, Escape::Rust) => {
+                while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+                    chars.next();
+                }
+                continue;
+            }
+            '\r' if matches!(escape, Escape::Rust) && chars.peek() == Some(&'\n') => {
+                chars.next();
+                while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+                    chars.next();
+                }
+                continue;
+            }
+            '\n' if matches!(escape, Escape::Python) => continue,
+            '\r' if matches!(escape, Escape::Python) && chars.peek() == Some(&'\n') => {
+                chars.next();
+                continue;
+            }
             _ => return None,
         };
         out.push(decoded);

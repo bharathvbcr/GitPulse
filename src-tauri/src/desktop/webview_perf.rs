@@ -45,11 +45,14 @@ mod imp {
         })
     }
 
-    /// Disables WebKit's 60 FPS cap on a raw `WKWebView` pointer.
+    /// Sets WebKit's 60 FPS preference key on a raw `WKWebView` pointer.
     ///
     /// # Safety
     /// When non-null, `webview_ptr` must point to a live `WKWebView` on the AppKit main thread.
-    pub unsafe fn unlock_wkwebview_120hz(webview_ptr: *mut c_void) -> Result<(), String> {
+    pub unsafe fn set_wkwebview_prefer_60fps(
+        webview_ptr: *mut c_void,
+        prefer_60: bool,
+    ) -> Result<(), String> {
         if webview_ptr.is_null() {
             return Err("WKWebView pointer is null".to_string());
         }
@@ -72,32 +75,70 @@ mod imp {
         if prefs.is_null() {
             return Err("WKWebView configuration or preferences is null".to_string());
         }
-        set_kvc_bool_caught(&*prefs, PREFER_60FPS_KVC_KEY, false)
+        set_kvc_bool_caught(&*prefs, PREFER_60FPS_KVC_KEY, prefer_60)
     }
 
-    pub fn unlock_window_high_refresh_rate(window: &tauri::WebviewWindow) {
-        if let Err(err) = window.with_webview(|webview| {
+    /// Disables WebKit's 60 FPS cap on a raw `WKWebView` pointer.
+    ///
+    /// # Safety
+    /// When non-null, `webview_ptr` must point to a live `WKWebView` on the AppKit main thread.
+    pub unsafe fn unlock_wkwebview_120hz(webview_ptr: *mut c_void) -> Result<(), String> {
+        set_wkwebview_prefer_60fps(webview_ptr, false)
+    }
+
+    /// Applies or clears the native WebView idle memory/frame-pacing hint on macOS.
+    ///
+    /// When `low_memory` is `true`, re-enables WebKit's 60 FPS cap so idle or
+    /// occluded windows stop pacing at 120 Hz; when `false`, restores 120 Hz.
+    pub fn set_webview_idle_hint<R: tauri::Runtime>(
+        window: &tauri::WebviewWindow<R>,
+        low_memory: bool,
+    ) {
+        if let Err(err) = window.with_webview(move |webview| {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            let ptr = webview.inner();
             // SAFETY: `with_webview` runs on the main thread with a live `WKWebView` handle.
-            if let Err(reason) = unsafe { unlock_wkwebview_120hz(webview.inner()) } {
+            if let Err(reason) = unsafe { set_wkwebview_prefer_60fps(ptr, low_memory) } {
                 log::debug!(
                     target: "desktop",
-                    "120 Hz WKWebView preference was not applied: {reason}"
+                    "WebView idle hint ({low_memory}) was not applied: {reason}"
                 );
             }
         }) {
             log::debug!(
                 target: "desktop",
-                "Could not access native webview for 120 Hz unlock: {err}"
+                "Could not access native webview for idle hint: {err}"
             );
         }
+    }
+
+    pub fn unlock_window_high_refresh_rate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+        set_webview_idle_hint(window, false);
     }
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{set_kvc_bool_caught, unlock_window_high_refresh_rate, unlock_wkwebview_120hz};
+pub use imp::{
+    set_kvc_bool_caught, set_webview_idle_hint, set_wkwebview_prefer_60fps,
+    unlock_window_high_refresh_rate, unlock_wkwebview_120hz,
+};
 
 #[cfg(not(target_os = "macos"))]
-pub fn unlock_window_high_refresh_rate(_window: &tauri::WebviewWindow) {}
+/// Unlocks high-refresh-rate rendering on platforms that support it (no-op outside macOS).
+pub fn unlock_window_high_refresh_rate<R: tauri::Runtime>(_window: &tauri::WebviewWindow<R>) {}
+
+#[cfg(not(target_os = "macos"))]
+/// Applies or clears the native WebView low-memory hint.
+///
+/// Outside macOS, `Cargo.toml` does not link `wry` or `webview2-com` directly
+/// into the app crate and `tauri::webview::PlatformWebview` does not wrap
+/// `MemoryUsageLevel` / `WebKitMemoryPressureSettings`, so this remains a safe
+/// no-op until a platform binding is exposed.
+pub fn set_webview_idle_hint<R: tauri::Runtime>(
+    _window: &tauri::WebviewWindow<R>,
+    _low_memory: bool,
+) {
+}
 
 #[cfg(test)]
 mod tests {
@@ -128,19 +169,28 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn kvc_bool_writes_false_to_kvc_compliant_container() {
+    fn kvc_bool_writes_false_and_true_to_kvc_compliant_container() {
         use objc2::rc::Retained;
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
         use objc2_foundation::{NSNumber, NSString};
 
         let dict: Retained<AnyObject> = unsafe { msg_send![class!(NSMutableDictionary), new] };
-        unsafe { set_kvc_bool_caught(&dict, PREFER_60FPS_KVC_KEY, false) }
-            .expect("NSMutableDictionary accepts KVC bool writes");
+        unsafe { set_kvc_bool_caught(&dict, PREFER_60FPS_KVC_KEY, true) }
+            .expect("NSMutableDictionary accepts KVC bool true writes");
         let key = NSString::from_str(PREFER_60FPS_KVC_KEY);
-        let stored: *const NSNumber = unsafe { msg_send![&*dict, valueForKey: &*key] };
-        assert!(!stored.is_null(), "KVC value should be stored");
-        let flag = unsafe { (&*stored).as_bool() };
-        assert!(!flag, "expected false, got true");
+        let stored_true: *const NSNumber = unsafe { msg_send![&*dict, valueForKey: &*key] };
+        assert!(!stored_true.is_null(), "KVC true value should be stored");
+        assert!(unsafe { (&*stored_true).as_bool() }, "expected true");
+
+        unsafe { set_kvc_bool_caught(&dict, PREFER_60FPS_KVC_KEY, false) }
+            .expect("NSMutableDictionary accepts KVC bool false writes");
+        let stored_false: *const NSNumber = unsafe { msg_send![&*dict, valueForKey: &*key] };
+        assert!(!stored_false.is_null(), "KVC false value should be stored");
+        assert!(!unsafe { (&*stored_false).as_bool() }, "expected false");
+
+        let err = unsafe { set_wkwebview_prefer_60fps(std::ptr::null_mut(), true) }
+            .expect_err("null pointer must fail cleanly for idle hint");
+        assert!(err.contains("null"), "unexpected error: {err}");
     }
 }

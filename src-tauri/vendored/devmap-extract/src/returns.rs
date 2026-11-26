@@ -21,6 +21,9 @@ const MAX_RETURN_TYPE_BYTES: usize = 200;
 /// Stamp `return_type` on every function and method in `symbols`.
 pub fn stamp_return_types(symbols: &mut [ExtractedSymbol], root: Node, source: &str) {
     for symbol in symbols.iter_mut() {
+        if crate::treesitter::walk_deadline_passed() {
+            break;
+        }
         if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
             continue;
         }

@@ -15,7 +15,7 @@ import { get, writable } from "svelte/store";
  * catalog: adding a target means adding an entry and its anchor, and a target
  * without an anchor fails the test rather than silently landing at the top.
  */
-export const MANVI_FOCUS_IDS = ["harness", "model", "activity", "cleanup"] as const;
+export const MANVI_FOCUS_IDS = ["harness", "model", "steward", "activity", "cleanup"] as const;
 export type ManviFocusId = (typeof MANVI_FOCUS_IDS)[number];
 
 /**
@@ -56,6 +56,7 @@ export interface ManviFocusTarget {
 export const MANVI_FOCUS_TARGETS: Readonly<Record<ManviFocusId, ManviFocusTarget>> = {
   harness: { id: "harness", destination: SETTINGS_AGENTS, label: "Manvi policy" },
   model: { id: "model", destination: SETTINGS_AGENTS, label: "Local model servers" },
+  steward: { id: "steward", destination: SETTINGS_AGENTS, label: "Manvi system steward" },
   activity: { id: "activity", destination: WORK_OVERVIEW, label: "Policy activity" },
   cleanup: { id: "cleanup", destination: WORK_OVERVIEW, label: "Branch and tag cleanup" },
 };

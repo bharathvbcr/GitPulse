@@ -95,7 +95,8 @@
   import { timestampFormat } from "../ui/timestampFormat";
   import { harnessStore, type PolicyStatus } from "../stores/harnessStore";
   import { policyActivityVisible } from "../harness/policyActivityVisible";
-  import { openConflicts } from "../ui/workConflicts";
+  import { conflictSessions } from "../diff/conflictSession";
+  import { WORK_CONFLICTS_ID, conflictDraftProbe, conflictsPanelOpen, openConflicts } from "../ui/workConflicts";
   import {
     MANVI_FOCUS_TARGETS,
     manviFocusRequest,
@@ -280,9 +281,60 @@
    * remote, not what was uncommitted in it. Those are the questions asked most
    * often on this screen and they were answered nowhere on it.
    */
+  const { conflictedCount, statuses } = repoStore;
+  const isBare = $derived($repoStore.isBare);
+  const hasParkedOrProbeFailure = $derived(
+    Boolean($repoStore.operation.operation || $repoStore.operation.probeFailed),
+  );
+  const conflictsOpen = $derived($conflictsPanelOpen);
+  const retainedDrafts = $derived.by(() => {
+    void $statuses;
+    void hasParkedOrProbeFailure;
+    void conflictsOpen;
+    void $conflictDraftProbe;
+    const path = $currentRepoPath;
+    return path && !isBare ? conflictSessions.summaries(path).length : 0;
+  });
+
+  type ChipTuple = [kind: string, tone: string, text: string | number];
+  const CONFLICTS = "Conflicts";
+  const OPEN_EDITOR = "Open the conflict editor";
+  const RESOLVE = "Resolve conflicts";
+  const canOpenConflicts = $derived(Boolean($repoStore.currentPath) && !isBare);
+  const conflictsBtn = $derived.by((): [string, string, string, string, ChipTuple | null] => {
+    if (!$repoStore.currentPath) return [CONFLICTS, CONFLICTS, "Open a repository", "text-textMuted", null];
+    if (isBare) return [CONFLICTS, CONFLICTS, "Bare repositories have no working tree to resolve", "text-textMuted", null];
+    if ($conflictedCount > 0) {
+      return [RESOLVE, `${RESOLVE} (${$conflictedCount} conflicted)`, OPEN_EDITOR, "text-danger", ["count", "danger", $conflictedCount]];
+    }
+    if (hasParkedOrProbeFailure) {
+      return [
+        RESOLVE,
+        `${RESOLVE} (waiting or unchecked)`,
+        OPEN_EDITOR,
+        "text-warn",
+        ["label", "warn", $repoStore.operation.probeFailed ? "Unchecked" : "Parked"],
+      ];
+    }
+    if (retainedDrafts > 0) {
+      const drafts = `${retainedDrafts} saved draft${retainedDrafts === 1 ? "" : "s"}`;
+      return [CONFLICTS, `${CONFLICTS} (${drafts})`, `${OPEN_EDITOR} (${drafts})`, "text-warn", ["count", "warn", retainedDrafts]];
+    }
+    return [
+      CONFLICTS,
+      CONFLICTS,
+      OPEN_EDITOR,
+      conflictsOpen ? "text-accent" : "text-textMuted",
+      conflictsOpen ? ["label", "accent", "Shown"] : null,
+    ];
+  });
+
   const here = $derived(
     hereSummary($repoStore.currentBranch, $repoStore.branches, $repoStore.statuses, Boolean($repoStore.currentPath) && !$repoStore.isBare),
   );
+  const canResolvePrimary = $derived(!isBare && ((here && here.conflicted > 0) || hasParkedOrProbeFailure));
+  const PROBE_FAILED_COPY = "Couldn't check for a parked merge or rebase here — this line is not “nothing is parked”.";
+  const WARN_BANNER = "mt-2 flex w-full items-start gap-2 rounded-xl bg-warn/15 px-2.5 py-1.5 text-left text-meta text-warn";
 
   /* --- narrowing ---------------------------------------------------------- */
 
@@ -467,6 +519,40 @@
   });
 </script>
 
+{#snippet resolveCta()}
+  <span class="ml-auto shrink-0 inline-flex items-center gap-1 font-medium">
+    {RESOLVE} <ChevronRight size={12} />
+  </span>
+{/snippet}
+
+{#snippet metricTile(target: WorkFacet, Icon: typeof Layers, label: string, value: string | number, sub: string, disabled = false, tone = "text-textPrimary")}
+  <button
+    type="button"
+    aria-pressed={facet === target}
+    {disabled}
+    onclick={() => toggleFacet(target)}
+    class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) disabled:cursor-default {tileClass(target)}"
+  >
+    <div class="gp-label flex items-center gap-1">
+      <Icon size={11} /> {label}
+    </div>
+    <div class="overview-metric-value {tone}">{value}</div>
+    <div class="text-micro text-textMuted truncate">{sub}</div>
+  </button>
+{/snippet}
+
+{#snippet detailToggle(open: boolean, toggle: () => void, label: string)}
+  <button
+    type="button"
+    class="flex w-full items-center gap-1.5 rounded-xl border border-edge px-3 py-2 text-meta font-medium text-textMuted hover:bg-surfaceHover"
+    onclick={toggle}
+    aria-expanded={open}
+  >
+    <ChevronRight size={13} class="shrink-0 transition-transform {open ? 'rotate-90' : ''}" />
+    {label}
+  </button>
+{/snippet}
+
 <!-- A scroller that is a column: every band below is `w-full`, so the content
      spans the whole pane at any window width rather than stopping at a fixed
      cap (it used to centre in max-w-6xl, which on a wide window left a quarter
@@ -483,6 +569,26 @@
     <span class="text-micro text-textMuted" aria-live="polite">
       {#if loadedAt}Loaded {new Date(loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{/if}
     </span>
+    <button
+      type="button"
+      class="gp-btn shrink-0"
+      data-testid="overview-conflicts-btn"
+      disabled={!$repoStore.currentPath || $repoStore.isBare}
+      aria-expanded={canOpenConflicts ? conflictsOpen : undefined}
+      aria-controls={canOpenConflicts && conflictsOpen ? WORK_CONFLICTS_ID : undefined}
+      aria-label={conflictsBtn[1]}
+      title={conflictsBtn[2]}
+      onclick={showConflicts}
+    >
+      <GitMerge size={12} class={conflictsBtn[3]} />
+      <span>{conflictsBtn[0]}</span>
+      {#if conflictsBtn[4]}
+        {@const chip = conflictsBtn[4]}
+        <span class="gp-chip" data-kind={chip[0]} data-size="inline" data-tone={chip[1]}>
+          {chip[2]}
+        </span>
+      {/if}
+    </button>
     <button
       type="button"
       class="gp-btn shrink-0"
@@ -515,13 +621,36 @@
           </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
-          {#if (here && here.conflicted > 0) || $repoStore.operation.operation}
-            <button type="button" class="gp-btn" data-variant="primary" onclick={showConflicts}>
-              <GitMerge size={13} /> Resolve conflicts
+          {#if canResolvePrimary}
+            <button
+              type="button"
+              class="gp-btn"
+              data-variant="primary"
+              data-testid="overview-repo-conflicts-btn"
+              onclick={showConflicts}
+            >
+              <GitMerge size={13} /> {RESOLVE}
             </button>
           {:else if here && here.staged + here.unstaged > 0}
             <button type="button" class="gp-btn" data-variant="primary" disabled={$repoStore.isLoading || Boolean($repoStore.error)} onclick={reviewChanges}>
               <FileDiff size={13} /> Review changes <ChevronRight size={12} />
+            </button>
+          {/if}
+          {#if here && !canResolvePrimary}
+            <button
+              type="button"
+              class="gp-btn"
+              data-testid="overview-repo-conflicts-btn"
+              title={conflictsBtn[2]}
+              onclick={showConflicts}
+            >
+              <GitMerge size={13} class={retainedDrafts > 0 ? "text-warn" : "text-textMuted"} />
+              {RESOLVE}
+              {#if retainedDrafts > 0}
+                <span class="gp-chip" data-kind="count" data-size="inline" data-tone="warn">
+                  {retainedDrafts}
+                </span>
+              {/if}
             </button>
           {/if}
           <button type="button" class="gp-btn" onclick={() => repoStore.setActiveTab("code", "explorer")}>
@@ -608,20 +737,36 @@
       {/if}
 
       <!-- The one thing here that cannot make progress on its own. -->
-      {#if $repoStore.operation.operation}
+      {#if !isBare && $repoStore.operation.operation}
         <button
           type="button"
-          class="mt-2 flex w-full items-start gap-2 rounded-xl bg-warn/15 px-2.5 py-1.5 text-left text-meta text-warn hover:bg-warn/25"
+          class="{WARN_BANNER} hover:bg-warn/25"
           onclick={showConflicts}
           title="Open the conflict editor to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
         >
           <GitMerge size={12} class="mt-px shrink-0" />
           <span class="min-w-0">{headline($repoStore.operation.operation)}</span>
+          {@render resolveCta()}
         </button>
       {:else if $repoStore.operation.probeFailed}
-        <p class="mt-2 text-meta text-warn">
-          Couldn't check for a parked merge or rebase here — this line is not “nothing is parked”.
-        </p>
+        {#if !isBare}
+          <button
+            type="button"
+            class="{WARN_BANNER} hover:bg-warn/25"
+            data-testid="overview-probe-failed-conflicts-btn"
+            onclick={showConflicts}
+            title={OPEN_EDITOR}
+          >
+            <AlertTriangle size={12} class="mt-px shrink-0" />
+            <span class="min-w-0">{PROBE_FAILED_COPY}</span>
+            {@render resolveCta()}
+          </button>
+        {:else}
+          <p class={WARN_BANNER}>
+            <AlertTriangle size={12} class="mt-px shrink-0" />
+            <span>{PROBE_FAILED_COPY}</span>
+          </p>
+        {/if}
       {/if}
     </section>
   {/if}
@@ -631,66 +776,40 @@
          ever count as zero would be four doors to an empty room, so a zero
          tile stays readable but is not offered as a filter. -->
     <div aria-label="Workspace summary filters" class="overview-metrics mb-3 w-full grid grid-cols-2 @2xl:grid-cols-4 gap-3">
-      <button
-        type="button"
-        aria-pressed={facet === "all"}
-        onclick={() => (facet = "all")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) {tileClass('all')}"
-      >
-        <div class="gp-label flex items-center gap-1">
-          <Layers size={11} /> Worktrees
-        </div>
-        <div class="overview-metric-value text-textPrimary">{worktreeListKnown ? summary.worktrees : "—"}</div>
-        <div class="text-micro text-textMuted">
-          {#if !worktreeListKnown}Worktree list unavailable{:else}
-            {#if !projection?.sources.worktrees.ok}Partial data · {/if}{summary.dirtyWorktrees} dirty{#if summary.unscannedDirty > 0}
-              · {summary.unscannedDirty} unscanned{/if}
-          {/if}
-        </div>
-      </button>
-      <button
-        type="button"
-        aria-pressed={facet === "agents"}
-        disabled={summary.agentSessions === 0}
-        onclick={() => toggleFacet("agents")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) disabled:cursor-default {tileClass('agents')}"
-      >
-        <div class="gp-label flex items-center gap-1">
-          <Bot size={11} /> Agent worktrees
-        </div>
-        <div class="overview-metric-value text-textPrimary">{worktreeListKnown ? summary.agentSessions : "—"}</div>
-        <div class="text-micro text-textMuted truncate">
-          {!worktreeListKnown ? "Worktree list unavailable" : summary.agentKinds.length > 0 ? summary.agentKinds.join(", ") : "No agent worktrees detected"}
-        </div>
-      </button>
-      <button
-        type="button"
-        aria-pressed={facet === "blocked"}
-        disabled={summary.blocked === 0}
-        onclick={() => toggleFacet("blocked")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) disabled:cursor-default {tileClass('blocked')}"
-      >
-        <div class="gp-label flex items-center gap-1">
-          <GitMerge size={11} /> Blocked
-        </div>
-        <div class="overview-metric-value {summary.blocked > 0 ? 'text-warn' : 'text-textPrimary'}">
-          {summary.blocked > 0 || (worktreeListKnown && summary.unscannedOperations === 0) ? summary.blocked : "—"}
-        </div>
-        <div class="text-micro text-textMuted">{!worktreeListKnown ? "Operation status unavailable" : summary.unscannedOperations > 0 ? `${summary.unscannedOperations} worktrees not checked` : summary.blocked > 0 ? "Operations waiting for you" : "Parked merges, rebases & picks"}</div>
-      </button>
-      <button
-        type="button"
-        aria-pressed={facet === "pullRequests"}
-        disabled={summary.pullRequests === 0}
-        onclick={() => toggleFacet("pullRequests")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) disabled:cursor-default {tileClass('pullRequests')}"
-      >
-        <div class="gp-label flex items-center gap-1">
-          <GitPullRequest size={11} /> Pull requests
-        </div>
-        <div class="overview-metric-value text-textPrimary">{projection?.sources.github.present && (projection.sources.github.ok || summary.pullRequests > 0) ? summary.pullRequests : "—"}</div>
-        <div class="text-micro text-textMuted">{!projection?.sources.github.present ? "GitHub not available" : !projection.sources.github.ok ? "Partial GitHub data" : "Across workspace branches"}</div>
-      </button>
+      {@render metricTile(
+        "all",
+        Layers,
+        "Worktrees",
+        worktreeListKnown ? summary.worktrees : "—",
+        !worktreeListKnown
+          ? "Worktree list unavailable"
+          : `${!projection?.sources.worktrees.ok ? "Partial data · " : ""}${summary.dirtyWorktrees} dirty${summary.unscannedDirty > 0 ? ` · ${summary.unscannedDirty} unscanned` : ""}`,
+      )}
+      {@render metricTile(
+        "agents",
+        Bot,
+        "Agent worktrees",
+        worktreeListKnown ? summary.agentSessions : "—",
+        !worktreeListKnown ? "Worktree list unavailable" : summary.agentKinds.length > 0 ? summary.agentKinds.join(", ") : "No agent worktrees detected",
+        summary.agentSessions === 0,
+      )}
+      {@render metricTile(
+        "blocked",
+        GitMerge,
+        "Blocked",
+        summary.blocked > 0 || (worktreeListKnown && summary.unscannedOperations === 0) ? summary.blocked : "—",
+        !worktreeListKnown ? "Operation status unavailable" : summary.unscannedOperations > 0 ? `${summary.unscannedOperations} worktrees not checked` : summary.blocked > 0 ? "Operations waiting for you" : "Parked merges, rebases & picks",
+        summary.blocked === 0,
+        summary.blocked > 0 ? "text-warn" : "text-textPrimary",
+      )}
+      {@render metricTile(
+        "pullRequests",
+        GitPullRequest,
+        "Pull requests",
+        projection?.sources.github.present && (projection.sources.github.ok || summary.pullRequests > 0) ? summary.pullRequests : "—",
+        !projection?.sources.github.present ? "GitHub not available" : !projection.sources.github.ok ? "Partial GitHub data" : "Across workspace branches",
+        summary.pullRequests === 0,
+      )}
     </div>
 
     <div class="mb-3 w-full flex flex-wrap items-center justify-between gap-2">
@@ -1066,7 +1185,7 @@
           {#if row.operation}
             <button
               type="button"
-              class="mt-2 flex w-full items-start gap-2 rounded-xl bg-warn/15 px-2.5 py-1.5 text-left text-meta text-warn hover:bg-warn/25"
+              class="{WARN_BANNER} hover:bg-warn/25"
               onclick={() => openWorktree(row)}
               title="Open this worktree to finish or abort the {kindTitle(row.operation.kind).toLowerCase()}"
             >
@@ -1079,6 +1198,21 @@
                     : "s"} still conflicted
                 {/if}
               </span>
+              {@render resolveCta()}
+            </button>
+          {:else if row.worktrees.some((binding) => binding.worktree.path === $repoStore.currentPath) && here && here.conflicted > 0}
+            <button
+              type="button"
+              class="mt-2 flex w-full items-center gap-2 rounded-xl bg-danger/15 px-2.5 py-1.5 text-left text-meta text-danger hover:bg-danger/25"
+              data-testid="work-row-resolve-current"
+              onclick={showConflicts}
+              title={OPEN_EDITOR}
+            >
+              <GitMerge size={12} class="shrink-0" />
+              <span class="min-w-0">
+                {here.conflicted} conflicted file{here.conflicted === 1 ? "" : "s"} in this worktree
+              </span>
+              {@render resolveCta()}
             </button>
           {/if}
 
@@ -1154,18 +1288,7 @@
 
   {#if $repoStore.currentPath}
     <div class="mt-4 w-full">
-      <button
-        type="button"
-        class="flex w-full items-center gap-1.5 rounded-xl border border-edge px-3 py-2 text-meta font-medium text-textMuted hover:bg-surfaceHover"
-        onclick={() => (showRepoDetail = !showRepoDetail)}
-        aria-expanded={showRepoDetail}
-      >
-        <ChevronRight
-          size={13}
-          class="shrink-0 transition-transform {showRepoDetail ? 'rotate-90' : ''}"
-        />
-        Remotes, submodules and stash
-      </button>
+      {@render detailToggle(showRepoDetail, () => (showRepoDetail = !showRepoDetail), "Remotes, submodules and stash")}
       {#if showRepoDetail}
         <div class="mt-2">
           <RepoPanel embedded />
@@ -1174,18 +1297,7 @@
     </div>
 
     <div class="mt-4 w-full">
-      <button
-        type="button"
-        class="flex w-full items-center gap-1.5 rounded-xl border border-edge px-3 py-2 text-meta font-medium text-textMuted hover:bg-surfaceHover"
-        onclick={() => (showStackDetail = !showStackDetail)}
-        aria-expanded={showStackDetail}
-      >
-        <ChevronRight
-          size={13}
-          class="shrink-0 transition-transform {showStackDetail ? 'rotate-90' : ''}"
-        />
-        Branch chains and stacked diffs
-      </button>
+      {@render detailToggle(showStackDetail, () => (showStackDetail = !showStackDetail), "Branch chains and stacked diffs")}
       {#if showStackDetail}
         <div class="mt-2">
           <LazyView load={loadStack} name="branch chains" />

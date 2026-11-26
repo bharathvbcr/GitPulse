@@ -40,6 +40,7 @@
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../../ui/transitions";
   import { trapFocus } from "../../ui/focusTrap";
   import { isImeComposition } from "../../keyboard/imeGuard";
+  import BrandMark from "../BrandMark.svelte";
 
   const wizard = onboardingStore.wizard;
   const status = onboardingStore.status;
@@ -161,8 +162,11 @@
       <div class="flex items-center justify-between px-4 py-3">
         <div>
           <h2 class="text-sm font-semibold text-textPrimary">{t("setup.title")}</h2>
-          <p class="text-meta text-textMuted">
-            <span class="font-mono">{$wizard.tool}</span> — {t("setup.subtitle")}
+          <p class="flex items-center gap-1.5 text-meta text-textMuted">
+            {#if $wizard.tool === "manvi"}
+              <BrandMark mark="manvi" size={14} class="shrink-0" />
+            {/if}
+            <span><span class="font-mono">{$wizard.tool}</span> — {t("setup.subtitle")}</span>
           </p>
         </div>
         <button type="button" class="p-1 text-textMuted hover:text-textPrimary" onclick={closeSetupWizard} aria-label={t("setup.close")}>
@@ -188,12 +192,15 @@
         {#each (["devmap", "manvi"] as ExternalTool[]) as t (t)}
           <button
             type="button"
-            class="rounded-lg border px-2 py-1 text-meta font-mono {$wizard.tool === t
+            class="inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-meta font-mono {$wizard.tool === t
               ? 'border-accent/35 bg-accent/10 text-textPrimary'
               : 'border-edge text-textMuted'}"
             onclick={() => setWizardTool(t)}
           >
-            {t}
+            {#if t === "manvi"}
+              <BrandMark mark="manvi" size={14} class="shrink-0" />
+            {/if}
+            <span>{t}</span>
           </button>
         {/each}
       </div>

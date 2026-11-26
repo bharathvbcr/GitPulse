@@ -294,11 +294,23 @@ describe("Sidebar change lists", () => {
     expect(source).toContain("aria-expanded={!sections.unstaged}");
   });
 
-  it("grows result windows stepwise instead of jumping to full length", () => {
-    expect(source).toContain("FILE_LIST_STEP * 2");
-    expect(source).toContain("`Show ${remaining.toLocaleString()} more`");
-    expect(source).toContain("`Show all ${total.toLocaleString()}`");
-    expect(source).toContain("limit + FILE_LIST_STEP");
+  it("windows both lists through VirtualList instead of growing them in steps", () => {
+    expect(source).toContain('import VirtualList from "./VirtualList.svelte"');
+    expect(source).toContain("items={filteredStaged}");
+    expect(source).toContain("items={filteredUnstaged}");
+    expect((source.match(/rowHeight=\{CHANGE_ROW_HEIGHT\}/g) ?? []).length).toBe(2);
+    // The box is bounded, so the window is a handful of rows however many files changed.
+    expect(source).toContain("Math.min(count, MAX_LIST_ROWS) * CHANGE_ROW_HEIGHT");
+    // Nothing renders the whole list or asks for the rest with a button.
+    expect(source).not.toContain("FILE_LIST_STEP");
+    expect(source).not.toMatch(/Show (all|\$\{)/);
+    // Rows are keyed by path (made unique per list) so a stage button's focus never slides to the next file.
+    expect(source).toContain("key={(_, i) => stagedKeys[i]}");
+    expect(source).toContain("key={(_, i) => unstagedKeys[i]}");
+    expect(source).toContain("uniqueRowKeys(filteredStaged.map((f) => f.path))");
+    expect(source).toContain("uniqueRowKeys(filteredUnstaged.map((f) => f.path))");
+    expect(source).not.toContain("visibleStaged");
+    expect(source).not.toContain("visibleUnstaged");
   });
 
   it("styles conflicted paths warn-semibold in both lists via one helper", () => {
@@ -346,10 +358,15 @@ describe("Sidebar change lists", () => {
       join(dirname(fileURLToPath(import.meta.url)), "SidebarExplorerPane.svelte"),
       "utf8",
     );
-    // Expanded switcher + collapsed rail navigation buttons with icons
-    expect(source).toContain('data-testid="sidebar-view-switcher"');
-    expect(source).toContain('data-testid="sidebar-view-git"');
-    expect(source).toContain('data-testid="sidebar-view-files"');
+    // Expanded switcher + collapsed rail navigation buttons with icons. The
+    // expanded switcher is its own component; SidebarViewSwitch.test.ts
+    // renders it and holds its test ids.
+    const switchSource = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "SidebarViewSwitch.svelte"),
+      "utf8",
+    );
+    expect(switchSource).toContain('data-testid="sidebar-view-switcher"');
+    expect(switchSource).toContain('data-testid="sidebar-view-{id}"');
     expect(source).toContain('data-testid="sidebar-rail-git"');
     expect(source).toContain('data-testid="sidebar-rail-files"');
     expect(source).toContain("FolderTree");
@@ -362,10 +379,12 @@ describe("Sidebar change lists", () => {
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-tab"');
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-split"');
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-dock-terminal"');
-    // Routing goes through the shared resolver: `resolveSidebarOpen` (which
-    // lets a double-click follow its own clicks) delegates every fresh
-    // decision to `resolveSidebarFileAction`, unit-tested in layoutStore.test.
-    expect(explorerPaneSource).toContain("resolveSidebarOpen(");
+    expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-auto"');
+    // Routing goes through the one shared resolver, `resolveFileOpen` (which
+    // lets a double-click follow its own clicks), unit-tested in
+    // layoutStore.test. "Auto" needs the last-used surface and the dock's state.
+    expect(explorerPaneSource).toContain("resolveFileOpen(");
+    expect(explorerPaneSource).toContain('terminalActive: $lastSurface === "terminal" && $repoStore.terminalOpen');
     expect(explorerPaneSource).not.toMatch(/altKey \? "split"|metaOrCtrlKey \? /);
     // A double-click (onPinFile) asks to keep the file's tab.
     expect(explorerPaneSource).toContain("onPinFile={(path) => void handleOpenFile(path, null, null, true)}");
@@ -377,5 +396,45 @@ describe("Sidebar change lists", () => {
     expect((source.match(/startSidebarFileDrag\(e, f\.path\)/g) ?? []).length).toBe(2);
     expect(source).toContain("terminalDropZones.beginInAppDrag(");
     expect(source).toContain("setSidebarExplorerDocked(");
+  });
+
+  it("draws the Git | Explorer switcher as tabs whose panels exist for them to point at", () => {
+    expect(source).toContain('import SidebarViewSwitch from "./SidebarViewSwitch.svelte"');
+    expect(source).toContain("<SidebarViewSwitch view={sidebarView} onSelect={selectSidebarView} />");
+    // Each panel names itself after its tab, so aria-controls resolves and a
+    // screen reader can say which tab a panel belongs to.
+    expect(source).toContain('id={panelId("sidebar-view", "git")}');
+    expect(source).toContain('id={panelId("sidebar-view", "files")}');
+    // With no repository there is no switch, so the Git column is no tab's panel.
+    expect(source).toContain('role={$repoStore.currentPath ? "tabpanel" : undefined}');
+    expect(source).toContain('aria-labelledby={$repoStore.currentPath ? tabId("sidebar-view", "git") : undefined}');
+    expect(source).toContain('aria-labelledby={tabId("sidebar-view", "files")}');
+    // The Explorer panel exists from the first paint; only its contents wait
+    // until it is first shown. Gating the container dangled aria-controls.
+    const panel = source.indexOf('data-testid="sidebar-explorer-container"');
+    const gate = source.lastIndexOf("{#if", panel);
+    expect(source.slice(gate, panel)).not.toContain("explorerMounted");
+    expect(source.slice(panel, source.indexOf("</div>", panel))).toContain("{#if explorerMounted}");
+  });
+
+  it("opens the Explorer page from a double-click on the docked Explorer's empty space or chrome, never a row", () => {
+    const explorerPaneSource = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "SidebarExplorerPane.svelte"),
+      "utf8",
+    );
+    const root = explorerPaneSource.slice(
+      explorerPaneSource.indexOf('data-testid="sidebar-explorer-pane"'),
+      explorerPaneSource.indexOf(">", explorerPaneSource.indexOf("onpointerdowncapture")),
+    );
+    // One decision owns which targets count (opensExplorerPage); a row keeps
+    // its own double-click, which pins the file where its click opened it.
+    expect(root).toMatch(/ondblclick=\{\(event\) => \{\s*if \(opensExplorerPage\(event\)\) openExplorerPage\(\);\s*\}\}/);
+    expect(explorerPaneSource).toContain('import { opensExplorerPage } from "../files/explorerPageGesture"');
+    // Navigation goes through the page owner every other entry point uses.
+    expect(explorerPaneSource).toMatch(/function openExplorerPage\(\) \{\s*repoStore\.setActiveTab\("code", "explorer"\);/);
+    // A gesture alone is mouse-only; the same move is one labelled button.
+    expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-open-page"');
+    expect(explorerPaneSource).toContain('aria-label="Open the Explorer page"');
+    expect(explorerPaneSource).toContain("onclick={openExplorerPage}");
   });
 });

@@ -67,4 +67,27 @@ describe("Skeleton", () => {
     const circle = render(Skeleton, { props: { variant: "circle" } });
     expect(circle.body).toContain("rounded-full");
   });
+
+  it("supports graph-rows, diff-hunks, terminal-replay, and pane-shell wake variants", () => {
+    const graph = render(Skeleton, { props: { variant: "graph-rows", count: 4 } });
+    expect(graph.body).toContain("rounded-full");
+    expect(graph.body).toContain("animate-pulse");
+
+    const diff = render(Skeleton, { props: { variant: "diff-hunks", count: 3 } });
+    expect(diff.body).toContain("font-mono");
+
+    const replay = render(Skeleton, { props: { variant: "terminal-replay" } });
+    expect(replay.body).toContain("gp-indeterminate");
+    expect(replay.body).toContain("Reattaching terminal…");
+
+    const shell = render(Skeleton, { props: { variant: "pane-shell" } });
+    expect(shell.body).toContain("grid-cols-1");
+    expect(shell.body).toContain("rounded-xl");
+  });
+
+  it("respects animated=false for static reduced-motion skeletons", () => {
+    const replay = render(Skeleton, { props: { variant: "terminal-replay", animated: false } });
+    expect(replay.body).not.toContain("gp-indeterminate");
+    expect(replay.body).not.toContain("animate-pulse");
+  });
 });

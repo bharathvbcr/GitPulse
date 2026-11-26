@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { compile } from "svelte/compiler";
+import { render } from "svelte/server";
 import { describe, expect, it } from "vitest";
+import SessionNotificationBridge from "./SessionNotificationBridge.svelte";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const read = (...path: string[]) => readFileSync(join(root, ...path), "utf8");
@@ -42,5 +45,32 @@ describe("SessionNotificationBridge placement", () => {
     const backend = read("src-tauri", "src", "workbench", "notifications.rs");
     expect(backend).toContain('Some(key) => opening.emit("gitpulse-session-notification-open", key.clone())');
     expect(backend).toMatch(/if session\.is_none\(\) \{\s*if let Err\(error\) = activate\(&host, &native\)/);
+  });
+});
+
+describe("SessionNotificationBridge branding and compilation", () => {
+  const source = read("src", "lib", "components", "SessionNotificationBridge.svelte");
+
+  it("compiles cleanly and imports Logo inside aria-hidden", () => {
+    const { warnings } = compile(source, { generate: "client", filename: "SessionNotificationBridge.svelte" });
+    expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
+    expect(source).toMatch(/import Logo from "\.\/Logo\.svelte";/);
+    expect(source).toMatch(/aria-hidden="true"[^>]*><Logo\b/);
+  });
+
+  it("renders nothing when no notice is active", () => {
+    const { body } = render(SessionNotificationBridge);
+    expect(body).not.toContain("session-activation");
+  });
+
+  it("renders .session-activation with the current GitPulse badge Logo when a notice is active", () => {
+    const { body } = render(SessionNotificationBridge, {
+      props: { initialMissed: "That terminal session has ended." },
+    });
+    expect(body).toMatch(/class="session-activation gp-card shadow-float\b/);
+    expect(body).toContain("That terminal session has ended.");
+    expect(body).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
+    expect(body).toMatch(/id="gp-[a-z0-9]+-badge"/);
+    expect(body).toMatch(/<span class="session-activation-logo[^"]*" aria-hidden="true">[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
   });
 });

@@ -9,12 +9,12 @@
         "@tauri-apps/api": "^2.12.5",
         "@tauri-apps/plugin-autostart": "^2.7.0",
         "@tauri-apps/plugin-opener": "^2.7.3",
-        "@xterm/addon-fit": "0.12.0-beta.334",
-        "@xterm/addon-search": "0.17.0-beta.332",
-        "@xterm/addon-serialize": "0.15.0-beta.332",
-        "@xterm/addon-unicode11": "0.10.0-beta.332",
-        "@xterm/addon-webgl": "0.20.0-beta.331",
-        "@xterm/xterm": "6.1.0-beta.338",
+        "@xterm/addon-fit": "0.12.0-beta.335",
+        "@xterm/addon-search": "0.17.0-beta.333",
+        "@xterm/addon-serialize": "0.15.0-beta.333",
+        "@xterm/addon-unicode11": "0.10.0-beta.333",
+        "@xterm/addon-webgl": "0.20.0-beta.332",
+        "@xterm/xterm": "6.1.0-beta.339",
       },
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "^7.3.1",
@@ -229,17 +229,17 @@
 
     "@vitest/spy": ["@vitest/spy@5.1.1", "", {}, "sha512-6K8C6alQG1/Yc8/ZI22iJS7JEsxPdVzqtqDq+/xM4Z0mGVykemMVjLhqMy/q6/IHYG3kKD8hKSwRen/ZdyI9vQ=="],
 
-    "@xterm/addon-fit": ["@xterm/addon-fit@0.12.0-beta.334", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.338" } }, "sha512-fIFQHJ15PER9KhAG24IhA5vF4ysHEKrJgImt/ZqRcahvNUGF1T3WnpJ6bLvlvnsft7bVT0ofBWySx6nxFNAXkA=="],
+    "@xterm/addon-fit": ["@xterm/addon-fit@0.12.0-beta.335", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.339" } }, "sha512-9Vq68k+fqqybegkIx9CTojoEbf7DmsflWGd58wt5Po1gWEt6KgxCR64LsNK+b3rDJTYzfMb5qspa2cGJd455VQ=="],
 
-    "@xterm/addon-search": ["@xterm/addon-search@0.17.0-beta.332", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.338" } }, "sha512-XiyGiCWIRdguk45PiXT9ejuuGcCh0Z46ADBXNK4JNL8ElXIwyJ3uiljjxjFOiZ4QFeSrvhUtaQYgmvtOwWEO1A=="],
+    "@xterm/addon-search": ["@xterm/addon-search@0.17.0-beta.333", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.339" } }, "sha512-EW+S89LLjnHHl0K22F1GwHjTfGgmdwn3Q7nxsq6zJKIPgQPo7h2JUGMjUYV6w1jx7W0bPlb94/msy98mqJwwAg=="],
 
-    "@xterm/addon-serialize": ["@xterm/addon-serialize@0.15.0-beta.332", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.338" } }, "sha512-2GkWnfAIzXJSvcAxT2oRYmzsw7/KU+4cgyWhNmS9CEegh2r7arVNIHC8mjaZwqpr+Ch1bBP4ZExWM746n6+tNg=="],
+    "@xterm/addon-serialize": ["@xterm/addon-serialize@0.15.0-beta.333", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.339" } }, "sha512-3k+4F86+D2wheKWoIreltkxA4HF9+zG/ZERyMnOcleQdNb8Sftr13CepXwtM5+W0K9hCtEY0AWG8VUazIFqi0g=="],
 
-    "@xterm/addon-unicode11": ["@xterm/addon-unicode11@0.10.0-beta.332", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.338" } }, "sha512-74+j6gsPld1czK1Zl8+z9LBLsZUZFcgHXP4VSwd+DAPZYTLQcDFV+DbY854enx/9uKNyxuYwR0ec86XFej6iEA=="],
+    "@xterm/addon-unicode11": ["@xterm/addon-unicode11@0.10.0-beta.333", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.339" } }, "sha512-gpTMOtyK0o5gFxQC1p9eErP7txDEZ9HJSAMqnFyi3y2kadb8bwzqGHq/OugT0kzihitjtNP7qnlV/HUTu7Fyog=="],
 
-    "@xterm/addon-webgl": ["@xterm/addon-webgl@0.20.0-beta.331", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.338" } }, "sha512-gAcYQI1zgO62vAZmeAho1C3D+rqoFslS60eGr5lfxah+POEQCzIjEV97wrDwzY1m+VReKawMiYkZ8Nhawbzkfw=="],
+    "@xterm/addon-webgl": ["@xterm/addon-webgl@0.20.0-beta.332", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.339" } }, "sha512-RAXxe8y9LDiSRyuwl0r8ifWnBdXwEyDhPXRnTzBkFvzEGLTviw7YqbNJEbETXkHssknGHajtLL29kagPP8ndLg=="],
 
-    "@xterm/xterm": ["@xterm/xterm@6.1.0-beta.338", "", {}, "sha512-VBygvapFKV5gsqvVFsk6gYpArn4AXnUtZvt3tfN2LXI284i0mivC6Kus84GMJo0GJPLRFziWcSPVz95nViPuWw=="],
+    "@xterm/xterm": ["@xterm/xterm@6.1.0-beta.339", "", {}, "sha512-qOwEyAmL4zpcI35I8AszEQLW+y1j5fMLV5bgvud8zhI1aUE5sbu2llLsPqQj7uilwUdkHZnKCHZQK6J8hRQxdQ=="],
 
     "acorn": ["acorn@8.19.0", "", { "bin": { "acorn": "bin/acorn" } }, "sha512-oJlA3XiRm7Cyk6qFD2Jn8ak9B7jSy0qy00ADO3+8dpT0LSjFihQYv4C02LFCSYJV3Q37xYwwRy5m+IpIiUzqWw=="],
 

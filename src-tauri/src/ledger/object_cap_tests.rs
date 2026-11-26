@@ -45,7 +45,10 @@ fn stored(
 }
 
 fn hash_of(text: &str) -> String {
-    format!("fnv1a64:{:016x}", devmap_extract::content_hash(text))
+    format!(
+        "fnv1a64:{:016x}",
+        crate::ledger::ids::fnv1a64(text.as_bytes())
+    )
 }
 
 /// A command `length` bytes long with `SECRET` starting at byte `at`.

@@ -66,7 +66,35 @@ pub enum ResolutionAvailability {
 /// verified verdict for the generation they answered from when the store
 /// knows one, or an explicit reason when they do not. `fresh: null` alone is
 /// not enough — a check that did not run must say so.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **Age.** A verdict is only as good as the moment `status` walked the tree.
+/// `verified_age_ms` is the time since that walk, measured by the process
+/// answering (monotonic, so a wall-clock jump cannot move it).
+///
+/// - A `fresh: true` verdict **no watcher backs** (the CLI, or an MCP-only
+///   process) older than 60 seconds is reported as `fresh: null` with a reason
+///   naming its age and `status` as the way to re-verify. `status` re-stamps
+///   it, and so does the next query in a long-lived reader (the MCP server),
+///   which re-runs the read-only source walk itself, at most once a minute and
+///   within a time budget; a walk that overruns leaves the null and its reason.
+/// - A verdict a **live watcher backs** (the daemon, from the walk it runs
+///   after each drain) does not age out: an edit the watcher sees queues a
+///   path and ends the verdict at once, so a healthy idle daemon keeps
+///   answering `fresh: true` with a growing `verified_age_ms`.
+/// - A `fresh: false` verdict stays `false` however old, until `status` runs
+///   again.
+/// - A `fresh: true` walk over a **resolver-stale base** (the stored edges
+///   were written by another resolver epoch, or the extraction payload is
+///   obsolete) is reported as `fresh: null` with a reason naming the
+///   resolver-stale base: the tree matched the stored hashes, but the index
+///   is not the one this binary would build.
+///
+/// The field is absent when no walk backs the answer (never verified, or the
+/// verdict came from somewhere other than the store's cached walk), and
+/// absence means "unknown age", not "fresh". Readers that predate the field
+/// ignore it; a reader that builds this struct by literal must add
+/// `verified_age_ms: None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceFreshness {
     /// `Some(true/false)` when verified against the working tree; `None` when
     /// this answer did not (or could not) verify.
@@ -77,7 +105,24 @@ pub struct SourceFreshness {
     /// Why `fresh` is null, or why a verified mismatch was reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Milliseconds since `status` last verified the tree for this verdict.
+    /// See the type docs for the age bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_age_ms: Option<u64>,
 }
+
+/// Two verdicts are equal when they *say* the same thing. `verified_age_ms` is
+/// when the answer was read, not part of what it claims, so two envelopes
+/// built a millisecond apart from one verdict compare equal.
+impl PartialEq for SourceFreshness {
+    fn eq(&self, other: &Self) -> bool {
+        self.fresh == other.fresh
+            && self.generation_id == other.generation_id
+            && self.reason == other.reason
+    }
+}
+
+impl Eq for SourceFreshness {}
 
 impl SourceFreshness {
     pub fn unverified(reason: impl Into<String>) -> Self {
@@ -85,6 +130,7 @@ impl SourceFreshness {
             fresh: None,
             generation_id: None,
             reason: Some(reason.into()),
+            verified_age_ms: None,
         }
     }
 
@@ -93,6 +139,7 @@ impl SourceFreshness {
             fresh: Some(fresh),
             generation_id: Some(generation_id),
             reason: None,
+            verified_age_ms: None,
         }
     }
 
@@ -105,6 +152,7 @@ impl SourceFreshness {
             fresh: Some(fresh),
             generation_id: Some(generation_id),
             reason: Some(reason.into()),
+            verified_age_ms: None,
         }
     }
 
@@ -113,6 +161,7 @@ impl SourceFreshness {
             fresh: value.fresh,
             generation_id: value.generation_id,
             reason: value.reason,
+            verified_age_ms: value.verified_age_ms,
         }
     }
 }
@@ -281,9 +330,61 @@ pub struct UnresolvedSite {
     pub source_file: String,
     pub source_symbol: String,
     pub callee_name: String,
+    /// The receiver expression, copied out of the file (a content-bearing
+    /// key). Empty when `withheld` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<String>,
     pub classification: String,
+    /// `"secret_path"` when `source_file` is a secret path and the receiver
+    /// text was blanked; absent otherwise. Same convention as the hit builders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
+}
+
+/// JSON keys, in any `--json` answer or MCP envelope, whose string values are
+/// text copied out of a repository file.
+///
+/// A host that gates reads (Manvi's read gate) must treat a value under one of
+/// these keys as file content, and must treat every other string as metadata:
+/// names, paths, counts, reasons and provenance (`evidence.source` is
+/// `Resolver | Stored | Reconstructed`, never file text). Adding a field that
+/// carries file text means adding its key here; `docs/devmap/HOST_INTEGRATION.md`
+/// and `rust/devmap-cli/tests/content_bearing_keys_are_published.rs` hold the
+/// list to the real output.
+///
+/// Key names alone are not enough: use [`is_content_bearing_path`], because an
+/// edge's `evidence.source` is provenance.
+///
+/// A secret-path file's text is withheld: the key stays, its value is empty,
+/// and a sibling `withheld` key says why (`"secret_path"`).
+pub const CONTENT_BEARING_KEYS: &[&str] = &[
+    // `explore` definitions and `ask --evidence` units: the symbol's text.
+    "source",
+    "source_span",
+    // The whitespace a mid-line span lost: still bytes of the file.
+    "source_indent",
+    // `skeleton`: declaration text.
+    "signature",
+    // `literals`: the constant as the file writes it.
+    "value",
+    // `impact` `unresolved_namesakes.sites`: the expression a call was made on,
+    // up to 64 characters of the file. Never repeated in prose.
+    "receiver",
+];
+
+/// Whether the string at JSON path `path` (dot-joined keys, array indices
+/// elided, e.g. `$.definitions.items.callers.items.evidence.source`) is file
+/// text under [`CONTENT_BEARING_KEYS`].
+///
+/// One key is ambiguous: an edge's `evidence.source` shares the name `source`
+/// with an explore definition's text but is provenance (`Resolver`, `Stored` or
+/// `Reconstructed`). Matching on the key alone would call it content.
+pub fn is_content_bearing_path(path: &str) -> bool {
+    if path.ends_with(".evidence.source") {
+        return false;
+    }
+    let key = path.rsplit('.').next().unwrap_or(path);
+    CONTENT_BEARING_KEYS.contains(&key)
 }
 
 /// Distinct target names an `impact` answer looks up in the ledger.

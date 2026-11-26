@@ -499,10 +499,14 @@ mod tests {
             cored.contains(&"wait_status_raw: 0x0086".to_string()),
             "{cored:?}"
         );
-        assert!(
-            cored.contains(&"exit_signal: SIGABRT (6)".to_string()),
-            "{cored:?}"
-        );
+        // Signals are named where they exist; Windows has none, so a number is
+        // all it can print.
+        let abort = if cfg!(unix) {
+            "exit_signal: SIGABRT (6)"
+        } else {
+            "exit_signal: signal 6"
+        };
+        assert!(cored.contains(&abort.to_string()), "{cored:?}");
         assert!(
             cored.contains(&"core_dumped: true".to_string()),
             "{cored:?}"

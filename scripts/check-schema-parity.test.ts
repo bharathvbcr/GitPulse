@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ import {
   SERVE_CONTRACT,
   contractRow,
   devmapReading,
+  gitpulseToolNames,
   jarvisPin,
   judge,
   manviPin,
@@ -20,6 +21,9 @@ import {
   rustConstant,
   schemasAt,
   summarize,
+  toolNamesRow,
+  toolNamesRowAt,
+  upstreamToolNames,
 } from "./check-schema-parity.mjs";
 
 const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94, lease: 2 };
@@ -30,8 +34,37 @@ afterAll(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
+/**
+ * Identity and signing come from the environment so a fixture repository
+ * needs no `git config` spawns: these tests' cost is serial process spawns.
+ */
+const FIXTURE_GIT_ENV = {
+  ...process.env,
+  GIT_AUTHOR_NAME: "fixture",
+  GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+  GIT_COMMITTER_NAME: "fixture",
+  GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "commit.gpgsign",
+  GIT_CONFIG_VALUE_0: "false",
+};
+
+/**
+ * What one serial `git` spawn may cost before a test is called hung. The pin
+ * tests below do 10 to 30 spawns and no CPU work, so their time is the host's
+ * process-spawn cost: about 55 ms here, and about 470 ms on the Windows runner
+ * (a 22-spawn test took 8.9 s there against vitest's flat 5 s). The budget is
+ * per spawn, the way `SHELL_CASE_BUDGET_MS` is in agentCommit.stress.test.ts, so
+ * a hung `git` still fails the test by name, just not before it could finish.
+ */
+const GIT_SPAWN_BUDGET_MS = 1_500;
+/** `git init`, then add + commit + rev-parse three times, in `devcouncilFixture`. */
+const FIXTURE_SPAWNS = 10;
+/** `schemasAt` is one `cat-file` and one `show` per schema; a test may call it a few times. */
+const PIN_TEST_TIMEOUT_MS = wallClockBudget((FIXTURE_SPAWNS + 20) * GIT_SPAWN_BUDGET_MS);
+
 function git(cwd: string, ...args: string[]): string {
-  const out = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const out = spawnSync("git", args, { cwd, encoding: "utf8", env: FIXTURE_GIT_ENV });
   if (out.status !== 0) throw new Error(`git ${args.join(" ")}: ${out.stderr}`);
   return out.stdout.trim();
 }
@@ -67,9 +100,6 @@ function devcouncilFixture() {
   const root = mkdtempSync(path.join(tmpdir(), "gitpulse-schema-parity-"));
   tempDirs.push(root);
   git(root, "init", "-q");
-  git(root, "config", "user.email", "fixture@example.invalid");
-  git(root, "config", "user.name", "fixture");
-  git(root, "config", "commit.gpgsign", "false");
   writeOwner(root, { ...owner, store: 26 });
   git(root, "add", "-A");
   git(root, "commit", "-q", "-m", "store 26");
@@ -268,7 +298,7 @@ describe("pins", () => {
     const { root, old, bump } = devcouncilFixture();
     expect(schemasAt(root, old)).toEqual({ ...owner, store: 26 });
     expect(schemasAt(root, bump)).toEqual(owner);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("calls a pin whose schemas DevCouncil has since moved stale", () => {
     const { root, old, head } = devcouncilFixture();
@@ -278,7 +308,7 @@ describe("pins", () => {
     const row = judge(owner, pinReading("Jarvis pin", root, head, consumer, "upstream.lock.json", jarvisPin));
     expect(row.verdict).toBe("stale");
     expect(row.detail).toContain("devmap store 26, DevCouncil writes 27");
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("calls a pin behind HEAD with the same schemas a match, and says it is behind", () => {
     const { root, bump, head } = devcouncilFixture();
@@ -288,7 +318,7 @@ describe("pins", () => {
     const row = judge(owner, pinReading("Jarvis pin", root, head, consumer, "upstream.lock.json", jarvisPin));
     expect(row.verdict).toBe("match");
     expect(row.detail).toContain(`pins ${bump.slice(0, 8)}, DevCouncil HEAD is ${head.slice(0, 8)}`);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reports a pin the local clone does not have as unverifiable, not stale or matching", () => {
     const { root, head } = devcouncilFixture();
@@ -298,7 +328,7 @@ describe("pins", () => {
     const row = judge(owner, pinReading("Jarvis pin", root, head, consumer, "upstream.lock.json", jarvisPin));
     expect(row.verdict).toBe("unverifiable");
     expect(row.detail).toMatch(/fetch it/);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reads a pin from before the extract constant existed as unverifiable for it, not a crash", () => {
     const { root, old } = devcouncilFixture();
@@ -308,15 +338,12 @@ describe("pins", () => {
     const row = judge(owner, { reader: "Manvi pin", keys: [...ALL], schemas: schemasAt(root, git(root, "rev-parse", "HEAD")) });
     expect(row.verdict).toBe("unverifiable");
     expect(schemasAt(root, old)).toHaveProperty("extract", 94);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reads a pin from before a schema was versioned as stale on what it did declare", () => {
     const root = mkdtempSync(path.join(tmpdir(), "gitpulse-schema-early-"));
     tempDirs.push(root);
     git(root, "init", "-q");
-    git(root, "config", "user.email", "fixture@example.invalid");
-    git(root, "config", "user.name", "fixture");
-    git(root, "config", "commit.gpgsign", "false");
     writeOwner(root, { store: 23, dcStore: 9, workbench: 0, extract: 94 });
     // Before the workbench schema existed: no constant in its file.
     writeFileSync(path.join(root, "rust", SCHEMAS.workbench.file), "const SCHEMA: &str = \"\";\n");
@@ -326,7 +353,7 @@ describe("pins", () => {
     expect(schemasAt(root, early)).toEqual({ store: 23, dcStore: 9, extract: 94, lease: 2 });
     const row = judge(owner, { reader: "Jarvis pin", keys: [...ALL], schemas: schemasAt(root, early) });
     expect(row.verdict).toBe("stale");
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reports a consumer that is not checked out here as absent", () => {
     const row = judge(owner, pinReading("Jarvis pin", "/nowhere", "", null, "upstream.lock.json", jarvisPin));
@@ -394,5 +421,93 @@ describe("parseArgs", () => {
     expect(parseArgs(["--json", "--app", "/x/GitPulse.app", "--timeout", "500"])).toEqual({ app: "/x/GitPulse.app", timeoutMs: 500, json: true });
     expect(parseArgs(["--timeout", "0"])).toHaveProperty("error");
     expect(parseArgs(["--bogus"])).toHaveProperty("error");
+  });
+});
+
+describe("devmap tool-list row", () => {
+  const UPSTREAM_SRC = `
+const TOOLS: &[(&str, &str)] = &[
+    ("devmap_status", "status"),
+    // ("devmap_commented", "commented"),
+    ("devmap_search", "search"),
+    ("devmap_ask", "ask"),
+];
+pub const TOOL_NAMES: &[&str] = &{ [] };
+`;
+  const GITPULSE_SRC = `
+/// "devmap_doc" is prose.
+pub const TOOL_NAMES: &[&str] = &[
+    "devmap_search",
+    "devmap_status",
+];
+`;
+  const upstream = { names: ["devmap_status", "devmap_search", "devmap_ask"] };
+  const REV = "a".repeat(40);
+  const shown = (stdout: string) => ((..._a: unknown[]) => ({ status: 0, stdout, stderr: "" }) as never) as never;
+
+  // The real list, parsed from the file GitPulse serves it from. Properties
+  // only: a legitimate tool addition must not turn these red.
+  const realNames = gitpulseToolNames(
+    readFileSync(fileURLToPath(new URL("../src-tauri/src/mcp/devmap_parity.rs", import.meta.url)), "utf8"),
+  );
+  // A fixture upstream built from the real list plus tools GitPulse does not serve.
+  const upstreamFixture = `const TOOLS: &[(&str, &str)] = &[${[...(realNames ?? []), "devmap_not_served_here"]
+    .map((n) => `("${n}", "x"),`)
+    .join("")}];`;
+
+  it("parses upstream's TOOLS table and skips commented entries", () => {
+    expect(upstreamToolNames(UPSTREAM_SRC)).toEqual(["devmap_status", "devmap_search", "devmap_ask"]);
+  });
+  it("parses GitPulse's TOOL_NAMES and skips doc comments", () => {
+    expect(gitpulseToolNames(GITPULSE_SRC)).toEqual(["devmap_search", "devmap_status"]);
+  });
+  it("returns null when there is no list", () => {
+    expect(upstreamToolNames("fn main() {}")).toBeNull();
+    expect(gitpulseToolNames("const TOOL_NAMES: &[&str] = &[];")).toBeNull();
+  });
+
+  it("GitPulse's real list is non-empty, unique and devmap_-prefixed", () => {
+    expect(realNames).not.toBeNull();
+    const names = realNames ?? [];
+    expect(names.length).toBeGreaterThan(0);
+    expect(new Set(names).size).toBe(names.length);
+    for (const name of names) {
+      expect(name.startsWith("devmap_"), name).toBe(true);
+    }
+  });
+  it("matches GitPulse's real list against the fixture upstream", () => {
+    expect(toolNamesRowAt("/nowhere", REV, shown(upstreamFixture)).verdict).toBe("match");
+  });
+
+  it("passes a subset, whatever the order", () => {
+    expect(toolNamesRow(["devmap_search", "devmap_status"], upstream).verdict).toBe("match");
+  });
+  it("fails a GitPulse name upstream does not publish, and names it", () => {
+    const row = toolNamesRow(["devmap_status", "devmap_invented"], upstream);
+    expect(row.verdict).toBe("stale");
+    expect(row.detail).toContain("devmap_invented");
+    expect(summarize([row]).ok).toBe(false);
+  });
+  it("fails distinctly, as unverifiable, when upstream is unreadable", () => {
+    const row = toolNamesRow(["devmap_status"], { error: "no commit" });
+    expect(row.verdict).toBe("unverifiable");
+    expect(row.detail).toContain("unreadable");
+    expect(summarize([row]).ok).toBe(false);
+  });
+  it("is unverifiable when GitPulse's own list could not be read", () => {
+    expect(toolNamesRow(null, upstream).verdict).toBe("unverifiable");
+  });
+
+  it("is unverifiable when the vendored rev names no commit", () => {
+    expect(toolNamesRowAt("/nowhere", null, shown(UPSTREAM_SRC)).verdict).toBe("unverifiable");
+  });
+  it("is unverifiable when git cannot show the file at the rev", () => {
+    const fail = ((..._a: unknown[]) => ({ status: 128, stdout: "", stderr: "fatal: bad object" }) as never) as never;
+    const row = toolNamesRowAt("/nowhere", REV, fail);
+    expect(row.verdict).toBe("unverifiable");
+    expect(row.detail).toContain("bad object");
+  });
+  it("is unverifiable when the file at the rev has no TOOLS table", () => {
+    expect(toolNamesRowAt("/nowhere", REV, shown("fn x() {}")).verdict).toBe("unverifiable");
   });
 });

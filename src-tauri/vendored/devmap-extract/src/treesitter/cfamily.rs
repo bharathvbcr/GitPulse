@@ -495,11 +495,17 @@ pub(super) fn c_enclosing_type(node: Node, source: &str) -> Option<String> {
             "struct_specifier" | "class_specifier" | "union_specifier" => {
                 return get_child_text(parent, "name", source).filter(|name| !name.is_empty());
             }
+            // C syntax written between `@implementation` and `@end` is a C
+            // function: it belongs to no class and C code can call it by its
+            // bare name. Only a `method_definition` is a member of the
+            // container, and that arm reads `objc_enclosing_container`, not
+            // this walk.
             "class_implementation"
             | "class_interface"
             | "category_implementation"
-            | "category_interface" => return objc_container_name(parent, source),
-            "function_definition" | "compound_statement" => return None,
+            | "category_interface"
+            | "function_definition"
+            | "compound_statement" => return None,
             _ => ancestor = bounded_parent(parent),
         }
     }

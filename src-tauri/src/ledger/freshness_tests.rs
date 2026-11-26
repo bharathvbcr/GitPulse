@@ -222,6 +222,8 @@ fn an_unreadable_database_is_never_reported_fresh() {
     // A file that is not a database: the open succeeds, every query fails.
     let garbage = [0x5a_u8; 4096];
     let moved = db.with_extension("sqlite.orig");
+    // Windows cannot rename a file the cached connection still holds open.
+    crate::ledger::tests_support::reset_registry_for(&repo);
     std::fs::rename(&db, &moved).unwrap();
     // The write-ahead log and its index would otherwise be replayed over the
     // garbage and make it read as the old database.
@@ -445,4 +447,83 @@ fn the_basis_tells_a_persisted_pass_from_an_inferred_one() {
         freshness_readonly_at(&repo2, at).last_catch_up_basis,
         "newest_row"
     );
+}
+
+#[test]
+fn removed_worktree_unfinished_catch_up_is_dormant_while_active_fails_closed() {
+    use std::collections::HashSet;
+    let (_dir, repo) = repo_dir();
+    append(draft(&repo)).unwrap();
+    let t0 = newest_ms(&repo) + minutes(1);
+    let gone_worktree = format!("{repo}/.gitpulse/worktrees/deleted-lane");
+    let active_worktree = format!("{repo}/.gitpulse/worktrees/active-lane");
+
+    // Active repo completed cleanly; deleted worktree left an unfinished
+    // truncated attempt behind before being removed.
+    record_catch_up(
+        &repo,
+        &repo,
+        &CatchUpRecord {
+            completed: true,
+            truncated: false,
+            recorded: 2,
+            ..CatchUpRecord::default()
+        },
+        t0,
+    )
+    .unwrap();
+    record_catch_up(
+        &repo,
+        &gone_worktree,
+        &CatchUpRecord {
+            completed: false,
+            truncated: true,
+            error:
+                "catch-up truncated: 18 reflog(s) not read this pass (git was deferred under load)"
+                    .into(),
+            ..CatchUpRecord::default()
+        },
+        t0,
+    )
+    .unwrap();
+
+    // Without member filtering, the unfinished row stays current.
+    let unfiltered = freshness_readonly_at(&repo, t0 + minutes(1));
+    assert!(unfiltered.catch_up.as_ref().expect("catch_up").truncated);
+
+    // With authenticated active members excluding the deleted worktree, the
+    // deleted row is dormant (`stale_worktrees == 1`) and does not poison
+    // current coverage.
+    let mut members = HashSet::new();
+    members.insert(transcript_key(std::path::Path::new(&repo)));
+    members.insert(transcript_key(std::path::Path::new(&active_worktree)));
+    let filtered = super::freshness_readonly_for_members_at(&repo, t0 + minutes(1), &members);
+    let covered = filtered.catch_up.expect("catch_up");
+    assert!(!covered.truncated, "{covered:?}");
+    assert!(covered.error.is_empty(), "{covered:?}");
+    assert_eq!(covered.stale_worktrees, 1, "{covered:?}");
+
+    // Fail-closed: an unfinished truncated attempt on an ACTIVE member MUST
+    // still surface as truncated with its error.
+    record_catch_up(
+        &repo,
+        &active_worktree,
+        &CatchUpRecord {
+            completed: false,
+            truncated: true,
+            error: "catch-up truncated: active worktree deferred".into(),
+            ..CatchUpRecord::default()
+        },
+        t0,
+    )
+    .unwrap();
+    let active_truncated =
+        super::freshness_readonly_for_members_at(&repo, t0 + minutes(1), &members);
+    let covered = active_truncated.catch_up.expect("catch_up");
+    assert!(covered.truncated, "{covered:?}");
+    assert!(
+        covered.error.contains("active worktree deferred"),
+        "{covered:?}"
+    );
+    assert_eq!(covered.stale_worktrees, 1, "{covered:?}");
 }

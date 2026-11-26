@@ -660,10 +660,11 @@ mod tests {
             .paths
             .iter()
             .map(|(p, _)| {
+                // As git spells it: `/`, whatever the platform's separator.
                 p.strip_prefix(&root)
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned()
+                    .replace('\\', "/")
             })
             .collect();
         assert!(registered.contains(&".claude/settings.json".to_string()));
@@ -680,6 +681,16 @@ mod tests {
     fn a_colon_named_directory_is_handled_literally() {
         let (_dir, root) = repo();
         write(&root, ".gitignore", "/:target/\n");
+        if cfg!(windows) {
+            // Windows cannot hold the name, so there is nothing for it to
+            // exclude: the ignore line names no directory, and the plan is
+            // the whole root.
+            let refused = std::fs::create_dir(root.join(":target")).unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidFilename);
+            write(&root, "a.txt", "a");
+            assert_eq!(plan_of(&root), Plan::Whole(None));
+            return;
+        }
         write(
             &root,
             ":target/CACHEDIR.TAG",

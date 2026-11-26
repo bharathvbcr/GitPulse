@@ -572,3 +572,121 @@ fn an_unreadable_slot_uses_up_a_slot_of_the_capacity() {
     };
     assert!(waited >= Duration::from_secs(4));
 }
+
+#[test]
+fn steward_critical_slowdown_gates_builds_even_when_leases_off_or_verdict_admits() {
+    // 1. Wrapper entry decision: `LeaseMode::Off` still enters the queue when
+    //    `steward_active` is true, while nested and `MAC_HEAVY_LABEL` stay exempt.
+    assert!(!should_enter_wrapper(
+        false,
+        false,
+        true,
+        LeaseMode::Off,
+        false
+    ));
+    assert!(should_enter_wrapper(
+        false,
+        false,
+        true,
+        LeaseMode::Off,
+        true
+    ));
+    assert!(!should_enter_wrapper(
+        true,
+        false,
+        true,
+        LeaseMode::Off,
+        true
+    ));
+    assert!(!should_enter_wrapper(
+        false,
+        true,
+        true,
+        LeaseMode::Off,
+        true
+    ));
+    assert!(!should_enter_wrapper(
+        false,
+        false,
+        false,
+        LeaseMode::On,
+        true
+    ));
+
+    // 2. Even when `load` is `Tier::Clear` (`admit: true`) or `Load::Unknown` (for
+    //    instance `host_load.govern_launches == false`), an active steward critical
+    //    slowdown holds slots at 0 (`refuses = true`), blocks overflow past `wait_max`,
+    //    and grants immediately once critical slowdown clears.
+    struct StewardFake {
+        inner: Fake,
+        steward_until_ns: Option<u64>,
+    }
+    impl Ports for StewardFake {
+        fn load(&mut self) -> Load {
+            self.inner.load()
+        }
+        fn steward_refusal(&mut self) -> Option<String> {
+            self.steward_until_ns
+                .filter(|until| self.inner.now < *until)
+                .map(|_| {
+                    "Manvi system steward critical slowdown is active (severe load: swap)".into()
+                })
+        }
+        fn now_ns(&self) -> u64 {
+            self.inner.now_ns()
+        }
+        fn sleep(&mut self, how_long: Duration) {
+            // The inner fake's clock, advanced the same way: no real wait.
+            self.inner.now += how_long.as_nanos() as u64;
+            self.inner.slept += how_long;
+        }
+        fn say(&mut self, line: &str) {
+            self.inner.say(line);
+        }
+    }
+
+    let (_temp, dir) = dir();
+    let mut pol = policy();
+    pol.wait_max = Duration::from_secs(10);
+    pol.wait_hard = Duration::from_secs(60);
+
+    // Steward stays active past `wait_max` (10s) and clears at 20s -> does NOT overflow
+    // at 10s, then grants a slot at >= 20s!
+    let start_ns = 1_000_000_000;
+    let mut ports = StewardFake {
+        inner: Fake::new(verdict(Tier::Clear, true)),
+        steward_until_ns: Some(start_ns + Duration::from_secs(20).as_nanos() as u64),
+    };
+    let acquired = acquire(&dir, &mine(start_ns), &pol, &mut ports).unwrap();
+    let Acquired::Granted { grant, waited, .. } = acquired else {
+        panic!("expected Granted after steward slowdown cleared, got {acquired:?}");
+    };
+    assert!(
+        waited >= Duration::from_secs(20),
+        "must wait until steward slowdown clears rather than overflowing at 10s: {waited:?}"
+    );
+    assert!(ports
+        .inner
+        .said
+        .iter()
+        .any(|line| line.contains("Manvi system steward critical slowdown is active")));
+    drop(grant);
+
+    // Steward stays active past `wait_hard` (60s) even with `Load::Unknown` -> `GaveUp`!
+    let mut hard_ports = StewardFake {
+        inner: Fake::new(Load::Unknown("govern_launches switched off".into())),
+        steward_until_ns: Some(u64::MAX),
+    };
+    let gave_up = acquire(&dir, &mine(hard_ports.now_ns()), &pol, &mut hard_ports).unwrap();
+    assert!(
+        matches!(gave_up, Acquired::GaveUp { waited } if waited >= Duration::from_secs(60)),
+        "expected GaveUp at wait_hard under persistent steward critical slowdown, got {gave_up:?}"
+    );
+
+    // Terminal PATH injection predicate: non-hook agents (Codex/CLI) must still receive
+    // `lease-bin` on PATH when `LeaseMode::Off` and steward `slow_critical` is enabled,
+    // so an active steward slowdown mid-session is never bypassed.
+    assert!(!should_inject_lease_bin(LeaseMode::Off, false));
+    assert!(should_inject_lease_bin(LeaseMode::Off, true));
+    assert!(should_inject_lease_bin(LeaseMode::On, false));
+}

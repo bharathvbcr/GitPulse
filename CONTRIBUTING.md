@@ -269,7 +269,7 @@ flowchart TD
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares GitPulse's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
-| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 133 contracts (351 structs, 2454 fields) |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 140 contracts (371 structs, 2610 fields) |
 | `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
@@ -335,6 +335,7 @@ several were added after the drift had already happened.
 | `bun-audit-ignores-contract` | An advisory ignore that stops being a decision. `bun audit --ignore=<GHSA>` accepts a finding no release can clear, and an ignore with no reason and no end date is how a gate quietly stops gating. Each must be one GHSA id, named in the comment above it with why it is safe, and carry a `revisit by YYYY-MM-DD` that has not passed; a blanket `--audit-level` or `--prod` (which would hide every other advisory) is refused. Each rule is shown failing on its own mutation. |
 | `native-test-quiet-contract` | A native test putting an icon in the Dock and a menu bar on the screen of whoever ran it. Tao launches a real loop as a Regular application and activates it unless told otherwise, even when every window the test builds is hidden, so a `harness = false` target that runs one must call `tests/common/quiet_app.rs` between `build` and `run`. A detector self-test pins the shape before and after, because a scan that finds no targets passes. |
 | `ci-shards-contract` | The macOS Rust shards dropping part of the suite while every job is green. The shard count is spelled in the matrix, the `--partition hash:M/N` denominator, the job name, the completeness check's `--shards` and its report list, and none of them is compiled against another: a matrix of two with a denominator of three never runs a third of the tests. It also pins that a shard runs under the serial `ci` nextest profile, that the completeness job runs after a red shard rather than only a green one, and that Linux and Windows keep the in-process `--test-threads=1` gate. Each rule is shown failing on its own mutation. |
+| `cloud-bootstrap` | The cloud/SSH DevMap bootstrap (`scripts/cloud/`) claiming more than it did. The `SessionStart` hook must stay silent off-cloud and say DevMap is unavailable rather than nothing, and `setup.sh` must install from the `DEVMAP_REV` in `ci.yml` and never print `AVAILABLE` for an install that did not happen. |
 | `devmap-pin-contract` | A stale or loose pin on the `devmap` CLI that CI builds for the tests driving it. The pin only protects anything while it is a full 40-character commit SHA (a branch or an abbreviation moves under the cache key), every `cargo install --git` uses it with `--locked`, the cache key moves with it, and every job that installs the CLI then runs `check:vendor-schema`, so a re-vendor that bumps the store schema fails the job instead of passing on an older CLI. The schema number the workflow comment states is also held against the vendored `CURRENT_SCHEMA_VERSION`. Each rule is shown failing on its own mutation. |
 | `update-privacy-contract` | The release check gaining a repository path or a credential flag, which SECURITY.md says it never sends. |
 | `diagnostics-contract` | The crash log going quiet. The panic hook captures its logger at install time, so installing it before `logging::init()` binds nothing and every later panic is recorded where no one can read it — a hook that looks installed and is inert. It also pins the reverse gap: a new `[[bin]]` inherits neither the logger nor the hook and is absent from `LOGGED_BINARIES`, so it writes no durable log, and nothing about a silent binary looks wrong. Both lists are derived from Cargo.toml rather than restated here. |
@@ -659,17 +660,27 @@ can be reviewed in one sitting.
 
 ### Licence of contributions
 
-GitPulse is under the [MIT License](LICENSE), and a contribution is accepted
-under that same licence. Signing off a commit adds a `Signed-off-by:` line with
-your name and email, which states that you agree to the
-[Developer Certificate of Origin 1.1](https://developercertificate.org/): you
-wrote the change, or otherwise have the right to submit it under the
-project's licence. Use your real name. A pull request with an unsigned commit
-is asked to amend it (`git commit --amend -s`, or
-`git rebase --signoff main` for several commits).
+GitPulse is dual-licensed under the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your
+option (see [LICENSE](LICENSE)).
 
-The GitPulse name and logo are not covered by the MIT License; see
-[TRADEMARKS.md](TRADEMARKS.md).
+**Inbound = outbound (Apache-2.0 §5):** Unless you explicitly state otherwise,
+any contribution intentionally submitted for inclusion in this work by you, as
+defined in the Apache-2.0 license, shall be dual-licensed as above
+(`MIT OR Apache-2.0`), without any additional terms or conditions.
+
+**Developer Certificate of Origin (DCO 1.1):** We use the
+[Developer Certificate of Origin 1.1](DCO.txt)
+([developercertificate.org](https://developercertificate.org/)) rather than a
+separate Contributor License Agreement (CLA). Signing off a commit adds a
+`Signed-off-by:` line with your real name and email, certifying that you wrote
+the change or otherwise have the right to submit it under the project's
+open-source licenses. A pull request with an unsigned commit is asked to amend
+it (`git commit --amend -s --no-edit`, or `git rebase --signoff main` for
+several commits).
+
+The GitPulse name and logo are not covered by the MIT or Apache-2.0 licenses;
+see [TRADEMARKS.md](TRADEMARKS.md).
 
 ### Looking for something to work on?
 

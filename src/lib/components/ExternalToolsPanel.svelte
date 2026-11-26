@@ -23,6 +23,7 @@
   } from "../tools/externalTools";
   import { openSetupWizard } from "../tools/onboardingStore";
   import { confirmAndUninstall } from "../tools/confirmUninstall";
+  import BrandMark from "./BrandMark.svelte";
 
   let {
     /** When set, only this tool's row is shown (Map → devmap, MANVI → manvi). */
@@ -127,7 +128,12 @@
       >
         <div class="flex items-start gap-2">
           <div class="min-w-0 flex-1">
-            <div class="text-textPrimary text-meta font-medium font-mono">{row.tool}</div>
+            <div class="flex items-center gap-1.5 text-textPrimary text-meta font-medium font-mono">
+              {#if row.tool === "manvi"}
+                <BrandMark mark="manvi" size={14} class="shrink-0" />
+              {/if}
+              <span>{row.tool}</span>
+            </div>
             <div class="text-textMuted text-micro font-mono break-all leading-snug">
               {toolStatusSummary(row)}
             </div>

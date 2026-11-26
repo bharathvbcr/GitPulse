@@ -17,10 +17,15 @@ fn sent(event: &str, input: &HookInput) -> String {
         .set(bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
     let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
     let sink = seen.clone();
-    let result = run_notify(Some(event), input, move |_, payload| {
-        *sink.lock().unwrap() = Some(payload.to_owned());
-        Ok(())
-    });
+    let result = run_notify(
+        Some(event),
+        input,
+        move |_, payload| {
+            *sink.lock().unwrap() = Some(payload.to_owned());
+            Ok(())
+        },
+        INJECTED_TRANSPORT,
+    );
     assert!(result.is_ok(), "{result:?}");
     let payload = seen.lock().unwrap().clone().expect("a report was sent");
     payload
