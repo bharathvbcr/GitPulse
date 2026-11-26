@@ -849,7 +849,7 @@
           button("Push release tag…", releases()).click();
           await settle();
           check("opening it suggests the next patch and states what the gate will still require", () =>
-            !!$('input[aria-label="Release tag"]', releases()) && words(releases()).includes("GitPulse will still require a clean, fully synchronized default branch"));
+            !!$('input[aria-label="Release tag"]', releases()) && words(releases()).includes("Waylode will still require a clean, fully synchronized default branch"));
           await input($('input[aria-label="Release tag"]', releases()), "v3.0.1");
           check("without the confirmation, Push release tag is disabled and nothing is sent", () =>
             button("Push release tag", releases()).disabled && count("cmd_publish_release") === 0);

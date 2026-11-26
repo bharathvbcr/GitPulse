@@ -346,7 +346,7 @@
     await flip(refreshRow());
     publishNativeRenderingStatus({ liquid_glass: { requested: false, active: false, reason: null }, high_refresh: { requested: true, active: true, reason: null } });
     await settle();
-    check("turning 120 Hz on after launch says it waits for the next launch, not In effect", () => outcomeOf(refreshRow()) === "restart" && refreshRow().textContent.includes("next time GitPulse starts") && !refreshRow().textContent.includes("In effect."));
+    check("turning 120 Hz on after launch says it waits for the next launch, not In effect", () => outcomeOf(refreshRow()) === "restart" && refreshRow().textContent.includes("next time Waylode starts") && !refreshRow().textContent.includes("In effect."));
     publishNativeRenderingStatus({ liquid_glass: { requested: false, active: false, reason: null }, high_refresh: { requested: true, active: false, reason: "Frame pacing is unchanged: stuck." } });
     await settle();
     check("a refusal still wins over the restart note", () => outcomeOf(refreshRow()) === "refused");

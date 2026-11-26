@@ -1855,7 +1855,15 @@ fn build_pty_command(
     for (key, value) in env.into_iter().flatten() {
         cmd.env(key, value);
     }
-    cmd.cwd(cwd);
+    // The shell is a child like git: it gets the ordinary spelling of its
+    // directory, not the `\\?\C:\...` one the repository's identity is kept in.
+    // `cmd.exe` refuses a `\\?\` working directory ("UNC paths are not
+    // supported") and starts in C:\Windows instead (E2E run on 17e968915:
+    // the prompt read `C:\Windows>`). Identity off Windows.
+    match cwd.to_str() {
+        Some(text) => cmd.cwd(crate::engine::process::plain_path_text(text)),
+        None => cmd.cwd(cwd),
+    }
     PtyCommand { cmd, resolved }
 }
 
@@ -8235,6 +8243,40 @@ mod tests {
         assert!(list_sessions(&state).unwrap().is_empty());
     }
 
+    /// A shell starts in the plain spelling of its directory. Handed the
+    /// `\\?\C:\...` spelling a repository is admitted under, `cmd.exe` refuses
+    /// it ("UNC paths are not supported") and starts in C:\Windows (E2E run
+    /// on 17e968915: the prompt read `C:\Windows>`).
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_shell_starts_in_the_plain_spelling_of_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            verbatim.to_string_lossy().starts_with(r"\\?\"),
+            "the premise: canonical paths are verbatim here: {verbatim:?}"
+        );
+        let PtyCommand { cmd, .. } = build_pty_command(
+            "cmd.exe",
+            true,
+            None,
+            None,
+            &verbatim,
+            &PtyEnv::from_process(),
+        );
+        let cwd = cmd
+            .get_cwd()
+            .expect("the shell is given a working directory")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!cwd.starts_with(r"\\?\"), "{cwd}");
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            verbatim,
+            "the plain spelling names the same directory"
+        );
+    }
+
     /// Spawns `cmd.exe /c <line>` in a trusted scratch repo.
     #[cfg(windows)]
     fn spawn_cmd(state: &TerminalSessions, dir: &std::path::Path, line: &str) -> TerminalSpawned {
@@ -8260,14 +8302,7 @@ mod tests {
 
     #[cfg(windows)]
     fn session_gone_within(state: &TerminalSessions, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
-            if list_sessions(state).unwrap().is_empty() {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        list_sessions(state).unwrap().is_empty()
+        crate::test_support::wait_until(within, || list_sessions(state).unwrap().is_empty())
     }
 
     /// ConPTY ends its output only when its console closes, which used to wait

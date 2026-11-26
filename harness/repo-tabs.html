@@ -831,7 +831,7 @@
           drag("dragstart", dragged, "left", dragTransfer);
           check("a drag carries the tab id under both the plain and the app-specific type", () => {
             const id = rec(API).id;
-            return dragTransfer.getData("text/plain") === id && dragTransfer.getData("application/x-gitpulse-repo-tab") === id;
+            return dragTransfer.getData("text/plain") === id && dragTransfer.getData("application/x-waylode-repo-tab") === id;
           });
           drag("dragover", shellOf(MAIN), "left", dragTransfer);
           drag("drop", shellOf(MAIN), "left", dragTransfer);

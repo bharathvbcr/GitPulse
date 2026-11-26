@@ -3371,6 +3371,32 @@ mod real_signals {
         let child = Sleeper::spawn();
         let (pid, start) = (child.pid(), child.start_us());
         assert_eq!(OsActuator.is_background(pid, start), Some(false));
+        // Linux slows a process only when it could put it back: lowering nice
+        // again needs the target's RLIMIT_NICE to cover nice 0 (20), or root.
+        // A host without that (the CI runner's limit is 0) refuses, says why,
+        // and leaves the process at normal priority, which is the answer to
+        // check there.
+        #[cfg(target_os = "linux")]
+        {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: reads this process's limit (the child inherits it) into a local.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut limit) }, 0);
+            // SAFETY: `geteuid` has no preconditions.
+            let privileged = unsafe { libc::geteuid() } == 0;
+            if !privileged && limit.rlim_cur < 20 {
+                let refused = OsActuator.set_background(pid, start, true).unwrap_err();
+                assert!(refused.contains("RLIMIT_NICE"), "{refused}");
+                assert_eq!(
+                    OsActuator.is_background(pid, start),
+                    Some(false),
+                    "a refused slowing leaves the process at normal priority"
+                );
+                return;
+            }
+        }
         assert_eq!(OsActuator.set_background(pid, start, true), Ok(true));
         assert_eq!(OsActuator.is_background(pid, start), Some(true));
         assert_eq!(
@@ -3479,15 +3505,22 @@ mod real_signals {
     /// The identification of an agent's tool shell reads `/bin/zsh`'s own
     /// arguments, and `/bin/zsh` is an Apple platform binary: macOS hides the
     /// *environment* of those, and this test is what shows it does not hide
-    /// the arguments.
+    /// the arguments. Elsewhere the shell is whatever the host has (the
+    /// Ubuntu runner has no zsh); the identification reads only the argument
+    /// mark, never the shell's name.
     #[test]
     fn a_shell_started_with_a_tool_snapshot_is_identified_through_real_argv() {
+        let shell = if cfg!(target_os = "macos") {
+            "/bin/zsh"
+        } else {
+            "/bin/sh"
+        };
         let spawn = |script: &str| {
             Sleeper(
-                std::process::Command::new("/bin/zsh")
+                std::process::Command::new(shell)
                     .args(["-c", script])
                     .spawn_locked()
-                    .expect("zsh"),
+                    .unwrap_or_else(|error| panic!("{shell}: {error}")),
             )
         };
         let tool = spawn("sleep 60; echo # source /x/.claude/shell-snapshots/snapshot-zsh-1-a.sh");

@@ -12,6 +12,7 @@ import {
   detectDisplayBackend,
   main,
   parseArgs,
+  ptyProbeForShell,
   remainingBudgetMs,
   webviewOptionsFor,
   windowsLoggingDriver,
@@ -209,6 +210,24 @@ describe("e2e-driver-smoke", () => {
     const winPs = buildPtyProbeCommand(prefix, suffix, "win32", { COMSPEC: "powershell.exe" });
     expect(winPs.join("")).not.toContain(marker);
     expect(winPs[0].endsWith("\r") && !winPs[0].endsWith("\r\n")).toBe(true);
+  });
+
+  it("reads Windows' ComSpec in any case, the way the app's default shell does", () => {
+    // Windows spells it `ComSpec`; a copied environment object is not
+    // case-insensitive, and the probe fell back to PowerShell syntax for the
+    // cmd.exe the app started (E2E run on 17e968915).
+    const viaComSpec = buildPtyProbeCommand("P_", "s", "win32", { ComSpec: "C:\\Windows\\system32\\cmd.exe" });
+    expect(viaComSpec).toEqual(ptyProbeForShell("P_", "s", "win32", "cmd.exe"));
+    expect(buildPtyProbeCommand("P_", "s", "win32", {})).toEqual(ptyProbeForShell("P_", "s", "win32", "powershell.exe"));
+  });
+
+  it("types for the shell the app reports it started", () => {
+    const cmd = ptyProbeForShell("P_", "s", "win32", "C:\\Windows\\system32\\cmd.exe");
+    expect(cmd.join("")).toContain("%_gp_m%");
+    for (const shell of ["powershell.exe", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"]) {
+      expect(ptyProbeForShell("P_", "s", "win32", shell)[0]).toContain("Write-Output");
+    }
+    expect(ptyProbeForShell("P_", "s", "linux", "/bin/zsh")[0]).toContain("printf");
   });
 
   it("matches every CLI invocation in .github/workflows/e2e-desktop.yml", () => {

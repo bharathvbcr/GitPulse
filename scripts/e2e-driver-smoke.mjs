@@ -461,8 +461,29 @@ function commandAvailable(program) {
  */
 export function buildPtyProbeCommand(prefix, suffix, platform = process.platform, env = process.env) {
   if (platform === "win32") {
-    const comspec = (env.COMSPEC || "powershell.exe").toLowerCase();
-    if (comspec.includes("powershell") || comspec.includes("pwsh")) {
+    // The app's own default (`default_shell`): COMSPEC, else PowerShell. Windows
+    // spells it `ComSpec`, and a copied environment object is not
+    // case-insensitive the way `process.env` is, so look it up by any case.
+    const key = Object.keys(env).find((name) => name.toUpperCase() === "COMSPEC");
+    return ptyProbeForShell(prefix, suffix, platform, (key && env[key]) || "powershell.exe");
+  }
+  return ptyProbeForShell(prefix, suffix, platform, "");
+}
+
+/**
+ * [`buildPtyProbeCommand`] for the shell the app reports it started
+ * (`cmd_terminal_spawn`'s `shell`): PowerShell and cmd.exe read different
+ * syntax, and typing the wrong one only prints an error.
+ * @param {string} prefix
+ * @param {string} suffix
+ * @param {NodeJS.Platform} platform
+ * @param {string} shell
+ * @returns {string[]}
+ */
+export function ptyProbeForShell(prefix, suffix, platform, shell) {
+  if (platform === "win32") {
+    const name = shell.toLowerCase();
+    if (name.includes("powershell") || name.includes("pwsh")) {
       return [`Write-Output ("${prefix}" + "${suffix}")\r`];
     }
     return [`set "_gp_m=${suffix}"\r`, `echo ${prefix}%_gp_m%\r`];
@@ -940,11 +961,20 @@ async function runSmoke(opts) {
       const suffix = randomUUID().slice(0, 8);
       const marker = `${prefix}${suffix}`;
       const probeLines = buildPtyProbeCommand(prefix, suffix, process.platform, env);
+      // On Windows the page types for the shell the app reports it started.
+      const probeByShell =
+        process.platform === "win32"
+          ? {
+              powershell: ptyProbeForShell(prefix, suffix, "win32", "powershell.exe"),
+              cmd: ptyProbeForShell(prefix, suffix, "win32", "cmd.exe"),
+            }
+          : null;
       const result = await client.executeAsyncScript(
         `
         const repoPath = arguments[0];
         const marker = arguments[1];
-        const probeLines = arguments[2];
+        const defaultProbeLines = arguments[2];
+        const probeByShell = arguments[3];
         const done = arguments[arguments.length - 1];
         (async () => {
           let sessionId = null;
@@ -993,6 +1023,10 @@ async function runSmoke(opts) {
               onOutput: "__CHANNEL__:" + cbId,
             });
             sessionId = spawned.id;
+            const shellName = String(spawned.shell || "");
+            const probeLines = probeByShell
+              ? (/powershell|pwsh/i.test(shellName) ? probeByShell.powershell : probeByShell.cmd)
+              : defaultProbeLines;
             // Wait briefly for initial shell prompt/banner (cold cmd.exe/PowerShell
             // on Windows can take >400ms before reading ConPTY input).
             const readyDeadline = Date.now() + 3000;
@@ -1043,7 +1077,7 @@ async function runSmoke(opts) {
           }
         })();
         `,
-        [repoAlpha, marker, probeLines],
+        [repoAlpha, marker, probeLines, probeByShell],
       );
       if (!result?.ok) throw new Error(result?.error ?? "Terminal PTY round-trip failed");
       await snap("03-terminal-pty");

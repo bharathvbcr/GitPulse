@@ -1023,14 +1023,20 @@ fn dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back() {
     // so for a moment the queue can still be full of them: a write in that
     // moment is refused (nothing delivered). The slots must come back within
     // a prompt answer, not be held for good.
-    loop {
-        match write_now(&handle, &id, token(2, 0)) {
-            Err(message) if message.contains("queue is full") && after.elapsed() < prompt() => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            result => break result.unwrap(),
+    let mut refused = None;
+    let through = wait_until(prompt(), || match write_now(&handle, &id, token(2, 0)) {
+        Ok(()) => true,
+        Err(message) if message.contains("queue is full") => {
+            refused = Some(message);
+            false
         }
-    }
+        Err(other) => panic!("the write after the skipped jobs failed: {other}"),
+    });
+    assert!(
+        through,
+        "the skipped jobs' slots did not come back within {:?}: {refused:?}",
+        prompt()
+    );
     println!(
         "write after {INPUT_QUEUE_CAPACITY} skipped jobs took {:?}",
         after.elapsed()

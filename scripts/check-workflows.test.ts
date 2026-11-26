@@ -438,6 +438,21 @@ describe("check:workflows", () => {
     expect(windows).toContain("retention-days: 14");
   });
 
+  it("never lets a runtime-directory cleanup replace a Linux E2E step's own result", () => {
+    // D-Bus activated the document portal, which FUSE-mounted
+    // $XDG_RUNTIME_DIR/doc; the trap's `rm -rf` failed on the live mount and
+    // failed a step whose tests had all passed (run on 17e968915).
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const cleanups = [...e2e.matchAll(/cleanup\(\) \{\n([\s\S]*?)\n\s*\}\n\s*trap cleanup EXIT/g)].map((m) => m[1]);
+    expect(cleanups.length).toBeGreaterThanOrEqual(3);
+    for (const body of cleanups) {
+      expect(body).toMatch(/rc=\$\?/);
+      expect(body).toMatch(/fusermount3? -u "\$XDG_RUNTIME_DIR\/doc"/);
+      expect(body).toMatch(/rm -rf "\$XDG_RUNTIME_DIR" [^\n]*\|\|/);
+      expect(body.trimEnd().endsWith('exit "$rc"')).toBe(true);
+    }
+  });
+
   it("runs the Windows tauri-driver smoke de-elevated, after proving the de-elevation carries", () => {
     // WebView2 150+ drops WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS for an elevated
     // host, so an elevated smoke never gets --remote-debugging-port.

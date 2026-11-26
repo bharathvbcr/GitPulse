@@ -177,7 +177,13 @@ jobs:
             fi
             kill "$wpid" 2>/dev/null || true
             wait "$wpid" 2>/dev/null || true
-            rm -rf "$XDG_RUNTIME_DIR"
+            # D-Bus may activate the document portal, which FUSE-mounts
+            # $XDG_RUNTIME_DIR/doc; rm cannot remove a live mount ("Is a
+            # directory"), and a cleanup must never replace the step's own
+            # result, so the step exits with what it ran to.
+            fusermount3 -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || fusermount -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || echo "::warning::could not remove $XDG_RUNTIME_DIR" >&2
+            exit "$rc"
           }
           trap cleanup EXIT
           for _ in $(seq 1 50); do
@@ -253,7 +259,13 @@ jobs:
             fi
             kill "$wpid" 2>/dev/null || true
             wait "$wpid" 2>/dev/null || true
-            rm -rf "$XDG_RUNTIME_DIR"
+            # D-Bus may activate the document portal, which FUSE-mounts
+            # $XDG_RUNTIME_DIR/doc; rm cannot remove a live mount ("Is a
+            # directory"), and a cleanup must never replace the step's own
+            # result, so the step exits with what it ran to.
+            fusermount3 -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || fusermount -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || echo "::warning::could not remove $XDG_RUNTIME_DIR" >&2
+            exit "$rc"
           }
           trap cleanup EXIT
           for _ in $(seq 1 50); do
@@ -309,7 +321,13 @@ jobs:
             fi
             kill "$wpid" 2>/dev/null || true
             wait "$wpid" 2>/dev/null || true
-            rm -rf "$XDG_RUNTIME_DIR"
+            # D-Bus may activate the document portal, which FUSE-mounts
+            # $XDG_RUNTIME_DIR/doc; rm cannot remove a live mount ("Is a
+            # directory"), and a cleanup must never replace the step's own
+            # result, so the step exits with what it ran to.
+            fusermount3 -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || fusermount -u "$XDG_RUNTIME_DIR/doc" 2>/dev/null || true
+            rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || echo "::warning::could not remove $XDG_RUNTIME_DIR" >&2
+            exit "$rc"
           }
           trap cleanup EXIT
           for _ in $(seq 1 50); do
