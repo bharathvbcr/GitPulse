@@ -1,11 +1,12 @@
 //! The spawn budget's observability and churn tests (process side).
 
+use super::gate::RefusalCause;
 use super::{
     is_deferred_under_load, refusal_message, refusal_message_at, shared_budget, with_admission,
     with_background_processes, Admission, BucketLevel, Refusal, RefusingBucket, RunError,
     SpawnGate,
 };
-use crate::test_support::coverage_relaxed;
+use crate::test_support::{coverage_relaxed, wait_until};
 use std::time::{Duration, Instant};
 
 fn level(bucket: RefusingBucket, tokens: u32, floor: u32, burst: u32) -> BucketLevel {
@@ -33,7 +34,10 @@ fn a_refusal_names_the_refusing_bucket_and_its_level() {
     .err()
     .expect("refused");
     assert!(matches!(refusal, Refusal::Refused { .. }), "{refusal:?}");
-    assert_eq!(judged, Some(level(RefusingBucket::Shared, 0, 0, 8)));
+    assert_eq!(
+        judged,
+        Some(RefusalCause::Bucket(level(RefusingBucket::Shared, 0, 0, 8)))
+    );
     let message = refusal_message_at("git status", refusal, judged);
     assert!(
         message.message().ends_with(
@@ -61,7 +65,10 @@ fn a_refusal_names_the_refusing_bucket_and_its_level() {
     .err()
     .expect("shed");
     assert_eq!(refusal, Refusal::Shed);
-    assert_eq!(judged, Some(level(RefusingBucket::Local, 3, 4, 16)));
+    assert_eq!(
+        judged,
+        Some(RefusalCause::Bucket(level(RefusingBucket::Local, 3, 4, 16)))
+    );
     let message = refusal_message_at("git worktree", refusal, judged);
     assert_eq!(
         message,
@@ -191,4 +198,159 @@ fn a_waiter_asleep_for_a_token_still_ends_at_its_deadline_and_on_cancellation() 
             began.elapsed()
         );
     });
+}
+
+/// A reactive read queued behind an older one while every slot is busy is
+/// refused at the same 2 s as ever, but the refusal names the slots: it asked
+/// the rate budget nothing, so the rate-limit sentence would name the wrong
+/// cause. The front keeps its ticket and is admitted once a slot frees.
+#[test]
+fn a_reactive_read_behind_the_line_while_slots_are_full_names_the_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate: &'static SpawnGate = Box::leak(Box::new(
+        SpawnGate::with_rate(1, 8, 1).sharing(Ok(dir.path().join("spawn-budget.v2"))),
+    ));
+    assert!(gate.shared.is_some());
+    let held = with_admission(Admission::Reactive, || {
+        gate.acquire(Instant::now() + Duration::from_secs(30))
+    })
+    .expect("the one slot");
+    let front = std::thread::spawn(move || {
+        with_admission(Admission::Reactive, || {
+            gate.acquire_judged(Instant::now() + Duration::from_secs(10), &|| false)
+        })
+        .is_ok()
+    });
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            gate.state.lock().unwrap().reactive_line.len() == 1
+        }),
+        "the front never queued"
+    );
+    let began = Instant::now();
+    let (refusal, cause) = with_admission(Admission::Reactive, || {
+        gate.acquire_judged(Instant::now() + Duration::from_secs(10), &|| false)
+    })
+    .err()
+    .expect("refused");
+    let waited = began.elapsed();
+    assert!(matches!(refusal, Refusal::Refused { .. }), "{refusal:?}");
+    assert!(
+        waited >= Duration::from_millis(1_900) && waited < coverage_relaxed(Duration::from_secs(3)),
+        "the refusal timing moved: {waited:?}"
+    );
+    assert_eq!(
+        cause,
+        Some(RefusalCause::Line {
+            in_flight: 1,
+            limit: 1,
+            ahead: 1
+        })
+    );
+    let message = refusal_message_at("git status", refusal, cause);
+    let text = message.message();
+    assert!(is_deferred_under_load(text), "{text}");
+    assert_eq!(RunError::classify(text), RunError::Deferred);
+    assert!(text.contains("process slot"), "{text}");
+    assert!(
+        !text.contains("rate limit admitted nothing sooner"),
+        "{text}"
+    );
+    drop(held);
+    assert!(front.join().unwrap(), "the front kept its ticket");
+}
+
+/// The line cause's text at its edges: zero and enormous counts render, both
+/// sentences stay deferrals that `RunError` classifies as such, a line cause never leaks into the rate-limit sentence.
+#[test]
+fn a_line_cause_renders_at_its_edges_and_stays_a_deferral() {
+    let waited = Refusal::Refused {
+        waited: Duration::from_millis(2_004),
+    };
+    for (in_flight, limit, ahead, expected) in [
+        (
+            0,
+            0,
+            0,
+            "no process slot came free (0 of 0 busy, 0 read(s) ahead in line)",
+        ),
+        (
+            16,
+            16,
+            3,
+            "no process slot came free (16 of 16 busy, 3 read(s) ahead in line)",
+        ),
+        (
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            &format!(
+                "no process slot came free ({m} of {m} busy, {m} read(s) ahead in line)",
+                m = usize::MAX
+            ),
+        ),
+        (
+            2,
+            16,
+            1,
+            "1 read(s) ahead in line were still waiting (2 of 16 process slots busy)",
+        ),
+    ] {
+        let cause = Some(RefusalCause::Line {
+            in_flight,
+            limit,
+            ahead,
+        });
+        let message = refusal_message_at("git status", waited, cause);
+        let text = message.message();
+        assert_eq!(
+            text,
+            format!("git status deferred under load after 2.004s: {expected}")
+        );
+        assert!(is_deferred_under_load(text), "{text}");
+        assert_eq!(RunError::classify(text), RunError::Deferred);
+        assert!(!text.contains("admitted nothing sooner"), "{text}");
+    }
+}
+
+/// The rate-limit refusal text is unchanged byte for byte for no cause and for
+/// a bucket cause, and a line cause only rewrites a `Refused`: every other
+/// refusal renders as it does with no cause.
+#[test]
+fn only_a_refused_read_takes_the_line_sentence_and_rate_text_is_unchanged() {
+    let waited = Refusal::Refused {
+        waited: Duration::from_millis(2_004),
+    };
+    assert_eq!(
+        refusal_message_at("git status", waited, None).message(),
+        "git status deferred under load after 2.004s: the git spawn rate limit admitted nothing sooner"
+    );
+    let bucket = Some(RefusalCause::Bucket(level(RefusingBucket::Shared, 0, 0, 8)));
+    assert_eq!(
+        refusal_message_at("git status", waited, bucket).message(),
+        "git status deferred under load after 2.004s: the git spawn rate limit admitted nothing sooner \
+         (shared bucket: 0 token(s), needs more than 0, burst 8)"
+    );
+    let line = Some(RefusalCause::Line {
+        in_flight: 1,
+        limit: 1,
+        ahead: 1,
+    });
+    for other in [
+        Refusal::Shed,
+        Refusal::Cancelled,
+        Refusal::Pressure {
+            reactive: true,
+            cause: None,
+        },
+        Refusal::TimedOut {
+            deadline: Duration::from_secs(1),
+        },
+    ] {
+        assert_eq!(
+            refusal_message_at("git status", other, line),
+            refusal_message_at("git status", other, None),
+            "{other:?}"
+        );
+    }
 }
