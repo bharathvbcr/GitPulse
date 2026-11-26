@@ -39,7 +39,7 @@ fn build_scale_farm() -> ScaleFarm {
     let linked = tempfile::tempdir().expect("linked dir");
     // git cannot create a worktree under a `\\?\` path, which is what
     // `canonicalize` gives on Windows; the plain spelling is canonical too.
-    let plain = gitpulse_lib::engine::process::canonicalize_plain;
+    let plain = waylode_lib::engine::process::canonicalize_plain;
     let repo = plain(main.path()).expect("canonical main");
     let linked_root = plain(linked.path()).expect("canonical linked");
 
