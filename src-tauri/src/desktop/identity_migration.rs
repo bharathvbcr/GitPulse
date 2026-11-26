@@ -216,7 +216,7 @@ fn migrate_ordered_stores<'a>(
         for ((src, dst), has_data) in source_stores
             .iter()
             .zip(target_stores.iter())
-            .zip(active.into_iter())
+            .zip(active)
         {
             if has_data {
                 total_files += copy_store_atomically(&src.path, &dst.path)?;
