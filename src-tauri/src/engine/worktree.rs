@@ -5763,11 +5763,17 @@ struct IntegrateBranchOutcome {
 /// `checkout_holders`, falling back to `in_checkout_merge` only when allowed.
 fn integrate_branch_locked<'a>(
     req: IntegrateBranchRequest<'_>,
-    repo_lock: &'a Mutex<()>,
-    mut guard: std::sync::MutexGuard<'a, ()>,
+    repo_lock: &'a crate::engine::git_writer::RepoMutationLock,
+    mut guard: crate::engine::git_writer::RepoMutationGuard<'a>,
     verify: Option<&mut crate::engine::merge_tree::CandidateVerifier<'_>>,
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
-) -> Result<(IntegrateBranchOutcome, std::sync::MutexGuard<'a, ()>), MergeTeardownError> {
+) -> Result<
+    (
+        IntegrateBranchOutcome,
+        crate::engine::git_writer::RepoMutationGuard<'a>,
+    ),
+    MergeTeardownError,
+> {
     let repo = req.repo;
     let branch = req.branch;
     let target = req.target;
