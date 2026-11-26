@@ -163,6 +163,8 @@ site | src/engine/process/thread_io.rs | settle_or_report | 0 | bounded-poll
 site | src/engine/git_writer.rs | a_cancelled_commit_leaves_no_index_lock | 0 | bounded-poll
 site | src/engine/git_writer.rs | a_cancelled_commit_whose_hook_flooded_leaves_no_index_lock | 0 | bounded-poll
 site | src/engine/git_writer.rs | a_running_hook_is_cancelled_on_request | 0 | bounded-poll
+site | src/engine/git_writer.rs | repo_mutation_lock_hold_child | 0 | bounded-poll
+site | src/engine/git_writer.rs | repo_mutation_lock_serializes_across_processes_and_respects_asker_deadline | 0 | bounded-poll
 site | src/engine/git_writer.rs | stage_retries_while_index_lock_is_held_then_released | 0 | hold
 
 # src/engine/git_writer_commit_graph_adv_tests.rs
