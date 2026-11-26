@@ -236,16 +236,13 @@ fn provision_with(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     crate::harness::guard_command(selected, &refs)
         .map_err(|e| WorkbenchError::new("policy_refused", e))?;
-    // The lane's DevMap store is cloned from the main checkout's (APFS
-    // `clonefile` / Linux `FICLONE`, `repo_root` rebound to the lane), never
-    // left absent. An absent store is not "no index": DevMap's SessionStart
-    // hook answers it with a cold `devmap build` in every new lane — measured
-    // on this repository at ~7.6 s, ~38 CPU-s and ~366 MB per lane, against
-    // ~1.2 s (debug build) and 7–20 MB for this seed, which `devmap build`
-    // then brings up to the lane's tree incrementally with an identical graph
-    // (docs/ZERO_COPY_AGENTIC_WORKTREES.md §7). A zero-copy
-    // pointer is no substitute: the `devmap` binary agents run does not read
-    // `base_store_ref.json`, so the hook cold-builds beside it.
+    // Provision the lane's DevMap store via `DevmapMode::Stacked`, which
+    // publishes an immutable `0444` shared base snapshot + `stack_lease.json`
+    // (`StackedStore::open_if_leased`) without copying `devmap.sqlite`. If the
+    // anchor's store is unready or stacked leasing is unsupported,
+    // `add_worktree_with_devmap` automatically falls back to `DevmapMode::Copy`
+    // (APFS `clonefile` / Linux `FICLONE`, `repo_root` rebound to the lane) so
+    // lanes never fall back to a cold `devmap build`.
     let created = crate::engine::worktree::add_worktree_with_devmap(
         selected,
         &path_text,
@@ -255,7 +252,7 @@ fn provision_with(
         Some(caches),
         // Approved hooks only: an unapproved file is reported, not run.
         true,
-        crate::engine::worktree::DevmapMode::Copy,
+        crate::engine::worktree::DevmapMode::Stacked,
     )
     .map_err(|e| refused(e.into_message()))?;
     let provisioned = Provisioned {
@@ -1188,6 +1185,45 @@ mod tests {
         // And it never shows in the lane's `git status`.
         let porcelain = git_text(lane, &["status", "--porcelain"]).unwrap();
         assert_eq!(porcelain.trim(), "", "seeding dirtied the lane");
+    }
+
+    #[test]
+    fn a_lane_cut_from_a_committed_indexed_checkout_gets_a_stacked_lease() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let _devmap = crate::devmap::cli::bind_test_binary(
+            bin_dir
+                .path()
+                .join("no-devmap")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        crate::test_support::trust_repo(anchor_dir.path());
+        crate::codeintel::tests::commit_and_stamp_head(anchor_dir.path());
+
+        let made = provision_with(
+            anchor_dir.path().to_str().unwrap(),
+            "57ac0001-lease",
+            "Stacked lease lane",
+            false,
+            &with_reader(plenty),
+        )
+        .expect("committed indexed checkout must provision a stacked lane");
+        let lane = Path::new(&made.path);
+        assert!(
+            devmap_extract::paths::stack_lease_path(lane).is_file(),
+            "expected stack_lease.json in {}",
+            lane.display()
+        );
+        assert!(
+            !devmap_query::paths::store_path(lane).exists(),
+            "stacked lane must not copy devmap.sqlite"
+        );
+        let status = crate::codeintel::status(&made.path);
+        assert!(
+            status.available,
+            "stacked lease status must open: {status:?}"
+        );
     }
 
     /// The rebind rewrites only the lane copy's LATEST generation row; every

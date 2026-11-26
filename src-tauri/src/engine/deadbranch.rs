@@ -249,6 +249,10 @@ pub struct DeadbranchScanResult {
     pub squash_merged_count: usize,
     /// Non-fatal diagnostics or warnings encountered during tree comparison
     pub warnings: Vec<String>,
+    /// Read-only inventory of non-standard ref namespaces (`refs/backup/*`, `refs/gitpulse/*`, etc.),
+    /// populated best-effort during scans without deleting any refs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_standard_refs: Option<crate::ops::NonStandardRefInventory>,
 }
 
 /// Result of executing branch cleanup.
@@ -967,6 +971,12 @@ fn scan_branches(
         })
         .collect();
 
+    let non_standard_refs = if only.is_none() {
+        crate::ops::non_standard_ref_inventory(repo_path).ok()
+    } else {
+        None
+    };
+
     Ok(Scan {
         result: DeadbranchScanResult {
             default_branch: default_branch.clone().unwrap_or_else(|| "main".to_string()),
@@ -976,6 +986,7 @@ fn scan_branches(
             merged_count,
             squash_merged_count,
             warnings,
+            non_standard_refs,
         },
         default_branch,
     })
@@ -2589,5 +2600,47 @@ mod tests {
         assert!(refs.contains("refs/heads/keep-new"), "{refs:?}");
         assert!(refs.contains("refs/heads/keep-legacy"), "{refs:?}");
         assert!(!refs.contains("refs/heads/delete-me"), "{refs:?}");
+    }
+
+    #[test]
+    fn scan_stale_branches_populates_non_standard_refs_without_deleting_backup_or_gitpulse_refs() {
+        let (_dir, repo) = seeded_repo();
+        let head = rev(&repo, "HEAD").unwrap();
+        let non_standard = [
+            "refs/backup/old-branch",
+            "refs/gitpulse/proposals/0123456789abcdef/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "refs/gitpulse/turns/turn-1",
+        ];
+        for r in non_standard {
+            git_in(&repo, &["update-ref", r, &head]);
+        }
+
+        let scan = scan_stale_branches(repo.to_str().unwrap(), &DeadbranchConfig::default())
+            .expect("scan_stale_branches");
+        let inv = scan
+            .non_standard_refs
+            .expect("non_standard_refs must be populated");
+        assert_eq!(inv.total_refs, 3, "{inv:?}");
+        let backup = inv
+            .namespaces
+            .iter()
+            .find(|n| n.namespace == "refs/backup")
+            .expect("refs/backup summary");
+        assert_eq!(backup.count, 1);
+        let gitpulse = inv
+            .namespaces
+            .iter()
+            .find(|n| n.namespace == "refs/gitpulse")
+            .expect("refs/gitpulse summary");
+        assert_eq!(gitpulse.count, 2);
+
+        // Read-only inventory must never delete any refs/backup/* or refs/gitpulse/* ref.
+        for r in non_standard {
+            assert_eq!(
+                rev(&repo, r).as_deref(),
+                Some(head.as_str()),
+                "non-standard ref {r} must remain untouched after scan"
+            );
+        }
     }
 }

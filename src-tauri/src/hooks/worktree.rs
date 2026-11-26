@@ -414,12 +414,11 @@ pub(crate) fn create(input: &HookInput, gate: Gate<'_>, progress: &AtomicI32) ->
         // Approved hooks only: an unapproved or changed file runs nothing and
         // says so in `hook_notice`.
         true,
-        // A copy-on-write clone of the anchor's store, rebound to the new
-        // worktree. Not the zero-copy pointer: the `devmap` binary an agent's
-        // session runs does not read `base_store_ref.json`, so a pointer lane
-        // still cold-builds its own index (measured 2026-11-06). Skipped, and
-        // said, under low disk.
-        DevmapMode::Copy,
+        // Zero-copy canonical `StackedStore` lease (`stack_lease.json` +
+        // sealed `0444` shared base snapshot) with automatic `DevmapMode::Copy`
+        // fallback if stacked provisioning is skipped or unsupported by the
+        // anchor (skipped, and said, under low disk).
+        DevmapMode::Stacked,
     ) {
         Ok(created) => created,
         Err(error) => {

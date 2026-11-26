@@ -2769,6 +2769,26 @@ fn before_publish_hook() {
 }
 
 /// One listing with no sharing: what [`list_worktrees_scanned`] runs.
+/// True when a `git worktree list` entry is Waylode's internal pooled
+/// verification scratch checkout (`<common>/gitpulse/verify-scratch/worktree`).
+/// Hidden from user/agent worktree listings so it is never surfaced in the UI
+/// or pruned by `waylode-worktree prune`.
+fn is_internal_verify_scratch(entry: &ParsedWorktree) -> bool {
+    if entry.branch.is_some() {
+        return false;
+    }
+    let path = Path::new(&entry.path);
+    let mut comps = path.components().rev();
+    matches!(
+        (comps.next(), comps.next(), comps.next()),
+        (
+            Some(std::path::Component::Normal(wt)),
+            Some(std::path::Component::Normal(scratch)),
+            Some(std::path::Component::Normal(gp)),
+        ) if wt == "worktree" && scratch == "verify-scratch" && gp == "gitpulse"
+    )
+}
+
 fn scan_listing(
     repo_path: &str,
     depth: ScanDepth,
@@ -2776,7 +2796,10 @@ fn scan_listing(
 ) -> Result<Vec<WorktreeInfo>, CommandError> {
     let repo = validate_repo(repo_path)?;
     let pass = ScanPass::asked_at(not_before);
-    let parsed = read_worktree_entries(&repo)?;
+    let parsed: Vec<ParsedWorktree> = read_worktree_entries(&repo)?
+        .into_iter()
+        .filter(|entry| !is_internal_verify_scratch(entry))
+        .collect();
     let member_paths: Vec<&str> = parsed
         .iter()
         .filter(|entry| !entry.is_bare)
@@ -4598,16 +4621,39 @@ pub fn add_worktree_with_devmap(
         crate::sysload::free_bytes as crate::sysload::FreeSpace,
         |s| s.free_space,
     );
-    let low_space = devmap == DevmapMode::Copy
+    let low_space = matches!(devmap, DevmapMode::Copy | DevmapMode::Stacked)
         && matches!(
             crate::engine::cow_clone::read_free(free_space, target),
             crate::sysload::Reading::Value(left) if left < crate::sysload::LOW_DISK_FLOOR
         );
     let provision = || match devmap {
         DevmapMode::None => DevmapOutcome::NotRequested,
-        DevmapMode::Stacked => DevmapOutcome::from_provision(
-            crate::codeintel::provision_worktree_devmap_stacked(&anchor, target),
-        ),
+        DevmapMode::Stacked => {
+            let stacked = DevmapOutcome::from_provision(
+                crate::codeintel::provision_worktree_devmap_stacked(&anchor, target),
+            );
+            match stacked {
+                outcome @ DevmapOutcome::Provisioned { .. } => outcome,
+                DevmapOutcome::Skipped { reason } | DevmapOutcome::Failed { error: reason } => {
+                    log::info!(
+                        target: "worktree",
+                        "stacked DevMap lease unavailable for {} ({reason}); falling back to Copy",
+                        target.display()
+                    );
+                    if low_space {
+                        DevmapOutcome::Skipped {
+                            reason: "skipped local devmap clone fallback under low disk"
+                                .to_string(),
+                        }
+                    } else {
+                        DevmapOutcome::from_provision(crate::codeintel::provision_worktree_devmap(
+                            &anchor, target,
+                        ))
+                    }
+                }
+                DevmapOutcome::NotRequested => DevmapOutcome::NotRequested,
+            }
+        }
         DevmapMode::ZeroCopy => DevmapOutcome::from_provision(
             crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target),
         ),
@@ -5962,6 +6008,48 @@ fn integrate_branch_locked<'a>(
     .parse()
     .map_err(|_| format!("git did not report how many commits {branch} adds to {target}"))?;
 
+    if let Some(matched) = crate::ledger::land_identity::check_already_landed(
+        repo,
+        &target_ref,
+        &merged_tip,
+        &before_oid,
+    )? {
+        if let Some(reverted_by) = matched.reverted_by {
+            return Err(MergeTeardownError::Refused {
+                message: format!(
+                    "{branch} ({merged_tip}) already landed on {target} as {} (AlreadyLanded), \
+                     but that landing was reverted by {reverted_by} (reverted_by={reverted_by}); \
+                     nothing was merged.",
+                    matched.landed_oid
+                ),
+            });
+        }
+        if let Err(err) = crate::engine::land_proposals::drop_proposal(repo, target, &merged_tip) {
+            log::warn!(
+                target: "worktree",
+                "failed to drop proposal ref for already-landed {target}/{merged_tip}: {}",
+                err.message()
+            );
+        }
+        return Ok((
+            IntegrateBranchOutcome {
+                before_oid,
+                base_oid,
+                merged_tip,
+                commits_merged,
+                candidate_oid: Some(matched.landed_oid.clone()),
+                squashed_commit: req.squash.then_some(matched.landed_oid.clone()),
+                checkout_advanced: false,
+                checkout_fallback: false,
+                checkout_note: Some(format!(
+                    "AlreadyLanded: {branch} already landed on {target} as {}",
+                    matched.landed_oid
+                )),
+            },
+            guard,
+        ));
+    }
+
     if req.check_six_point {
         let check = verify_branch_integration(repo, branch, target)?;
         if check.is_integrated {
@@ -6140,15 +6228,38 @@ fn integrate_branch_locked<'a>(
         checkout_note = Some(crate::engine::merge_tree::fallback_note());
     }
 
-    let squashed_commit = if req.squash {
-        match candidate_oid.as_deref() {
-            Some(cand) if cand != before_oid => Some(cand.to_string()),
-            Some(_) => None,
-            None => git_text(repo, &["rev-parse", "--verify", target_ref.as_str()])
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|tip| tip != &before_oid),
+    let landed_oid = candidate_oid.clone().or_else(|| {
+        git_text(repo, &["rev-parse", "--verify", target_ref.as_str()])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|tip| !tip.is_empty())
+    });
+
+    if let Some(ref oid) = landed_oid {
+        let _ = crate::devmap::init::ensure_dir_excluded(
+            repo,
+            ".devcouncil",
+            "# Added by GitPulse ledger",
+        );
+        if let Err(err) =
+            crate::ledger::land_identity::record_land_identity(repo, &target_ref, &merged_tip, oid)
+        {
+            log::warn!(
+                target: "worktree",
+                "merged {branch} into {target}, but failed to record land identity in ledger: {err}"
+            );
         }
+    }
+    if let Err(err) = crate::engine::land_proposals::drop_proposal(repo, target, &merged_tip) {
+        log::warn!(
+            target: "worktree",
+            "merged {branch} into {target}, but failed to drop proposal ref: {}",
+            err.message()
+        );
+    }
+
+    let squashed_commit = if req.squash {
+        landed_oid.filter(|tip| tip != &before_oid)
     } else {
         None
     };
@@ -17593,6 +17704,60 @@ some-future-field whatever
     }
 
     #[test]
+    fn add_worktree_with_stacked_devmap_falls_back_to_copy_when_stacked_unavailable() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        // `repo_with_one_generation` has `head_sha = "fixture"` (not a full commit
+        // id), so `provision_worktree_devmap_stacked` fails `BaseKey::new` and
+        // `DevmapMode::Stacked` must fall back automatically to `Copy`.
+        let anchor_fixture = crate::codeintel::tests::repo_with_one_generation();
+        let repo_dir = anchor_fixture.path().to_path_buf();
+        crate::test_support::trust_repo(&repo_dir);
+        git_text(&repo_dir, &["add", "src"]).unwrap();
+        git_text(
+            &repo_dir,
+            &[
+                "-c",
+                "user.name=Fallback Test",
+                "-c",
+                "user.email=fallback@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+
+        let wt = sandbox.path().join("wt-stacked-fallback");
+        let created = add_worktree_with_devmap(
+            repo_dir.to_str().unwrap(),
+            wt.to_str().unwrap(),
+            Some("feat/stacked-fallback"),
+            None,
+            false,
+            None,
+            false,
+            DevmapMode::Stacked,
+        )
+        .expect("add_worktree_with_devmap Stacked fallback");
+
+        assert_eq!(
+            created.devmap,
+            DevmapOutcome::Provisioned { zero_copy: false }
+        );
+        assert!(
+            devmap_query::paths::store_path(&wt).is_file(),
+            "expected Copy fallback devmap.sqlite in {}",
+            wt.display()
+        );
+        assert!(
+            !devmap_extract::paths::stack_lease_path(&wt).exists(),
+            "fallback Copy must not leave a stack_lease.json"
+        );
+    }
+
+    #[test]
     fn add_worktree_propagates_claude_account_marker_with_clean_git_status_and_info_exclude() {
         let sandbox = tempfile::TempDir::new().unwrap();
         let main = sandbox.path().join("main");
@@ -17811,6 +17976,212 @@ some-future-field whatever
             "work\n",
             "new worktree created from linked worktree must inherit rotated canonical seat from main checkout"
         );
+    }
+
+    #[test]
+    fn integrate_branch_locked_records_land_identity_drops_proposal_and_detects_already_landed_on_retry(
+    ) {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        diverge_main(&dir);
+        let main_tip = rev(repo, "refs/heads/main");
+        let source_oid = rev(repo, "refs/heads/feature-x");
+
+        let proposal = crate::engine::land_proposals::create_proposal(
+            repo,
+            &crate::engine::land_proposals::CreateProposalRequest {
+                branch: "main".to_string(),
+                tip_oid: main_tip.clone(),
+                source_commit_oid: source_oid.clone(),
+                resolver: "test-resolver".to_string(),
+                requested_by: "author-wire-core".to_string(),
+                files: vec![crate::engine::land_proposals::ProposedFileInput {
+                    path: "feature.txt".to_string(),
+                    mode: "100644".to_string(),
+                    bytes: b"lane work\n".to_vec(),
+                }],
+                expected_old_oid: None,
+            },
+        )
+        .expect("create proposal");
+        assert_eq!(
+            crate::engine::land_proposals::list_proposals(repo, Some("main"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let repo_lock = repo_mutation_lock(repo);
+        let guard = repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (outcome, guard) = integrate_branch_locked(
+            IntegrateBranchRequest {
+                repo,
+                source_wt: Some(wt.path()),
+                branch: "feature-x",
+                target: "main",
+                squash: true,
+                commit_message: Some("squash feature-x"),
+                expected_tip: Some(&source_oid),
+                config: crate::engine::merge_tree::IntegrateConfig::default(),
+                check_six_point: false,
+                filter_runtime_artifacts_on_source: false,
+                allow_dirty_main_hooks_fallback: true,
+            },
+            &repo_lock,
+            guard,
+            None,
+            &mut allow_all,
+        )
+        .expect("integrate_branch_locked first land");
+        drop(guard);
+
+        let landed_oid = outcome
+            .squashed_commit
+            .clone()
+            .expect("squash commit recorded");
+        assert_eq!(rev(repo, "refs/heads/main"), landed_oid);
+        main_checkout_is_idle(repo);
+
+        // Proposal ref was dropped on successful land.
+        assert!(
+            crate::engine::land_proposals::list_proposals(repo, Some("main"))
+                .unwrap()
+                .is_empty(),
+            "matching proposal ref {} must be dropped on land",
+            proposal.ref_name
+        );
+
+        // Land identity was recorded in `.devcouncil/ledger.sqlite`.
+        let matched = crate::ledger::land_identity::check_already_landed(
+            repo,
+            "refs/heads/main",
+            &source_oid,
+            &landed_oid,
+        )
+        .expect("check_already_landed")
+        .expect("land_identity recorded");
+        assert_eq!(matched.landed_oid, landed_oid);
+        assert_eq!(matched.reverted_by, None);
+
+        // Advance `main` modifying `feature.txt` so a naive re-merge would conflict.
+        std::fs::write(repo.join("feature.txt"), "main updated feature\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "feature.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-qm", "main updates feature.txt"]);
+        let moved_main = rev(repo, "refs/heads/main");
+
+        // Retry `integrate_branch_locked` -> detects AlreadyLanded without re-applying or conflicting.
+        let guard = repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (retry_outcome, guard) = integrate_branch_locked(
+            IntegrateBranchRequest {
+                repo,
+                source_wt: Some(wt.path()),
+                branch: "feature-x",
+                target: "main",
+                squash: true,
+                commit_message: Some("squash feature-x"),
+                expected_tip: Some(&source_oid),
+                config: crate::engine::merge_tree::IntegrateConfig::default(),
+                check_six_point: false,
+                filter_runtime_artifacts_on_source: false,
+                allow_dirty_main_hooks_fallback: true,
+            },
+            &repo_lock,
+            guard,
+            None,
+            &mut allow_all,
+        )
+        .expect("retried integrate_branch_locked detects AlreadyLanded cleanly");
+        drop(guard);
+
+        assert_eq!(rev(repo, "refs/heads/main"), moved_main);
+        assert_eq!(
+            retry_outcome.candidate_oid.as_deref(),
+            Some(landed_oid.as_str())
+        );
+        assert!(
+            retry_outcome
+                .checkout_note
+                .as_deref()
+                .is_some_and(|n| n.contains("AlreadyLanded")),
+            "expected AlreadyLanded note, got {:?}",
+            retry_outcome.checkout_note
+        );
+    }
+
+    #[test]
+    fn integrate_branch_locked_refuses_retry_with_reverted_by_when_landed_commit_was_reverted() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        diverge_main(&dir);
+        let source_oid = rev(repo, "refs/heads/feature-x");
+
+        let repo_lock = repo_mutation_lock(repo);
+        let guard = repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (outcome, guard) = integrate_branch_locked(
+            IntegrateBranchRequest {
+                repo,
+                source_wt: Some(wt.path()),
+                branch: "feature-x",
+                target: "main",
+                squash: true,
+                commit_message: Some("squash feature-x"),
+                expected_tip: Some(&source_oid),
+                config: crate::engine::merge_tree::IntegrateConfig::default(),
+                check_six_point: false,
+                filter_runtime_artifacts_on_source: false,
+                allow_dirty_main_hooks_fallback: true,
+            },
+            &repo_lock,
+            guard,
+            None,
+            &mut allow_all,
+        )
+        .expect("first land");
+        drop(guard);
+
+        let landed_oid = outcome.squashed_commit.expect("landed squash commit");
+        crate::test_support::git_in(repo, &["revert", "--no-edit", &landed_oid]);
+        let revert_oid = rev(repo, "refs/heads/main");
+
+        let guard = repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let err = match integrate_branch_locked(
+            IntegrateBranchRequest {
+                repo,
+                source_wt: Some(wt.path()),
+                branch: "feature-x",
+                target: "main",
+                squash: true,
+                commit_message: Some("squash feature-x"),
+                expected_tip: Some(&source_oid),
+                config: crate::engine::merge_tree::IntegrateConfig::default(),
+                check_six_point: false,
+                filter_runtime_artifacts_on_source: false,
+                allow_dirty_main_hooks_fallback: true,
+            },
+            &repo_lock,
+            guard,
+            None,
+            &mut allow_all,
+        ) {
+            Ok(_) => panic!("retried land of reverted commit must refuse and surface reverted_by"),
+            Err(err) => err,
+        };
+        let MergeTeardownError::Refused { message } = err else {
+            panic!("expected Refused error, got {err:?}");
+        };
+        assert!(
+            message.contains("AlreadyLanded") && message.contains(&revert_oid),
+            "expected AlreadyLanded and reverted_by ({revert_oid}) in message, got: {message}"
+        );
+        assert_eq!(rev(repo, "refs/heads/main"), revert_oid);
     }
 }
 
