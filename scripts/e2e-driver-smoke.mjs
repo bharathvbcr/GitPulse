@@ -546,15 +546,19 @@ function windowsAttachProcesses() {
     encoding: "utf8",
     timeout: 45_000,
   });
-  if (res.error || res.status !== 0) {
-    const why = res.error ? res.error.message : `exit ${res.status}: ${String(res.stderr ?? "").trim()}`;
-    return [`(process query failed: ${why.slice(0, 300)})`];
-  }
-  return String(res.stdout ?? "")
+  if (res.error) return [`(process query failed: ${res.error.message.slice(0, 300)})`];
+  const rows = String(res.stdout ?? "")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => (line.length > 700 ? `${line.slice(0, 700)}…` : line));
+  // pwsh exits 1 when any named process is absent, even with the error
+  // silenced, so a non-zero status with rows is still an answer. Only one
+  // with nothing printed is reported as the query failing.
+  if (rows.length === 0 && res.status !== 0) {
+    return [`(process query found nothing; exit ${res.status}: ${String(res.stderr ?? "").trim().slice(0, 300)})`];
+  }
+  return rows;
 }
 
 /** @param {SmokeOptions} opts */
