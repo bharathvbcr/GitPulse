@@ -983,12 +983,21 @@ pub enum PathLoadKind {
     #[default]
     Module,
     /// `module_specifier` is a directory — possibly empty, meaning the anchor
-    /// directory itself — inserted on `sys.path` at module level by this file
+    /// directory itself — inserted on `sys.path` by this file
     /// (`sys.path.insert(0, str(ROOT / "scripts"))`). Not an import of
     /// anything: it widens where this file's *later* imports may resolve, and
-    /// `span` is where it happened, so an import before it is untouched. Only
-    /// ever emitted with an anchor (`anchor_up` is `Some`), and never for a
-    /// file that also removes or reassigns `sys.path`.
+    /// `span` is where it happened, so an import before it is untouched. A
+    /// readable entry carries an anchor (`anchor_up` is `Some`); `scope` is
+    /// `None` for a module-level insert, names the function for a
+    /// function-body insert, and carries the file's own symbol name for a
+    /// class-body insert.
+    ///
+    /// An empty specifier with no `anchor_up` is a veto, not a directory: the
+    /// insert's directory could not be read, so it may hold any module. With
+    /// `scope: None` (a module-level insert) it vetoes every `sys.path`-derived
+    /// link in the file; with a scope it is the in-function or class-body
+    /// case. A file that removes, pops or reassigns `sys.path` emits no
+    /// `SearchDirectory` row at all.
     SearchDirectory,
     /// `module_specifier` is an absolute dotted module **name**, not a path:
     /// `mod = importlib.import_module("pkg.util")` with a literal argument,
@@ -1881,6 +1890,8 @@ pub struct RustScopeFacts {
 pub struct Extraction {
     pub file_path: String,
     pub language: String,
+    /// `source_identity` of the file bytes (FNV-1a 64 with the byte length
+    /// folded in), under the name the payload JSON and SQL columns always had.
     pub content_hash: u64,
     #[serde(default = "default_extraction_engine")]
     pub engine: ExtractionEngine,

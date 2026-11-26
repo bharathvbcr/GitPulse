@@ -12,6 +12,81 @@ pub(crate) mod env;
 #[cfg(target_os = "macos")]
 pub(crate) mod fsmonitor;
 
+/// Converts a filesystem path to forward-slash POSIX notation so Git hooks and
+/// `diff.<driver>.textconv` scripts execute identically on Unix and Git for
+/// Windows's bundled MSYS2 `sh`.
+#[cfg(test)]
+pub(crate) fn sh_path(path: &Path) -> String {
+    plain_git_path(path).to_string_lossy().replace('\\', "/")
+}
+
+/// Formats `path` as a single-quoted POSIX shell token (forward slashes,
+/// verbatim Win32 prefixes stripped, embedded `'` escaped as `'\''`) so
+/// spaces and apostrophes in temp paths never break `#!/bin/sh` fixtures.
+#[cfg(test)]
+pub(crate) fn sh_quote(path: &Path) -> String {
+    format!("'{}'", sh_path(path).replace('\'', "'\\''"))
+}
+
+/// Writes an executable POSIX `#!/bin/sh` script at `path` (setting `0o755` on
+/// Unix; Git for Windows invokes `.git/hooks/*` and `textconv` scripts through
+/// its bundled `sh` without requiring a POSIX execute bit).
+#[cfg(test)]
+pub(crate) fn write_git_script(path: &Path, body: &str, executable: bool) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+}
+
+/// Writes an executable PATH stub named `name` inside `bin_dir`: an executable
+/// POSIX shell script on Unix, and a CRLF `.cmd` batch script on Windows (which
+/// `engine::process::env::find_in_dirs` resolves before the bare name).
+#[cfg(test)]
+pub(crate) fn write_path_stub(
+    bin_dir: &Path,
+    name: &str,
+    unix_sh: &str,
+    windows_cmd: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    #[cfg(unix)]
+    {
+        let _ = windows_cmd;
+        let path = bin_dir.join(name);
+        write_git_script(&path, unix_sh, true);
+        path
+    }
+    #[cfg(windows)]
+    {
+        let _ = unix_sh;
+        let path = bin_dir.join(format!("{name}.cmd"));
+        let crlf = windows_cmd.replace("\r\n", "\n").replace('\n', "\r\n");
+        std::fs::write(&path, crlf).unwrap();
+        path
+    }
+}
+
+/// Prepends `dir` to the inherited `PATH` using the OS path separator (`:` on
+/// Unix, `;` on Windows) so tests that inject a fake binary keep `git` and
+/// system utilities reachable on every platform.
+#[cfg(test)]
+pub(crate) fn prepend_path_dir(dir: &Path) -> std::ffi::OsString {
+    let mut entries = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(entries).expect("join PATH entries")
+}
+
 /// Writes an executable stand-in for `gitpulse-hook` at `path` that answers
 /// `--version` the way a build with lease mode does, for tests of the
 /// `lease-bin` links, which only link to a binary that says it is a lease
@@ -231,6 +306,48 @@ pub(crate) fn run_within(
 /// production code spawning outside the gated seam.
 #[cfg(test)]
 pub(crate) fn git_in(dir: &Path, args: &[&str]) {
+    let (dir, output) = pinned_git(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed with {}",
+        output.status
+    );
+    if args.first() == Some(&"init") {
+        pin_repo_local_identity(&dir);
+        trust_repo(&dir);
+    }
+}
+
+/// Runs a merge (or any command that may stop on a conflict) in `dir` the way
+/// [`git_in`] runs everything, and says whether it conflicted: `false` when it
+/// succeeded, `true` when it failed and left unmerged entries in the index.
+///
+/// Any other failure panics with git's own words. A fixture that only checked
+/// that its merge failed read every refusal as a conflict: on a runner with
+/// no identity, `git merge` stops at "Committer identity unknown" before it
+/// merges anything, and the tests went on to report "no longer conflicted",
+/// a rollback that had nothing to roll back, or a stage count of 1, instead
+/// of the reason.
+#[cfg(test)]
+pub(crate) fn git_merge_in(dir: &Path, args: &[&str]) -> bool {
+    let (dir, output) = pinned_git(dir, args);
+    if output.status.success() {
+        return false;
+    }
+    let (_, unmerged) = pinned_git(&dir, &["ls-files", "--unmerged"]);
+    assert!(
+        unmerged.status.success() && !unmerged.stdout.is_empty(),
+        "git {args:?} failed with {} without leaving a conflict: {}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    true
+}
+
+/// The command [`git_in`] and [`git_merge_in`] run, and what it printed.
+#[cfg(test)]
+fn pinned_git(dir: &Path, args: &[&str]) -> (PathBuf, std::process::Output) {
     // Persisting a fixture identity is how contract@gitpulse.test became the
     // author of real commits. `-c` on one command is hermetic; `git config
     // user.*` is not, and this checkout refuses to store it.
@@ -265,16 +382,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     // and a child forked in that window keeps their ends for its lifetime.
     let child = command.spawn_locked().expect("spawn git");
     let output = child.wait_with_output().expect("wait for git");
-    assert!(
-        output.status.success(),
-        "fixture git command failed with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if args.first() == Some(&"init") {
-        pin_repo_local_identity(&dir);
-        trust_repo(&dir);
-    }
+    (dir, output)
 }
 
 /// Writes hermetic local identity/signing settings into a test repo's
@@ -627,6 +735,61 @@ mod plain_path_tests {
             plain_git_path(Path::new("/tmp/repo")),
             PathBuf::from("/tmp/repo")
         );
+    }
+
+    #[test]
+    fn sh_path_and_sh_quote_handle_verbatim_unc_spaces_and_apostrophes() {
+        assert_eq!(
+            super::sh_path(Path::new(r"\\?\C:\Users\runner admin\Temp\it's\hook")),
+            "C:/Users/runner admin/Temp/it's/hook"
+        );
+        assert_eq!(
+            super::sh_path(Path::new(r"\\?\UNC\server\share\repo")),
+            "//server/share/repo"
+        );
+        assert_eq!(
+            super::sh_quote(Path::new(r"\\?\C:\Temp\it's a test\out.txt")),
+            r"'C:/Temp/it'\''s a test/out.txt'"
+        );
+    }
+
+    #[test]
+    fn prepend_path_dir_places_dir_first_using_platform_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let joined = super::prepend_path_dir(dir.path());
+        let mut iter = std::env::split_paths(&joined);
+        assert_eq!(iter.next().as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn write_path_stub_writes_expected_platform_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = super::write_path_stub(
+            dir.path(),
+            "demo-tool",
+            "#!/bin/sh\necho ok\n",
+            "@echo off\necho ok\n",
+        );
+        assert!(stub.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(stub.file_name().and_then(|n| n.to_str()), Some("demo-tool"));
+            let mode = std::fs::metadata(&stub).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                stub.file_name().and_then(|n| n.to_str()),
+                Some("demo-tool.cmd")
+            );
+            let body = std::fs::read_to_string(&stub).unwrap();
+            assert!(
+                body.contains("\r\n"),
+                "Windows .cmd must use CRLF: {body:?}"
+            );
+        }
     }
 }
 
@@ -1130,6 +1293,52 @@ mod tests {
             .set("HOME", neighbour.path())
             .set("XDG_CONFIG_HOME", neighbour.path());
         super::git_in(second.path(), &["init", "-q"]);
+    }
+
+    use super::{git_in, git_merge_in, git_repo, write};
+    use tempfile::TempDir;
+
+    /// Two branches that edit one line, ready for `merge side`.
+    fn diverged(conflicting: bool) -> TempDir {
+        let dir = git_repo();
+        write(dir.path(), "f.txt", "base\n");
+        git_in(dir.path(), &["add", "f.txt"]);
+        git_in(dir.path(), &["commit", "-qm", "base"]);
+        git_in(dir.path(), &["checkout", "-qb", "side"]);
+        write(dir.path(), "f.txt", "side\n");
+        git_in(dir.path(), &["commit", "-qam", "side"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        let (path, text) = if conflicting {
+            ("f.txt", "main\n")
+        } else {
+            ("g.txt", "main\n")
+        };
+        write(dir.path(), path, text);
+        git_in(dir.path(), &["add", path]);
+        git_in(dir.path(), &["commit", "-qm", "main"]);
+        dir
+    }
+
+    #[test]
+    fn git_merge_in_tells_a_conflict_from_a_clean_merge() {
+        let clean = diverged(false);
+        assert!(!git_merge_in(clean.path(), &["merge", "--no-edit", "side"]));
+        let conflict = diverged(true);
+        assert!(git_merge_in(
+            conflict.path(),
+            &["merge", "--no-edit", "side"]
+        ));
+        assert!(conflict.path().join(".git/MERGE_HEAD").exists());
+    }
+
+    /// A merge that fails without merging anything is not a conflict: the
+    /// fixture stops there, with git's reason, rather than letting the test
+    /// read whatever state the refusal left.
+    #[test]
+    #[should_panic(expected = "without leaving a conflict")]
+    fn git_merge_in_refuses_a_failure_that_left_no_conflict() {
+        let dir = diverged(true);
+        git_merge_in(dir.path(), &["merge", "--no-edit", "no-such-branch"]);
     }
 
     /// `GIT_WORK_TREE` moves the work tree git reads files from: with a

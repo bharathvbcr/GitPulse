@@ -53,6 +53,7 @@ import { hostLoadPulse, startHostLoad } from "./hostLoadStore";
 import { themeStore } from "./themeStore";
 import { hostPlatform } from "./platformStore";
 import { isAgentFilter, type AgentFilter } from "../agents/plane";
+import { isAgentGroupMode, type AgentGroupMode } from "../agents/viewModel";
 import {
   DEFAULT_TAB_WIDTH,
   isDiffLayout,
@@ -256,6 +257,8 @@ export interface InterfacePrefs extends AppearancePrefs {
   agentsCompact: boolean;
   /** Which sessions the Agents plane lists. Anything else reads as all. */
   agentsFilter: AgentFilter;
+  /** How the Agents plane groups rows by repository: auto, repo, or flat. */
+  agentsGroupByRepo: AgentGroupMode;
   /**
    * Layout the Tasks board opens in. The header still switches the one on
    * screen; this is what a fresh window starts with.
@@ -552,6 +555,7 @@ const DEFAULTS: InterfacePrefs = {
   agentsHiddenColumns: [],
   agentsCompact: false,
   agentsFilter: "all",
+  agentsGroupByRepo: "auto",
   taskLayout: "board",
   taskDensity: "comfortable",
   taskHiddenColumns: [],
@@ -732,6 +736,7 @@ function readPrefs(): InterfacePrefs {
       agentsHiddenColumns: columnKeys(parsed.agentsHiddenColumns, DEFAULTS.agentsHiddenColumns),
       agentsCompact: bool(parsed.agentsCompact, DEFAULTS.agentsCompact),
       agentsFilter: isAgentFilter(parsed.agentsFilter) ? parsed.agentsFilter : DEFAULTS.agentsFilter,
+      agentsGroupByRepo: isAgentGroupMode(parsed.agentsGroupByRepo) ? parsed.agentsGroupByRepo : DEFAULTS.agentsGroupByRepo,
       taskLayout: isBoardLayout(parsed.taskLayout) ? parsed.taskLayout : DEFAULTS.taskLayout,
       taskDensity: isTaskDensity(parsed.taskDensity) ? parsed.taskDensity : DEFAULTS.taskDensity,
       // Both sanitizers bound and normalize the stored array; neither can
@@ -1030,6 +1035,8 @@ function createInterfaceStore() {
     showAllAgentsColumns: () => patch({ agentsHiddenColumns: [] }),
     toggleAgentsCompact: () => patch((prefs) => ({ agentsCompact: !prefs.agentsCompact })),
     setAgentsFilter: (agentsFilter: AgentFilter) => patch({ agentsFilter }),
+    setAgentsGroupByRepo: (mode: AgentGroupMode) =>
+      patch({ agentsGroupByRepo: isAgentGroupMode(mode) ? mode : DEFAULTS.agentsGroupByRepo }),
     setTaskLayout: (taskLayout: BoardLayout) => patch({ taskLayout }),
     setTaskDensity: (taskDensity: TaskDensity) => patch({ taskDensity }),
     /** Adds or removes one status column; never hides the last visible one. */

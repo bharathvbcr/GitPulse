@@ -43,13 +43,32 @@ const HOOKS_JSON: &str = include_str!("../../../plugins/gitpulse/hooks.json");
 #[cfg(unix)]
 const SKILL_COLLISIONS: &str = include_str!("../../../plugins/gitpulse/skills/collisions/SKILL.md");
 #[cfg(unix)]
+const SKILL_COMMIT_AND_MERGE: &str =
+    include_str!("../../../plugins/gitpulse/skills/commit-and-merge/SKILL.md");
+#[cfg(unix)]
 const SKILL_INSIGHTS: &str = include_str!("../../../plugins/gitpulse/skills/insights/SKILL.md");
 #[cfg(unix)]
 const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/load/SKILL.md");
 #[cfg(unix)]
+const SKILL_MERGE_PRS: &str = include_str!("../../../plugins/gitpulse/skills/merge-prs/SKILL.md");
+#[cfg(unix)]
+const SKILL_MERGE_TRAIN: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/SKILL.md");
+#[cfg(unix)]
+const MERGE_TRAIN_FAILSET_GO_MOD: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/go.mod");
+#[cfg(unix)]
+const MERGE_TRAIN_FAILSET_MAIN: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/main.go");
+#[cfg(unix)]
+const MERGE_TRAIN_FAILSET_TEST: &str =
+    include_str!("../../../plugins/gitpulse/skills/merge-train/failset/main_test.go");
+#[cfg(unix)]
 const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/tasks/SKILL.md");
 #[cfg(unix)]
 const SKILL_TERMINAL: &str = include_str!("../../../plugins/gitpulse/skills/terminal/SKILL.md");
+#[cfg(unix)]
+const SKILL_WRAP_UP: &str = include_str!("../../../plugins/gitpulse/skills/wrap-up/SKILL.md");
 
 /// Producer marker proving GitPulse created `~/.gemini/config/plugins/gitpulse`.
 #[cfg(unix)]
@@ -65,12 +84,35 @@ pub(crate) const ANTIGRAVITY_SKILL_PREFIX: &str = "gitpulse-";
 
 /// Installed directory name, then the bundled `SKILL.md` it is written from.
 #[cfg(unix)]
-const SKILLS: [(&str, &str); 5] = [
+const SKILLS: [(&str, &str); 9] = [
     ("gitpulse-collisions", SKILL_COLLISIONS),
+    ("gitpulse-commit-and-merge", SKILL_COMMIT_AND_MERGE),
     ("gitpulse-insights", SKILL_INSIGHTS),
     ("gitpulse-load", SKILL_LOAD),
+    ("gitpulse-merge-prs", SKILL_MERGE_PRS),
+    ("gitpulse-merge-train", SKILL_MERGE_TRAIN),
     ("gitpulse-tasks", SKILL_TASKS),
     ("gitpulse-terminal", SKILL_TERMINAL),
+    ("gitpulse-wrap-up", SKILL_WRAP_UP),
+];
+
+#[cfg(unix)]
+const SKILL_SUBFILES: [(&str, &str, &str); 3] = [
+    (
+        "gitpulse-merge-train",
+        "failset/go.mod",
+        MERGE_TRAIN_FAILSET_GO_MOD,
+    ),
+    (
+        "gitpulse-merge-train",
+        "failset/main.go",
+        MERGE_TRAIN_FAILSET_MAIN,
+    ),
+    (
+        "gitpulse-merge-train",
+        "failset/main_test.go",
+        MERGE_TRAIN_FAILSET_TEST,
+    ),
 ];
 
 #[cfg(unix)]
@@ -302,6 +344,13 @@ fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
     if !exists {
         return Ok(());
     }
+    for (skill_name, rel_path, _) in SKILL_SUBFILES {
+        let subfile = plugin_dir.join("skills").join(skill_name).join(rel_path);
+        let _ = std::fs::remove_file(&subfile);
+        if let Some(parent) = subfile.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
     for (skill_name, _) in SKILLS {
         let skill_dir = plugin_dir.join("skills").join(skill_name);
         let skill_file = skill_dir.join("SKILL.md");
@@ -429,6 +478,16 @@ pub(crate) fn sync_under_home(
             false,
         )?;
     }
+    for (skill_name, rel_path, contents) in SKILL_SUBFILES {
+        let skill_dir = skills_root.join(skill_name);
+        let subfile = skill_dir.join(rel_path);
+        if let Some(parent) = subfile.parent() {
+            if parent != skill_dir {
+                ensure_non_symlink_dir(parent)?;
+            }
+        }
+        write_regular_file(&subfile, contents.as_bytes(), false)?;
+    }
 
     Ok(())
 }
@@ -508,6 +567,26 @@ mod tests {
             .join("skills/gitpulse-terminal/SKILL.md")
             .is_file());
         assert!(plugin_dir.join("skills/gitpulse-load/SKILL.md").is_file());
+        assert!(plugin_dir
+            .join("skills/gitpulse-merge-train/SKILL.md")
+            .is_file());
+        assert!(plugin_dir
+            .join("skills/gitpulse-merge-train/failset/go.mod")
+            .is_file());
+        for landing in [
+            "gitpulse-commit-and-merge",
+            "gitpulse-merge-prs",
+            "gitpulse-wrap-up",
+        ] {
+            assert!(
+                plugin_dir
+                    .join("skills")
+                    .join(landing)
+                    .join("SKILL.md")
+                    .is_file(),
+                "{landing}"
+            );
+        }
         // Antigravity has no plugin namespace: each copy is named for its
         // directory and names its sibling skills the same way.
         for (installed, _) in SKILLS {

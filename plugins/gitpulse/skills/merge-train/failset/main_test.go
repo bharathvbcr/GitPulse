@@ -177,7 +177,7 @@ const dcFailed = "\n== script tests ==\nok\n" +
 
 func TestDevCouncilStopsAtANamedFailure(t *testing.T) {
 	r := extract(t, dcFailed)
-	if r.Format != FormatDCLocal || !r.Complete || r.StoppedAt != "go orchestrator tests" {
+	if r.Format != FormatStepLocal || !r.Complete || r.StoppedAt != "go orchestrator tests" {
 		t.Fatalf("%+v", r)
 	}
 	if !reflect.DeepEqual(r.Failures, []string{"go orchestrator tests :: go:github.com/bharathvbcr/devcouncil/backend/go_orchestrator/cmd/dctestselect.TestSelector"}) {
@@ -289,7 +289,7 @@ func statusOf(r Report) map[string]string {
 // failure is a nested step's is not an opaque failure of its own.
 func TestDevCouncilContinueSummaryIsTheVerdict(t *testing.T) {
 	r := extract(t, dcContinue)
-	if r.Format != FormatDCLocal || !r.Complete || r.StoppedAt != "" || r.Reason != "" {
+	if r.Format != FormatStepLocal || !r.Complete || r.StoppedAt != "" || r.Reason != "" {
 		t.Fatalf("%+v", r)
 	}
 	if want := []string{dcLibtestFailure, dcSelectorFailure}; !reflect.DeepEqual(r.Failures, want) {
@@ -434,7 +434,7 @@ const scholar = "===============================================================
 
 func TestScholarLMSteps(t *testing.T) {
 	r := extract(t, scholar)
-	if r.Format != FormatScholarLM || !r.Complete {
+	if r.Format != FormatLocalCIJS || !r.Complete {
 		t.Fatalf("%+v", r)
 	}
 	if !reflect.DeepEqual(r.Failures, []string{"frontend :: vitest:frontend/src/a.test.tsx > renders"}) {

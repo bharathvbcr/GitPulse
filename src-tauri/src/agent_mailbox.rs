@@ -6,6 +6,7 @@
 //! <GitPulse config dir>/agent-mailbox/            0700
 //!   .lock                                         0600, advisory flock for root dir mutations
 //!   .locks/<session uuid>.lock                    0600, advisory flock per session
+//!   .hw/<session uuid>                            0600, highest envelope stamp issued (stamps only climb)
 //!   .meta/<session uuid>/<request id>.json        0600, EnvelopeProvenance sidecar
 //!   .epochs/<session uuid>                        0600, monotonic turn_epoch counter
 //!   .continuations/<session uuid>                 0600, per-turn continuation counter
@@ -58,6 +59,8 @@ pub(crate) const MAX_PENDING: usize = 8;
 pub(crate) const MAX_SESSIONS: usize = 256;
 /// How long a message waits for a hook to take it.
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// The largest envelope stamp: stamps are 13 digits in a message file name.
+const MAX_STAMP: u64 = 9_999_999_999_999;
 /// How long a claimed message is kept, so the sender can see that it was.
 pub(crate) const CLAIMED_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long an unfinished write is left alone.
@@ -68,6 +71,9 @@ pub(crate) const WAITER_STALE: Duration = Duration::from_secs(10);
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(2);
 /// How often a waiter looks for a message. A directory read, not a busy loop.
 pub(crate) const POLL: Duration = Duration::from_millis(250);
+/// Why a wait that ended with only refused envelopes pending says it was declined.
+const PAUSED_AT_HOP_LIMIT: &str =
+    "pending peer message paused at hop limit; leaving unclaimed for manual review";
 /// Hook processes waiting on one session.
 pub(crate) const MAX_WAITERS_PER_SESSION: usize = 2;
 /// Guaranteed minimum places reserved for GitPulse-hosted terminal sessions.
@@ -420,6 +426,15 @@ struct AdvisoryLock {
 
 impl AdvisoryLock {
     fn acquire(path: &Path) -> Result<Self, MailboxError> {
+        Ok(Self::open_locked(path, true)?.expect("a blocking lock is always taken"))
+    }
+
+    /// Takes the lock only if it is free right now; `Ok(None)` means another holder has it.
+    fn try_acquire(path: &Path) -> Result<Option<Self>, MailboxError> {
+        Self::open_locked(path, false)
+    }
+
+    fn open_locked(path: &Path, wait: bool) -> Result<Option<Self>, MailboxError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -439,16 +454,33 @@ impl AdvisoryLock {
                 path.display()
             )));
         }
-        // A signal can interrupt the blocking `flock`; the Unix code this
-        // replaced retried it, and `File::lock` makes one attempt.
-        loop {
-            match file.lock() {
-                Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(io("could not lock the mailbox", &e)),
+        // A signal can interrupt the blocking `flock`; retry `EINTR` on both
+        // blocking and non-blocking acquisitions across Unix and Windows.
+        if wait {
+            loop {
+                match file.lock() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(io("could not lock the mailbox", &e)),
+                }
+            }
+        } else {
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::fs::TryLockError::Error(e))
+                        if e.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        continue
+                    }
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        return Err(io("could not lock the mailbox", &e))
+                    }
+                }
             }
         }
-        Ok(Self { file })
+        Ok(Some(Self { file }))
     }
 }
 
@@ -498,6 +530,15 @@ impl Mailbox {
         let locks_dir = self.root.join(".locks");
         private_dir(&locks_dir)?;
         AdvisoryLock::acquire(&locks_dir.join(format!("{session_uuid}.lock")))
+    }
+
+    /// [`Self::lock_session`] that gives up instead of waiting: `Ok(None)` when another holder has
+    /// the session's lock.
+    fn try_lock_session(&self, session_uuid: &str) -> Result<Option<AdvisoryLock>, MailboxError> {
+        self.ensure_root()?;
+        let locks_dir = self.root.join(".locks");
+        private_dir(&locks_dir)?;
+        AdvisoryLock::try_acquire(&locks_dir.join(format!("{session_uuid}.lock")))
     }
 
     fn meta_path(&self, session_uuid: &str, request_id: &str) -> PathBuf {
@@ -616,11 +657,42 @@ impl Mailbox {
             .collect()
     }
 
+    /// Removes the `.tmp-*` files a crashed counter write left behind, once they are a minute
+    /// old (a live write finishes in milliseconds).
+    fn remove_stale_counter_temps(&self, now: SystemTime) {
+        for subdir in [".hw", ".epochs", ".continuations", ".stop_continued"] {
+            let Ok(entries) = std::fs::read_dir(self.root.join(subdir)) else {
+                continue;
+            };
+            for entry in entries.take(SCAN_LIMIT).flatten() {
+                let stale = entry.file_name().to_string_lossy().starts_with(".tmp-")
+                    && entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .is_ok_and(|modified| age(now, modified) > Duration::from_secs(60));
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     /// Removes expired files from every session and empty sessions that have
     /// sat unused. Best effort: a stale file costs bytes, not correctness.
     fn prune_sessions(&self, now: SystemTime) {
+        self.remove_stale_counter_temps(now);
         for name in self.session_names() {
             let dir = self.root.join(&name);
+            // Under the session's lock, like every other path that removes a message and its
+            // sidecar: unlocked, the sidecar removal here could delete one a concurrent deposit
+            // of the same request id had just written for its new message. No path takes a
+            // session lock and then the root lock, so root -> session cannot deadlock.
+            // Pruning is best effort and holds the root lock, so a session whose lock is
+            // held (or cannot be taken) is skipped rather than waited on: one stalled holder
+            // must not stall every deposit and waiter registration behind the root lock.
+            let Ok(Some(_session_lock)) = self.try_lock_session(&name) else {
+                continue;
+            };
             self.expire_session(&name, &dir, now);
             let empty = std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none());
             let old = std::fs::metadata(&dir)
@@ -628,6 +700,7 @@ impl Mailbox {
                 .is_ok_and(|m| age(now, m) > EMPTY_SESSION_TTL);
             if empty && old && std::fs::remove_dir(&dir).is_ok() {
                 let _ = std::fs::remove_file(self.root.join(".locks").join(format!("{name}.lock")));
+                let _ = std::fs::remove_file(self.root.join(".hw").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".epochs").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".continuations").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".stop_continued").join(&name));
@@ -656,6 +729,45 @@ impl Mailbox {
                 }
             }
         }
+    }
+
+    /// The creation stamp for the next envelope of a session: the caller's clock, but strictly
+    /// above every stamp this session has issued or holds (a persisted high-water mark and the
+    /// files present). Callers stamp before they wait for the lock, and a clock can step back, so
+    /// the raw clock does not follow publish order; a reader that has seen stamp T must never
+    /// find a later publish below it. Must be called with the session lock held.
+    ///
+    /// The mark is read through the counter reader (no symlinks, a private file of this user; only
+    /// a missing file means none yet). An unparseable mark falls back to the stamps of the files
+    /// present, never to zero, and is rewritten. A stamp is 13 digits in a file name, so one past
+    /// [`MAX_STAMP`] is refused rather than minting a name that cannot be parsed back.
+    fn next_stamp(
+        &self,
+        session_key: &str,
+        files: &[(String, SystemTime)],
+        now: SystemTime,
+    ) -> Result<u64, MailboxError> {
+        let persisted = match self.read_counter_text(".hw", session_key)? {
+            None => 0,
+            Some(text) => text.trim().parse::<u64>().unwrap_or_else(|_| {
+                log::warn!(target: "mailbox", "unreadable stamp high-water mark for a session; using the stamps of its files");
+                0
+            }),
+        };
+        let held = files
+            .iter()
+            .filter_map(|(name, _)| parse_message_name(name).map(|(_, stamp, _)| stamp))
+            .max()
+            .unwrap_or(0);
+        let stamp = millis(now).max(persisted.max(held).saturating_add(1));
+        if stamp > MAX_STAMP {
+            return Err(MailboxError::Invalid(
+                "This session's mailbox stamps are exhausted, so it cannot take another message."
+                    .into(),
+            ));
+        }
+        self.write_u64_counter(".hw", session_key, stamp, now)?;
+        Ok(stamp)
     }
 
     /// Puts one human-confirmed message in a session's mailbox.
@@ -786,8 +898,10 @@ impl Mailbox {
                 "This session already has {MAX_PENDING} messages waiting for it."
             )));
         }
+        // Assigned here, under the session lock, so the stamp order is the publish order a
+        // cursor-reading peeker sees (see `next_stamp`).
+        let created = self.next_stamp(&key, &files, now)?;
         self.write_provenance(&key, request_id, &provenance, now)?;
-        let created = millis(now);
         let temp = dir.join(format!(".tmp-{}-{:08x}", std::process::id(), nonce(now)));
         if let Err(err) = write_private(&temp, normalized.as_bytes()) {
             self.remove_provenance(&key, request_id);
@@ -841,7 +955,7 @@ impl Mailbox {
         let notice_text = format!(
             "More peer messages are waiting on the GitPulse agent bus for this session in {repo_root}. \
              Call gitpulse_agent_inbox with repo_path={repo_root} and for_peer={for_peer} to read them; \
-             pass ack=true to mark what it reads as read, or since_seq to page."
+             pass ack=true to mark what it reads as read, or page with next_since_seq (as since_seq) and mailbox_cursor_ms (as since_mailbox_ms)."
         );
         let notice_id = overflow_notice_id(&repo_root);
         let notice = EnvelopeProvenance::PeerAgent {
@@ -924,14 +1038,30 @@ impl Mailbox {
     where
         F: Fn(&EnvelopeProvenance) -> bool,
     {
+        self.claim_batch_reporting_refused(session, max_items, now, accept)
+            .map(|(claimed, _)| claimed)
+    }
+
+    /// [`Self::try_claim_batch_filtered`] that also reports whether `accept` refused at least one
+    /// pending envelope, decided under the same lock acquisition as the claim.
+    fn claim_batch_reporting_refused<F>(
+        &self,
+        session: &str,
+        max_items: usize,
+        now: SystemTime,
+        accept: F,
+    ) -> Result<(Vec<ClaimedEnvelope>, bool), MailboxError>
+    where
+        F: Fn(&EnvelopeProvenance) -> bool,
+    {
         if max_items == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let key = session_key(session)?;
         let dir = self.root.join(&key);
         match std::fs::symlink_metadata(&dir) {
             Ok(_) => private_dir(&dir)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
             Err(e) => return Err(io("could not look at the session's mailbox", &e)),
         }
         let _session_lock = self.lock_session(&key)?;
@@ -943,6 +1073,7 @@ impl Mailbox {
             .collect();
         pending.sort();
         let mut claimed_batch = Vec::new();
+        let mut refused = false;
         for name in pending {
             if claimed_batch.len() >= max_items {
                 break;
@@ -950,11 +1081,12 @@ impl Mailbox {
             if let Some((_, _, id)) = parse_message_name(&name) {
                 if let Ok(prov) = self.read_provenance(&key, id) {
                     if !accept(&prov) {
+                        refused = true;
                         continue;
                     }
                 }
             }
-            if !rename_to_claimed(&dir, &name)? {
+            if !rename_to_claimed(&dir, &name, now)? {
                 continue;
             }
             let claimed = format!("c-{}", &name[2..]);
@@ -982,7 +1114,7 @@ impl Mailbox {
                 }
             }
         }
-        Ok(claimed_batch)
+        Ok((claimed_batch, refused))
     }
 
     /// Non-destructively reads up to `max_items` oldest pending envelopes
@@ -1134,7 +1266,7 @@ impl Mailbox {
         for (name, _) in regular_files(&dir) {
             if let Some(('p', _, id)) = parse_message_name(&name) {
                 if id == request_id {
-                    return rename_to_claimed(&dir, &name);
+                    return rename_to_claimed(&dir, &name, now);
                 }
             }
         }
@@ -1160,6 +1292,19 @@ impl Mailbox {
     }
 
     fn read_u64_counter(&self, subdir: &str, session_uuid: &str) -> Result<u64, MailboxError> {
+        Ok(self
+            .read_counter_text(subdir, session_uuid)?
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// The text of a counter file: `None` only when it does not exist. Opened without following
+    /// symlinks and checked to be a regular file private to this user.
+    fn read_counter_text(
+        &self,
+        subdir: &str,
+        session_uuid: &str,
+    ) -> Result<Option<String>, MailboxError> {
         let path = self.root.join(subdir).join(session_uuid);
         let mut options = OpenOptions::new();
         options.read(true);
@@ -1170,7 +1315,7 @@ impl Mailbox {
         }
         let file = match options.open(&path) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io("could not open mailbox counter", &e)),
         };
         let meta = file
@@ -1186,7 +1331,7 @@ impl Mailbox {
         file.take(64)
             .read_to_string(&mut buf)
             .map_err(|e| io("could not read mailbox counter", &e))?;
-        Ok(buf.trim().parse::<u64>().unwrap_or(0))
+        Ok(Some(buf))
     }
 
     fn write_u64_counter(
@@ -1378,10 +1523,12 @@ impl Mailbox {
         self.wait_in_pool_filtered(session, limit, pool, |_| true)
     }
 
-    /// Waits in `pool` for an envelope accepted by `accept`. When the oldest
-    /// pending envelope fails `accept` (for example a peer message that has
-    /// reached `max_hops`), the waiter declines without claiming it so the
-    /// message stays pending for manual/boundary inspection instead of looping.
+    /// Waits in `pool` for an envelope accepted by `accept`. An envelope `accept` refuses (for
+    /// example a peer message that has reached `max_hops`) is never claimed: it stays pending
+    /// for manual/boundary inspection, and the waiter looks past it to the first acceptable
+    /// envelope and keeps waiting while only refused ones are pending, as it would on an empty
+    /// mailbox. Only when the limit passes with a refused envelope still pending does it return
+    /// `Declined` ("paused") rather than `TimedOut`.
     pub(crate) fn wait_in_pool_filtered<F>(
         &self,
         session: &str,
@@ -1423,19 +1570,23 @@ impl Mailbox {
             if let Some(reason) = waiter.displaced_reason()? {
                 return Ok(EnvelopeWait::Declined(reason));
             }
-            if let Some(reason) = self.peek_rejected_by(&key, &dir, SystemTime::now(), &accept)? {
-                return Ok(EnvelopeWait::Declined(reason));
-            }
-            // Claim through the filter the peek used: another consumer may have taken what
-            // was peeked, and an unfiltered claim would then hand over the next message even
-            // when it is a peer message at its hop limit.
-            let mut claimed = self.try_claim_batch_filtered(&key, 1, SystemTime::now(), &accept)?;
+            // One lock acquisition both claims the first acceptable envelope (skipping any
+            // `accept` refuses, such as a peer message at its hop limit) and notes whether a
+            // refused one is pending, so the two cannot disagree.
+            let (mut claimed, refused) =
+                self.claim_batch_reporting_refused(&key, 1, SystemTime::now(), &accept)?;
             if let Some(envelope) = claimed.pop() {
                 return Ok(EnvelopeWait::Message(envelope));
             }
             let spent = started.elapsed();
             if spent >= limit {
-                return Ok(EnvelopeWait::TimedOut);
+                // Refused envelopes do not end the wait early (an acceptable one may still
+                // arrive), but one still pending at the limit is reported as paused.
+                return Ok(if refused {
+                    EnvelopeWait::Declined(PAUSED_AT_HOP_LIMIT.into())
+                } else {
+                    EnvelopeWait::TimedOut
+                });
             }
             if last_beat.elapsed() >= HEARTBEAT {
                 waiter.beat();
@@ -1444,54 +1595,44 @@ impl Mailbox {
             std::thread::sleep(POLL.min(limit - spent));
         }
     }
-
-    fn peek_rejected_by<F>(
-        &self,
-        session_uuid: &str,
-        dir: &Path,
-        now: SystemTime,
-        accept: &F,
-    ) -> Result<Option<String>, MailboxError>
-    where
-        F: Fn(&EnvelopeProvenance) -> bool,
-    {
-        let _session_lock = self.lock_session(session_uuid)?;
-        self.expire_session(session_uuid, dir, now);
-        let mut pending: Vec<String> = regular_files(dir)
-            .into_iter()
-            .map(|(name, _)| name)
-            .filter(|name| name.starts_with("p-") && parse_message_name(name).is_some())
-            .collect();
-        pending.sort();
-        let Some(oldest) = pending.first() else {
-            return Ok(None);
-        };
-        let Some((_, _, id)) = parse_message_name(oldest) else {
-            return Ok(None);
-        };
-        // An envelope whose origin cannot be read is not a hop-limit pause. The claim that
-        // follows drops it (`try_claim_batch_filtered`), so the waiter is not wedged on it.
-        let Ok(prov) = self.read_provenance(session_uuid, id) else {
-            return Ok(None);
-        };
-        if !accept(&prov) {
-            return Ok(Some(
-                "pending peer message paused at hop limit; leaving unclaimed for manual review"
-                    .into(),
-            ));
-        }
-        Ok(None)
-    }
 }
 
 /// Renames one pending `p-*` file to its `c-*` name. `Ok(false)` means the file
 /// was no longer there: another consumer took it first, or it expired.
-fn rename_to_claimed(dir: &Path, pending_name: &str) -> Result<bool, MailboxError> {
+///
+/// A rename keeps the file's modification time, which is when the message was deposited, and
+/// [`CLAIMED_TTL`] is measured from it. A message that sat pending for most of its window
+/// would lose its claimed copy almost at once, and an idempotent retry of its request id would
+/// then deliver it a second time. So the claimed file is restamped with the claim time.
+fn rename_to_claimed(
+    dir: &Path,
+    pending_name: &str,
+    now: SystemTime,
+) -> Result<bool, MailboxError> {
     let claimed = format!("c-{}", &pending_name[2..]);
-    match crate::fs_entry::rename_noreplace(&dir.join(pending_name), &dir.join(claimed)) {
-        Ok(()) => Ok(true),
+    let claimed_path = dir.join(claimed);
+    match crate::fs_entry::rename_noreplace(&dir.join(pending_name), &claimed_path) {
+        Ok(()) => {
+            restamp(&claimed_path, now);
+            Ok(true)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(io("could not claim a message", &e)),
+    }
+}
+
+/// Sets a claimed file's modification time to the claim time. Best effort: failing leaves the
+/// deposit time, which only shortens how long a retry is recognised.
+fn restamp(path: &Path, at: SystemTime) {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Err(error) = options.open(path).and_then(|file| file.set_modified(at)) {
+        log::warn!(target: "mailbox", "could not restamp a claimed message: {error}");
     }
 }
 
@@ -1550,6 +1691,7 @@ where
             Err(e) => return Err(io("could not look at the session's mailbox", &e)),
         }
         let _session_lock = mailbox.lock_session(&key)?;
+        let now = SystemTime::now();
         let mut won = Vec::new();
         for item in items {
             let unchanged = mailbox
@@ -1558,7 +1700,7 @@ where
             if !unchanged {
                 continue;
             }
-            match rename_to_claimed(&dir, &item.file) {
+            match rename_to_claimed(&dir, &item.file, now) {
                 Ok(true) => won.push((item.envelope, item.built)),
                 Ok(false) => {}
                 Err(error) if won.is_empty() => return Err(error),

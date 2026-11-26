@@ -181,12 +181,12 @@ function schemaNumber(value) {
 /**
  * The schema identity a server's manifest declares.
  *
- * @typedef {{ storeSchema: number | null, dcStoreSchema: number | null, workbenchSchema: number | null, extractSchema: number | null, error: string | null }} ManifestIdentity
+ * @typedef {{ storeSchema: number | null, dcStoreSchema: number | null, workbenchSchema: number | null, extractSchema: number | null, leaseSchema: number | null, error: string | null }} ManifestIdentity
  */
 
 /** @param {string} error @returns {ManifestIdentity} */
 function unidentified(error) {
-  return { storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error };
+  return { storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, leaseSchema: null, error };
 }
 
 /**
@@ -230,6 +230,7 @@ export function parseServerManifest(stdout, id) {
       dcStoreSchema: schemaNumber(manifest.dcStoreSchemaVersion),
       workbenchSchema: schemaNumber(manifest.workbenchSchemaVersion),
       extractSchema: schemaNumber(manifest.extractionSchemaVersion),
+      leaseSchema: schemaNumber(manifest.stackLeaseFormatVersion),
       error: null,
     };
   }
@@ -254,7 +255,7 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
     try {
       child = spawn(binPath, [], { stdio: ["pipe", "pipe", "pipe"] });
     } catch (err) {
-      resolve({ version: null, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: /** @type {Error} */ (err).message });
+      resolve({ version: null, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, leaseSchema: null, error: /** @type {Error} */ (err).message });
       return;
     }
     let stdout = "";
@@ -271,18 +272,18 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
       resolve(outcome);
     };
     const timer = setTimeout(
-      () => finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: `no complete identity response within ${timeoutMs}ms` }),
+      () => finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, leaseSchema: null, error: `no complete identity response within ${timeoutMs}ms` }),
       timeoutMs,
     );
 
-    child.on("error", (err) => finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: err.message }));
+    child.on("error", (err) => finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, leaseSchema: null, error: err.message }));
     child.stderr.resume();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       if (settled) return;
       receivedBytes += Buffer.byteLength(chunk, "utf8");
       if (receivedBytes > MAX_RESPONSE_BYTES) {
-        finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
+        finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, leaseSchema: null, error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
         return;
       }
       stdout += chunk;
@@ -296,7 +297,7 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
       if (manifest !== null) finish({ version, ...manifest });
     });
     child.on("close", () => {
-      finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: version === null
+      finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, leaseSchema: null, error: version === null
         ? "server exited without a usable initialize response"
         : "server exited without its manifest schema identity" });
     });
@@ -1164,7 +1165,7 @@ export async function main(argv = process.argv.slice(2)) {
     const expected = opts.expect ?? expectedVersion();
     const expectedSchema = readVendoredSchema();
     const binPath = opts.bin ?? resolveOnPath(SERVER_BIN);
-    const probe = binPath === null ? { version: null, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: null } : await probeServer(binPath, opts.timeoutMs);
+    const probe = binPath === null ? { version: null, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, leaseSchema: null, error: null } : await probeServer(binPath, opts.timeoutMs);
     const commandProbe = binPath === null
       ? { commands: null, error: null }
       : await probeServerCommands(binPath, opts.timeoutMs);

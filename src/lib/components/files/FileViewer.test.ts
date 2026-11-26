@@ -382,4 +382,17 @@ describe("FileViewer", () => {
     expect(source).toContain("explorerForcedWithOuterSidebar");
     expect(source).toContain("explorerRequested: effectiveExplorerOpen");
   });
+
+  it("exits Blame lens once per HTML preview or split open request nonce without locking Blame out", () => {
+    expect(source).toContain("htmlViewModeRequest");
+    expect(source).toContain("matchHtmlViewMode(req, repo, path)");
+    expect(source).toContain("matched.nonce > lastHandledHtmlModeNonce");
+    expect(source).toContain('setEditorLens("edit")');
+  });
+
+  it("exits Blame lens once per SVG preview or split open request nonce without locking Blame out", () => {
+    expect(source).toContain("svgViewModeRequest");
+    expect(source).toContain("matchSvgViewMode(req, repo, path)");
+    expect(source).toContain("matched.nonce > lastHandledSvgModeNonce");
+  });
 });

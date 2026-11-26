@@ -82,6 +82,7 @@ rust-coverage-summary.txt
 /docs/AGENT_OUTPUT_REVIEW.md
 /docs/FILE_CLAIM_CWD_EXPERIMENT.md
 /docs/QUALIFICATION.md
+/docs/GAPS.md
 
 # Session audit, build, wave, branch, test, and release reports, and idea dumps
 /AUDIT_REPORT*.md
@@ -418,4 +419,3 @@ blob-report/
 *.pdb
 
 /crates/gitpulse-worktree/target/
-/crates/git-status-parity/target/

@@ -3,6 +3,9 @@ pub mod actions;
 pub mod confirm;
 pub mod editor;
 pub mod exit;
+pub mod hibernate;
+#[cfg(any(target_os = "macos", test))]
+pub mod identity_migration;
 #[cfg(target_os = "macos")]
 pub mod instance;
 #[cfg(target_os = "macos")]
@@ -20,6 +23,9 @@ mod tray;
 pub mod webcrash;
 pub mod webview_perf;
 
+pub use hibernate::{
+    cmd_idle_memory_status, cmd_main_hibernate, cmd_main_ready, cmd_webview_idle_hint,
+};
 pub use state::MenuState;
 pub use tray::build_tray_menu;
 
@@ -50,6 +56,7 @@ pub struct DesktopState {
     exit: exit::ExitGate,
     tray_glyph: Mutex<Option<GlyphVariant>>,
     popover: popover::Presence,
+    pub hibernation: hibernate::HibernationState,
 }
 
 #[derive(Clone, Serialize)]
@@ -105,8 +112,8 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
     }
     // Refresh, switching, copy and appearance stay in the status menu. Reveal and
     // remote website run in the background so Finder or a browser can take over.
-    if from_tray
-        && !matches!(
+    let should_reveal = from_tray
+        && (!matches!(
             action,
             NativeAction::Refresh
                 | NativeAction::ActivateRepo(_)
@@ -116,20 +123,15 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
                 | NativeAction::CopyCommit
                 | NativeAction::RevealRepo
                 | NativeAction::OpenRemote
-        )
-    {
-        if let Err(error) = reveal_main(app) {
-            log::error!(target: "desktop", "Could not reveal GitPulse: {error}");
-        }
-    }
-    if let Err(e) = app.emit(
-        MENU_EVENT,
-        NativeEvent {
-            id: action.event_id().to_string(),
-            path: action.path().map(str::to_string),
-            repo_path: state.active_path.clone(),
-        },
-    ) {
+        ) || app
+            .try_state::<DesktopState>()
+            .is_some_and(|d| d.hibernation.is_hibernated_or_absent()));
+    let event_payload = NativeEvent {
+        id: action.event_id().to_string(),
+        path: action.path().map(str::to_string),
+        repo_path: state.active_path.clone(),
+    };
+    if let Err(e) = deliver_to_main(app, MENU_EVENT, event_payload, should_reveal) {
         log::warn!(target: "desktop", "menu event {id} emit failed: {e}");
     }
     if from_tray {
@@ -151,6 +153,40 @@ pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) 
     // nothing: the window may still be showing.)
     if matches!(event, WindowEvent::Focused(true)) && window.label() == "main" {
         crate::workbench::external_changes::note_main_window_on_screen(true);
+        if let Some(desktop) = window.app_handle().try_state::<DesktopState>() {
+            if !desktop.hibernation.is_hibernated_or_absent() {
+                desktop
+                    .hibernation
+                    .set_lifecycle(hibernate::MainWindowLifecycle::Visible);
+            }
+        }
+    }
+    if matches!(event, WindowEvent::Destroyed) && window.label() == "main" {
+        let app = window.app_handle();
+        if let Some(desktop) = app.try_state::<DesktopState>() {
+            desktop.hibernation.set_main_ready(false);
+            let lifecycle = desktop.hibernation.lifecycle();
+            if lifecycle == hibernate::MainWindowLifecycle::Hibernating {
+                hibernate::complete_hibernated_transition(app);
+            } else if lifecycle != hibernate::MainWindowLifecycle::Waking
+                && lifecycle != hibernate::MainWindowLifecycle::Hibernated
+            {
+                desktop
+                    .hibernation
+                    .set_lifecycle(hibernate::MainWindowLifecycle::Hibernated);
+                crate::workbench::external_changes::note_main_window_on_screen(false);
+            }
+            if desktop.hibernation.take_wake_after_destroy() {
+                let wake_app = app.clone();
+                if let Err(error) = app.run_on_main_thread(move || {
+                    if let Err(err) = reveal_main(&wake_app) {
+                        log::warn!(target: "desktop", "Could not reveal main window after destroy: {err}");
+                    }
+                }) {
+                    log::warn!(target: "desktop", "Could not schedule post-destroy wake: {error}");
+                }
+            }
+        }
     }
     if let WindowEvent::CloseRequested { api, .. } = event {
         if request_window_close(window) {
@@ -179,6 +215,11 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
         match window.hide() {
             Ok(()) => {
                 crate::workbench::external_changes::note_main_window_on_screen(false);
+                if let Some(desktop) = app.try_state::<DesktopState>() {
+                    desktop
+                        .hibernation
+                        .set_lifecycle(hibernate::MainWindowLifecycle::Hidden);
+                }
                 #[cfg(target_os = "macos")]
                 {
                     let state = menu_state(app);
@@ -195,6 +236,9 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
     if exit::begin(app, exit::Origin::Internal) != exit::Begin::Proceed {
         true
     } else {
+        if let Some(desktop) = app.try_state::<DesktopState>() {
+            desktop.hibernation.mark_closing_to_quit();
+        }
         // Before the listener is installed, nobody can answer a quit request.
         // macOS normally leaves the process alive after its last window closes.
         #[cfg(target_os = "macos")]
@@ -225,12 +269,32 @@ pub fn navigation_allowed(url: &tauri::Url) -> bool {
     }
 }
 
-/// Registers [`navigation_allowed`] for every webview the app creates, the
-/// configured main window included, which has no builder to hang it on.
+/// Whether `webview_label` may navigate to `url`.
+///
+/// Extends [`navigation_allowed`] only for the `"main"` webview's sandboxed
+/// `<iframe srcdoc>` HTML preview: WKWebView and WebKitGTK invoke the webview's
+/// navigation delegate for subframe `about:srcdoc` loads (and in-page
+/// `about:srcdoc#<fragment>` jumps), so refusing them leaves `HtmlPreviewViewer`
+/// blank. Top-level frames cannot load external content via `about:srcdoc`, the
+/// main window's CSP still enforces `script-src 'self'`, and the preview iframe
+/// itself is strictly sandboxed (`sandbox="allow-forms"`, no `allow-scripts` or
+/// `allow-same-origin`). Non-main webviews (such as the status popover) keep
+/// refusing `about:srcdoc`.
+pub fn navigation_allowed_for_webview(webview_label: &str, url: &tauri::Url) -> bool {
+    if navigation_allowed(url) {
+        return true;
+    }
+    webview_label == "main"
+        && (url.as_str() == "about:srcdoc" || url.as_str().starts_with("about:srcdoc#"))
+}
+
+/// Registers [`navigation_allowed_for_webview`] for every webview the app
+/// creates, the configured main window included, which has no builder to hang
+/// it on.
 pub fn navigation_guard<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new("navigation-guard")
         .on_navigation(|webview, url| {
-            let allowed = navigation_allowed(url);
+            let allowed = navigation_allowed_for_webview(webview.label(), url);
             if !allowed {
                 log::warn!(
                     target: "desktop",
@@ -256,6 +320,9 @@ pub fn handle_page_load<R: Runtime>(
         || !matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
     {
         return;
+    }
+    if let Some(desktop) = webview.app_handle().try_state::<DesktopState>() {
+        desktop.hibernation.set_main_ready(false);
     }
     exit::disarm(webview.app_handle(), "the main window's page is reloading");
     let sessions = webview.state::<crate::terminal::TerminalSessions>();
@@ -284,14 +351,29 @@ impl DesktopState {
     pub fn exit_gate(&self) -> &exit::ExitGate {
         &self.exit
     }
+
+    /// True while `"main"` is intentionally tearing down (`Hibernating`) or
+    /// already hibernated (`Hibernated`), suppressing crash recovery and
+    /// code-less exit teardown.
+    pub fn is_hibernating_main(&self) -> bool {
+        self.hibernation.is_intentional_teardown()
+    }
 }
 
 /// `AppHandle::exit` supplies a code: that exit was already approved and is
 /// never asked about again. Only a code-less request (the last window closing)
 /// goes to the frontend.
-fn route_exit_requested<R: Runtime>(app: &AppHandle<R>, code: Option<i32>) -> exit::Begin {
+pub(crate) fn route_exit_requested<R: Runtime>(
+    app: &AppHandle<R>,
+    code: Option<i32>,
+) -> exit::Begin {
     if code.is_some() {
         return exit::Begin::Proceed;
+    }
+    if app.try_state::<DesktopState>().is_some_and(|desktop| {
+        desktop.is_hibernating_main() && !desktop.hibernation.is_closing_to_quit()
+    }) {
+        return exit::Begin::Deferred;
     }
     let begin = exit::begin(app, exit::Origin::Internal);
     if begin != exit::Begin::Proceed {
@@ -460,12 +542,22 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         // and its dock's browser tab (`browseRequests.ts`); the request was
         // validated (absolute repository, loopback URL) before it got here.
         instance::Request::Browse { repo, url } => {
-            if let Err(error) = reveal_main(&handle) {
-                log::warn!(target: "desktop", "Could not reveal GitPulse for a browser session: {error}");
-            }
-            let request = crate::browser::BrowseRequest { repo, url };
-            if let Err(error) = handle.emit(crate::browser::BROWSE_EVENT, request) {
-                log::warn!(target: "browser", "A browser session request was not delivered to the window: {error}");
+            if should_queue_for_main(&handle) {
+                handle
+                    .state::<DesktopState>()
+                    .hibernation
+                    .push_pending(hibernate::PendingMainEvent::Browse { repo, url });
+                if let Err(error) = reveal_main(&handle) {
+                    log::warn!(target: "desktop", "Could not reveal GitPulse for a browser session: {error}");
+                }
+            } else {
+                if let Err(error) = reveal_main(&handle) {
+                    log::warn!(target: "desktop", "Could not reveal GitPulse for a browser session: {error}");
+                }
+                let request = crate::browser::BrowseRequest { repo, url };
+                if let Err(error) = handle.emit(crate::browser::BROWSE_EVENT, request) {
+                    log::warn!(target: "browser", "A browser session request was not delivered to the window: {error}");
+                }
             }
         }
         instance::Request::AgentSessionMeta {
@@ -534,13 +626,22 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
             }
         }
         instance::Request::Notification { id, snooze } => {
-            if let Err(error) = crate::workbench::notifications::forward(&handle, id, snooze) {
+            let main_was_live = !should_queue_for_main(&handle);
+            let forwarded = crate::workbench::notifications::forward(&handle, id.clone(), snooze);
+            if let Err(ref error) = forwarded {
                 log::warn!(target: "desktop", "A banner response from another launch was not delivered: {error}");
-                // The click still asked for GitPulse. Snooze asked for nothing.
-                if !snooze {
-                    if let Err(error) = reveal_main(&handle) {
-                        log::warn!(target: "desktop", "Could not reveal GitPulse for a banner: {error}");
-                    }
+                if !snooze && !main_was_live {
+                    handle
+                        .state::<DesktopState>()
+                        .hibernation
+                        .push_pending(hibernate::PendingMainEvent::Notification { id });
+                }
+            }
+            // The click still asked for GitPulse (including waking a hibernated
+            // window). Snooze asked for nothing.
+            if !snooze && (forwarded.is_err() || !main_was_live) {
+                if let Err(error) = reveal_main(&handle) {
+                    log::warn!(target: "desktop", "Could not reveal GitPulse for a banner: {error}");
                 }
             }
         }
@@ -699,12 +800,14 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
 
     if peer.record.provider == "agy" && peer.record.turn_state != "working" {
         if let Some(tid) = peer.record.terminal_session_id.as_deref() {
-            let agy_foreground = app
-                .try_state::<crate::terminal::TerminalSessions>()
-                .and_then(|ts| crate::terminal::session_context(ts.inner(), tid).ok())
-                .is_some_and(|ctx| {
-                    crate::terminal::is_agy_foreground_process(ctx.process.as_deref())
-                });
+            let main_live = !should_queue_for_main(app) && app.get_webview_window("main").is_some();
+            let agy_foreground = main_live
+                && app
+                    .try_state::<crate::terminal::TerminalSessions>()
+                    .and_then(|ts| crate::terminal::session_context(ts.inner(), tid).ok())
+                    .is_some_and(|ctx| {
+                        crate::terminal::is_agy_foreground_process(ctx.process.as_deref())
+                    });
             if agy_foreground {
                 let _ = app.emit(
                     PEER_INBOX_EVENT,
@@ -782,14 +885,33 @@ fn serve_kickoff_spawn<R: tauri::Runtime>(
                 "prompt": prompt_text,
                 "auto_wake": true,
             });
-            app.emit(AGENT_KICKOFF_EVENT, payload)
-                .map_err(|e| format!("could not emit kickoff request: {e}"))?;
+            let main_was_live = !should_queue_for_main(app);
+            let outcome = if main_was_live {
+                app.emit(AGENT_KICKOFF_EVENT, payload)
+                    .map_err(|e| format!("could not emit kickoff request: {e}"))?;
+                "woken_immediately"
+            } else {
+                if let Some(desktop) = app.try_state::<DesktopState>() {
+                    desktop
+                        .hibernation
+                        .push_pending(hibernate::PendingMainEvent::AgentKickoff(payload));
+                }
+                let wake_handle = app.clone();
+                if let Err(error) = app.run_on_main_thread(move || {
+                    if let Err(err) = reveal_main(&wake_handle) {
+                        log::warn!(target: "desktop", "Could not reveal GitPulse for agent kickoff: {err}");
+                    }
+                }) {
+                    log::warn!(target: "desktop", "Could not schedule wake for agent kickoff: {error}");
+                }
+                "queued_for_main_wake"
+            };
             Ok(serde_json::json!({
                 "ok": true,
                 "spawn": "terminal",
                 "provider": chosen_provider,
                 "auto_wake": true,
-                "delivery_outcome": "woken_immediately",
+                "delivery_outcome": outcome,
             }))
         }
         "managed" => {
@@ -904,12 +1026,112 @@ pub fn second_launch(argv: &[String]) -> SecondLaunch<'_> {
     SecondLaunch::Reveal
 }
 
+/// Whether `"main"` exists, is not hibernating/hibernated/waking, and has
+/// registered its JS listeners via `cmd_main_ready`.
+pub fn is_main_ready<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.get_webview_window("main").is_some()
+        && app.try_state::<DesktopState>().is_some_and(|desktop| {
+            desktop.hibernation.is_main_ready() && !desktop.hibernation.is_hibernated_or_absent()
+        })
+}
+
+fn should_queue_for_main<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let Some(desktop) = app.try_state::<DesktopState>() else {
+        return false;
+    };
+    if desktop.hibernation.is_hibernated_or_absent() {
+        return true;
+    }
+    app.get_webview_window("main").is_some() && !desktop.hibernation.is_main_ready()
+}
+
+/// Queues a `(event, payload)` for `"main"` to be re-emitted via
+/// `emit_to("main", ...)` after `cmd_main_ready`.
+pub fn queue_main_event<R: Runtime>(app: &AppHandle<R>, event: &str, payload: serde_json::Value) {
+    if let Some(desktop) = app.try_state::<DesktopState>() {
+        desktop
+            .hibernation
+            .push_pending(hibernate::PendingMainEvent::Emit {
+                event: event.to_string(),
+                payload,
+            });
+    }
+}
+
+/// Single choke point for main-window-targeted events (`MENU_EVENT`,
+/// notifications, etc.). Wakes `"main"` when `reveal` is true, emits directly
+/// when ready, or queues into [`hibernate::HibernationState`] for replay after
+/// `cmd_main_ready`.
+pub fn deliver_to_main<R: Runtime, P: Serialize + Clone>(
+    app: &AppHandle<R>,
+    event: &str,
+    payload: P,
+    reveal: bool,
+) -> Result<(), String> {
+    if reveal {
+        reveal_main(app)?;
+    }
+    if should_queue_for_main(app) {
+        let value = serde_json::to_value(payload).map_err(|e| e.to_string())?;
+        queue_main_event(app, event, value);
+        Ok(())
+    } else if app.get_webview_window("main").is_some() {
+        app.emit_to("main", event, payload)
+            .map_err(|e| e.to_string())
+    } else {
+        app.emit(event, payload).map_err(|e| e.to_string())
+    }
+}
+
+/// Installs the tray icon and Dock policy during `--background` lazy boot when
+/// persisted settings indicate `show_status_icon` is enabled, keeping `"main"`
+/// hibernated with zero WebView memory.
+pub fn apply_background_boot_tray<R: Runtime>(
+    app: &AppHandle<R>,
+    show_status_icon: bool,
+    hide_dock_when_closed: bool,
+) -> Result<(), String> {
+    if !show_status_icon {
+        return Ok(());
+    }
+    let next = {
+        let desktop = app.state::<DesktopState>();
+        let mut guard = crate::supervisor::lock_or_recover(&desktop.menu_state);
+        guard.show_status_icon = true;
+        guard.hide_dock_when_closed = hide_dock_when_closed;
+        guard.clone()
+    };
+    tray::apply(app, &next)?;
+    if let Some(desktop) = app.try_state::<DesktopState>() {
+        desktop
+            .hibernation
+            .set_lifecycle(hibernate::MainWindowLifecycle::Hibernated);
+    }
+    crate::workbench::external_changes::note_main_window_on_screen(false);
+    crate::sysload::sampler::set_app_hibernated(true);
+    #[cfg(target_os = "macos")]
+    apply_dock_policy(
+        app,
+        dock_policy(show_status_icon, hide_dock_when_closed, false),
+    );
+    Ok(())
+}
+
 pub fn queue_and_emit_open<R: Runtime>(app: &AppHandle<R>, path: &Path) {
     match find_git_root(path) {
         Some(root) => {
             let root_str = root.to_string_lossy().into_owned();
+            let desktop_state = app.state::<DesktopState>();
+            if should_queue_for_main(app) {
+                desktop_state
+                    .hibernation
+                    .push_pending(hibernate::PendingMainEvent::OpenRepo(root_str));
+                if let Err(error) = reveal_main(app) {
+                    log::warn!(target: "desktop", "Could not reveal main window: {error}");
+                }
+                return;
+            }
             {
-                let desktop_state = app.state::<DesktopState>();
                 let mut pending = desktop_state
                     .pending_open
                     .lock()
@@ -935,7 +1157,6 @@ pub fn queue_and_emit_open<R: Runtime>(app: &AppHandle<R>, path: &Path) {
                 )
                 .is_ok()
             {
-                let desktop_state = app.state::<DesktopState>();
                 let mut pending = desktop_state
                     .pending_open
                     .lock()
@@ -958,10 +1179,34 @@ pub fn queue_and_emit_open<R: Runtime>(app: &AppHandle<R>, path: &Path) {
     }
 }
 
-fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or("GitPulse main window is unavailable")?;
+pub fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if let Some(desktop) = app.try_state::<DesktopState>() {
+        desktop.hibernation.cancel_hibernating();
+        if desktop.hibernation.lifecycle() == hibernate::MainWindowLifecycle::Hibernated
+            && app.get_webview_window("main").is_some()
+        {
+            // `main.destroy()` has run, but `WindowEvent::Destroyed` has not
+            // yet removed `"main"` from Tauri's window registry. Defer wake
+            // until `Destroyed` completes instead of reviving a dying window.
+            desktop.hibernation.request_wake_after_destroy();
+            crate::sysload::sampler::set_app_hibernated(false);
+            return Ok(());
+        }
+    }
+    let (window, built_from_absent) = match app.get_webview_window("main") {
+        Some(window) => (window, false),
+        None => (hibernate::build_main_window(app, true)?, true),
+    };
+    if let Some(desktop) = app.try_state::<DesktopState>() {
+        if !built_from_absent
+            && desktop.hibernation.lifecycle() != hibernate::MainWindowLifecycle::Waking
+        {
+            desktop
+                .hibernation
+                .set_lifecycle(hibernate::MainWindowLifecycle::Visible);
+        }
+    }
+    crate::sysload::sampler::set_app_hibernated(false);
     #[cfg(target_os = "macos")]
     {
         apply_dock_policy(app, DockMode::Regular);
@@ -1050,6 +1295,7 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
         .menu_state
         .lock()
         .map_err(|error| error.to_string())? = next.clone();
+    hibernate::persist_boot_tray_hint(next.show_status_icon, next.hide_dock_when_closed);
     popover::publish(app, &next)
 }
 
@@ -1380,6 +1626,27 @@ mod tests {
             }
             assert!(!allow(hostile), "{hostile} must be refused");
         }
+    }
+
+    #[test]
+    fn main_webview_admits_srcdoc_subframes_only_while_other_webviews_refuse() {
+        let allow_main =
+            |u: &str| navigation_allowed_for_webview("main", &tauri::Url::parse(u).unwrap());
+        let allow_popover = |u: &str| {
+            navigation_allowed_for_webview(popover::LABEL, &tauri::Url::parse(u).unwrap())
+        };
+        assert!(allow_main("about:srcdoc"));
+        assert!(allow_main("about:srcdoc#section-1"));
+        assert!(!allow_main("about:srcdoc?"));
+        assert!(!allow_main("about:srcdoc?x=1"));
+        assert!(!allow_main("about:srcdoc?x=1#section-1"));
+        assert!(!allow_main("about:srcdoc/other"));
+        assert!(!allow_main("about://evil.example/srcdoc"));
+        assert!(!allow_main("about:config"));
+        assert!(!allow_main("https://example.com/"));
+        assert!(!allow_main("data:text/html,<h1>x</h1>"));
+        assert!(!allow_popover("about:srcdoc"));
+        assert!(!allow_popover("about:srcdoc#section-1"));
     }
 
     #[test]
@@ -1871,5 +2138,97 @@ mod tests {
             0,
             "PEER_INBOX_EVENT must not be emitted when no hosted agy PTY is in the foreground"
         );
+    }
+
+    #[test]
+    fn deliver_to_main_queues_when_hibernated_and_emits_when_ready() {
+        use tauri::{Listener, WebviewUrl, WebviewWindowBuilder};
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .build(crate::context())
+            .unwrap();
+        let desktop = app.state::<DesktopState>();
+        desktop
+            .hibernation
+            .set_lifecycle(hibernate::MainWindowLifecycle::Hibernated);
+
+        deliver_to_main(
+            app.handle(),
+            MENU_EVENT,
+            NativeEvent {
+                id: "focus-agent:term-1".into(),
+                path: None,
+                repo_path: None,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(desktop.hibernation.pending_len(), 1);
+        let drained = desktop.hibernation.drain_pending();
+        assert!(matches!(
+            drained.as_slice(),
+            [hibernate::PendingMainEvent::Emit { event, .. }] if event == MENU_EVENT
+        ));
+
+        let main = WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
+            .build()
+            .unwrap();
+        desktop
+            .hibernation
+            .set_lifecycle(hibernate::MainWindowLifecycle::Visible);
+        desktop.hibernation.set_main_ready(true);
+
+        let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = std::sync::Arc::clone(&delivered);
+        let _listener = main.listen(MENU_EVENT, move |_| {
+            sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        deliver_to_main(
+            app.handle(),
+            MENU_EVENT,
+            NativeEvent {
+                id: "refresh".into(),
+                path: None,
+                repo_path: None,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(desktop.hibernation.pending_len(), 0);
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn serve_kickoff_spawn_queues_terminal_when_main_is_hibernated() {
+        let repo_dir = crate::codeintel::tests::repo_with_one_generation();
+        let repo = repo_dir.path().to_str().unwrap().to_string();
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .build(crate::context())
+            .unwrap();
+        let desktop = app.state::<DesktopState>();
+        desktop
+            .hibernation
+            .set_lifecycle(hibernate::MainWindowLifecycle::Hibernated);
+
+        let ans = serve_kickoff_spawn(
+            app.handle(),
+            &repo,
+            "req-1",
+            "terminal",
+            Some("claude"),
+            Some("main"),
+            Some("inspect"),
+            None,
+        )
+        .expect("serve_kickoff_spawn");
+        assert_eq!(ans["delivery_outcome"], "queued_for_main_wake");
+        assert_eq!(desktop.hibernation.pending_len(), 1);
+        let drained = desktop.hibernation.drain_pending();
+        assert!(matches!(
+            drained.as_slice(),
+            [hibernate::PendingMainEvent::AgentKickoff(_)]
+        ));
     }
 }

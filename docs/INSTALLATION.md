@@ -102,9 +102,9 @@ To avoid the refused run when installing such a build, unload the cleaner agent
 before you replace the app and load it again afterwards:
 
 ```sh
-launchctl bootout "gui/$(id -u)/com.gitpulse.hygiene"
+launchctl bootout "gui/$(id -u)/dev.vbcr.gitpulse.hygiene"
 # replace /Applications/GitPulse.app here
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.gitpulse.hygiene.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.vbcr.gitpulse.hygiene.plist
 ```
 
 `bootout` stops a cleaner run that is in progress at that moment. An agent
@@ -112,10 +112,23 @@ loaded with `bootstrap` is not pinned for the rest of that login session; macOS
 pins it again when it loads the agent at the next login. Skip both commands if
 the agent is not installed.
 
+#### Upgrading from the `com.gitpulse.desktop` bundle identifier
+
+GitPulse's bundle identifier is now `dev.vbcr.gitpulse`. The first launch
+copies the page's website data (`~/Library/WebKit/com.gitpulse.desktop/WebsiteData`)
+to the new identifier, moves a saved Claude API key to its new Keychain item,
+and replaces the cleaner agent `com.gitpulse.hygiene` with
+`dev.vbcr.gitpulse.hygiene`. The old website data is left in place, so a
+downgrade still finds it; delete it when you no longer need it. Your repositories,
+profile (`~/Library/Application Support/GitPulse`) and launch-at-login entry do
+not depend on the identifier. macOS treats the renamed app as a new app, so it
+asks again for notifications and for access to Desktop, Documents and Downloads,
+and a Full Disk Access grant has to be given again.
+
 #### Quitting
 
 Cmd-Q, Dock → Quit, the status menu's Quit item, and a Quit Apple event
-(`osascript -e 'quit app id "com.gitpulse.desktop"'`) all go through the same
+(`osascript -e 'quit app id "dev.vbcr.gitpulse"'`) all go through the same
 confirmation. GitPulse asks first when Git actions are still running, editor saves
 are in flight, or editor drafts are unsaved, and quits immediately otherwise.
 A logout or restart waits while GitPulse asks, then continues if you quit, or

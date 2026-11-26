@@ -11,7 +11,7 @@ pub(super) fn unparsed_extraction(
     Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
-        content_hash: content_hash(source),
+        content_hash: source_identity(source),
         engine,
         parse_outcome,
         // The File node is still emitted: being unable to parse a file is not a
@@ -161,7 +161,7 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
     Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
-        content_hash: content_hash(source),
+        content_hash: source_identity(source),
         engine: match (recovered, declarative) {
             (true, _) => ExtractionEngine::RegexFallback {
                 requested_language: lang.to_string(),
@@ -338,7 +338,17 @@ pub(super) fn walk_tree(
 ) -> bool {
     let mut worklist = vec![root];
     let mut since_check = 0u32;
+    let mut visited: usize = 0;
     while let Some(node) = worklist.pop() {
+        visited += 1;
+        if visited > MAX_WALK_NODES {
+            WALK_OVERRAN.with(|slot| slot.set(true));
+            return false;
+        }
+        if symbols.len().saturating_sub(1) > MAX_FILE_SYMBOLS {
+            WALK_OVERRAN.with(|slot| slot.set(true));
+            return false;
+        }
         // A `Cell` read, cheap enough for every node, unlike a clock read.
         if walk_overran() {
             return false;
@@ -377,6 +387,9 @@ pub(super) fn walk_tree(
 
 /// Nodes walked between deadline checks. See `walk_tree`.
 pub(crate) const DEADLINE_CHECK_STRIDE: u32 = 256;
+
+/// Maximum AST nodes visited during a single file's syntax tree walk.
+pub(crate) const MAX_WALK_NODES: usize = 1_000_000;
 
 /// The `{ a, b as c }` clause of a JavaScript/TypeScript import or export
 /// statement, or `None` when the statement has no binding clause at all.

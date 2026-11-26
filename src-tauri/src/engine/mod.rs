@@ -10,6 +10,7 @@ pub mod deadbranch;
 pub mod git_cli;
 pub mod git_reader;
 pub mod git_writer;
+pub mod gix_status;
 pub mod merge_tree;
 #[cfg(test)]
 mod merge_tree_adversarial_tests;

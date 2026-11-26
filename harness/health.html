@@ -13,8 +13,21 @@
       import "../src/app.css";
 
       const errors = [];
-      addEventListener("error", event => errors.push(event.message));
-      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+      // Each error says where the run was when it fired: how many checks had
+      // been recorded, the last one's name, and the repository open then. The
+      // list is only judged at the end ("no unhandled runtime errors"), so
+      // without this an error that broke a check mid-run arrived with nothing
+      // tying it to the switch that raised it.
+      const at = { results: null, repo: () => null };
+      const where = () => {
+        const last = at.results?.at(-1);
+        const after = at.results ? `after ${at.results.length} checks${last ? `, last "${last.name}"` : ""}` : "before the checks";
+        let repo = null;
+        try { repo = at.repo(); } catch { /* the store is not loaded yet */ }
+        return ` [${after}; repository ${repo ?? "none"}]`;
+      };
+      addEventListener("error", event => errors.push(`${event.message}${where()}`));
+      addEventListener("unhandledrejection", event => errors.push(`${String(event.reason)}${where()}`));
 
       // Fixture shapes are the complete wire types, per src/lib/health/types.ts
       // and src/lib/codeintel/types.ts. A fixture short of a field is not a
@@ -233,6 +246,7 @@
       const { createChecks, CheckFailed } = await import("./checks.ts");
       const { HEALTH_SECTIONS } = await import("../src/lib/health/sections.ts");
       const { get } = await import("svelte/store");
+      at.repo = () => get(repoStore.currentPath);
       const { diagnostics } = await import("../src/lib/diagnostics/diagnostics.ts");
       const HealthPanel = (await import("../src/lib/components/HealthPanel.svelte")).default;
 
@@ -287,6 +301,7 @@
         // beside its name, and the run writes down where it stopped instead of
         // ending in a short list of passes that reads as silence.
         const { results, check, stopped } = createChecks();
+        at.results = results;
         const finish = () => {
           const payload = { results, errors };
           document.querySelector("#result").textContent = JSON.stringify(results, null, 2);

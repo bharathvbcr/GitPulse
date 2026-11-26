@@ -6454,13 +6454,16 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&sec_dir).unwrap();
 
+        // Items are kept per service, as the real Keychain keeps them: `item`
+        // is the current service and `item-legacy` the pre-rename one. A fake
+        // that ignored the service would let `save`'s cleanup of the old item
+        // delete the key it had just written.
         let sec_item = sec_dir.join("item");
+        let sec_legacy = sec_dir.join("item-legacy");
         let sec_script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  -i)\n    read -r line\n    key=${{line##* -w }}\n    printf '%s' \"$key\" > '{}'\n    exit 0 ;;\n  find-generic-password)\n    [ -f '{}' ] || exit 44\n    cat '{}'; echo; exit 0 ;;\n  delete-generic-password)\n    rm -f '{}'; exit 0 ;;\nesac\nexit 2\n",
-            sec_item.display(),
-            sec_item.display(),
-            sec_item.display(),
-            sec_item.display(),
+            "#!/bin/sh\npick() {{\n  case \"$1\" in\n    com.gitpulse.desktop*) item='{legacy}' ;;\n    *) item='{item}' ;;\n  esac\n}}\ncase \"$1\" in\n  -i)\n    read -r line\n    key=${{line##* -w }}\n    svc=${{line#* -s }}; svc=${{svc%% *}}\n    pick \"$svc\"\n    printf '%s' \"$key\" > \"$item\"\n    exit 0 ;;\n  find-generic-password)\n    pick \"$3\"\n    [ -f \"$item\" ] || exit 44\n    cat \"$item\"; echo; exit 0 ;;\n  delete-generic-password)\n    pick \"$3\"\n    rm -f \"$item\"; exit 0 ;;\nesac\nexit 2\n",
+            item = sec_item.display(),
+            legacy = sec_legacy.display(),
         );
         let sec_bin = sec_dir.join("security");
         fs::write(&sec_bin, sec_script).unwrap();
@@ -6811,6 +6814,10 @@ mod tests {
                 "1-hour-old scratch build must be offered when disk_critical=true in cloud mode",
             );
         assert_eq!(recent_entry["recent_below_retention"], true);
+        assert!(
+            recent_entry["bytes"].is_u64(),
+            "cloud inventory must measure bytes on scratch targets: {recent_entry:?}"
+        );
         // Clone-private bytes come from APFS (`storage::clone_size`, macOS
         // only). Elsewhere the inventory must say they were not measured, not
         // offer a number it never read.

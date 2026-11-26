@@ -66,7 +66,7 @@ use std::time::Instant;
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::model::TextRange;
-use crate::treesitter::{DEADLINE_CHECK_STRIDE, bounded_parent, parse_until, walk_deadline_passed};
+use crate::treesitter::{bounded_parent, parse_until, walk_deadline_passed, DEADLINE_CHECK_STRIDE};
 
 /// Separators written per file. A file that wants more is not rewritten.
 pub(crate) const MAX_EDITS: usize = 512;

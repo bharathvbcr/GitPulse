@@ -6,7 +6,7 @@
   <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml/badge.svg" alt="Coverage"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/bharathvbcr/GitPulse"><img src="https://api.scorecard.dev/projects/github.com/bharathvbcr/GitPulse/badge" alt="OpenSSF Scorecard"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/releases"><img src="https://img.shields.io/github/v/release/bharathvbcr/GitPulse?include_prereleases&sort=semver" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
   <img src="https://img.shields.io/badge/tested%20on-macOS-lightgrey" alt="Tested on macOS; Windows and Linux builds are not yet tested">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202%20%7C%20Rust%20%7C%20Svelte%205-orange" alt="Tech Stack">
 </p>
@@ -19,7 +19,7 @@ GitPulse is built for the agentic era. It gives the same information and the sam
 people and to the agents doing the work. It runs Claude Code, Codex and other agents side by side
 across all your repositories. Each agent gets its own worktree, a policy guard and a code map, and
 a load scheduler keeps the machine responsive. A full Git client sits in the same window. It is a
-native Rust and Tauri 2 app with a Svelte 5 frontend, free and MIT-licensed.
+native Rust and Tauri 2 app with a Svelte 5 frontend, free and dual-licensed under `MIT OR Apache-2.0`.
 
 [Download the 0.2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1) ·
 [Getting started](docs/GETTING_STARTED.md) ·
@@ -392,13 +392,13 @@ types.
 | **GitHub Topics** | `git`, `git-client`, `git-gui`, `tauri`, `tauri-v2`, `rust`, `svelte5`, `svelte`, `local-first`, `code-intelligence`, `developer-tools`, `devtools`, `desktop-app`, `mcp`, `commit-graph`, `merge-conflict-resolver`, `reflog`, `test-coverage`, `terminal`, `privacy-first`, `zero-telemetry` |
 | **Tech Stack** | Rust (Tauri 2, Rayon), Svelte 5 (Runes), TypeScript, Tailwind CSS, portable-pty, DevMap, Manvi |
 | **Target Platforms** | Tested on macOS (universal build). Release CI also builds Linux x64 and arm64 (`.AppImage`, `.deb`) and Windows x64 and arm64 (`.msi`, `.exe`); those builds are not yet tested. |
-| **License & Privacy** | MIT License · 100% on-device · Zero telemetry |
+| **License & Privacy** | Dual-licensed (`MIT OR Apache-2.0`) · 100% on-device · Zero telemetry |
 
 ---
 
 ## License & Acknowledgements
 
-Distributed under the [MIT License](LICENSE). See [NOTICE](NOTICE) for third-party and vendored crate attributions. The GitPulse name and logo are not covered by the MIT License; see [TRADEMARKS.md](TRADEMARKS.md).
+Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option — see [LICENSE](LICENSE). See [NOTICE](NOTICE) for third-party and vendored crate attributions. The GitPulse name and logo are not covered by the MIT or Apache-2.0 licenses; see [TRADEMARKS.md](TRADEMARKS.md).
 
 - **[The Tauri Programme (`tauri-apps`)](https://github.com/tauri-apps/tauri)** (`tauri`, `wry`, `tao`, `muda` — Apache-2.0 OR MIT) — Desktop shell runtime and patched crates under `src-tauri/framework/`.
 - **[webkit2gtk-rs](https://github.com/tauri-apps/webkit2gtk-rs)** (`The Gtk-rs Project Developers` & `Antoni Boucher`, MIT), **[libappindicator-rs](https://github.com/qDot/libappindicator-rs)** (`Kyle Machulis / qDot`), and **[notify](https://github.com/notify-rs/notify)** (`Félix Saparelli & contributors`).

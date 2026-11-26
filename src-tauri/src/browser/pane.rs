@@ -11,7 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wry::dpi::{LogicalPosition, LogicalSize};
-use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder};
+use wry::{
+    NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder, WebViewBuilderExtDarwin,
+};
 
 /// Where a pane reports what its page did.
 pub type EventSink = Arc<dyn Fn(PaneEvent) + Send + Sync>;
@@ -55,7 +57,8 @@ fn builder(
     let report = Arc::new(report);
     let (on_nav, nav_id) = (report.clone(), id.to_owned());
     let (on_load, load_id) = (report.clone(), id.to_owned());
-    let (on_title, title_id) = (report, id.to_owned());
+    let (on_title, title_id) = (report.clone(), id.to_owned());
+    let (on_terminate, terminate_id) = (report, id.to_owned());
     WebViewBuilder::new()
         .with_url(url)
         .with_bounds(rect(bounds))
@@ -92,6 +95,9 @@ fn builder(
                 },
                 &title_id,
             );
+        })
+        .with_on_web_content_process_terminate_handler(move || {
+            on_terminate(PageEvent::Terminated, &terminate_id);
         })
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
     // No download handler: wry cancels a navigation that asks to download

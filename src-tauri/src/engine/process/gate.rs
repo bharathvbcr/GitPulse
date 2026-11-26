@@ -350,6 +350,9 @@ thread_local! {
     /// Whether this thread's spawn is the host-load exec probe (see
     /// [`with_exec_probe`]).
     static EXEC_PROBE: Cell<bool> = const { Cell::new(false) };
+    /// Whether this thread's spawns draw no git rate token (see
+    /// [`with_unmetered_spawn_rate`]).
+    static UNMETERED: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread's background spawns wait for budget; a thread
     /// starts in the process default, like [`ADMISSION`].
     static AWAITS_BUDGET: Cell<bool> =
@@ -518,6 +521,38 @@ pub(super) fn with_exec_probe<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// Runs `body` with its spawns admitted outside the git spawn rate budget, both
+/// the process bucket and the shared record: they take a slot and answer to the
+/// load governor like any other, and neither wait for a token nor spend one.
+///
+/// The budget exists to cap `git` process starts (the 2026-10-02 storm). A
+/// child that is not git and starts none through this gate has no business
+/// drawing on it: the code map's `devmap status` was shed fifteen times in four
+/// minutes by a bucket that git reads had spent, and devmap never ran. The
+/// caller owns the cost this stops charging to git, because the gate no longer
+/// sees it: a devmap read that spawns git of its own (a stacked lane) has to
+/// bound itself, as `devmap::cli`'s read budget does. Not for anything that
+/// runs git, or whose rate is not otherwise bounded.
+pub(crate) fn with_unmetered_spawn_rate<T>(body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(UNMETERED.replace(true), |prev| {
+        UNMETERED.set(prev);
+    });
+    body()
+}
+
+/// A deferral for a refusal that is not the git budget's: the same sentence
+/// shape and typed kind every reader of a deferral matches on
+/// ([`is_deferred_under_load`]), with `why` naming what refused.
+pub(crate) fn deferred_under_load_error(label: &str, waited: Duration, why: &str) -> CommandError {
+    CommandError::typed(
+        crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
+        format!(
+            "{label}{DEFERRED_MARKER}{:.3}s: {why}",
+            waited.as_secs_f64()
+        ),
+    )
+}
+
 /// The load governor's verdict for one spawn of `class`, and the only reader of
 /// it: the refusal the gate gives under pressure, or `None` when the class is
 /// not shed (a user action never is) or the disk remedy's relief applies.
@@ -550,6 +585,48 @@ pub(crate) fn background_deferral_cause() -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+/// Applies the spawn gate's host-load shedding verdict to an in-process read
+/// before it starts work, keeping `sysload::shed` single-owned in
+/// [`pressure_refusal`].
+pub(crate) fn check_in_process_admission(label: &str) -> Result<(), CommandError> {
+    #[cfg(test)]
+    if super::runner::forced_deferral_active() {
+        return Err(refusal_message(label, Refusal::Shed));
+    }
+    let class = current_admission();
+    if let Some(refusal) = pressure_refusal(class) {
+        spawn_gate()
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counters[class.index()]
+        .count(refusal);
+        return Err(refusal_message_at(label, refusal, None));
+    }
+    Ok(())
+}
+
+/// Runs a one-shot command's body as the user's own action ([`Admission::Interactive`]):
+/// concurrency-limited, never shed, never drawing a rate token. For a binary
+/// whose process default is background (see [`run_process_as_background`]) and
+/// whose one command the user (or an agent on the user's behalf) asked for by
+/// name, so that no amount of other traffic on the shared budget can refuse
+/// the command that was typed. Only the thread that calls it is promoted: work
+/// the body hands to another thread keeps that thread's class.
+pub fn run_as_user_action<T>(body: impl FnOnce() -> T) -> T {
+    with_admission(Admission::Interactive, body)
+}
+
+/// Wraps `body` so that it runs under the admission class the calling thread
+/// has *now*, wherever it is run: the way a body that hands work to another
+/// thread (`thread::scope`, a pool) carries the class across, since a new thread
+/// starts in the process default and would otherwise turn a user action's
+/// follow-up work back into optional work.
+pub fn carry_admission<T>(body: impl FnOnce() -> T) -> impl FnOnce() -> T {
+    let class = current_admission();
+    move || with_admission(class, body)
 }
 
 /// Applies only inside a synchronous blocking operation.
@@ -1263,7 +1340,8 @@ impl SpawnGate {
         }
         let rate_limited = self.refill_per_sec != u32::MAX
             && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed)
-            && !EXEC_PROBE.get();
+            && !EXEC_PROBE.get()
+            && !UNMETERED.get();
         let entered = self.clock.now();
         // Declared before the state guard so that, unwinding, the guard is
         // released first and the reservation can take the lock to give its
@@ -1836,9 +1914,42 @@ pub(super) fn format_gate_report(counters: &[AdmissionCounters; 3], sharing: &st
 static SPAWN_GATE: OnceLock<SpawnGate> = OnceLock::new();
 
 pub(super) fn spawn_gate() -> &'static SpawnGate {
+    #[cfg(test)]
+    if let Some(gate) = GATE_FOR_THIS_THREAD.get() {
+        return gate;
+    }
     // Tests share this process-wide gate and spawn far above the storm cap.
     // Production uses the same constructor with `testing == false`.
     SPAWN_GATE.get_or_init(|| configured_spawn_gate(cfg!(test)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The gate this thread's spawns go through instead of the process-wide
+    /// one, set by [`with_gate_for_test`]. Thread-local so that a test that
+    /// wants an empty bucket does not take it from every other test.
+    static GATE_FOR_THIS_THREAD: Cell<Option<&'static SpawnGate>> = const { Cell::new(None) };
+}
+
+/// Runs `body` with every spawn on this thread admitted by `gate`: the way a
+/// caller that reaches the gate through [`run_observed`] (a devmap read) is
+/// tested against a bucket it cannot spend.
+#[cfg(test)]
+pub(crate) fn with_gate_for_test<T>(gate: &'static SpawnGate, body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(GATE_FOR_THIS_THREAD.replace(Some(gate)), |prev| {
+        GATE_FOR_THIS_THREAD.set(prev);
+    });
+    body()
+}
+
+/// A production-rate gate whose bucket is empty and cannot refill during the
+/// test: the state a git spawn storm leaves the budget in.
+#[cfg(test)]
+pub(crate) fn spent_gate() -> &'static SpawnGate {
+    let (burst, rate) = production_spawn_rate();
+    let gate = frozen_gate(SpawnGate::with_rate(spawn_limit(), burst, rate));
+    gate.state.lock().unwrap().tokens = 0;
+    gate
 }
 
 #[cfg(test)]

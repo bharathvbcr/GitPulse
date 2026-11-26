@@ -40,6 +40,11 @@ pub trait SessionEvents: Send + Sync {
     /// The session ended. Called once, after its last byte was sent and its
     /// entry left the session map.
     fn exit(&self, ended: SessionEnded);
+    /// A connection to the terminal host listed its sessions: the one moment a
+    /// reconcile that could not ask the host earlier can run. Must not block.
+    fn host_adopted(&self) {}
+    /// A session was recorded in the durable ledger: the recovery view changed.
+    fn session_recorded(&self) {}
 }
 
 /// The engine's events, inside the app: the Tauri events and banners the
@@ -79,6 +84,33 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
         crate::alerts::record_scan_drops(dropped);
     }
 
+    fn session_recorded(&self) {
+        self.session_ledger.emit_view(&self.app);
+    }
+
+    fn host_adopted(&self) {
+        if !self.session_ledger.reconcile_pending() {
+            return;
+        }
+        let app = self.app.clone();
+        let spawned = crate::supervisor::spawn_one_of_many(
+            "terminal-ledger-reconcile",
+            "terminal session ledger reconcile",
+            move || {
+                use tauri::Manager as _;
+                let Some(terminals) = app.try_state::<super::TerminalSessions>() else {
+                    return;
+                };
+                if terminals.retry_session_ledger_reconcile().is_some() {
+                    terminals.session_ledger().emit_view(&app);
+                }
+            },
+        );
+        if let Err(error) = spawned {
+            log::warn!(target: "terminal", "ledger reconcile retry did not start: {error}");
+        }
+    }
+
     fn exit(&self, ended: SessionEnded) {
         self.session_ledger.record_lifecycle(
             "exit",
@@ -86,6 +118,8 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
                 "session_id": ended.payload.id,
                 "exit_code": ended.payload.exit_code,
                 "signal": ended.payload.signal,
+                "error": ended.payload.error,
+                "reaped": ended.payload.reaped,
                 "ended_by_gitpulse": ended.ended_by_gitpulse,
                 "program": ended.program,
                 "cwd": ended.cwd,
@@ -93,9 +127,13 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
         );
         if self.session_ledger.record_exit(
             &ended.payload.id,
-            ended.ended_by_gitpulse,
-            ended.payload.exit_code,
-            Some(ended.payload.signal.as_str()).filter(|s| !s.is_empty()),
+            session_ledger::ExitFacts {
+                ended_by_gitpulse: ended.ended_by_gitpulse,
+                exit_code: ended.payload.exit_code,
+                signal: Some(ended.payload.signal.as_str()).filter(|s| !s.is_empty()),
+                error: ended.payload.error.as_deref(),
+                reaped: ended.payload.reaped,
+            },
         ) {
             self.session_ledger.emit_view(&self.app);
         }

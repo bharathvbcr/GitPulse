@@ -337,6 +337,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
             for_peer: "p".into(),
             provider_session_id: None,
             since_seq: None,
+            since_mailbox_ms: None,
             thread_key: None,
             include_broadcasts: None,
             timeout_ms: Some(100),
@@ -368,6 +369,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
             for_peer: "waiter-target".into(),
             provider_session_id: Some(sid.into()),
             since_seq: None,
+            since_mailbox_ms: None,
             thread_key: None,
             include_broadcasts: None,
             timeout_ms: Some(500),
@@ -418,6 +420,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
             for_peer: "waiter-target".into(),
             provider_session_id: Some(sid.into()),
             since_seq: Some(0),
+            since_mailbox_ms: None,
             thread_key: None,
             include_broadcasts: Some(false),
             timeout_ms: Some(5_000),
@@ -830,7 +833,27 @@ fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses(
     assert_eq!(sent["hop"], 1);
     assert_eq!(sent["delivery_outcome"], "paused_hop_limit");
 
+    // At its limit the envelope is not deposited: the bus row is the record.
     let mb = Mailbox::at_default().expect("mailbox");
+    assert!(mb
+        .peek_pending(sid, 16, SystemTime::now())
+        .expect("peek mailbox")
+        .is_empty());
+
+    // Under the limit the same caller's message is deposited with peer provenance.
+    let sent = handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "claude:coder",
+            "to_peer": "hop-victim",
+            "body": "claims to be hop zero, with room",
+            "hop": 0,
+            "max_hops": 8,
+        }),
+    )
+    .expect("send as a peer under the limit");
+    assert_eq!(sent["hop"], 1);
     let pending = mb
         .peek_pending(sid, 16, SystemTime::now())
         .expect("peek mailbox");
@@ -1460,6 +1483,7 @@ fn a_wait_reports_has_more_and_dropped_before_seq_like_the_inbox() {
                 for_peer: "wait-owner".into(),
                 provider_session_id: Some(sid.into()),
                 since_seq: None,
+                since_mailbox_ms: None,
                 thread_key: None,
                 include_broadcasts: None,
                 timeout_ms: Some(timeout_ms),
@@ -1575,4 +1599,695 @@ fn an_agent_cannot_send_as_gitpulse_to_take_the_reserved_overflow_slot() {
         !mb.has_unclaimed(sid).expect("look"),
         "nothing may be deposited"
     );
+}
+
+/// Writes a bus file with two unread direct rows for `role` and 300 broadcasts, so the next
+/// post evicts past the two pinned rows.
+fn seed_bus_with_two_pinned_rows(repo: &str, role: &str) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let row = |seq: u64, to: Option<&str>| {
+        json!({ "seq": seq, "from_agent": "agy:filler", "to_agent": to, "kind": "note",
+                "body": "filler", "created_at_ms": now, "msg_id": format!("seed-{seq}") })
+    };
+    let mut rows = vec![row(1, Some(role)), row(2, Some(role))];
+    rows.extend((3..=302).map(|seq| row(seq, None)));
+    let state = json!({ "next_seq": 302, "dropped_before_seq": 0, "messages": rows });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+}
+
+#[test]
+fn an_inbox_and_a_wait_list_only_the_returned_rows_below_dropped_before_seq() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888806";
+    register_inbox_peer(&repo, sid, "pin-owner");
+    seed_bus_with_two_pinned_rows(&repo, "pin-owner");
+    send_to_role(&repo, "pin-owner", "trigger the eviction");
+
+    let inbox = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "pin-owner", "limit": 1 }),
+    )
+    .expect("inbox");
+    assert!(inbox["dropped_before_seq"].as_u64().unwrap() > 2, "{inbox}");
+    assert_eq!(inbox["messages"][0]["seq"], 1, "{inbox}");
+    assert_eq!(
+        inbox["pinned_below_dropped_before_seq"],
+        json!([1]),
+        "limit 1 returns one row, so only that row is listed: {inbox}"
+    );
+
+    let counter = AtomicUsize::new(0);
+    let wait = handle_agent_wait_with_counter(
+        AgentWaitArgs {
+            repo_path: repo.clone(),
+            for_peer: "pin-owner".into(),
+            provider_session_id: Some(sid.into()),
+            since_seq: None,
+            since_mailbox_ms: None,
+            thread_key: None,
+            include_broadcasts: None,
+            timeout_ms: Some(0),
+            ack: Some(false),
+            limit: Some(10),
+        },
+        &counter,
+        60_000,
+    )
+    .expect("wait");
+    assert_eq!(
+        wait["pinned_below_dropped_before_seq"],
+        json!([1, 2]),
+        "{wait}"
+    );
+}
+
+#[test]
+fn following_the_over_cap_hint_literally_repairs_the_bus() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888807";
+    register_inbox_peer(&repo, sid, "cap-owner");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let cap = usize::try_from(8u64 * 1024 * 1024).unwrap();
+    let state = json!({ "next_seq": 1, "dropped_before_seq": 0, "messages": [{
+        "seq": 1, "from_agent": "agy:filler", "to_agent": null, "kind": "note",
+        "body": "x".repeat(cap), "created_at_ms": now, "msg_id": "seed-1" }] });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(&repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+    let read = || {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "cap-owner", "ack": true }),
+        )
+    };
+
+    let err = read().expect_err("an over-cap bus is refused");
+    assert!(
+        err.contains("gitpulse_agent_send without thread_key or in_reply_to"),
+        "{err}"
+    );
+    send_to_role(&repo, "cap-owner", "the repairing send");
+    let healed = read().expect("the named send repaired the bus");
+    assert_eq!(
+        healed["messages"][0]["body"], "the repairing send",
+        "{healed}"
+    );
+}
+
+#[test]
+fn a_returned_envelope_whose_bus_row_was_evicted_is_not_listed_as_pinned() {
+    let (_dir, repo) = trusted_git_repo();
+    let nonce = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let sid = format!(
+        "88888888-{:04x}-4888-8888-{:012x}",
+        (std::process::id() & 0xffff),
+        (nonce & 0xffff_ffff_ffff)
+    );
+    register_forgery_target(&repo, &sid, "evict-owner");
+    let mb = Mailbox::at_default().expect("mailbox");
+    crate::harness::steward::deliver_directive_to_repo(
+        &repo,
+        &mb,
+        "steward-evict-1",
+        "claude-sonnet-4-6",
+        "cloud",
+        "severe",
+        "swap",
+        "Directive whose bus row will be evicted",
+    )
+    .expect("deliver directive");
+    for idx in 0..(crate::engine::agent_bus::MAX_BUS_MESSAGES + 4) {
+        crate::engine::agent_bus::post_peer_message(
+            &repo,
+            crate::engine::agent_bus::MessageOrigin::Agent,
+            "claude:chatter",
+            Some("other-peer"),
+            None,
+            "note",
+            &format!("ring rotation filler {idx}"),
+            None,
+            None,
+            1,
+            6,
+        )
+        .expect("post filler");
+    }
+    assert!(
+        crate::engine::agent_bus::get_message_by_id(&repo, "steward-evict-1")
+            .expect("lookup")
+            .is_none(),
+        "the steward row must be evicted from the bus"
+    );
+
+    let page = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "evict-owner", "limit": 50 }),
+    )
+    .expect("inbox");
+    let returned = page["messages"].as_array().unwrap();
+    let steward = returned
+        .iter()
+        .find(|m| m["msg_id"] == "steward-evict-1")
+        .unwrap_or_else(|| panic!("the envelope is still returned: {page}"));
+    let steward_seq = steward["seq"].as_u64().unwrap();
+    assert!(steward_seq < page["dropped_before_seq"].as_u64().unwrap());
+    let listed = page["pinned_below_dropped_before_seq"].as_array().unwrap();
+    assert!(
+        !listed.contains(&json!(steward_seq)),
+        "a row that is not on the bus must not be listed as retained: {page}"
+    );
+}
+
+#[test]
+fn a_legacy_bus_row_hydrated_for_a_mailbox_envelope_is_acked_and_claimed() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888808";
+    register_inbox_peer(&repo, sid, "legacy-owner");
+    handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({ "repo_path": repo, "from_peer": "agy:lead", "to_peer": "legacy-owner",
+                 "body": "legacy row", "msg_id": "msg-1" }),
+    )
+    .expect("send");
+    // Make the bus row a legacy one (no msg_id) that the bus read does not match to the
+    // reader, so only the mailbox envelope leads to it through get_message_by_id.
+    let path = crate::engine::agent_bus::lanes_messages_path(&repo, false).expect("bus path");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read bus")).expect("parse bus");
+    let row = state["messages"][0].as_object_mut().expect("row");
+    assert_eq!(row["seq"], 1);
+    row.remove("msg_id");
+    row.insert("to_agent".into(), json!("somebody-else"));
+    std::fs::write(&path, serde_json::to_vec_pretty(&state).expect("serialize")).expect("write");
+
+    let read = || {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "legacy-owner", "ack": true }),
+        )
+        .expect("inbox")
+    };
+    let first = read();
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(first["messages"][0]["msg_id"], "msg-1", "{first}");
+    assert_eq!(first["acked_count"], 1, "{first}");
+    let second = read();
+    assert!(
+        second["messages"].as_array().unwrap().is_empty(),
+        "{second}"
+    );
+}
+
+#[test]
+fn an_exact_retry_of_a_threaded_send_keeps_the_stored_hop_and_the_mailbox_deposit() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "99999999-9999-4999-8999-999999999991";
+    register_forgery_target(&repo, sid, "retry-target");
+    let args = json!({"from_peer": "claude:a", "to_peer": "retry-target", "body": "q",
+                      "thread_key": "retry-thread", "msg_id": "retry-1"});
+
+    let first = send_json(&repo, args.clone()).expect("first send");
+    let retry = send_json(&repo, args).expect("exact retry");
+
+    assert_eq!(retry["hop"], first["hop"], "a retry must not climb a hop");
+    assert_eq!(retry["message"]["seq"], first["message"]["seq"]);
+    assert_eq!(retry["mailbox"]["deposited"], true, "{retry}");
+    assert_eq!(retry["mailbox"]["duplicate"], true, "{retry}");
+    assert_eq!(retry["delivery_outcome"], first["delivery_outcome"]);
+}
+
+fn wait_peek(repo: &str, role: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut args = json!({ "repo_path": repo, "for_peer": role, "ack": false, "timeout_ms": 300 });
+    args.as_object_mut()
+        .expect("args object")
+        .extend(extra.as_object().expect("extra object").clone());
+    handle_tool_call("gitpulse_agent_wait", &args).expect("wait")
+}
+
+#[test]
+fn a_non_acking_wait_resumes_past_a_pending_human_envelope_with_the_returned_cursors() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01";
+    register_inbox_peer(&repo, sid, "peekwait-human");
+    Mailbox::at_default()
+        .expect("mailbox")
+        .deposit(sid, "human-peek-1", "from the person", SystemTime::now())
+        .expect("deposit human envelope");
+
+    let first = wait_peek(&repo, "peekwait-human", json!({}));
+    assert_eq!(first["timed_out"], false, "{first}");
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1, "{first}");
+    let seq = first["next_since_seq"].as_u64().expect("next_since_seq");
+    let cursor = first["mailbox_cursor_ms"]
+        .as_u64()
+        .expect("mailbox_cursor_ms");
+
+    let second = wait_peek(
+        &repo,
+        "peekwait-human",
+        json!({ "since_seq": seq, "since_mailbox_ms": cursor }),
+    );
+    assert_eq!(second["timed_out"], true, "{second}");
+    assert!(
+        second["messages"].as_array().unwrap().is_empty(),
+        "{second}"
+    );
+
+    // The envelope was never acknowledged, so a plain read still sees it.
+    let plain = wait_peek(&repo, "peekwait-human", json!({}));
+    assert_eq!(plain["messages"].as_array().unwrap().len(), 1, "{plain}");
+}
+
+#[test]
+fn paging_an_inbox_by_next_since_seq_returns_every_bus_row_when_the_page_is_cut() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa02";
+    register_inbox_peer(&repo, sid, "page-owner");
+    send_to_role(&repo, "page-owner", "page one");
+    send_to_role(&repo, "page-owner", "page two");
+
+    let read = |since: u64| {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "page-owner", "limit": 1, "since_seq": since }),
+        )
+        .expect("inbox read")
+    };
+    let first = read(0);
+    assert_eq!(first["has_more"], true, "{first}");
+    let next = first["next_since_seq"].as_u64().expect("next_since_seq");
+    assert!(next < first["latest_seq"].as_u64().unwrap(), "{first}");
+    let second = read(next);
+    assert_eq!(second["has_more"], false, "{second}");
+    let bodies: Vec<String> = [&first, &second]
+        .iter()
+        .flat_map(|page| page["messages"].as_array().unwrap().iter())
+        .map(|m| m["body"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(bodies, ["page one", "page two"]);
+    assert_eq!(second["next_since_seq"], second["latest_seq"], "{second}");
+}
+
+#[test]
+fn a_send_at_its_hop_limit_is_not_deposited_and_says_why() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa03";
+    register_inbox_peer(&repo, sid, "limit-target");
+    let sent = send_json(
+        &repo,
+        json!({ "from_peer": "claude:a", "to_peer": "limit-target", "body": "last hop", "max_hops": 1 }),
+    )
+    .expect("send at the limit");
+    assert_eq!(sent["delivery_outcome"], "paused_hop_limit", "{sent}");
+    assert_eq!(sent["mailbox"]["deposited"], false, "{sent}");
+    assert_eq!(sent["mailbox"]["reason"], "hop_limit", "{sent}");
+    let pending = Mailbox::at_default()
+        .expect("mailbox")
+        .peek_pending(sid, 16, SystemTime::now())
+        .expect("peek mailbox");
+    assert!(
+        pending.is_empty(),
+        "the mailbox must stay empty: {pending:?}"
+    );
+}
+
+#[test]
+fn a_reply_through_in_reply_to_cannot_raise_the_ceiling_of_an_unthreaded_row() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(
+        &repo,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa04",
+        "ceiling-target",
+    );
+    send_json(
+        &repo,
+        json!({ "from_peer": "claude:a", "to_peer": "ceiling-target", "body": "root",
+                "msg_id": "ceiling-root", "max_hops": 2 }),
+    )
+    .expect("root send");
+    let reply = send_json(
+        &repo,
+        json!({ "from_peer": "claude:b", "to_peer": "ceiling-target", "body": "answer",
+                "msg_id": "ceiling-reply", "in_reply_to": "ceiling-root", "max_hops": 32 }),
+    )
+    .expect("reply");
+    assert_eq!(reply["message"]["max_hops"], 2, "{reply}");
+    assert_eq!(reply["max_hops"], 2, "{reply}");
+    assert_eq!(reply["hop"], 2, "{reply}");
+    assert_eq!(reply["delivery_outcome"], "paused_hop_limit", "{reply}");
+}
+
+/// Sends the same message twice while a fake desktop owner answers `reply` and counts its
+/// calls. Returns (calls, first send, retry).
+#[cfg(target_os = "macos")]
+fn retry_under_fake_desktop(
+    sid: &str,
+    reply: Result<serde_json::Value, String>,
+) -> (usize, serde_json::Value, serde_json::Value) {
+    retry_under_fake_desktop_between(sid, reply, |_| {})
+}
+
+/// [`retry_under_fake_desktop`] that runs `between` (given the repo path) after the first send.
+#[cfg(target_os = "macos")]
+fn retry_under_fake_desktop_between(
+    sid: &str,
+    reply: Result<serde_json::Value, String>,
+    between: impl Fn(&str),
+) -> (usize, serde_json::Value, serde_json::Value) {
+    use crate::desktop::instance::{claim, Claim};
+    let (_dir, repo) = trusted_git_repo();
+    register_inbox_peer(&repo, sid, "retry-desk");
+    let profile = tempfile::Builder::new()
+        .prefix("gpdk")
+        .tempdir()
+        .expect("short socket tempdir");
+    crate::browser::TEST_PROFILE
+        .with(|slot| *slot.borrow_mut() = Some(profile.path().to_path_buf()));
+    let owner = match claim(profile.path(), Duration::from_secs(2)) {
+        Claim::Primary(owner) => owner,
+        _ => panic!("test must claim primary socket"),
+    };
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    owner.attach_agent_deliver(std::sync::Arc::new(move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        reply.clone()
+    }));
+    let args = json!({ "from_peer": "agy:lead", "to_peer": "retry-desk",
+                       "body": "deliver me once", "msg_id": "desk-retry-1" });
+    let first = send_json(&repo, args.clone()).expect("first send");
+    between(&repo);
+    let retry = send_json(&repo, args).expect("exact retry");
+    drop(owner);
+    crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
+    (
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        first,
+        retry,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_exact_retry_after_a_successful_desktop_delivery_does_not_deliver_again() {
+    let (calls, first, retry) = retry_under_fake_desktop(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa05",
+        Ok(json!({"ok": true, "delivery_outcome": "woken_immediately", "channel": "banner"})),
+    );
+    assert_eq!(calls, 1, "{first} / {retry}");
+    assert_eq!(
+        retry["delivery_outcome"], first["delivery_outcome"],
+        "{retry}"
+    );
+    assert_eq!(first["replayed"], false, "{first}");
+    assert_eq!(retry["replayed"], true, "{retry}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_row_reusing_an_evicted_msg_id_does_not_replay_the_old_rows_delivery() {
+    let (calls, first, retry) = retry_under_fake_desktop_between(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa07",
+        Ok(json!({"ok": true, "delivery_outcome": "woken_immediately", "channel": "banner"})),
+        |repo| {
+            // The first row is gone (evicted or repaired away); the sequence keeps counting.
+            let path = crate::engine::agent_bus::lanes_messages_path(repo, true).expect("bus path");
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read bus")).expect("bus json");
+            state["messages"] = json!([]);
+            std::fs::write(&path, serde_json::to_vec(&state).expect("encode")).expect("write bus");
+        },
+    );
+    assert_ne!(first["message"]["seq"], retry["message"]["seq"], "{retry}");
+    assert_eq!(
+        calls, 2,
+        "a new row must be delivered, not matched to the old one"
+    );
+    assert_eq!(retry["replayed"], false, "{retry}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_exact_retry_after_a_failed_desktop_delivery_delivers_again() {
+    let (calls, _first, _retry) = retry_under_fake_desktop(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa06",
+        Err("owner timed out".to_string()),
+    );
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn a_retry_of_a_row_the_target_already_read_reports_already_delivered_not_a_new_wake() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa08";
+    register_inbox_peer(&repo, sid, "read-target");
+    let args = json!({ "from_peer": "agy:lead", "to_peer": "read-target",
+                       "body": "read before the retry", "msg_id": "read-retry-1" });
+    let first = send_json(&repo, args.clone()).expect("first send");
+    assert_eq!(first["replayed"], false, "{first}");
+    handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "read-target", "ack": true }),
+    )
+    .expect("target reads and acknowledges");
+    let retry = send_json(&repo, args).expect("exact retry");
+    assert_eq!(retry["delivery_outcome"], "already_delivered", "{retry}");
+    assert_eq!(retry["replayed"], false, "{retry}");
+}
+
+#[test]
+fn a_mailbox_cursor_never_skips_an_envelope_published_after_the_reader_saw_a_later_stamp() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa09";
+    register_inbox_peer(&repo, sid, "cursor-owner");
+    let mb = Mailbox::at_default().expect("mailbox");
+    let t0 = SystemTime::now();
+    mb.deposit(
+        sid,
+        "cursor-a",
+        "first published",
+        t0 + Duration::from_millis(5_000),
+    )
+    .expect("deposit a");
+    let first = wait_peek(&repo, "cursor-owner", json!({}));
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1, "{first}");
+    let cursor = first["mailbox_cursor_ms"].as_u64().expect("cursor");
+
+    // Published later, but stamped by a clock that reads earlier.
+    mb.deposit(sid, "cursor-b", "published after", t0)
+        .expect("deposit b");
+    let second = wait_peek(
+        &repo,
+        "cursor-owner",
+        json!({ "since_mailbox_ms": cursor, "since_seq": first["next_since_seq"] }),
+    );
+    let bodies: Vec<&str> = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["published after"], "{second}");
+}
+
+#[test]
+fn paging_cut_mailbox_only_envelopes_by_cursor_returns_every_one_exactly_once() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0a";
+    register_inbox_peer(&repo, sid, "cut-owner");
+    let mb = Mailbox::at_default().expect("mailbox");
+    let now = SystemTime::now();
+    for (id, body) in [("cut-1", "one"), ("cut-2", "two"), ("cut-3", "three")] {
+        mb.deposit(sid, id, body, now).expect("deposit");
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let (mut seq, mut cursor) = (json!(0), json!(0));
+    for _ in 0..5 {
+        let page = wait_peek(
+            &repo,
+            "cut-owner",
+            json!({ "limit": 1, "since_seq": seq, "since_mailbox_ms": cursor }),
+        );
+        seen.extend(
+            page["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["body"].as_str().unwrap().to_string()),
+        );
+        if page["has_more"] == false {
+            break;
+        }
+        seq = page["next_since_seq"].clone();
+        cursor = page["mailbox_cursor_ms"].clone();
+    }
+    assert_eq!(seen, ["one", "two", "three"]);
+}
+
+#[test]
+fn an_evicted_steward_envelope_cut_from_a_page_is_still_reachable_by_the_cursors() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0b";
+    register_inbox_peer(&repo, sid, "steward-owner");
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let live = json!({ "seq": 50, "from_agent": "agy:lead", "to_agent": "steward-owner",
+                       "kind": "note", "body": "live row", "created_at_ms": now_ms,
+                       "msg_id": "seed-50" });
+    let state = json!({ "next_seq": 50, "dropped_before_seq": 0, "messages": [live] });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(&repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+    // A steward directive whose bus row was evicted: it keeps its old bus_seq (10).
+    Mailbox::at_default()
+        .expect("mailbox")
+        .deposit_with_provenance(
+            sid,
+            "steward-evicted-1",
+            "evicted steward directive",
+            crate::agent_mailbox::EnvelopeProvenance::SystemSteward {
+                msg_id: "steward-evicted-1".into(),
+                model: "m".into(),
+                mode: "advise".into(),
+                tier: "t".into(),
+                binding: "b".into(),
+                repo_root: repo.clone(),
+                bus_seq: 10,
+            },
+            SystemTime::now(),
+        )
+        .expect("deposit steward envelope");
+
+    let first = wait_peek(&repo, "steward-owner", json!({ "limit": 1 }));
+    assert_eq!(first["has_more"], true, "{first}");
+    let second = wait_peek(
+        &repo,
+        "steward-owner",
+        json!({ "limit": 1, "since_seq": first["next_since_seq"],
+                "since_mailbox_ms": first["mailbox_cursor_ms"] }),
+    );
+    let bodies: Vec<&str> = [&first, &second]
+        .iter()
+        .flat_map(|p| p["messages"].as_array().unwrap().iter())
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["live row", "evicted steward directive"],
+        "{first} / {second}"
+    );
+}
+
+#[test]
+fn a_retry_after_the_claimed_copy_expired_deposits_nothing_and_says_already_delivered() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0c";
+    register_inbox_peer(&repo, sid, "expiry-target");
+    let args = json!({ "from_peer": "agy:lead", "to_peer": "expiry-target",
+                       "body": "delivered once", "msg_id": "expiry-retry-1" });
+    send_json(&repo, args.clone()).expect("first send");
+    handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "expiry-target", "ack": true }),
+    )
+    .expect("target reads and acknowledges");
+    // The claimed copy outlives its ten minutes and is gone.
+    let mb = Mailbox::at_default().expect("mailbox");
+    let dir = mb.session_path(sid).expect("session dir");
+    for entry in std::fs::read_dir(&dir).expect("session files").flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".msg") {
+            std::fs::remove_file(entry.path()).expect("expire claimed copy");
+        }
+    }
+    let retry = send_json(&repo, args).expect("exact retry");
+    assert_eq!(retry["delivery_outcome"], "already_delivered", "{retry}");
+    assert_eq!(retry["mailbox"]["deposited"], false, "{retry}");
+    assert_eq!(retry["mailbox"]["reason"], "already_delivered", "{retry}");
+    assert!(
+        mb.peek_pending(sid, 16, SystemTime::now())
+            .expect("peek mailbox")
+            .is_empty(),
+        "a retry must not hand the recipient the message a second time"
+    );
+}
+
+#[test]
+fn paging_terminates_when_a_mailbox_envelope_names_a_bus_row_outside_the_page_read() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0d";
+    register_inbox_peer(&repo, sid, "paging-owner");
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let row = |seq: u64, to: &str, id: &str| {
+        json!({ "seq": seq, "from_agent": "agy:filler", "to_agent": to, "kind": "note",
+                "body": id, "created_at_ms": now_ms, "msg_id": id })
+    };
+    let state = json!({ "next_seq": 11, "dropped_before_seq": 0, "messages": [
+        row(3, "someone-else", "x-3"), row(10, "paging-owner", "seed-10"),
+        row(11, "paging-owner", "seed-11") ] });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(&repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+    // The mailbox holds an envelope for row 3, which the bus read for this peer does not return.
+    Mailbox::at_default()
+        .expect("mailbox")
+        .deposit_with_provenance(
+            sid,
+            "x-3",
+            "x-3",
+            crate::agent_mailbox::EnvelopeProvenance::PeerAgent {
+                msg_id: "x-3".into(),
+                from_peer: "agy:filler".into(),
+                provider: "agy".into(),
+                branch: String::new(),
+                thread_key: String::new(),
+                hop: 1,
+                max_hops: 6,
+                truncated_in_bus: false,
+                repo_root: repo.clone(),
+            },
+            SystemTime::now(),
+        )
+        .expect("deposit envelope");
+
+    let mut seen: Vec<String> = Vec::new();
+    let (mut seq, mut cursor) = (json!(0), json!(0));
+    for _ in 0..6 {
+        let page = wait_peek(
+            &repo,
+            "paging-owner",
+            json!({ "limit": 1, "since_seq": seq, "since_mailbox_ms": cursor }),
+        );
+        seen.extend(
+            page["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["msg_id"].as_str().unwrap().to_string()),
+        );
+        if page["has_more"] == false {
+            break;
+        }
+        seq = page["next_since_seq"].clone();
+        cursor = page["mailbox_cursor_ms"].clone();
+    }
+    assert_eq!(seen, ["x-3", "seed-10", "seed-11"]);
 }

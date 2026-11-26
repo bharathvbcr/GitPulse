@@ -186,10 +186,18 @@ if(params.has("check")){
   [...host.querySelectorAll("[data-testid='work-conflicts-bar'] button")].find(b=>b.textContent.trim()==="Hide").click();
   await waitFor(()=>!host.querySelector(".resolve-page"));
   check("Hide closes the clean editor and restores focus to Overview's Conflicts button",()=>host.querySelector("[data-overview-layout='overview']")&&document.activeElement===headerConflictsBtn&&headerConflictsBtn.getAttribute("aria-expanded")==="false");
-  // openConflicts() works programmatically when clean, and repo switching clears manual open.
+  // openConflicts() works programmatically when clean, and Hide / repo switching clears manual open.
   openConflicts();
   await waitFor(()=>host.querySelector(".resolve-page"));
   check("openConflicts reveals and focuses the editor even when clean",()=>host.querySelector("[data-overview-layout='with-conflicts']")&&document.activeElement===host.querySelector("#work-conflicts"));
+  const cleanHideBtn=[...host.querySelectorAll("[data-testid='work-conflicts-bar'] button")].find(b=>b.textContent.trim()==="Hide");
+  if(cleanHideBtn){
+   cleanHideBtn.click();
+   await waitFor(()=>!host.querySelector(".resolve-page"));
+   check("hiding clean conflict editor after openConflicts restores focus to header Conflicts button",()=>document.activeElement?.getAttribute("data-testid")==="overview-conflicts-btn");
+  }
+  openConflicts();
+  await waitFor(()=>host.querySelector(".resolve-page"));
   await repoStore.openRepo("/fixture/other-clean");await settle();
   check("switching repositories clears manual reveal so the new clean repo opens on Overview",()=>!host.querySelector(".resolve-page")&&host.querySelector("[data-overview-layout='overview']"));
   // Manually opening clean Conflicts, then starting & finishing a live merge still hands back to Overview.

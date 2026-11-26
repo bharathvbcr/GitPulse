@@ -60,4 +60,27 @@ describe("ImageDiffViewer states", () => {
     const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "ImageDiffViewer.svelte"), "utf8");
     expect(source).toContain('onclick={onRetry}>Try again</button>');
   });
+
+  it("offers Light, Dark, and Grid canvas toggles and propagates explicit canvas surface onto the stage", () => {
+    const light = body({ filePath: "icon.svg", oldSrc: IMG, newSrc: IMG, canvas: "light" });
+    expect(light).toContain('data-testid="image-diff-canvas-light"');
+    expect(light).toContain('data-testid="image-diff-canvas-dark"');
+    expect(light).toContain('data-testid="image-diff-canvas-grid"');
+    expect(light).toContain('data-image-canvas="light"');
+
+    const dark = body({ filePath: "icon.svg", oldSrc: IMG, newSrc: IMG, canvas: "dark" });
+    expect(dark).toContain('data-image-canvas="dark"');
+  });
+
+  it("surfaces a single-side error when neither image could be rendered instead of claiming there is no image", () => {
+    const html = body({ filePath: "new.svg", status: "ready", newError: "Unclosed <svg> element." });
+    expect(html).toContain("Couldn't read this image.");
+    expect(html).toContain("Unclosed &lt;svg> element.");
+    expect(html).not.toContain("No image on either side");
+  });
+
+  it("scales SVG artwork cleanly in 2-up comparison mode", () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "ImageDiffViewer.svelte"), "utf8");
+    expect(source).toContain('isSvgDiff ? "w-full h-full object-contain p-3" : "max-w-full max-h-full object-contain"');
+  });
 });

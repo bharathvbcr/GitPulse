@@ -431,6 +431,22 @@ fn kept() -> &'static KeptTable {
     TABLE.with(|table| *table)
 }
 
+/// Evicts cached ref listings and shrinks the backing table capacity when idle.
+///
+/// Non-blocking (`try_lock`) so an active reader/writer is never stalled, and
+/// returns the number of entries evicted.
+pub fn trim_idle() -> usize {
+    let Ok(mut table) = kept().try_lock() else {
+        return 0;
+    };
+    let evicted = table.len();
+    if evicted > 0 {
+        table.clear();
+        table.shrink_to_fit();
+    }
+    evicted
+}
+
 /// [`git_cli::git_text_shared`] for a ref listing over `namespaces`.
 pub(crate) fn git_text(
     repo: &Path,
@@ -1983,5 +1999,21 @@ mod tests {
         );
         assert_eq!(led.kind, IpcErrorKind::DeferredUnderLoad, "{led}");
         assert_eq!(waited.kind, IpcErrorKind::DeferredUnderLoad, "{waited}");
+    }
+
+    #[test]
+    fn trim_idle_clears_kept_entries_and_returns_evicted_count() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let stamp = stamp_aged(&clock, Duration::from_secs(10));
+        assert!(computed(&fx, &["log", "trim-a"], &stamp));
+        assert!(computed(&fx, &["log", "trim-b"], &stamp));
+        assert!(!computed(&fx, &["log", "trim-a"], &stamp));
+
+        let evicted = trim_idle();
+        assert!(evicted >= 2, "expected >= 2 evicted, got {evicted}");
+        assert_eq!(trim_idle(), 0, "second trim finds cache empty");
+        assert!(computed(&fx, &["log", "trim-a"], &stamp));
     }
 }

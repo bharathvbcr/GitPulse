@@ -73,7 +73,7 @@ before closing to avoid transient forked descriptors retaining ownership.
 
 Optional **Also run when GitPulse is closed** is available in an installed macOS
 application bundle. It registers the current user's
-`~/Library/LaunchAgents/com.gitpulse.hygiene.plist`, with a 60-second interval and
+`~/Library/LaunchAgents/dev.vbcr.gitpulse.hygiene.plist` (builds before the VBCR Dev rename used `com.gitpulse.hygiene`; the first launch of a newer build replaces that agent with this one), with a 60-second interval and
 explicit `--cleaner-due` arguments. The worker checks the same policy without
 creating a window. Registration first commits disabled authority; only successful
 setup enables it. A crash, unavailable launchd or failed recovery write cannot

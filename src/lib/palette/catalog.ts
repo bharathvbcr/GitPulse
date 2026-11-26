@@ -234,10 +234,10 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     // that answers it rather than on nothing.
     ...(view.id === "work" ? [
       {
-        id: "work:conflicts", label: "Resolve conflicts — finish a parked merge or rebase",
-        description: "Work → Overview · The conflict editor leads Overview while a merge, rebase or cherry-pick is parked.",
-        keywords: "Work Overview Resolve conflicts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work,
-        disabledReason: unavailable ?? (state.operation.operation || state.operation.probeFailed || state.statuses.some(file => file.is_conflicted) ? undefined : "No merge, rebase or cherry-pick is waiting on you."),
+        id: "work:conflicts", label: "Resolve conflicts — open the conflict editor or finish a parked merge",
+        description: "Work → Overview · Open the conflict editor, review saved drafts, or finish a parked merge, rebase or cherry-pick.",
+        keywords: "Work Overview Resolve conflicts editor drafts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work,
+        disabledReason: unavailable ?? (state.isBare ? "This bare repository has no working tree." : undefined),
         action: () => {
           interfaceStore.setGlobalSurface("repository");
           openConflicts();

@@ -1089,10 +1089,67 @@ fn file_id(_path: &Path) -> Option<FileId> {
 type Registry = Mutex<HashMap<PathBuf, std::sync::Arc<Slot>>>;
 type DroppedRegistry = Mutex<HashMap<PathBuf, u64>>;
 
+/// Drops the registered connections whose database is gone or was replaced,
+/// before another repository is added.
+///
+/// A connection was kept until its own path was used again, so one opened on
+/// a ledger that was then deleted (a removed worktree, a test's temporary
+/// repository) held its `ledger.sqlite`, `-wal` and `-shm` descriptors for
+/// the life of the process. A whole lib-suite run reached thousands that way,
+/// past the 4,096 descriptors `terminal::port_probe` reads per process, so its
+/// tests stopped finding the listener they had just bound.
+///
+/// A slot another thread holds is left to that thread, which reopens on its
+/// own when the file changed; every lookup takes the registry lock, so a slot
+/// held only here is not in use. Without a file identity (not Unix) nothing is
+/// dropped. An empty slot holds no descriptor and is dropped with the rest.
+fn prune_departed(reg: &mut HashMap<PathBuf, std::sync::Arc<Slot>>) {
+    reg.retain(|path, slot| {
+        if std::sync::Arc::strong_count(slot) > 1 {
+            return true;
+        }
+        let Ok(live) = slot.conn.try_lock() else {
+            return true;
+        };
+        match live.as_ref() {
+            Some(live) => live.file.is_none() || file_id(path) == live.file,
+            None => false,
+        }
+    });
+}
+
 /// One connection per repository, opened once.
 pub(crate) fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Best-effort, non-blocking idle trim across already-open repository ledger
+/// connections (`PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);`).
+pub(crate) fn trim_idle() -> usize {
+    let slots: Vec<std::sync::Arc<Slot>> = {
+        let Ok(reg) = registry().try_lock() else {
+            return 0;
+        };
+        reg.values().cloned().collect()
+    };
+    let mut trimmed = 0usize;
+    for slot in slots {
+        let Ok(guard) = slot.conn.try_lock() else {
+            continue;
+        };
+        let Some(live) = guard.as_ref() else {
+            continue;
+        };
+        if live
+            .conn
+            .execute_batch("PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);")
+            .is_ok()
+        {
+            trimmed += 1;
+        }
+    }
+    trimmed
 }
 
 /// Failed appends counted by the canonical database they would have reached.
@@ -1689,6 +1746,9 @@ fn with_conn<T>(
         let mut reg = registry().lock().map_err(|_| {
             LedgerError::new("registry_poisoned", "ledger registry mutex was poisoned")
         })?;
+        if !reg.contains_key(&db_path) {
+            prune_departed(&mut reg);
+        }
         std::sync::Arc::clone(reg.entry(db_path.clone()).or_default())
     };
     let mut guard = slot
@@ -7312,6 +7372,37 @@ mod tests {
     /// a WAL database checkpoints and deletes its `-wal` file, which changes the
     /// stamp consolidation compares: the warm read then re-imported the
     /// sibling, spawning `git hash-object` and opening it again.
+    /// A connection to a ledger that was deleted is closed once another
+    /// repository is opened, instead of holding its descriptors for the life
+    /// of the process; a live repository's connection stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_ledgers_connection_is_dropped_when_another_repository_opens() {
+        let live = temp_repo();
+        let live = live.path().to_str().unwrap().to_owned();
+        append(draft(&live, "git.commit")).expect("append");
+        let gone_dir = temp_repo();
+        let gone = gone_dir.path().to_str().unwrap().to_owned();
+        append(draft(&gone, "git.commit")).expect("append");
+        // The key as it was registered, while the path still resolves.
+        let gone_db = ledger_path(&gone);
+        assert!(registry().lock().unwrap().contains_key(&gone_db));
+        drop(gone_dir);
+
+        let next = temp_repo();
+        append(draft(next.path().to_str().unwrap(), "git.commit")).expect("append");
+
+        let held = registry().lock().unwrap();
+        assert!(
+            !held.contains_key(&gone_db),
+            "a deleted ledger's connection is still registered"
+        );
+        assert!(
+            held.contains_key(&ledger_path(&live)),
+            "a live repository's connection was dropped"
+        );
+    }
+
     #[test]
     fn resetting_one_repository_leaves_another_repositorys_connection_alone() {
         let mine = temp_repo();

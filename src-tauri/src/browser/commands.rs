@@ -123,6 +123,29 @@ pub async fn cmd_browser_inspect_point(
     imp::inspect_point(app, id, norm_x, norm_y).await
 }
 
+/// Discovers loopback local servers (`portless` + bounded `lsof`) and any
+/// repository-local `gitpulse-run.sh` `# gitpulse-preview:` URL.
+#[tauri::command(async)]
+pub async fn cmd_browser_discover_local_servers(
+    repo_path: Option<String>,
+) -> Result<super::local_servers::LocalServerDiscovery, String> {
+    crate::commands::off_thread(move || {
+        let repo_dir = match repo_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(path) => Some(crate::engine::git_cli::validate_repo(path)?),
+            None => None,
+        };
+        Ok::<_, crate::ipc_error::CommandError>(super::local_servers::discover_local_servers(
+            repo_dir.as_deref(),
+        ))
+    })
+    .await
+    .map_err(|e| e.message)
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::super::{self as browser, Bounds, BrowserError, EventSink, PaneEvent, EVENT};

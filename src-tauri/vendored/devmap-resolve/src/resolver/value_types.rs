@@ -269,26 +269,17 @@ impl Resolver {
             })
     }
 
-    /// The nominal type a factory call returns, from the callee's written
-    /// return type: `NewRegistry` → `Registry` for `func NewRegistry()
-    /// *Registry`, `svc.make` → `Svc`, `Svc::open` → `Svc`.
-    ///
-    /// The callee is found the way the call ladder would find it, and only by
-    /// rungs that name one declaration: a file-level function of this file (or
-    /// of its Go package), a named import, a member of an imported module
-    /// handle, or an associated function of a type. A bare callee the scope
-    /// binds itself — a parameter or a local closure named `make` — is not the
-    /// module's `make`, so it abstains. The answer must be a single indexed
-    /// class or struct; a generic, a tuple, `Promise<T>` or an optional names
-    /// no type a method can be dispatched on, and `admissible_nominal_type`
-    /// refuses each.
-    pub(super) fn factory_return_type(
+    /// Resolve a factory call `shape` written in `file` (inside `scope`) to the
+    /// one declaration `(callee_file, callee_qualified_name)` it calls, using
+    /// only deterministic rungs (same-file, named import, imported module
+    /// handle, or unique static method).
+    pub(super) fn resolve_factory_callee(
         &self,
         family: LangFamily,
         file: &str,
         scope: Option<&str>,
         shape: &str,
-    ) -> Option<String> {
+    ) -> Option<(String, String)> {
         let shape = shape.trim();
         if shape.ends_with("{..}") || shape.ends_with("::new") {
             // Constructor shapes have their own rung, which needs no callee.
@@ -312,11 +303,11 @@ impl Resolver {
                 .is_none()
                 .then(|| (file.clone(), identity.to_string()))
         });
-        let (callee_file, callee) = if let Some(found) = operator {
-            found?
+        if let Some(found) = operator {
+            found
         } else if let Some((owner, function)) = shape.rsplit_once("::") {
             let owner = owner.rsplit("::").next()?;
-            self.unique_type_method(family, owner, function)?
+            self.unique_type_method(family, owner, function)
         } else if let Some((receiver, function)) = shape.rsplit_once('.') {
             let root = Self::path_root(receiver);
             if !Self::is_plain_ident(function)
@@ -329,22 +320,22 @@ impl Resolver {
                     .import_binding_at(family, file, scope, receiver)
                     .filter(|_| !self.is_value_import(file, receiver));
                 match module {
-                    Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
+                    Some((module_file, _)) => self.lookup_in_package(module_file, function),
                     // `Svc.create()`: a static factory on a type this corpus
                     // declares once.
                     None if self.unique_indexed_type(family, receiver) => {
-                        self.unique_type_method(family, receiver, function)?
+                        self.unique_type_method(family, receiver, function)
                     }
                     None => {
                         let base_type = self.receiver_type_for(file, scope, receiver, None)?;
                         let key = (family, base_type, function.to_string());
-                        self.type_methods.get(&key)?.first()?.clone()
+                        self.type_methods.get(&key)?.first().cloned()
                     }
                 }
             } else {
                 let base_type = self.receiver_type_for(file, scope, receiver, None)?;
                 let key = (family, base_type, function.to_string());
-                self.type_methods.get(&key)?.first()?.clone()
+                self.type_methods.get(&key)?.first().cloned()
             }
         } else {
             if !Self::is_plain_ident(shape)
@@ -353,7 +344,7 @@ impl Resolver {
                 return None;
             }
             match self.lookup_in_package(file, shape) {
-                Some(found) => found,
+                Some(found) => Some(found),
                 None => {
                     if family == LangFamily::Python
                         && !self.python_bare_name_has_one_provider(file, shape)
@@ -361,10 +352,92 @@ impl Resolver {
                         return None;
                     }
                     let (target, declared) = self.import_binding_at(family, file, scope, shape)?;
-                    self.lookup_in_package(target, declared)?
+                    self.lookup_in_package(target, declared)
                 }
             }
+        }
+    }
+
+    /// Look up the factory call `(declaring_file, factory_shape)` that
+    /// initialized a JS/TS module-scope `const` reached as `receiver` in
+    /// `file` — same-file, named import, re-export chain, default import, or
+    /// `ns.value` on a namespace import.
+    pub(super) fn js_module_value_factory(
+        &self,
+        file: &str,
+        receiver: &str,
+    ) -> Option<(String, String)> {
+        let lookup_in = |module_file: &str, name: &str| -> Option<(String, String)> {
+            if let Some((LangFamily::JsTs, shape)) = self
+                .module_value_factories
+                .get(&(module_file.to_string(), name.to_string()))
+            {
+                return Some((module_file.to_string(), shape.clone()));
+            }
+            if let Some((terminal_file, terminal_name)) = self
+                .reexport_chains
+                .get(&format!("{module_file}::{name}"))
+                .and_then(|terminal| terminal.rsplit_once("::"))
+            {
+                if let Some((LangFamily::JsTs, shape)) = self
+                    .module_value_factories
+                    .get(&(terminal_file.to_string(), terminal_name.to_string()))
+                {
+                    return Some((terminal_file.to_string(), shape.clone()));
+                }
+            }
+            None
         };
+        if Self::is_plain_ident(receiver) {
+            if let Some(found) = lookup_in(file, receiver) {
+                return Some(found);
+            }
+            if let Some((declaring_file, declared)) = self
+                .value_imports
+                .get(&(file.to_string(), receiver.to_string()))
+            {
+                return lookup_in(declaring_file, declared);
+            }
+            if let Some((module_file, _)) = self
+                .import_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(receiver))
+            {
+                if let Some(declared) = self.default_exports.get(module_file) {
+                    return lookup_in(module_file, declared);
+                }
+            }
+            return None;
+        }
+        let (root, member) = Self::one_hop_field(receiver)?;
+        if self.is_value_import(file, root) {
+            return None;
+        }
+        let (module_file, _) = self.import_bindings.get(file)?.get(root)?;
+        lookup_in(module_file, member)
+    }
+
+    /// The nominal type a factory call returns, from the callee's written
+    /// return type: `NewRegistry` → `Registry` for `func NewRegistry()
+    /// *Registry`, `svc.make` → `Svc`, `Svc::open` → `Svc`.
+    ///
+    /// The callee is found the way the call ladder would find it, and only by
+    /// rungs that name one declaration: a file-level function of this file (or
+    /// of its Go package), a named import, a member of an imported module
+    /// handle, or an associated function of a type. A bare callee the scope
+    /// binds itself — a parameter or a local closure named `make` — is not the
+    /// module's `make`, so it abstains. The answer must be a single indexed
+    /// class or struct; a generic, a tuple, `Promise<T>` or an optional names
+    /// no type a method can be dispatched on, and `admissible_nominal_type`
+    /// refuses each.
+    pub(super) fn factory_return_type(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: Option<&str>,
+        shape: &str,
+    ) -> Option<String> {
+        let (callee_file, callee) = self.resolve_factory_callee(family, file, scope, shape)?;
         // A Python callable a decorator may wrap returns whatever the decorator
         // makes of it, not what its own annotation says.
         if family == LangFamily::Python

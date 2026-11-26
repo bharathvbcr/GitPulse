@@ -67,6 +67,7 @@
     onResize,
     tab = $bindable<RailTab>("files"),
     history,
+    turns,
     /** A1 markers from the shared preview store — not a second query path. */
     previewMarkers = null,
   }: {
@@ -90,6 +91,8 @@
     tab?: RailTab;
     /** The History tab's body; the tab is offered only when one is given. */
     history?: Snippet;
+    /** The Turns tab's body; the tab is offered only when one is given. */
+    turns?: Snippet;
     previewMarkers?: Map<string, PreviewMarker> | null;
   } = $props();
 
@@ -113,6 +116,8 @@
 
   const note = $derived(truncationNote(rail));
   const showingHistory = $derived(tab === "history" && history !== undefined);
+  const showingTurns = $derived(tab === "turns" && turns !== undefined);
+  const showingFiles = $derived(!showingHistory && !showingTurns);
   const filesHeading = $derived(
     rail.source === "commit"
       ? "Commit files"
@@ -251,12 +256,12 @@
           type="button"
           role="tab"
           class="gp-seg-btn flex items-center gap-1 px-1.5! text-micro"
-          aria-selected={!showingHistory}
-          data-active={!showingHistory ? "true" : "false"}
+          aria-selected={showingFiles}
+          data-active={showingFiles ? "true" : "false"}
           title="Files in this change"
           onclick={() => (tab = "files")}
         >
-          {#if macos && !showingHistory}
+          {#if macos && showingFiles}
             <span
               class="gp-liquid-selection gp-gpu"
               aria-hidden="true"
@@ -293,6 +298,31 @@
             History
           </span>
         </button>
+        {#if turns}
+          <button
+            type="button"
+            role="tab"
+            class="gp-seg-btn flex items-center gap-1 px-1.5! text-micro"
+            aria-selected={showingTurns}
+            data-active={showingTurns ? "true" : "false"}
+            title="Agent turn checkpoints"
+            onclick={() => (tab = "turns")}
+            data-turns-tab
+          >
+            {#if macos && showingTurns}
+              <span
+                class="gp-liquid-selection gp-gpu"
+                aria-hidden="true"
+                in:receiveSelection={{ key: "rail-tab" }}
+                out:sendSelection={{ key: "rail-tab" }}
+              ></span>
+            {/if}
+            <span class="flex items-center gap-1">
+              <GitCommitHorizontal size={11} />
+              Turns
+            </span>
+          </button>
+        {/if}
       </div>
     {:else}
       <FileCode size={12} class="shrink-0 text-accent" />
@@ -341,6 +371,8 @@
 
   {#if showingHistory && history}
     {@render history()}
+  {:else if showingTurns && turns}
+    {@render turns()}
   {:else}
   <div class="flex items-center gap-1.5 px-2.5 py-1.5">
     <FileCode size={12} class="shrink-0 text-accent" />

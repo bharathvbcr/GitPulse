@@ -1224,10 +1224,10 @@ impl GitReader {
         })
     }
 
-    /// Porcelain status. This argv does not set `core.fsmonitor=false`.
-    /// Hygiene walks do, because a repository hook must not run there. A
-    /// status refresh should use the fsmonitor daemon when the repository
-    /// already has one, so `status` does not walk `target/` itself.
+    /// Porcelain status. `PINNED_GIT_CONFIG` sets `core.fsmonitor=false` on
+    /// every spawned git command so a deadlocked `fsmonitor--daemon` socket
+    /// cannot hang reads, and `worktree::status_cell` uses in-process `gix`
+    /// status by default before falling back to this argv.
     pub const STATUS_ARGV: &'static [&'static str] = crate::engine::git_cli::STATUS_ARGV;
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, CommandError> {
@@ -2040,12 +2040,19 @@ impl GitReader {
         };
 
         let lang = LanguageDetector::detect_from_bytes(file_path, &bytes);
-        let is_image = lang.name == "Image";
-        let is_binary = is_image || bytes.contains(&0);
-        let mime = if is_image {
+        let has_nul = bytes.contains(&0);
+        let is_image_lang = lang.name == "Image";
+        let mime = if is_image_lang {
             mime_from_path(file_path)
         } else {
             "application/octet-stream".into()
+        };
+        let is_svg = mime == "image/svg+xml";
+        let is_image = if is_svg { !has_nul } else { is_image_lang };
+        let is_binary = if is_svg {
+            has_nul
+        } else {
+            is_image_lang || has_nul
         };
 
         Ok(FileBlob {
@@ -8301,13 +8308,11 @@ mod tests {
     }
 
     #[test]
-    fn status_keeps_an_already_running_fsmonitor_daemon() {
+    fn pinned_git_config_disables_fsmonitor() {
         assert!(
-            !GitReader::STATUS_ARGV
-                .iter()
-                .any(|arg| arg.contains("fsmonitor")),
-            "status must not disable core.fsmonitor: {:?}",
-            GitReader::STATUS_ARGV
+            crate::engine::git_cli::PINNED_GIT_CONFIG.contains(&"core.fsmonitor=false"),
+            "PINNED_GIT_CONFIG must pin core.fsmonitor=false: {:?}",
+            crate::engine::git_cli::PINNED_GIT_CONFIG
         );
     }
 
@@ -19782,6 +19787,38 @@ mod relocated_cli_cycle_tests {
         let raw = dir.path().to_string_lossy().into_owned();
         let blob = crate::engine::GitReader::get_file_blob(&raw, "data.bin", None).unwrap();
         assert!(blob.is_binary);
+        assert_eq!((blob.invalid_utf8_bytes, blob.eol), (0, None));
+    }
+
+    #[test]
+    fn get_file_blob_returns_text_shape_and_image_mime_for_svg() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\">\r\n  <circle cx=\"8\" cy=\"8\" r=\"6\"/>\r\n</svg>\r\n";
+        std::fs::write(dir.path().join("icon.svg"), svg.as_bytes()).unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "icon.svg", None).unwrap();
+        assert!(blob.is_image);
+        assert!(!blob.is_binary);
+        assert_eq!(blob.mime, "image/svg+xml");
+        assert_eq!(blob.text.as_deref(), Some(svg));
+        assert_eq!(blob.base64, None);
+        assert_eq!(blob.invalid_utf8_bytes, 0);
+        assert_eq!(blob.eol, Some(crate::engine::text_shape::LineEnding::Crlf));
+        assert!(blob.disk_base.is_some());
+    }
+
+    #[test]
+    fn get_file_blob_treats_nul_containing_svg_as_binary_not_image() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("broken.svg"), b"<svg>\x00</svg>").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "broken.svg", None).unwrap();
+        assert!(blob.is_binary);
+        assert!(!blob.is_image);
+        assert_eq!(blob.text, None);
+        assert!(blob.base64.is_some());
         assert_eq!((blob.invalid_utf8_bytes, blob.eol), (0, None));
     }
 

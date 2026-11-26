@@ -46,7 +46,7 @@ pub mod lease;
 mod probe;
 pub(crate) mod procscan;
 mod profile;
-mod sampler;
+pub(crate) mod sampler;
 mod sensor;
 mod snapshot;
 mod thresholds;
@@ -87,8 +87,8 @@ pub use profile::{
     ResourceBudgets, ResourceProfile, COMPACT_MAX_BYTES, STANDARD_MAX_BYTES,
 };
 pub use sampler::{
-    profile, pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput,
-    Role, SamplerOptions, StopHandle,
+    profile, pulse_of, set_app_hibernated, start, start_app, status, HostLoadPulse, HostLoadStatus,
+    PressureInput, Role, SamplerOptions, StopHandle,
 };
 pub use sensor::{
     Compressor, CompressorDelta, CompressorSegments, CompressorTrend, Cores, CpuUsage, GpuSample,

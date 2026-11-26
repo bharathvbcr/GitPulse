@@ -121,6 +121,16 @@ describe("TerminalFilePane contracts", () => {
     expect(source).toContain("if (desired === false && prev !== false)");
   });
 
+  it("routes Cmd/Ctrl+F and Cmd/Ctrl+G chords to the scoped file viewer via triggerFileSearch", () => {
+    const chord = source.slice(
+      source.indexOf("export function handleViewChord(event: KeyboardEvent): boolean"),
+      source.indexOf("onDestroy(() =>"),
+    );
+    expect(chord).toContain('isCommitSearchChord(event) && triggerFileSearch(paneRoot, "find", extractSelectionSeed(null, paneRoot))');
+    expect(chord).toContain('triggerFileSearch(paneRoot, "line")');
+    expect(chord).toContain('el.addEventListener("keydown", onKeydown)');
+  });
+
   it("opens the Explorer page from a double-click on its Explorer card's empty space, and from a toolbar button", () => {
     const panelSource = readFileSync(join(here, "TerminalPanel.svelte"), "utf8");
     const card = source.slice(source.lastIndexOf("<div", source.indexOf("data-terminal-file-explorer-card")), source.indexOf("<ExplorerRail"));
@@ -133,5 +143,17 @@ describe("TerminalFilePane contracts", () => {
     expect(source.slice(button, source.indexOf("</button>", button))).toContain("onclick={onOpenExplorerPage}");
     // The terminal hands its host's page owner straight through.
     expect(panelSource).toContain("onOpenExplorerPage={onOpenExplorerPage}");
+  });
+
+  it("exits diff mode once per HTML preview or split open request nonce without locking Diff out", () => {
+    expect(source).toContain("htmlViewModeRequest");
+    expect(source).toContain("matchHtmlViewMode(req, repo, target)");
+    expect(source).toContain("matched.nonce > lastHandledHtmlModeNonce");
+  });
+
+  it("exits diff mode once per SVG preview or split open request nonce without locking Diff out", () => {
+    expect(source).toContain("svgViewModeRequest");
+    expect(source).toContain("matchSvgViewMode(req, repo, target)");
+    expect(source).toContain("matched.nonce > lastHandledSvgModeNonce");
   });
 });

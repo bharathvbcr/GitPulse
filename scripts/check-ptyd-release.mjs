@@ -25,11 +25,11 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MANIFEST = path.join(REPO_ROOT, "src-tauri", "Cargo.toml");
 const DIST = path.join(REPO_ROOT, "dist");
-const BINARY = path.join(REPO_ROOT, "src-tauri", "target", "release", "gitpulse-ptyd");
 
 /** A cold release build is minutes; bounded so a wedged toolchain reads as "could not run". */
 export const BUILD_TIMEOUT_MS = 60 * 60 * 1000;
@@ -39,55 +39,173 @@ export const NM_TIMEOUT_MS = 2 * 60 * 1000;
 export const FORBIDDEN = [/RunObserver/, /tauri_runtime_wry/];
 
 /**
+ * Resolve the default release binary path, respecting `CARGO_TARGET_DIR`.
+ *
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {string}
+ */
+export function defaultBinaryPath(env = process.env) {
+  const targetDir = env.CARGO_TARGET_DIR
+    ? path.resolve(REPO_ROOT, env.CARGO_TARGET_DIR)
+    : path.join(REPO_ROOT, "src-tauri", "target");
+  return path.join(targetDir, "release", "gitpulse-ptyd");
+}
+
+/**
+ * Parse CLI arguments for `check-ptyd-release.mjs`.
+ *
+ * @param {string[]} argv
+ * @returns {{ ok: true, help: boolean, binary: string | null } | { ok: false, error: string }}
+ */
+export function parseArgs(argv) {
+  if (wantsHelp(argv)) return { ok: true, help: true, binary: null };
+  /** @type {string | null} */
+  let binary = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--binary") {
+      const next = argv[i + 1];
+      if (!next || next.startsWith("-")) {
+        return { ok: false, error: "--binary requires a path to an already-built release gitpulse-ptyd" };
+      }
+      binary = path.resolve(next);
+      i += 1;
+    } else {
+      return { ok: false, error: `Unknown argument: ${arg}` };
+    }
+  }
+  return { ok: true, help: false, binary };
+}
+
+/**
+ * Non-header symbol lines in `nm` output (ignores blank lines and fat-binary
+ * architecture headers such as `/path/bin (for architecture x86_64):`).
+ *
+ * @param {string} nmOutput
+ * @returns {string[]}
+ */
+export function symbolLines(nmOutput) {
+  return nmOutput
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.endsWith(":"));
+}
+
+/**
  * Names of the forbidden symbols in `nm` output, one per offending line.
  *
  * @param {string} nmOutput
  * @returns {string[]}
  */
 export function forbiddenSymbols(nmOutput) {
-  return nmOutput
-    .split("\n")
+  return symbolLines(nmOutput)
     .filter((line) => FORBIDDEN.some((re) => re.test(line)))
-    .map((line) => line.trim().split(/\s+/).pop() ?? line.trim());
+    .map((line) => line.split(/\s+/).pop() ?? line);
 }
 
-function main() {
-  if (!existsSync(DIST)) {
-    console.error("check-ptyd-release: could not run: dist/ is missing; `bun run build` first (the release build embeds it)");
-    return 2;
+/**
+ * Inspect an already-built `gitpulse-ptyd` binary with `nm` and verify no
+ * app-runtime symbols leaked into it. Fails closed (exit 2) if `nm` fails or
+ * lists zero symbols (for example, a fully stripped binary where symbol
+ * inspection cannot prove absence).
+ *
+ * @param {string} binaryPath
+ * @param {(binary: string) => { status: number | null, stdout: string, stderr: string, error?: Error }} [runNm]
+ * @returns {{ code: number, message: string, offenders: string[] }}
+ */
+export function inspectBinary(binaryPath, runNm) {
+  if (!existsSync(binaryPath)) {
+    return {
+      code: 2,
+      message: `check-ptyd-release: could not run: binary not found at ${binaryPath}`,
+      offenders: [],
+    };
   }
-  // The bundle's own cargo invocation (scripts/tauri.mjs -> tauri build), narrowed to this binary.
-  const build = spawnSync(
-    "cargo",
-    ["build", "--manifest-path", MANIFEST, "--release", "--locked", "--features", "tauri/custom-protocol", "--bin", "gitpulse-ptyd"],
-    { stdio: ["ignore", "inherit", "pipe"], encoding: "utf8", timeout: BUILD_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 },
-  );
-  if (build.error) {
-    console.error(`check-ptyd-release: could not run: cargo: ${build.error.message}`);
-    return 2;
-  }
-  process.stderr.write(build.stderr ?? "");
-  if (build.status !== 0) {
-    const undefinedSymbols = /Undefined symbols/.test(build.stderr ?? "");
-    console.error(
-      undefinedSymbols
-        ? "FAIL: gitpulse-ptyd does not link in release: undefined symbols (see above)"
-        : `FAIL: the release build of gitpulse-ptyd exited ${build.status}`,
-    );
-    return 1;
-  }
-  const nm = spawnSync("nm", [BINARY], { encoding: "utf8", timeout: NM_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 });
+  const nmArgs = process.platform === "darwin" ? ["-arch", "all", binaryPath] : [binaryPath];
+  const nm = runNm
+    ? runNm(binaryPath)
+    : spawnSync("nm", nmArgs, { encoding: "utf8", timeout: NM_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 });
   if (nm.error || nm.status !== 0) {
-    console.error(`check-ptyd-release: could not run: nm ${BINARY}: ${nm.error?.message ?? nm.stderr}`);
+    return {
+      code: 2,
+      message: `check-ptyd-release: could not run: nm ${binaryPath}: ${nm.error?.message ?? (nm.stderr ?? "").trim()}`,
+      offenders: [],
+    };
+  }
+  const stdout = nm.stdout ?? "";
+  if (symbolLines(stdout).length === 0) {
+    return {
+      code: 2,
+      message: `check-ptyd-release: could not run: nm listed zero symbols for ${binaryPath} (binary may be stripped)`,
+      offenders: [],
+    };
+  }
+  const offenders = forbiddenSymbols(stdout);
+  if (offenders.length > 0) {
+    return {
+      code: 1,
+      message: `FAIL: gitpulse-ptyd carries ${offenders.length} app-runtime symbol(s), e.g. ${offenders.slice(0, 3).join(", ")}`,
+      offenders,
+    };
+  }
+  return {
+    code: 0,
+    message: `OK: ${path.basename(binaryPath)} links in release and carries no app-runtime symbols`,
+    offenders: [],
+  };
+}
+
+/** @param {string[]} [argv] */
+export function main(argv = process.argv.slice(2)) {
+  const parsed = parseArgs(argv);
+  if (!parsed.ok) {
+    console.error(`check-ptyd-release: ${parsed.error}`);
     return 2;
   }
-  const offenders = forbiddenSymbols(nm.stdout);
-  if (offenders.length > 0) {
-    console.error(`FAIL: gitpulse-ptyd carries ${offenders.length} app-runtime symbol(s), e.g. ${offenders.slice(0, 3).join(", ")}`);
-    return 1;
+  if (parsed.help) {
+    console.log(formatUsage({
+      name: "check-ptyd-release",
+      summary: "Verify release gitpulse-ptyd links cleanly and carries no app-runtime symbols.",
+      flags: [
+        { flag: "--binary <path>", description: "inspect an already-built release gitpulse-ptyd binary without rebuilding" },
+      ],
+      exits: "0 clean; 1 link failed or forbidden symbols present; 2 check could not run",
+    }));
+    return 0;
   }
-  console.log("OK: gitpulse-ptyd links in release and carries no app-runtime symbols");
-  return 0;
+
+  const binaryPath = parsed.binary ?? defaultBinaryPath();
+  if (!parsed.binary) {
+    if (!existsSync(DIST)) {
+      console.error("check-ptyd-release: could not run: dist/ is missing; `bun run build` first (the release build embeds it)");
+      return 2;
+    }
+    // The bundle's own cargo invocation (scripts/tauri.mjs -> tauri build), narrowed to this binary.
+    const build = spawnSync(
+      "cargo",
+      ["build", "--manifest-path", MANIFEST, "--release", "--locked", "--features", "tauri/custom-protocol", "--bin", "gitpulse-ptyd"],
+      { stdio: ["ignore", "inherit", "pipe"], encoding: "utf8", timeout: BUILD_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 },
+    );
+    if (build.error) {
+      console.error(`check-ptyd-release: could not run: cargo: ${build.error.message}`);
+      return 2;
+    }
+    process.stderr.write(build.stderr ?? "");
+    if (build.status !== 0) {
+      const undefinedSymbols = /Undefined symbols/.test(build.stderr ?? "");
+      console.error(
+        undefinedSymbols
+          ? "FAIL: gitpulse-ptyd does not link in release: undefined symbols (see above)"
+          : `FAIL: the release build of gitpulse-ptyd exited ${build.status}`,
+      );
+      return 1;
+    }
+  }
+
+  const verdict = inspectBinary(binaryPath);
+  if (verdict.code === 0) console.log(verdict.message);
+  else console.error(verdict.message);
+  return verdict.code;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

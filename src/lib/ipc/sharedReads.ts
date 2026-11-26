@@ -31,15 +31,16 @@
  * The reads that accept a `requestId`, so the backend can stop one whose
  * callers have all gone (`engine/process/read_cancel.rs`).
  *
- * Only reads a newer click really supersedes and whose git child runs long
- * enough for the kill to matter: the graph window and the commit, compare and
- * range diffs. Each is called with an abort signal by exactly one store
- * (`graphStore`, `diffSelection`); a read nobody aborts gains nothing from an
- * id, so it is not listed. The id is only ever sent for a call that carries a
- * signal, and `invoke` adds it under its own name, outside the arguments the
- * call is joined and retried by.
+ * Only reads a newer click or refresh supersedes and whose git work can run
+ * long enough for the kill to matter: working-tree status, the graph window,
+ * and the commit, compare and range diffs. Each is called with an abort signal
+ * by its owning store/controller (`hydration`, `graphStore`, `diffSelection`);
+ * a read nobody aborts gains nothing from an id, so it is not listed. The id
+ * is only ever sent for a call that carries a signal, and `invoke` adds it
+ * under its own name, outside the arguments the call is joined and retried by.
  */
 export const CANCELLABLE_READ_COMMANDS: ReadonlySet<string> = new Set([
+  "cmd_get_status",
   "cmd_get_commit_graph",
   "cmd_get_commit_diff",
   "cmd_get_commit_file_diff",

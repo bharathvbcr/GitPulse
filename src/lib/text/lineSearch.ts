@@ -21,6 +21,15 @@ export interface LineMatch {
   length: number;
 }
 
+export type MatchTier = "none" | "match" | "active";
+
+export interface LineMatchRange {
+  start: number;
+  /** Exclusive. */
+  end: number;
+  active: boolean;
+}
+
 export interface SearchOptions {
   caseSensitive?: boolean;
   regex?: boolean;
@@ -410,12 +419,145 @@ export function stepMatch(current: number, count: number, delta: number): number
   return ((current + delta) % count + count) % count;
 }
 
-/** `3 of 128`, or `128+ matches` when a cap cut collection short. */
+/** `3 of 128`, `3 of 128+` when capped, or `no matches (partial)` on a truncated zero-hit scan. */
 export function matchLabel(result: SearchResult, current: number): string {
   if (result.reason === "unbounded") return "pattern may not terminate";
   if (result.invalid) return "bad pattern";
   const count = result.matches.length;
-  if (count === 0) return "no matches";
+  if (count === 0) return result.truncated ? "no matches (partial)" : "no matches";
   const total = result.truncated ? `${count.toLocaleString()}+` : count.toLocaleString();
   return `${(current + 1).toLocaleString()} of ${total}`;
+}
+
+export interface MatchTick {
+  /** Vertical offset along the overview rail in `[0, 100]` percent. */
+  topPercent: number;
+  /** True when this bucket contains the active search hit. */
+  active: boolean;
+}
+
+/**
+ * Projects match line indices onto a bounded set of vertical overview ticks so
+ * long files can display match density beside the scrollbar without creating
+ * thousands of DOM nodes.
+ */
+export function buildMatchTicks(
+  matches: readonly LineMatch[],
+  totalLines: number,
+  activeIdx: number,
+  maxTicks = 200,
+): MatchTick[] {
+  if (matches.length === 0 || totalLines <= 0 || maxTicks <= 0) return [];
+  const buckets = new Map<number, MatchTick>();
+  const denom = Math.max(1, totalLines);
+  for (let i = 0; i < matches.length; i += 1) {
+    const ratio = Math.max(0, Math.min(1, (matches[i].lineIndex + 0.5) / denom));
+    const slot = Math.min(maxTicks - 1, Math.floor(ratio * maxTicks));
+    const isActive = i === activeIdx;
+    const existing = buckets.get(slot);
+    if (existing) {
+      if (isActive) existing.active = true;
+    } else {
+      buckets.set(slot, {
+        topPercent: Number(((slot + 0.5) / maxTicks * 100).toFixed(2)),
+        active: isActive,
+      });
+    }
+  }
+  return [...buckets.values()];
+}
+
+function sameTokenMeta<T extends { text: string }>(a: T, b: T): boolean {
+  if (a === b) return true;
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const keysA = Object.keys(aRecord);
+  const keysB = Object.keys(bRecord);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) {
+    if (key === "text") continue;
+    if (!Object.prototype.hasOwnProperty.call(bRecord, key) || aRecord[key] !== bRecord[key]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Splits syntax tokens at search-hit boundaries so inline find highlights
+ * (`match` vs `active`) overlay syntax colors without losing characters or
+ * desynchronizing when a match starts mid-token.
+ */
+export function sliceTokensWithMatches<T extends { text: string }>(
+  line: string,
+  tokens: readonly T[],
+  matches: readonly LineMatchRange[],
+  makeFallback: (text: string) => T,
+): (T & { match: MatchTier })[] {
+  if (line.length === 0) return [];
+
+  let tokenTotal = 0;
+  for (const token of tokens) {
+    tokenTotal += token.text.length;
+  }
+  const tokenList = tokenTotal === line.length ? tokens : [makeFallback(line)];
+
+  const validMatches: LineMatchRange[] = [];
+  for (const m of matches) {
+    if (!Number.isFinite(m.start) || !Number.isFinite(m.end)) continue;
+    const start = Math.max(0, Math.min(line.length, m.start));
+    const end = Math.max(0, Math.min(line.length, m.end));
+    if (end > start) {
+      validMatches.push({ start, end, active: m.active });
+    }
+  }
+
+  if (validMatches.length === 0) {
+    return tokenList.map((token) => ({ ...token, match: "none" as const }));
+  }
+
+  const boundaries = new Set<number>([0, line.length]);
+  let offset = 0;
+  for (const token of tokenList) {
+    offset += token.text.length;
+    if (offset > 0 && offset < line.length) boundaries.add(offset);
+  }
+  for (const m of validMatches) {
+    if (m.start > 0 && m.start < line.length) boundaries.add(m.start);
+    if (m.end > 0 && m.end < line.length) boundaries.add(m.end);
+  }
+
+  const cuts = [...boundaries].sort((a, b) => a - b);
+  const out: (T & { match: MatchTier })[] = [];
+  let tokenIndex = 0;
+  let tokenEnd = tokenList.length > 0 ? tokenList[0].text.length : line.length;
+
+  for (let i = 0; i < cuts.length - 1; i += 1) {
+    const start = cuts[i];
+    const end = cuts[i + 1];
+    if (end <= start) continue;
+    while (tokenIndex < tokenList.length - 1 && tokenEnd <= start) {
+      tokenIndex += 1;
+      tokenEnd += tokenList[tokenIndex].text.length;
+    }
+    const token = tokenList[tokenIndex];
+    let tier: MatchTier = "none";
+    for (const m of validMatches) {
+      if (m.start <= start && m.end > start) {
+        if (m.active) {
+          tier = "active";
+          break;
+        }
+        tier = "match";
+      }
+    }
+    const text = line.slice(start, end);
+    const prev = out[out.length - 1];
+    if (prev && prev.match === tier && sameTokenMeta(prev, token)) {
+      prev.text += text;
+    } else {
+      out.push({ ...token, text, match: tier });
+    }
+  }
+  return out;
 }

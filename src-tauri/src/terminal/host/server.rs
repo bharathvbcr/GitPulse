@@ -222,11 +222,28 @@ fn link_sink(link: Arc<Link>) -> OutputSink {
     })
 }
 
+/// What a session stopped by the host's own signal hook ended with. The
+/// system (a restart, a logout, `kill`) stopped the host, so the session
+/// ended without the person asking: the ledger offers it to reopen.
+pub(super) const HOST_SIGNALLED: &str =
+    "The terminal host was stopped by the system (a restart, logout or kill) while this session ran.";
+
+/// Puts [`HOST_SIGNALLED`] on an exit the signal hook caused. GitPulse ended
+/// the session, but nobody chose to: without a reason the exit is
+/// indistinguishable from a Close, which is never offered.
+fn mark_signalled(payload: &mut crate::terminal::TerminalExitPayload, signalled: bool) {
+    if signalled && payload.error.is_none() {
+        payload.error = Some(HOST_SIGNALLED.to_owned());
+    }
+}
+
 /// One session's events, as frames to the app, and its exit on disk first.
 struct HostEvents {
     link: Arc<Link>,
     receipts: Arc<Receipts>,
     run_id: Option<String>,
+    /// Set by the signal hook before it stops the sessions.
+    signalled: Arc<AtomicBool>,
 }
 
 impl SessionEvents for HostEvents {
@@ -244,8 +261,10 @@ impl SessionEvents for HostEvents {
     }
 
     fn exit(&self, ended: SessionEnded) {
+        let mut payload = ended.payload;
+        mark_signalled(&mut payload, self.signalled.load(Ordering::SeqCst));
         let ended = WireEnded {
-            payload: ended.payload,
+            payload,
             ended_by_gitpulse: ended.ended_by_gitpulse,
             program: ended.program,
             cwd: ended.cwd,
@@ -275,6 +294,9 @@ struct Host {
     holds: Mutex<HashMap<String, engine::MasterHold>>,
     /// Set by a granted `Retire`: the accept loop ends.
     retire: AtomicBool,
+    /// Set by the signal hook before it stops every session, so their exits
+    /// say the system stopped them ([`HOST_SIGNALLED`]).
+    signalled: Arc<AtomicBool>,
 }
 
 impl Host {
@@ -325,6 +347,7 @@ impl Host {
                     link: self.link.clone(),
                     receipts: self.receipts.clone(),
                     run_id: request.run_id.clone(),
+                    signalled: self.signalled.clone(),
                 });
                 match engine::start_unobserved(&self.engine, request, self.sink(), events) {
                     Ok(started) => {
@@ -768,11 +791,14 @@ fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) 
         transcripts,
         holds: Mutex::default(),
         retire: AtomicBool::new(false),
+        signalled: Arc::new(AtomicBool::new(false)),
     });
     if install_shutdown_hook {
         let host = host.clone();
         crate::procguard::set_shutdown_hook(move || {
             log::info!(target: "terminal_host", "signalled: stopping every session");
+            // Before the first session is stopped, so every exit says why.
+            host.signalled.store(true, Ordering::SeqCst);
             if let Err(error) = engine::shutdown_sessions(&host.engine) {
                 log::warn!(target: "terminal_host", "terminal shutdown incomplete: {error}");
             }
@@ -843,4 +869,85 @@ fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) 
     // while the lock is held.
     let _ = std::fs::remove_file(&socket);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mark_signalled, HOST_SIGNALLED};
+    use crate::terminal::session_ledger::{ExitFacts, NewSessionRow, SessionLedger};
+    use crate::terminal::TerminalExitPayload;
+    use crate::workbench::conversation::Transcript;
+
+    const UUID: &str = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+
+    /// The exit the signal hook's stop produces: GitPulse's own close of the
+    /// session, reaped, with the hangup it sent.
+    fn stopped_by_host() -> TerminalExitPayload {
+        TerminalExitPayload {
+            id: "term-1-1".into(),
+            exit_code: None,
+            signal: "Hangup: 1".into(),
+            error: None,
+            reaped: true,
+            ended_by_gitpulse: true,
+        }
+    }
+
+    fn offered_after(payload: &TerminalExitPayload) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::in_memory();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        ledger.record_spawn(NewSessionRow {
+            terminal_id: payload.id.clone(),
+            launcher: "claude".into(),
+            native_id: Some(UUID.into()),
+            repo_path: cwd.clone(),
+            start_dir: None,
+            cwd,
+            mode: None,
+            reopen_row_id: None,
+            parent_row_id: None,
+        });
+        ledger.record_exit(
+            &payload.id,
+            ExitFacts {
+                ended_by_gitpulse: payload.ended_by_gitpulse,
+                exit_code: payload.exit_code,
+                signal: Some(payload.signal.as_str()).filter(|s| !s.is_empty()),
+                error: payload.error.as_deref(),
+                reaped: payload.reaped,
+            },
+        );
+        ledger.view_with(|_, _| Transcript::Found).reopenable_count
+    }
+
+    /// A macOS restart or logout stops the host with a signal, and the hook
+    /// ends every agent itself. Those agents must be offered after the
+    /// restart: the person asked for none of it.
+    #[test]
+    fn agents_the_host_stops_on_a_system_signal_are_offered_after_the_restart() {
+        let mut payload = stopped_by_host();
+        mark_signalled(&mut payload, true);
+        assert_eq!(payload.error.as_deref(), Some(HOST_SIGNALLED));
+        assert_eq!(offered_after(&payload), 1, "a signalled stop is offered");
+    }
+
+    /// Without the reason the same exit is GitPulse's own close, which is
+    /// withdrawn: the shape that lost every agent on a normal restart.
+    #[test]
+    fn the_same_stop_without_the_signal_is_a_close_and_is_not_offered() {
+        let mut payload = stopped_by_host();
+        mark_signalled(&mut payload, false);
+        assert_eq!(payload.error, None);
+        assert_eq!(offered_after(&payload), 0);
+    }
+
+    /// A reason the session already carries is kept.
+    #[test]
+    fn a_signalled_exit_keeps_an_error_it_already_has() {
+        let mut payload = stopped_by_host();
+        payload.error = Some("PTY reader failed: x".into());
+        mark_signalled(&mut payload, true);
+        assert_eq!(payload.error.as_deref(), Some("PTY reader failed: x"));
+    }
 }

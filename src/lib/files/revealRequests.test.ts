@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import {
   clearReveal,
+  colonLineJump,
   consumeReveal,
   goToLineTarget,
+  parseColonLineJump,
+  parseGoToLineInput,
   requestReveal,
   revealRequest,
   MAX_REVEAL_LINE,
@@ -144,5 +147,59 @@ describe("go-to-line target", () => {
 
   it("has nowhere to go in an empty file", () => {
     expect(goToLineTarget(1, 0)).toBeNull();
+  });
+});
+
+describe("parseGoToLineInput", () => {
+  it("treats null, undefined, blank strings, and a lone colon as empty", () => {
+    expect(parseGoToLineInput(null, 100)).toEqual({ target: null, column: null, empty: true, invalid: false });
+    expect(parseGoToLineInput(undefined, 100)).toEqual({ target: null, column: null, empty: true, invalid: false });
+    expect(parseGoToLineInput("", 100)).toEqual({ target: null, column: null, empty: true, invalid: false });
+    expect(parseGoToLineInput("   ", 100)).toEqual({ target: null, column: null, empty: true, invalid: false });
+    expect(parseGoToLineInput(" : ", 100)).toEqual({ target: null, column: null, empty: true, invalid: false });
+  });
+
+  it("parses numeric values and rejects non-positive or fractional numbers", () => {
+    expect(parseGoToLineInput(42, 100)).toEqual({ target: 42, column: null, empty: false, invalid: false });
+    expect(parseGoToLineInput(250, 100)).toEqual({ target: 100, column: null, empty: false, invalid: false });
+    expect(parseGoToLineInput(0, 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput(-5, 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput(2.5, 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+  });
+
+  it("accepts plain, :line, and :line:col notation and rejects invalid forms", () => {
+    expect(parseGoToLineInput(" 15 ", 100)).toEqual({ target: 15, column: null, empty: false, invalid: false });
+    expect(parseGoToLineInput(":42", 100)).toEqual({ target: 42, column: null, empty: false, invalid: false });
+    expect(parseGoToLineInput(":42:10", 100)).toEqual({ target: 42, column: 10, empty: false, invalid: false });
+    expect(parseGoToLineInput("500:2", 100)).toEqual({ target: 100, column: 2, empty: false, invalid: false });
+
+    expect(parseGoToLineInput("abc", 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput(":abc", 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput(":0", 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput(":42:0", 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput(":42:", 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput({} as unknown, 100)).toEqual({ target: null, column: null, empty: false, invalid: true });
+    expect(parseGoToLineInput("1", 0)).toEqual({ target: null, column: null, empty: false, invalid: true });
+  });
+});
+
+describe("colonLineJump / parseColonLineJump", () => {
+  it("recognizes :line and :line:col queries and clamps to file length", () => {
+    expect(colonLineJump(":42", 100)).toBe(42);
+    expect(colonLineJump("  :42:10  ", 100)).toBe(42);
+    expect(colonLineJump(":500", 100)).toBe(100);
+    expect(parseColonLineJump(":42", 100)).toEqual({ line: 42, column: null });
+    expect(parseColonLineJump(" :42:10 ", 100)).toEqual({ line: 42, column: 10 });
+    expect(parseColonLineJump(":42:0", 100)).toBeNull();
+  });
+
+  it("ignores non-colon queries, invalid lines, regex mode, and queries with text matches", () => {
+    expect(colonLineJump("42", 100)).toBeNull();
+    expect(colonLineJump(":", 100)).toBeNull();
+    expect(colonLineJump(":0", 100)).toBeNull();
+    expect(colonLineJump(":abc", 100)).toBeNull();
+    expect(colonLineJump(":42", 0)).toBeNull();
+    expect(colonLineJump(":42", 100, { regex: true })).toBeNull();
+    expect(colonLineJump(":42", 100, { hasMatches: true })).toBeNull();
   });
 });

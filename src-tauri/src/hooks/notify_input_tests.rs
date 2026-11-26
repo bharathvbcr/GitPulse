@@ -238,3 +238,35 @@ fn a_reader_that_fails_is_refused() {
     }
     assert!(read_notify_input(Fails, MAX_READ_BYTES).is_err());
 }
+
+#[test]
+fn stop_or_notify_past_limit_retains_termination_reason_and_error() {
+    use super::notify_input::read_stop_notify_input_within;
+
+    for body in [
+        json!({
+            "conversationId": "91a8ef12-3456-4789-abcd-ef0123456789",
+            "terminationReason": "ERROR",
+            "error": "rate limit 429",
+            "pad": "x".repeat(64 * 1024),
+        })
+        .to_string(),
+        json!({
+            "pad": "x".repeat(64 * 1024),
+            "conversationId": "91a8ef12-3456-4789-abcd-ef0123456789",
+            "terminationReason": "ERROR",
+            "error": "rate limit 429",
+        })
+        .to_string(),
+    ] {
+        let input = read_stop_notify_input_within(
+            Cursor::new(body.into_bytes()),
+            4096,
+            Duration::from_secs(2),
+        )
+        .expect("oversized stop payload parses");
+        assert_eq!(input.termination_reason, "ERROR");
+        assert_eq!(input.error, "rate limit 429");
+        assert_eq!(input.session_id, "91a8ef12-3456-4789-abcd-ef0123456789");
+    }
+}

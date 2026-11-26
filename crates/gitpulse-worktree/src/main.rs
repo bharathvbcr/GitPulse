@@ -988,6 +988,23 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
     })
 }
 
+/// Runs `cmd`. A command that makes a worktree is the user's own action, so it
+/// is admitted as one: this process starts in the background class (its other
+/// commands are optional reads that the shared git spawn budget may shed), but
+/// a `create` that exits 1 because its `git worktree add` was deferred, or 3
+/// because the inline index refresh after it was, fails the one thing that was
+/// asked for. The rest keep the process default.
+fn execute_admitted(cmd: Subcommand) -> Result<Value, String> {
+    if matches!(
+        cmd,
+        Subcommand::Create { .. } | Subcommand::Switch { .. } | Subcommand::Isolate { .. }
+    ) {
+        gitpulse_lib::engine::process::run_as_user_action(|| execute_subcommand(cmd))
+    } else {
+        execute_subcommand(cmd)
+    }
+}
+
 fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
     match cmd {
         Subcommand::Create {
@@ -1051,7 +1068,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 if let Ok(family) = resolve_worktree_family(&repo, &path) {
                     let selection = CacheSelection::default();
                     let (_, dev_res) = std::thread::scope(|scope| {
-                        let c = scope.spawn(|| {
+                        let c = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
                             if share_cache {
                                 let _ = clone_ignored_caches(
                                     &family.anchor,
@@ -1059,10 +1076,10 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                                     &selection,
                                 );
                             }
-                        });
-                        let d = scope.spawn(|| {
+                        }));
+                        let d = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
                             provision_worktree_devmap_zero_copy(&family.anchor, &family.worktree)
-                        });
+                        }));
                         let _ = c.join();
                         ((), d.join().ok().and_then(Result::ok))
                     });
@@ -1248,14 +1265,20 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             let anchor = &family.anchor;
             let target = &family.worktree;
             let (cache_res, devmap_res) = std::thread::scope(|scope| {
-                let c = scope.spawn(|| clone_ignored_caches(anchor, target, &selection));
-                let d = scope.spawn(|| match effective_mode {
-                    CliDevmapMode::Stacked => {
-                        provision_worktree_devmap_zero_copy(anchor, target).map(Some)
+                // New threads start in the process default (background); both
+                // are part of the command the user asked for.
+                let c = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
+                    clone_ignored_caches(anchor, target, &selection)
+                }));
+                let d = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
+                    match effective_mode {
+                        CliDevmapMode::Stacked => {
+                            provision_worktree_devmap_zero_copy(anchor, target).map(Some)
+                        }
+                        CliDevmapMode::Copy => provision_worktree_devmap(anchor, target).map(Some),
+                        CliDevmapMode::None => Ok(None),
                     }
-                    CliDevmapMode::Copy => provision_worktree_devmap(anchor, target).map(Some),
-                    CliDevmapMode::None => Ok(None),
-                });
+                }));
                 let cr = c
                     .join()
                     .unwrap_or_else(|_| Err(CommandError::plain("cache clone worker panicked")));
@@ -2044,7 +2067,7 @@ fn main() {
         log::warn!(target: "setup", "{}", signals.describe());
     }
 
-    let exit_code = match execute_subcommand(cmd) {
+    let exit_code = match execute_admitted(cmd) {
         Ok(val) => {
             let emitted = emit_value(json_mode, &val).is_ok();
             // An answer that carries `ok: false` is not a success: name it on

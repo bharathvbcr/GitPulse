@@ -202,7 +202,7 @@ export async function checkStatusPopover() {
       const tinted = blend(base, [c, c, c]);
       return [tinted, blend(sheen, tinted)];
     });
-    return ["--text", "--muted", "--blue", "--green", "--amber"].every(token => {
+    return ["--text", "--muted", "--blue", "--green", "--amber", "--red"].every(token => {
       const foreground = luminance(color(style.getPropertyValue(token)));
       return backgrounds.every(rgb => {
         const background = luminance(rgb);
@@ -223,6 +223,7 @@ export async function checkStatusPopover() {
 
   try {
     await settle();
+    check("header uses the current GitPulse logo mark instead of legacy Activity", !!document.querySelector('.mark svg[aria-label="GitPulse"]') && !document.querySelector(".lucide-activity"));
     check("first glance has three equal metric cards", metrics().length === 3 && new Set(metrics().map(m => m.offsetWidth)).size === 1);
     check("numbers use the display step for metric numerals (24px)", getComputedStyle(element(".metric strong")).fontSize === "24px");
     check("the preview renders an actual backdrop blur", getComputedStyle(element(".panel")).getPropertyValue("backdrop-filter").includes("blur(34px)"));
@@ -362,6 +363,47 @@ export async function checkStatusPopover() {
     await click('[aria-label="Settings"]'); check("footer settings keeps its route", action("settings"));
     await click(".open-app"); check("footer restores GitPulse", action("show"));
     await click('[aria-label="Quit GitPulse"]'); check("footer retains guarded quit dispatch", action("quit"));
+
+    await select(1, "agents waiting");
+    const reqSection = document.querySelector('[data-testid="status-agent-requests"]');
+    const firstMetric = metrics()[0];
+    check("waiting agent requests appear above working tree metrics", reqSection instanceof HTMLElement && !!firstMetric && reqSection.getBoundingClientRect().top < firstMetric.getBoundingClientRect().top);
+    const reqRows = [...document.querySelectorAll<HTMLButtonElement>('[data-testid="status-agent-request"]')];
+    check("waiting requests show blocking and error urgency cards with timestamps and detail", reqRows.length === 3 && reqRows.some(r => r.dataset.urgency === "blocking") && reqRows.some(r => r.dataset.urgency === "error") && !!reqSection?.querySelector("time") && !!reqSection?.querySelector(".request-detail"));
+    const enabledReqRows = [...document.querySelectorAll<HTMLButtonElement>('[data-testid="status-agent-request"]:not(:disabled)')];
+    if (enabledReqRows.length >= 2) {
+      enabledReqRows[0].focus();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      const movedDown = document.activeElement === enabledReqRows[1];
+      enabledReqRows[0].focus();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      const wrappedUp = document.activeElement === enabledReqRows[enabledReqRows.length - 1];
+      check("arrow keys cycle and wrap across waiting agent request rows", movedDown && wrappedUp);
+    }
+    const reqList = element(".requests-list");
+    check("requests list stays bounded within 152px and panel fits inside 624px", reqList.getBoundingClientRect().height <= 152.5 && fits());
+    await click(DETAILS_TOGGLE);
+    check("expanding Details while agent requests are visible stays inside 624px", fits());
+    await click(DETAILS_TOGGLE);
+    check("waiting agents light glass keeps contrast over black and white", contrastOnGlass());
+    await select(0, "dark");
+    check("waiting agents dark glass keeps contrast over black and white", contrastOnGlass());
+    await select(0, "light");
+    await click('[data-request-id="term:claude-1"]');
+    check("clicking an agent request dispatches focus-agent:<id>", action("focus-agent:term:claude-1"));
+    await click('[data-testid="status-agent-requests-more"]');
+    check("overflow request link routes to Agents", action("agents"));
+    await click(PRIMARY);
+    await key("a");
+    check("pressing A routes to Agents", action("agents"));
+
+    await select(1, "agents quiet");
+    check("quiet strip appears when agents are running/notified with none waiting", !!document.querySelector('[data-testid="status-agent-quiet"]') && !document.querySelector('[data-testid="status-agent-requests"]'));
+    await click('[data-testid="status-agent-quiet"]');
+    check("clicking quiet agent strip opens Agents", action("agents"));
+
+    await select(1, "agents empty");
+    check("empty repository state still surfaces waiting agent requests above Open repository", metrics().length === 0 && !!document.querySelector('[data-testid="status-agent-requests"]') && element(PRIMARY).textContent?.includes("Open repository") === true && fits());
   } catch (error) {
     check(error instanceof Error ? error.message : String(error), false);
   }

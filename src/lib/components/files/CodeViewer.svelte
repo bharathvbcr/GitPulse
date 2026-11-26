@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { untrack } from "svelte";
   import { hostPlatform } from "../../stores/platformStore";
   import { shortcutTextLabel } from "../../ui/platformCopy";
   import { repoStore } from "../../stores/repoStore";
@@ -29,7 +29,6 @@
     Edit3,
     Save,
     RotateCcw,
-    Hash,
     Loader2,
     Send,
     ChevronDown,
@@ -47,8 +46,16 @@
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
   import FindField from "../FindField.svelte";
-  import { pageSearchScope, registerPageSearch } from "../../search/pageSearch.svelte";
-  import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
+  import {
+    buildMatchTicks,
+    findMatches,
+    firstMatchFrom,
+    matchLabel,
+    sliceTokensWithMatches,
+    stepMatch,
+    type LineMatchRange,
+  } from "../../text/lineSearch";
+  import { extractSelectionSeed } from "../../files/fileSearchTarget";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
   import { consumeReveal, goToLineTarget, revealRequest } from "../../files/revealRequests";
@@ -103,7 +110,6 @@
 
   let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
   let actionBar: HTMLDivElement | undefined = $state();
-  let goToBar: HTMLDivElement | undefined = $state();
   let statusBar: HTMLDivElement | undefined = $state();
   const OVERSCAN = 20;
   const MAX_RENDER_LINES = 80_000;
@@ -125,23 +131,19 @@
 
   let selectedLine = $state<number | null>(null);
   let selectedLineEnd = $state<number | null>(null);
+  let selectedColumn = $state<number>(1);
+  let codeViewerRoot: HTMLDivElement | undefined = $state();
 
-  // In-file search state
+  // Unified inline find & go-to-line state
   let isSearchOpen = $state(false);
-  /**
-   * Mounted as the Code view's file pane, the view bar's search field is
-   * this file's find: the viewer registers as its provider and draws no Find
-   * of its own. Mounted anywhere else (a stash preview) it keeps its own.
-   */
-  const searchScope = pageSearchScope();
+  let searchMode = $state<"find" | "line">("find");
   let searchQuery = $state("");
   let isCaseSensitive = $state(false);
   let isRegex = $state(false);
   let currentMatchIdx = $state(0);
   let searchInputEl: HTMLInputElement | undefined = $state();
-
-  let goToLineOpen = $state(false);
-  let targetLineInput = $state<number | null>(null);
+  let findFieldRef: ReturnType<typeof FindField> | undefined = $state();
+  let editorTextareaEl: HTMLTextAreaElement | undefined = $state();
 
   let scrollTop = $state(0);
 
@@ -272,50 +274,101 @@
     scrollToMatch(next);
   }
 
-  // A file opened as a page's own pane finds through the view bar's field;
-  // anywhere else (a stash preview) the toolbar Find above stays. Registered
-  // once on mount, as in DiffViewer: the scope is fixed for the viewer's life.
-  onMount(() => {
-    if (!searchScope) return;
-    return registerPageSearch(searchScope, {
-      kind: "find",
-      label: "Find in file",
-      placeholder: "Find in file…",
-      query: () => searchQuery,
-      setQuery: (next) => (searchQuery = next),
-      caseSensitive: () => isCaseSensitive,
-      setCaseSensitive: (next) => (isCaseSensitive = next),
-      regex: () => isRegex,
-      setRegex: (next) => (isRegex = next),
-      status: () => ({
-        text: matchLabel(searchResult, currentMatchIdx),
-        invalid: searchResult.invalid,
-        hasMatches: matchCount > 0,
-      }),
-      step: (delta) => (delta === 1 ? nextMatch() : prevMatch()),
+  let lastSearchSignature = "";
+  $effect(() => {
+    const signature = `${filePath}\u0000${debouncedQuery}\u0000${isCaseSensitive}\u0000${isRegex}\u0000${searchMatches.length}`;
+    if (signature === lastSearchSignature) return;
+    lastSearchSignature = signature;
+    if (searchMatches.length === 0) {
+      untrack(() => {
+        currentMatchIdx = 0;
+      });
+      return;
+    }
+    const anchor = firstMatchFrom(
+      searchMatches,
+      Math.max(0, Math.floor(untrack(() => scrollTop) / Math.max(1, untrack(() => rowPx)))),
+    );
+    const nextIdx = anchor < 0 ? 0 : anchor;
+    untrack(() => {
+      currentMatchIdx = nextIdx;
+      if (debouncedQuery.trim().length > 0) {
+        scrollToMatch(nextIdx);
+      }
     });
   });
+
+  let matchesByLine = $derived.by(() => {
+    const map = new Map<number, LineMatchRange[]>();
+    if (!isSearchOpen || !debouncedQuery.trim()) return map;
+    for (let i = 0; i < searchMatches.length; i += 1) {
+      const m = searchMatches[i];
+      const range: LineMatchRange = {
+        start: m.colStart,
+        end: m.colStart + m.length,
+        active: i === currentMatchIdx,
+      };
+      const bucket = map.get(m.lineIndex);
+      if (bucket) bucket.push(range);
+      else map.set(m.lineIndex, [range]);
+    }
+    return map;
+  });
+
+  let matchTicks = $derived(
+    isSearchOpen && !isEditing && searchMatches.length > 0
+      ? buildMatchTicks(searchMatches, rawLines.length, currentMatchIdx)
+      : [],
+  );
+
+  function clampColumnForLine(lineNum: number, column?: number | null): number {
+    if (column === null || column === undefined || !Number.isInteger(column) || column < 1) {
+      return 1;
+    }
+    const lineLen = rawLines[lineNum - 1]?.length ?? 0;
+    return Math.min(column, lineLen + 1);
+  }
+
+  function focusEditorAt(lineNum: number, column: number, length = 0, shouldFocus = false) {
+    if (!isEditing || !editorTextareaEl) return;
+    let offset = Math.max(0, column - 1);
+    for (let i = 0; i < lineNum - 1; i += 1) {
+      offset += (rawLines[i]?.length ?? 0) + 1;
+    }
+    if (shouldFocus) editorTextareaEl.focus();
+    editorTextareaEl.setSelectionRange(offset, offset + Math.max(0, length));
+    editorTextareaEl.scrollTop = Math.max(0, (lineNum - 1) * Math.max(1, rowPx) - 80);
+  }
 
   function scrollToMatch(idx: number) {
     const match = searchMatches[idx];
     if (!match) return;
     selectedLine = match.lineIndex + 1;
     selectedLineEnd = null;
-    scrollToLine(match.lineIndex);
+    selectedColumn = match.colStart + 1;
+    if (isEditing && editorTextareaEl) {
+      focusEditorAt(match.lineIndex + 1, match.colStart + 1, match.length, false);
+    } else {
+      scrollToLine(match.lineIndex);
+    }
   }
 
   function scrollToLine(lineIdx: number) {
     scrollTop = Math.max(0, lineIdx * rowPx - 80);
   }
 
-  function handleGoToLine() {
-    const num = goToLineTarget(targetLineInput, rawLines.length);
+  function handleGoToLine(targetInput: unknown, column?: number | null) {
+    const num = goToLineTarget(targetInput, rawLines.length);
     if (num === null) return;
+    const col = clampColumnForLine(num, column);
     selectedLine = num;
     selectedLineEnd = null;
-    scrollToLine(num - 1);
-    goToLineOpen = false;
-    targetLineInput = null;
+    selectedColumn = col;
+    if (isEditing && editorTextareaEl) {
+      focusEditorAt(num, col, 0, true);
+    } else {
+      scrollToLine(num - 1);
+    }
   }
 
   function handleLineClick(lineNum: number, event: MouseEvent) {
@@ -324,6 +377,15 @@
     } else {
       selectedLine = lineNum;
       selectedLineEnd = null;
+      selectedColumn = 1;
+    }
+  }
+
+  function handleFindClose() {
+    if (isEditing && editorTextareaEl) {
+      editorTextareaEl.focus({ preventScroll: true });
+    } else if (codeViewerRoot) {
+      codeViewerRoot.focus({ preventScroll: true });
     }
   }
 
@@ -528,16 +590,23 @@
       sendSelectionToAgent();
       return;
     }
-    // As the page's pane, ⌘F is the view bar field's (App routes it there).
-    if (!searchScope && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
       e.preventDefault();
-      isSearchOpen = true;
-      setTimeout(() => searchInputEl?.focus(), 50);
+      e.stopPropagation();
+      void findFieldRef?.openFind(extractSelectionSeed(editorTextareaEl, codeViewerRoot));
       return;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "g") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "g") {
       e.preventDefault();
-      goToLineOpen = true;
+      e.stopPropagation();
+      void findFieldRef?.openLine();
+      return;
+    }
+    if (e.key === "F3" && !e.metaKey && !e.ctrlKey && !e.altKey && isSearchOpen && matchCount > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.shiftKey) prevMatch();
+      else nextMatch();
       return;
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
@@ -548,13 +617,10 @@
       return;
     }
     if (e.key === "Escape") {
-      if (goToLineOpen) {
-        goToLineOpen = false;
-        return;
-      }
-      if (isSearchOpen && !searchScope) {
-        isSearchOpen = false;
-        searchQuery = "";
+      if (isSearchOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        findFieldRef?.close();
         return;
       }
     }
@@ -573,6 +639,9 @@
         isEditing = restored !== null;
         isSaving = false;
         saveSuccess = false;
+        selectedLine = null;
+        selectedLineEnd = null;
+        selectedColumn = 1;
       });
       return;
     }
@@ -633,10 +702,16 @@
     // A reference can name a line past the end of the file it was written
     // about; clamp rather than refuse, so the file still opens near the mark.
     const line = Math.min(target.line, lineCount);
+    const col = clampColumnForLine(line, target.column);
     untrack(() => {
       selectedLine = line;
       selectedLineEnd = null;
-      scrollToLine(line - 1);
+      selectedColumn = col;
+      if (isEditing && editorTextareaEl) {
+        focusEditorAt(line, col, 0, false);
+      } else {
+        scrollToLine(line - 1);
+      }
     });
   });
 
@@ -648,10 +723,16 @@
     appliedRevealSeq = target.seq;
     if (!target.line || target.line <= 0) return;
     const line = Math.min(target.line, lineCount);
+    const col = clampColumnForLine(line, target.column);
     untrack(() => {
       selectedLine = line;
       selectedLineEnd = null;
-      scrollToLine(line - 1);
+      selectedColumn = col;
+      if (isEditing && editorTextareaEl) {
+        focusEditorAt(line, col, 0, false);
+      } else {
+        scrollToLine(line - 1);
+      }
     });
   });
 
@@ -672,6 +753,7 @@
 </script>
 
 <div
+  bind:this={codeViewerRoot}
   class="flex flex-col h-full bg-background font-sans text-xs min-h-0 relative overflow-hidden select-text"
   onkeydown={handleKeydown}
   tabindex="0"
@@ -718,34 +800,29 @@
         <span class="text-micro font-semibold text-warn" role="status">Unsaved</span>
       {/if}
 
-      {#if !searchScope}
-      <div class="ml-2 flex min-w-0 items-center">
+      <div class="ml-2 flex min-w-0 items-center gap-1">
         <FindField
+          bind:this={findFieldRef}
           bind:open={isSearchOpen}
+          bind:mode={searchMode}
           bind:query={searchQuery}
           bind:caseSensitive={isCaseSensitive}
           bind:regex={isRegex}
           bind:input={searchInputEl}
+          registerControl
           label="Find in file"
           placeholder="Find in file…"
           shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
-          status={matchLabel(searchResult, currentMatchIdx)}
+          goToShortcut={shortcutTextLabel("⌘G", $hostPlatform.os)}
+          lineCount={rawLines.length}
+          status={matchLabel(linesTruncated ? { ...searchResult, truncated: true } : searchResult, currentMatchIdx)}
           invalid={searchResult.invalid}
           hasMatches={matchCount > 0}
           onstep={(delta) => (delta === 1 ? nextMatch() : prevMatch())}
+          ongotoline={handleGoToLine}
+          onclose={handleFindClose}
         />
       </div>
-      {/if}
-
-      <button
-        type="button"
-        onclick={() => (goToLineOpen = true)}
-        class="gp-btn px-2! flex items-center gap-1 text-meta" data-size="sm"
-      >
-        <Hash size={11} />
-        <span>Go to Line</span>
-        <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘G", $hostPlatform.os)}</span>
-      </button>
 
       {#if onSendSelectionToAgent}
         <button
@@ -917,31 +994,6 @@
     <ScrollCue target={actionBar} axis="x" />
   </div>
 
-  {#if goToLineOpen}
-    <div class="relative shrink-0 select-none">
-      <div bind:this={goToBar} class="gp-header-scroll">
-        <div class="flex items-center gap-2 px-3 py-2 min-w-max">
-      <span class="text-xs text-textMuted shrink-0">Go to line (1–{rawLines.length}):</span>
-      <input
-        type="number"
-        min="1"
-        max={rawLines.length}
-        bind:value={targetLineInput}
-        onkeydown={(e) => {
-          if (e.key === "Enter") handleGoToLine();
-          if (e.key === "Escape") goToLineOpen = false;
-        }}
-        placeholder="Line number"
-        class="gp-field w-24!"
-      />
-      <button type="button" class="gp-btn-primary px-3! shrink-0" data-size="sm" onclick={handleGoToLine}>Go</button>
-      <button type="button" class="gp-btn px-2! shrink-0" data-size="sm" onclick={() => (goToLineOpen = false)}>Cancel</button>
-        </div>
-      </div>
-      <ScrollCue target={goToBar} axis="x" />
-    </div>
-  {/if}
-
   <!-- Main Code Surface -->
   <div class="flex-1 min-h-0 relative overflow-hidden bg-background flex flex-col">
     {#if linesTruncated && !isEditing}
@@ -952,6 +1004,7 @@
     {#if isEditing}
       <!-- Inline Code Editor Mode -->
       <textarea
+        bind:this={editorTextareaEl}
         value={editDraft}
         oninput={onEditInput}
         disabled={isSaving}
@@ -961,7 +1014,7 @@
       ></textarea>
     {:else}
       <!-- Read-Only Syntax Highlighted View -->
-      <div class="flex-1 w-full min-h-0">
+      <div class="relative flex-1 w-full min-h-0">
         <div
           class="font-mono text-xs min-w-full h-full"
           style="font-size: {0.75 * (zoomPercent / 100)}rem;"
@@ -980,7 +1033,12 @@
                 (selectedLineEnd === null
                   ? selectedLine === lineNum
                   : lineNum >= Math.min(selectedLine, selectedLineEnd) && lineNum <= Math.max(selectedLine, selectedLineEnd))}
-              {@const tokens = tokensForLine(line ?? "", lineIdx)}
+              {@const lineText = line ?? ""}
+              {@const tokens = tokensForLine(lineText, lineIdx)}
+              {@const lineMatches = matchesByLine.get(lineIdx) ?? []}
+              {@const spans = lineMatches.length > 0
+                ? sliceTokensWithMatches(lineText, tokens, lineMatches, (text) => ({ text, type: "text" as const }))
+                : null}
               <div
                 class="relative flex items-center w-max min-w-full overflow-hidden {isHighlighted
                   ? 'bg-accent/15'
@@ -1002,6 +1060,22 @@
                 <div class="pr-4 whitespace-pre">
                   {#if tokens.length === 0}
                     <span>&nbsp;</span>
+                  {:else if spans}
+                    {#each spans as span}
+                      <span
+                        class="{tokenClass(span.type)} {span.match === 'active'
+                          ? 'rounded-sm bg-warn text-onWarn'
+                          : span.match === 'match'
+                            ? 'rounded-sm bg-warn/30'
+                            : ''}"
+                      >
+                        {#if showWhitespace}
+                          {span.text.replace(/ /g, '·').replace(/\t/g, '→   ')}
+                        {:else}
+                          {span.text}
+                        {/if}
+                      </span>
+                    {/each}
                   {:else}
                     {#each tokens as token}
                       <span class={tokenClass(token.type)}>
@@ -1018,6 +1092,16 @@
             {/snippet}
           </VirtualList>
         </div>
+        {#if matchTicks.length > 0}
+          <div class="pointer-events-none absolute inset-y-1 right-0.5 w-1.5" aria-hidden="true" data-find-overview>
+            {#each matchTicks as tick}
+              <span
+                class="absolute inset-x-0 h-0.5 rounded-full {tick.active ? 'bg-warn' : 'bg-warn/45'}"
+                style:top="{tick.topPercent}%"
+              ></span>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -1027,7 +1111,14 @@
     <div bind:this={statusBar} class="gp-header-scroll">
       <div class="flex items-center justify-between gap-3 px-3 py-1 min-w-max w-full">
     <div class="flex items-center gap-3 shrink-0">
-      <span>Ln {selectedLine ?? 1}, Col 1</span>
+      <button
+        type="button"
+        onclick={() => void findFieldRef?.openLine()}
+        disabled={rawLines.length === 0}
+        class="hover:text-textPrimary transition-colors cursor-pointer disabled:cursor-default disabled:hover:text-textMuted"
+        title="Go to line ({shortcutTextLabel('⌘G', $hostPlatform.os)})"
+        data-status-goto-line
+      ><span>Ln {selectedLine ?? 1}, Col {selectedColumn}</span></button>
       <span>•</span>
       <span>{indentInfo}</span>
       <span>•</span>

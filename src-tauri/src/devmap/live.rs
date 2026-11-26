@@ -477,7 +477,7 @@ const PROBE_FRESH: Duration = Duration::from_secs(2);
 /// Status probes in flight at once across every repository. A probe that hangs
 /// holds a thread for up to [`cli::STATUS_DEADLINE`]; this is what keeps a
 /// restore of many tabs from holding one each.
-const PROBE_LIMIT: usize = 4;
+pub(crate) const PROBE_LIMIT: usize = 4;
 
 /// What [`start_refresh`] knows about the `devmap status` probe of one repository.
 enum ProbeSlot {
@@ -609,6 +609,7 @@ fn run_probe(repo_path: &str, id: u64, answer: &mpsc::Sender<CliStatus>) {
                     lookup: None,
                     reason: Some("the devmap status probe thread panicked".into()),
                     status: None,
+                    deferral: None,
                 },
             );
             resume_unwind(payload);
@@ -2237,6 +2238,7 @@ mod tests {
                 "schema_outdated": false,
                 "generation_id": 3,
             })),
+            deferral: None,
         };
         assert_eq!(freshness_from_cli_status(&status), (true, false, true));
 
@@ -2249,6 +2251,7 @@ mod tests {
                 "is_fresh": false,
                 "schema_outdated": true,
             })),
+            deferral: None,
         };
         assert_eq!(freshness_from_cli_status(&outdated), (true, false, false));
 
@@ -2258,6 +2261,7 @@ mod tests {
             lookup: None,
             reason: Some("no binary".into()),
             status: None,
+            deferral: None,
         };
         assert_eq!(freshness_from_cli_status(&missing), (false, false, false));
     }
@@ -2291,6 +2295,7 @@ mod tests {
                 lookup: None,
                 reason: None,
                 status: Some(payload.clone()),
+                deferral: None,
             };
             let (available, is_fresh, schema_ok) = freshness_from_cli_status(&status);
             assert!(

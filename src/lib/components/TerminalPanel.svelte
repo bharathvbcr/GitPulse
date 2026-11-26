@@ -25,7 +25,7 @@
   import { resolveFileOpen, sidebarNavStore, type ResolvedFileOpen, type SidebarFileOpenTarget } from "../sidebar/layoutStore";
   import { lastSurface } from "../ui/lastSurface";
   import { taskTerminalRequests, taskTerminalHolds, consumeTaskTerminalRequest, heldElsewhere, holdTaskTerminal, launchFor, releaseTaskTerminal, requestFor, type HostCandidate, type TaskTerminalRequest } from "../terminal/taskLaunches";
-  import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
+  import { displayName, isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
@@ -131,7 +131,9 @@
     reopenAllSessionLedgerOffers,
     reopenBannerHeading,
     reopenSessionLedgerOffer,
+    offerRows,
     reopenableOffers,
+    topLevelOffers,
     sessionLedgerStore,
     subscribeSessionLedger,
   } from "../terminal/sessionLedger";
@@ -1382,23 +1384,52 @@
     tabState.tabs
       .filter((tab) => isHandoffCapableLauncher(tab.launcher))
       .map((tab) => {
-        const display = tabDisplayTitle(tab, effectiveAgentStatuses[tab.id], tabBrowserStates[tab.id]);
+        const agentStatus = effectiveAgentStatuses[tab.id];
+        const display = tabDisplayTitle(tab, agentStatus, tabBrowserStates[tab.id]);
         const backendId = backendSessionIdByTabId[tab.id];
+        const act = backendId ? $sessionActivity.get(backendId) : undefined;
+        const actStatus = activityToAgentStatus(act);
+        const tabStatus = tabStatuses[tab.id];
         const attention =
-          tabStatuses[tab.id] === "error"
+          tabStatus === "error"
             ? "Failed"
-            : backendId
-              ? activityAttentionLabel($sessionActivity.get(backendId))
-              : null;
+            : (backendId ? activityAttentionLabel(act) : null) ?? oscAttentionLabel(agentStatus);
+        const done =
+          !attention &&
+          tabStatus !== "exited" &&
+          (agentStatus?.state === "done" || actStatus?.state === "done");
+        const fullyIdle = Boolean(act?.fullyIdle && !act?.dirtyPrompt) || agentStatus?.state === "idle";
+        const running =
+          (tabStatus === "running" || tabStatus === "starting") &&
+          !attention &&
+          !done &&
+          !fullyIdle;
+        const oscBadge = oscStatusBadge(agentStatus);
+        const status =
+          tabStatus === "exited"
+            ? { label: "Ended", cls: "text-textMuted" }
+            : oscBadge ??
+              (done
+                ? { label: "Done", cls: "text-ok" }
+                : running
+                  ? { label: "Running", cls: "text-accent" }
+                  : null);
         return {
           id: tab.id,
           launcher: tab.launcher,
           title: display.primary,
           detail: display.secondary ?? null,
-          status: tabStatuses[tab.id] === "exited" ? { label: "Ended", cls: "text-textMuted" } : oscStatusBadge(effectiveAgentStatuses[tab.id]),
+          status,
           attention,
           active: tab.id === activeId,
           unread: unread.has(tab.id),
+          repoPath: repoPath || null,
+          repoName: checkoutInfo?.label.repository ?? (repoPath ? displayName(repoPath) : null),
+          checkout: checkoutInfo?.label.checkout ?? checkoutInfo?.currentBranch ?? null,
+          running,
+          done,
+          attentionDetail: act?.attention?.detail ?? (attention ? (agentStatus?.detail ?? null) : null),
+          lastActivityAt: act?.lastOutputAt ?? null,
         };
       }),
   );
@@ -1414,6 +1445,7 @@
     agentSessionsElsewhere.map((session) => {
       const info = sessionRow(session, repoPath, checkouts, pathOpts);
       const live = session.sessionId ? $sessionActivity.get(session.sessionId) : undefined;
+      const liveStatus = activityToAgentStatus(live);
       const cleaned = (raw: string | null | undefined) =>
         raw ? stripTitleSpinner(raw).replace(/^[✳✦★•]+\s+/u, "").trim() : "";
       const launcher = session.launcher ?? "claude";
@@ -1424,14 +1456,42 @@
         (liveTitle && !isGenericLauncherTitle(liveTitle, launcher) ? liveTitle : "") ||
         session.label.trim() ||
         launcherLabel(launcher);
+      const attention = session.attention ?? (session.sessionId ? activityAttentionLabel(live) : null);
+      const isLive = session.status === "running" || session.status === "starting";
+      const done =
+        !attention &&
+        liveStatus?.state === "done" &&
+        session.status !== "exited" &&
+        session.status !== "error" &&
+        session.status !== "closing";
+      const liveIdle = Boolean(live?.fullyIdle && !live?.dirtyPrompt);
+      const running = isLive && !attention && !done && !liveIdle;
+      const status = done
+        ? { label: "Done", cls: "text-ok" }
+        : running
+          ? { label: sessionStatusLabel(session.status), cls: "text-accent" }
+          : liveStatus?.state === "blocked"
+            ? { label: "Input", cls: "text-warn" }
+            : liveStatus?.state === "error"
+              ? { label: "Failed", cls: "text-danger" }
+              : liveIdle && isLive
+                ? { label: "Idle", cls: "text-textMuted" }
+                : { label: sessionStatusLabel(session.status), cls: "text-textMuted" };
       return {
         id: session.key,
         launcher,
         title,
         detail: `${info.repository}${info.checkout ? ` · ${info.checkout}` : ""}`,
-        status: { label: sessionStatusLabel(session.status), cls: "text-textMuted" },
-        attention: session.attention ?? (session.sessionId ? activityAttentionLabel(live) : null),
+        status,
+        attention,
         disabled: !session.reveal,
+        repoPath: session.repoPath,
+        repoName: info.repository,
+        checkout: info.checkout || null,
+        running,
+        done,
+        attentionDetail: live?.attention?.detail ?? null,
+        lastActivityAt: live?.lastOutputAt ?? null,
       };
     }),
   );
@@ -1449,6 +1509,10 @@
   const agentAttention = $derived(
     agentRowsHere.filter((row) => row.attention || row.unread).length +
       agentRowsElsewhere.filter((row) => row.attention).length,
+  );
+  const agentsRunning = $derived(
+    agentRowsHere.filter((row) => row.running).length +
+      agentRowsElsewhere.filter((row) => row.running).length,
   );
   /** The active tab is an agent, so the Agents list already highlights it. */
   const activeSessionListed = $derived(agentRowsHere.some((row) => row.active));
@@ -2197,7 +2261,7 @@
   });
 
   const repoLedgerOffers = $derived(filterOffersForRepo($sessionLedgerStore.offers, repoPath, pathOpts));
-  const repoReopenableOffers = $derived(reopenableOffers(repoLedgerOffers));
+  const repoReopenableOffers = $derived(reopenableOffers(topLevelOffers(repoLedgerOffers)));
   let reopeningLedgerRowId = $state<string | null>(null);
   let reopeningAllLedger = $state(false);
   let ledgerRowErrors = $state<Record<string, string>>({});
@@ -4610,6 +4674,7 @@
     onSection={setSection}
     os={$hostPlatform.os}
     {agentAttention}
+    {agentsRunning}
     {activeSessionListed}
     repoName={repoPath?.split(/[\\/]/).pop() ?? null}
     {repoPath}
@@ -4825,7 +4890,7 @@
       <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
     </div>
   {/if}
-  {#if repoLedgerOffers.length > 0 && mode === "shell"}
+  {#if repoLedgerOffers.length > 0}
     <div
       class="gp-notice flex flex-col gap-1.5"
       data-tone={repoReopenableOffers.length > 0 ? "warn" : "unknown"}
@@ -4851,11 +4916,13 @@
         {/if}
       </div>
       <ul class="space-y-1 max-h-40 overflow-y-auto">
-        {#each repoLedgerOffers as offer (offer.row_id)}
+        {#each offerRows(repoLedgerOffers) as { offer, child } (offer.row_id)}
           {@const rowErr = ledgerRowErrors[offer.row_id] ?? offer.last_error ?? (offer.end_state !== "unreadable" && offer.launcher !== "shell" && !offer.resumable ? offer.reason : null)}
           {@const ledgerTitle = offer.title ? stripTitleSpinner(offer.title).replace(/^[✳✦★•]+\s+/u, "").trim() : ""}
           <li
             class="flex items-start justify-between gap-2 rounded-lg border border-border/65 bg-surface/60 px-2 py-1 text-micro"
+            class:ml-4={child}
+            data-child={child ? "true" : undefined}
             data-testid="terminal-ledger-row"
             data-end-state={offer.end_state}
           >
@@ -7580,6 +7647,9 @@
         launchers={agentLaunchers}
         {followAgent}
         canFollow={Boolean(repoPath)}
+        currentRepoPath={repoPath || null}
+        currentRepoName={checkoutInfo?.label.repository ?? (repoPath ? displayName(repoPath) : null)}
+        onOpenGlobalAgents={() => interfaceStore.setGlobalSurface("agents")}
         onSelect={selectAgentRow}
         onGoTo={goToAgentSession}
         onLaunch={launchAgent}

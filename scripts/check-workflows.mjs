@@ -17,10 +17,12 @@
  * checkout sets `persist-credentials: false`, and no step pipes a download
  * straight into a shell.
  *
- * A fourth rule guards the release gate, which reads a workflow run's
- * conclusion and never its jobs: a trusted job or step that can be skipped, or
- * can fail without failing, would let the gate pass on a run where the check
- * never ran (see "Release-gate rule" below).
+ * A fourth rule guards the release gate statically: a trusted job or step that
+ * can be skipped, or can fail without failing, would let a workflow-level run
+ * conclude `success` even when a check never ran (see "Release-gate rule"
+ * below). `release-state.mjs` also checks every required job at runtime, and
+ * this rule enforces the same invariant statically across the trusted YAML and
+ * `.githooks/pre-push`.
  *
  * Exit codes: 0 workflows are clean · 1 actionlint or a pinning rule found
  * problems · 2 the check could not run
@@ -394,13 +396,13 @@ export function workflowPolicyFindings(dir) {
 // ---------------------------------------------------------------------------
 // Release-gate rule: a check the gate trusts must not be able to skip.
 //
-// `release-state.mjs` and `.githooks/pre-push` read the newest push run of each
-// trusted workflow and accept `completed` + `success`. They never read the
-// run's jobs, and GitHub concludes a run `success` when a job was skipped (a
-// false job-level `if:`, or a `needs:` on a skipped job) or when a step that
-// failed was marked `continue-on-error`. So a check that gained one of those
-// would satisfy the gate on a run in which it never ran — a check that did not
-// run reading exactly like one that passed.
+// `.githooks/pre-push` reads the newest push run conclusion of each trusted
+// workflow, and `release-state.mjs` additionally verifies every required job in
+// `REQUIRED_WORKFLOW_JOBS`. GitHub concludes a workflow run `success` when a
+// job was skipped (a false job-level `if:`, or a `needs:` on a skipped job) or
+// when a step that failed was marked `continue-on-error`. This rule catches
+// those skip/mask shapes statically before a push, so a check that did not run
+// can never read like one that passed.
 //
 // The workflow YAML is read with a small block-YAML reader below rather than
 // regexes, because the rule has to tell a step's own `if:` from the text

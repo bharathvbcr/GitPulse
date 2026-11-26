@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createServer, type Plugin, type ViteDevServer } from "vite";
+import { createServer, type Logger, type Plugin, type ViteDevServer } from "vite";
 import { REPO_ROOT } from "./env";
 
 export interface BrowserCheckRow {
@@ -53,6 +53,7 @@ export function chromeBinary(): string {
 
 const WATCHDOG_SCRIPT = `
 const runner = Number(process.argv[1]), chrome = Number(process.argv[2]), profile = process.argv[3];
+if (!Number.isInteger(chrome) || chrome <= 1 || chrome === process.pid) process.exit(0);
 const alive = (pid) => {
   try {
     process.kill(pid, 0);
@@ -166,22 +167,105 @@ function buildQueryString(
   return params.toString();
 }
 
+function createBufferedSilentLogger(viteLogs: string[]): Logger {
+  const loggedErrors = new WeakSet<Error | object>();
+  const warnedMessages = new Set<string>();
+  const pushLog = (level: "warn" | "error", msg: string) => {
+    if (viteLogs.length >= 20) return;
+    const clean = msg.replace(/\u001b\[[0-9;]*m/g, "").trim();
+    if (clean) viteLogs.push(`[${level}] ${clean}`);
+  };
+  const logger: Logger = {
+    hasWarned: false,
+    info() {},
+    warn(msg) {
+      logger.hasWarned = true;
+      pushLog("warn", msg);
+    },
+    warnOnce(msg) {
+      if (warnedMessages.has(msg)) return;
+      warnedMessages.add(msg);
+      logger.hasWarned = true;
+      pushLog("warn", msg);
+    },
+    error(msg, options) {
+      if (options?.error) loggedErrors.add(options.error);
+      const detail = options?.error?.message ? `${msg} (${options.error.message})` : msg;
+      pushLog("error", detail);
+    },
+    clearScreen() {},
+    hasErrorLogged(error) {
+      return loggedErrors.has(error);
+    },
+  };
+  return logger;
+}
+
+async function removeProfileWithRetry(dir: string, waitForViteSettle = false): Promise<void> {
+  const maxMs = waitForViteSettle ? 4000 : 2500;
+  const pollMs = waitForViteSettle ? 200 : 150;
+  const requiredQuietChecks = waitForViteSettle ? 3 : 2;
+  const deadline = Date.now() + maxMs;
+  let quietChecks = 0;
+
+  while (Date.now() <= deadline) {
+    if (existsSync(dir)) {
+      quietChecks = 0;
+      try {
+        await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      } catch {
+        // Retry if Chrome or Vite background optimizeDeps raced with rm.
+      }
+    } else {
+      quietChecks += 1;
+      if (quietChecks >= requiredQuietChecks) {
+        return;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  if (existsSync(dir)) {
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
+  }
+}
+
 export async function runBrowserPage<TData = Record<string, unknown>>(
   options: RunBrowserPageOptions,
 ): Promise<BrowserVerdict<TData>> {
   const chrome = chromeBinary();
   const pagePath = options.page.startsWith("/") ? options.page : `/${options.page}`;
-  const deadlineSeconds = options.deadlineSeconds ?? 45;
+  const deadlineSeconds = options.deadlineSeconds ?? 60;
   const windowSize = options.windowSize ?? { width: 1280, height: 820 };
   const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-e2e-browser-"));
   const reportPath = `/__gp_result/${randomUUID()}`;
 
   let server: ViteDevServer | undefined;
   let browser: ChildProcess | undefined;
+  let browserSpawnError = false;
+  let browserClosed = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let requests = 0;
+  let completedRequests = 0;
   let lastRequest = "none";
+  const httpErrors: string[] = [];
+  const viteLogs: string[] = [];
   const chromeStderr: Buffer[] = [];
+
+  const formatDiagnostics = () => {
+    const stderrText = Buffer.concat(chromeStderr).toString("utf8").trim();
+    const parts: string[] = [];
+    if (httpErrors.length > 0) {
+      parts.push(`HTTP errors: ${httpErrors.join(", ")}`);
+    }
+    if (viteLogs.length > 0) {
+      parts.push(`Vite logs:\n${viteLogs.join("\n")}`);
+    }
+    if (stderrText) {
+      parts.push(`Chrome stderr:\n${stderrText}`);
+    }
+    return parts.length > 0 ? `\n${parts.join("\n")}` : "";
+  };
 
   let deliver: (body: string) => void = () => {};
   let fail: (err: Error) => void = () => {};
@@ -189,10 +273,9 @@ export async function runBrowserPage<TData = Record<string, unknown>>(
     deliver = resolve;
     fail = reject;
     timer = setTimeout(() => {
-      const stderrText = Buffer.concat(chromeStderr).toString("utf8").trim();
       reject(
         new Error(
-          `Browser page ${pagePath} did not report within ${deadlineSeconds}s (${requests} HTTP requests; last: ${lastRequest})${stderrText ? `\nChrome stderr:\n${stderrText}` : ""}`,
+          `Browser page ${pagePath} did not report within ${deadlineSeconds}s (${requests} HTTP requests, ${completedRequests} completed; last: ${lastRequest})${formatDiagnostics()}`,
         ),
       );
     }, deadlineSeconds * 1000);
@@ -202,9 +285,21 @@ export async function runBrowserPage<TData = Record<string, unknown>>(
   const receiver: Plugin = {
     name: "gitpulse-e2e-browser-verdict",
     configureServer(srv) {
-      srv.middlewares.use((req, _res, next) => {
+      srv.middlewares.use((req, res, next) => {
+        if (req.url === "/favicon.ico") {
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+        const url = req.url ?? "unknown";
         requests += 1;
-        lastRequest = req.url ?? "unknown";
+        lastRequest = url;
+        res.once("finish", () => {
+          completedRequests += 1;
+          if (res.statusCode >= 400 && httpErrors.length < 20) {
+            httpErrors.push(`${res.statusCode} ${url}`);
+          }
+        });
         next();
       });
       srv.middlewares.use(reportPath, (req, res) => {
@@ -234,13 +329,14 @@ export async function runBrowserPage<TData = Record<string, unknown>>(
   try {
     server = await createServer({
       root: REPO_ROOT,
+      appType: "mpa",
       plugins: [receiver],
       cacheDir: path.join(profile, "vite-cache"),
       optimizeDeps: {
-        entries: [pagePath.replace(/^\//, ""), "src/lib/components/**/*.svelte"],
+        entries: [pagePath.replace(/^\//, "")],
       },
       server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false },
-      logLevel: "silent",
+      customLogger: createBufferedSilentLogger(viteLogs),
     });
 
     await server.listen();
@@ -253,15 +349,20 @@ export async function runBrowserPage<TData = Record<string, unknown>>(
     const url = `http://127.0.0.1:${address.port}${pagePath}?${qs}`;
 
     browser = startChrome(chrome, profile, url, windowSize, options.chromeArgs ?? []);
+    browser.once("error", () => {
+      browserSpawnError = true;
+    });
+    browser.once("close", () => {
+      browserClosed = true;
+    });
     browser.stderr?.on("data", (chunk: Buffer) => chromeStderr.push(chunk));
 
     const exited = new Promise<never>((_, reject) => {
       browser?.once("error", reject);
       browser?.once("exit", (code, signal) => {
-        const stderrText = Buffer.concat(chromeStderr).toString("utf8").trim();
         reject(
           new Error(
-            `Chrome exited before reporting for ${pagePath} (code=${code}, signal=${signal})${stderrText ? `\nChrome stderr:\n${stderrText}` : ""}`,
+            `Chrome exited before reporting for ${pagePath} (code=${code}, signal=${signal})${formatDiagnostics()}`,
           ),
         );
       });
@@ -272,22 +373,64 @@ export async function runBrowserPage<TData = Record<string, unknown>>(
     return parseVerdictPayload<TData>(rawBody);
   } finally {
     if (timer) clearTimeout(timer);
-    if (browser && browser.exitCode === null && browser.signalCode === null) {
+    if (
+      browser &&
+      !browserSpawnError &&
+      !browserClosed &&
+      browser.pid !== undefined &&
+      browser.exitCode === null &&
+      browser.signalCode === null
+    ) {
       const closed = new Promise<void>((resolve) => {
-        browser?.once("close", () => resolve());
+        const done = () => {
+          clearTimeout(closeTimeout);
+          resolve();
+        };
+        const closeTimeout = setTimeout(done, 3000);
+        browser?.once("close", done);
+        browser?.once("error", done);
       });
-      if (process.platform !== "win32" && browser.pid) {
+      if (process.platform !== "win32") {
         try {
           process.kill(-browser.pid, "SIGKILL");
         } catch {
-          browser.kill("SIGKILL");
+          try {
+            browser.kill("SIGKILL");
+          } catch {
+            // Process already exited.
+          }
         }
       } else {
-        browser.kill("SIGKILL");
+        try {
+          browser.kill("SIGKILL");
+        } catch {
+          // Process already exited.
+        }
       }
       await closed;
     }
-    await server?.close();
-    await rm(profile, { recursive: true, force: true, maxRetries: 3 });
+    const depsOptimizer = (
+      server as ViteDevServer & {
+        environments?: {
+          client?: {
+            depsOptimizer?: {
+              metadata?: {
+                discovered?: Record<string, unknown>;
+                optimized?: Record<string, unknown>;
+              };
+            };
+          };
+        };
+      }
+    )?.environments?.client?.depsOptimizer;
+    const discoveredKeys = Object.keys(depsOptimizer?.metadata?.discovered ?? {});
+    const optimizedMeta = depsOptimizer?.metadata?.optimized ?? {};
+    const hadInflightOptimize =
+      Boolean(depsOptimizer) && discoveredKeys.some((key) => !(key in optimizedMeta));
+    try {
+      await server?.close();
+    } finally {
+      await removeProfileWithRetry(profile, hadInflightOptimize);
+    }
   }
 }

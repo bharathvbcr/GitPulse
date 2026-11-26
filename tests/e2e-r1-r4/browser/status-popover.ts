@@ -3,7 +3,8 @@ import { mount, tick, unmount } from "svelte";
 import { mockIPCWithEvents } from "../../../harness/tauriMocks";
 import { invoke } from "../../../src/lib/ipc/invoke";
 import StatusPopover from "../../../src/lib/desktop/StatusPopover.svelte";
-import { makeMenuStateWithRequests, makeMenuState, type MenuAgentRequestFixture, type MenuStateFixture } from "../helpers/fixtures";
+import type { MenuAgentRequest, MenuState } from "../../../src/lib/desktop/menuState";
+import { makeMenuAgentRequest, makeMenuState, makeMenuStateWithRequests } from "../helpers/fixtures";
 
 const LOGO_TRUNK_FRAGMENT = "M24.04 9.25A10.5";
 
@@ -37,21 +38,25 @@ mockIPCWithEvents((cmd, args) => {
   return null;
 });
 
-function buildScenarioSnapshot(): MenuStateFixture {
+function buildScenarioSnapshot(): MenuState {
   const now = Date.now();
-  const sampleReq = (idx: number, agent = "claude"): MenuAgentRequestFixture => ({
-    id: `req-${idx}`,
-    sessionId: `pty-${agent}-${idx}`,
-    agent,
-    kind: agent,
-    label: `agent-${idx} (${agent})`,
-    repoPath: idx === 2 ? "/Projects/DevCouncil" : "/Projects/GitPulse",
-    repoLabel: idx === 2 ? "DevCouncil" : "GitPulse",
-    urgency: "blocking",
-    event: "permission_prompt",
-    detail: `Allow tool call #${idx}`,
-    at: now - idx * 15_000,
-  });
+  const sampleReq = (
+    idx: number,
+    provider: MenuAgentRequest["provider"] = "claude",
+    urgency: MenuAgentRequest["urgency"] = "blocking",
+  ): MenuAgentRequest =>
+    makeMenuAgentRequest({
+      id: `term:pty-${provider}-${idx}`,
+      source: "terminal",
+      provider,
+      agentLabel: `agent-${idx} (${provider})`,
+      repoPath: idx === 2 ? "/Projects/DevCouncil" : "/Projects/GitPulse",
+      repoLabel: idx === 2 ? "DevCouncil" : "GitPulse",
+      urgency,
+      reason: urgency === "error" ? "Stopped on an error" : "Needs your permission",
+      detail: `Allow tool call #${idx}`,
+      atMs: now - idx * 15_000,
+    });
 
   if (scenario === "none") {
     return makeMenuState({
@@ -154,15 +159,9 @@ try {
     Boolean(shellRect && shellRect.height > 0 && shellRect.height <= 640),
   );
 
-  const focusRequestButtons = [...stage.querySelectorAll<HTMLButtonElement>("button")].filter((btn) => {
-    const text = btn.textContent ?? "";
-    const testid = btn.getAttribute("data-testid") ?? "";
-    return (
-      testid.includes("agent-request") ||
-      text.includes("Allow tool call") ||
-      text.includes("agent-1")
-    );
-  });
+  const focusRequestButtons = [
+    ...stage.querySelectorAll<HTMLButtonElement>("button[data-testid='status-agent-request']"),
+  ];
   dataSummary.renderedRequestButtons = focusRequestButtons.length;
 
   if (scenario === "none") {
@@ -171,16 +170,40 @@ try {
     );
   } else {
     check("waiting-for-action agent request items are rendered in StatusPopover", () =>
-      focusRequestButtons.length > 0,
+      focusRequestButtons.length === snapshot.agentRequests.length && focusRequestButtons.length > 0,
     );
 
-    if (focusRequestButtons[0]) {
-      focusRequestButtons[0].click();
+    const firstReq = snapshot.agentRequests[0];
+    const firstBtn = focusRequestButtons[0];
+    check(
+      "agent request row renders canonical provider icon, agentLabel, reason, detail, and atMs",
+      () => {
+        if (!firstReq || !firstBtn) return false;
+        const text = firstBtn.textContent ?? "";
+        const hasProviderIcon = Boolean(
+          firstBtn.querySelector(`[data-launcher-icon="${firstReq.provider}"]`),
+        );
+        const hasTime = Boolean(firstBtn.querySelector("time.request-age[datetime]"));
+        return (
+          hasProviderIcon &&
+          hasTime &&
+          text.includes(firstReq.agentLabel) &&
+          text.includes(firstReq.reason) &&
+          (firstReq.detail === null || text.includes(firstReq.detail))
+        );
+      },
+    );
+
+    if (firstBtn) {
+      firstBtn.click();
       await settle(40);
     }
 
     check("clicking an agent request dispatches cmd_status_action with focus-agent:<id>", () =>
-      dispatchedActions.some((entry) => entry.id.startsWith("focus-agent:")),
+      Boolean(
+        firstReq &&
+          dispatchedActions.some((entry) => entry.id === `focus-agent:${firstReq.id}`),
+      ),
     );
 
     if (scenario === "overflow") {

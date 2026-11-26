@@ -148,6 +148,97 @@ impl Resolver {
         None
     }
 
+    /// How many declarations of `method` the type `enclosing` and its in-repo
+    /// supertypes carry between them (breadth-first, bounded like every other
+    /// heritage walk here).
+    fn chain_declarations_of(&self, family: LangFamily, enclosing: &str, method: &str) -> usize {
+        let mut frontier = vec![enclosing.to_string()];
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut total = 0;
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut next: Vec<String> = Vec::new();
+            for type_name in frontier.drain(..) {
+                if !visited.insert(type_name.clone()) {
+                    continue;
+                }
+                if let Some(hits) =
+                    self.type_methods
+                        .get(&(family, type_name.clone(), method.to_string()))
+                {
+                    total += hits.len();
+                }
+                if let Some(bases) = self.supertypes.get(&(family, type_name)) {
+                    next.extend(bases.iter().cloned());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        total
+    }
+
+    /// Java: whether the member the bare-call rung found is the one the call
+    /// names, which the language's own rules decide and this resolver can only
+    /// partly see. (Kotlin does not use this rung: ft-87b28bb6f7ee8702a35b06117e7efc0b.) Where it cannot prove it the rung abstains and the
+    /// call is left to the rungs after it, as it was before the rung existed.
+    ///
+    /// * **One declaration on the chain.** The call's arity is not extracted, so
+    ///   a name declared on two levels (or twice on one) may be an overload set
+    ///   whose members differ by arity, and the nearest is not necessarily the
+    ///   callee.
+    /// * **Not private on a supertype.** A `private` member is not inherited.
+    ///   The extractor's `is_exported` is false for Java `private` *and*
+    ///   `protected` (it cannot tell them apart), so a Java protected member of
+    ///   a superclass also abstains. A Java package-private member read from
+    ///   another package is exported as true and is not caught.
+    /// * **Not an interface member under an external class.** An external
+    ///   superclass may declare the name itself and the superclass wins over an
+    ///   interface default, so a member found only on an interface, while the
+    ///   chain reaches an external base, is not provable. Class and interface
+    ///   are told apart by the declaration's kind, since the heritage table
+    ///   keeps one set of names for both.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn jvm_bare_member_is_provable(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller_symbol: &str,
+        method: &str,
+        target_file: &str,
+        target_symbol: &str,
+        declaring_type: &str,
+    ) -> bool {
+        let Some(enclosing) = self.self_type_at(file, family, caller_symbol) else {
+            return false;
+        };
+        if self.chain_declarations_of(family, &enclosing, method) != 1 {
+            return false;
+        }
+        if declaring_type == enclosing {
+            return true;
+        }
+        if self
+            .unexported_symbols
+            .contains(&(target_file.to_string(), target_symbol.to_string()))
+        {
+            return false;
+        }
+        let declared_by_an_interface = self
+            .symbol_index
+            .get(declaring_type)
+            .into_iter()
+            .flatten()
+            .any(|(path, kind, candidate_family, _)| {
+                path == target_file
+                    && family.admits(*candidate_family)
+                    && *kind == SymbolKind::Interface
+            });
+        !(declared_by_an_interface
+            && self.has_external_supertype(file, family, Some(caller_symbol)))
+    }
+
     /// A unique hit on the receiver's type, or [`ImplicitReceiverAnswer::VirtualOverride`]
     /// when an indexed subtype of `enclosing` also declares `method`.
     pub(super) fn implicit_receiver_unique(
@@ -590,7 +681,21 @@ impl Resolver {
             || self
                 .import_bindings
                 .get(call_file)
-                .is_some_and(|bindings| bindings.contains_key(type_name))
+                .and_then(|bindings| bindings.get(type_name))
+                .is_some_and(|(imp_target_file, _)| {
+                    imp_target_file == target_file
+                        || match (
+                            self.swift_module_by_file.get(imp_target_file.as_str()),
+                            self.swift_module_by_file.get(target_file.as_str()),
+                        ) {
+                            (Some(imp_mods), Some(target_mods)) => {
+                                imp_mods.iter().any(|module| target_mods.contains(module))
+                            }
+                            _ => false,
+                        }
+                })
+            || (call_file.ends_with(".rs")
+                && rust_origin.is_some_and(|o| o != RustOrigin::Absent && o != RustOrigin::Unknown))
             || match (
                 self.swift_module_by_file.get(call_file),
                 self.swift_module_by_file.get(target_file.as_str()),

@@ -18,6 +18,8 @@
     GitCommit,
     Layers,
     FileCode,
+    Eye,
+    Columns,
     MoreVertical,
     Check,
     Undo2,
@@ -71,6 +73,9 @@
   import { reportFailure } from "../../stores/mutationOutcome";
   import type { MutationTarget } from "../../repos/storeTypes";
   import { describeDelete, isAtOrUnder, remapPath } from "../../files/fileOps";
+  import { isHtmlFile, requestHtmlViewMode, type HtmlViewMode } from "../../files/htmlPreview";
+  import { isSvgFile, requestSvgViewMode, type SvgViewMode } from "../../files/svgPreview";
+  import { consumeReveal } from "../../files/revealRequests";
   import { newPathProblem, readFileWriteError, withAncestors } from "../../files/fileWrite";
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
@@ -518,6 +523,34 @@
     } else {
       repoStore.selectFilePath(path);
     }
+  }
+
+  function openHtmlInMode(path: string, mode: HtmlViewMode) {
+    if (mode === "preview") {
+      consumeReveal(path);
+    }
+    requestHtmlViewMode(effectiveRepoPath, path, mode);
+    if (typeof onSelectFile === "function") {
+      onSelectFile(path);
+    } else {
+      repoStore.selectFilePath(path);
+      repoStore.setActiveTab("code", "explorer");
+    }
+    closeContextMenu();
+  }
+
+  function openSvgInMode(path: string, mode: SvgViewMode) {
+    if (mode === "preview") {
+      consumeReveal(path);
+    }
+    requestSvgViewMode(effectiveRepoPath, path, mode);
+    if (typeof onSelectFile === "function") {
+      onSelectFile(path);
+    } else {
+      repoStore.selectFilePath(path);
+      repoStore.setActiveTab("code", "explorer");
+    }
+    closeContextMenu();
   }
 
   function rowAction(row: FileRow) {
@@ -1498,10 +1531,74 @@
         <span>Delete folder…</span>
       </button>
     {:else}
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
-        <FileCode size={13} class="text-accent" />
-        <span>Open in viewer</span>
-      </button>
+      {#if isHtmlFile(row.path)}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-html-preview"
+          onclick={() => openHtmlInMode(row.path, "preview")}
+        >
+          <Eye size={13} class="text-accent" />
+          <span>Open as Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-html-split"
+          onclick={() => openHtmlInMode(row.path, "split")}
+        >
+          <Columns size={13} class="text-accent" />
+          <span>Open Code &amp; Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-html-code"
+          onclick={() => openHtmlInMode(row.path, "code")}
+        >
+          <FileCode size={13} class="text-textMuted" />
+          <span>Open HTML Code</span>
+        </button>
+      {:else if isSvgFile(row.path)}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-svg-preview"
+          onclick={() => openSvgInMode(row.path, "preview")}
+        >
+          <Eye size={13} class="text-accent" />
+          <span>Open as Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-svg-split"
+          onclick={() => openSvgInMode(row.path, "split")}
+        >
+          <Columns size={13} class="text-accent" />
+          <span>Open Code &amp; Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-svg-code"
+          onclick={() => openSvgInMode(row.path, "code")}
+        >
+          <FileCode size={13} class="text-textMuted" />
+          <span>Open SVG Code</span>
+        </button>
+      {:else}
+        <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
+          <FileCode size={13} class="text-accent" />
+          <span>Open in viewer</span>
+        </button>
+      {/if}
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => openInExternalEditor(row.path)}>
         <SquareArrowOutUpRight size={13} class="text-textMuted" />
         <span>Open in editor</span>

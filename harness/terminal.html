@@ -223,7 +223,10 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           // Repository logos: GitPulse ships an icon, Other has none, so the
           // session list draws one logo and one set of initials.
           case "cmd_list_repo_files": return args?.repoPath === "/fixture/GitPulse" ? ["src-tauri/icons/128x128.png", "src/lib.ts", "src/main.ts"] : ["src/main.ts"];
-          case "cmd_get_file_blob": if (String(args?.filePath).endsWith(".png")) return { path: args.filePath, is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 }; return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
+          case "cmd_get_file_blob":
+            if (String(args?.filePath).endsWith(".png")) return { path: args.filePath, is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 };
+            if (String(args?.filePath).endsWith(".svg")) return { path: args.filePath, is_binary: false, is_image: true, mime: "image/svg+xml", text: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="12" fill="currentColor"/></svg>', base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture-svg" };
+            return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
       }, { shouldMockEvents: true });
@@ -496,6 +499,89 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           check("the viewer reports the revealed line as selected",
             () => visible("[data-code-host]")[0].textContent.includes("Ln 240"));
           repoStore.selectFilePath(null); await wait();
+
+          // ---- SVG link hover parity & viewport right-click context menu (including proximity precedence over HTML selection)
+          {
+            for (const id of sessions.keys()) {
+              await output(id, "\r\nSVG assets: public/gitpulse-mark.svg badge.svg docs/demo.html\r\n");
+            }
+            await wait(300);
+            await hover("public/gitpulse-mark.svg", 4);
+            check("hovering a .svg path in terminal shows Preview hover verb",
+              () => footer().includes("Preview public/gitpulse-mark.svg beside terminal"));
+
+            // Select docs/demo.html via mouse drag, then right-click directly on bare badge.svg:
+            // pointer proximity MUST target badge.svg rather than the selected HTML path.
+            const htmlStart = pointAt("docs/demo.html", 0);
+            const htmlEnd = pointAt("docs/demo.html", "docs/demo.html".length - 1);
+            await mouse("mousedown", htmlStart, { button: 0, buttons: 1 });
+            await mouse("mousemove", htmlEnd, { button: 0, buttons: 1 });
+            await mouse("mouseup", htmlEnd, { button: 0, buttons: 0 });
+            await wait(120);
+
+            const badgePt = pointAt("badge.svg", 2);
+            const termScreen = visible(".xterm-screen")[0];
+            termScreen.dispatchEvent(new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              button: 2,
+              clientX: badgePt.clientX,
+              clientY: badgePt.clientY,
+            }));
+            await wait(150);
+            const svgCtxMenu = visible('[data-testid="terminal-viewport-context-menu"]')[0];
+            const hasSvgItems = Boolean(
+              svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-preview"]') &&
+              svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-split"]') &&
+              svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-code"]') &&
+              !svgCtxMenu?.querySelector('[data-testid="terminal-ctx-html-preview"]') &&
+              svgCtxMenu.textContent.includes("badge.svg")
+            );
+            check("right-clicking bare badge.svg offers SVG Preview/Split/Code actions even while an HTML path is selected",
+              () => hasSvgItems);
+
+            svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-split"]')?.click();
+            {
+              const deadline = performance.now() + 3000;
+              while (performance.now() < deadline) {
+                const img = filePane()?.querySelector('[data-testid="svg-preview-img"]');
+                if (
+                  filePane()?.querySelector('[data-testid="svg-preview-viewer"]') &&
+                  filePane()?.querySelector("[data-svg-split-code]") &&
+                  img?.complete &&
+                  img.naturalWidth > 0
+                ) break;
+                await wait(50);
+              }
+            }
+            const svgImg = filePane()?.querySelector('[data-testid="svg-preview-img"]');
+            // Probe an unstyled detached Image so WebKitGTK 2.50.4's SVGImageForContainer
+            // layout sizing does not mask the decoded SVG's true intrinsic 32x32 size.
+            const svgIntrinsic = svgImg?.getAttribute("src")
+              ? await new Promise((resolve) => {
+                  const probe = new Image();
+                  probe.onload = () => resolve({ w: probe.naturalWidth, h: probe.naturalHeight });
+                  probe.onerror = () => resolve({ w: 0, h: 0 });
+                  probe.src = svgImg.getAttribute("src");
+                })
+              : { w: 0, h: 0 };
+            const svgSplitOpened = Boolean(
+              filePane()?.querySelector('[data-testid="svg-preview-viewer"]') &&
+              filePane()?.querySelector("[data-svg-split-code]") &&
+              svgImg?.complete &&
+              svgImg.naturalWidth > 0 &&
+              svgIntrinsic.w === 32 &&
+              svgIntrinsic.h === 32
+            );
+            check("clicking Open Code & Preview from terminal SVG context menu opens TerminalFilePane in SVG Split mode",
+              () => svgSplitOpened);
+
+            if (filePane()) {
+              const svgPaneTab = document.getElementById(`terminal-tab-${filePane().dataset.terminalFilePane}`);
+              svgPaneTab?.parentElement?.querySelector('button[aria-label^="Close "]')?.click();
+              await wait(400);
+            }
+          }
 
           check("linkification writes nothing to the shell", () => report.writes === writesBefore);
 
@@ -2994,8 +3080,65 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
                 throw new Error(`G5: false Background job shown on generic card: ${genericCard.textContent}`);
               }
               check("G5: TerminalPill hover dropdown renders agent icon, repo logo, repo/worktree, title, and omits false Background job / generic startup titles", () => true);
-              window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
-              await waitFor(() => visible('[data-testid="terminal-pill-menu"]').length === 0);
+
+              // G5b: TerminalPill hover search stays open on pointerleave while focused, filters/highlights agents across checkouts, offers quick-start pills, and Enter / Shift+Enter quick-launch terminals
+              const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests.ts");
+              const quickPills = pillMenu?.querySelectorAll('[data-testid="terminal-pill-quick-launcher"]') ?? [];
+              if (quickPills.length < 6) {
+                throw new Error(`G5b: expected quick-start launcher pills, got ${quickPills.length}`);
+              }
+              const pillSearch = pillMenu?.querySelector('[data-testid="terminal-pill-search"]');
+              if (!(pillSearch instanceof HTMLInputElement)) {
+                throw new Error("G5b: missing terminal-pill-search input");
+              }
+              pillSearch.focus();
+              pillMenu?.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true }));
+              await wait(300);
+              if (visible('[data-testid="terminal-pill-menu"]').length === 0) {
+                throw new Error("G5b: hover menu closed on pointerleave while search input was focused");
+              }
+              const setPillSearch = (next) => {
+                pillSearch.value = next;
+                pillSearch.dispatchEvent(new Event("input", { bubbles: true }));
+              };
+              setPillSearch("sidebar");
+              await waitFor(() => pillMenu?.querySelectorAll('[data-testid="terminal-pill-session"]').length === 1);
+              const matchedCard = pillMenu?.querySelector('[data-testid="terminal-pill-session"]');
+              if (!matchedCard?.textContent?.includes("Improve sidebar navigation")) {
+                throw new Error("G5b: sidebar search did not narrow to matching agent session");
+              }
+              if (!matchedCard?.querySelector("mark")?.textContent?.toLowerCase().includes("sidebar")) {
+                throw new Error(`G5b: expected highlighted <mark> for sidebar match, got ${matchedCard?.innerHTML}`);
+              }
+              setPillSearch("zzzz-no-such-agent");
+              await waitFor(() => pillMenu?.querySelector('[data-testid="terminal-pill-empty"]'));
+              pillSearch.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+              await waitFor(() => pillSearch.value === "" && visible('[data-testid="terminal-pill-menu"]').length > 0);
+              // Shift+Enter launches a new Claude session directly even while matching Claude sessions are listed above it.
+              setPillSearch("claude");
+              await waitFor(() =>
+                (pillMenu?.querySelectorAll('[data-testid="terminal-pill-session"]').length ?? 0) >= 2 &&
+                pillMenu?.querySelector('[data-testid="terminal-pill-launch"]')?.textContent?.includes("New Claude session")
+              );
+              let capturedLaunch = null;
+              const unsubLaunch = terminalLaunchRequests.subscribe((req) => {
+                if (!req) return;
+                const claimed = terminalLaunchRequests.take(req.repoPath);
+                if (claimed) {
+                  capturedLaunch = { repoPath: claimed.repoPath, launcher: claimed.launcher };
+                  claimed.complete();
+                }
+              });
+              try {
+                pillSearch.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", shiftKey: true, bubbles: true, cancelable: true }));
+                await waitFor(() => capturedLaunch !== null && visible('[data-testid="terminal-pill-menu"]').length === 0);
+              } finally {
+                unsubLaunch();
+              }
+              if (capturedLaunch?.launcher !== "claude") {
+                throw new Error(`G5b: expected claude launch on Shift+Enter, got ${JSON.stringify(capturedLaunch)}`);
+              }
+              check("G5b: TerminalPill hover search pins on focus, highlights filtered agents, offers quick-start pills, clears on Esc, and launches via Shift+Enter", () => true);
             } finally {
               await unmountComp(mountedPill);
               claudeHandle.release();

@@ -57,6 +57,8 @@ export interface MapViewOptions {
   colorFor?: LanguageColorFor;
   /** Appended to the honesty line when the view is a capped sample. */
   capHint?: string;
+  /** Appended to the note when handoffs could not be placed. */
+  unplacedNote?: string;
   /** Ring meanings drawn under the toolbar: `[css colour variable, label]`, plus a closing sentence. */
   ringLegend?: { rings: ReadonlyArray<readonly [string, string]>; note: string };
   /** Text shown when the payload has no nodes at all. */
@@ -78,6 +80,22 @@ export interface MapViewHandle {
 
 const FOCUS_TWEEN_MS = 280;
 const KEY_ROTATION = (10 * Math.PI) / 180;
+
+/** Join non-empty note clauses displayed under the map toolbar counts. */
+export function composeMapNoteLines(input: {
+  honesty?: string | null;
+  nodesTruncated?: boolean;
+  capHint?: string | null;
+  coverageLabel?: string | null;
+  unplacedNote?: string | null;
+}): string[] {
+  return [
+    input.honesty,
+    input.nodesTruncated ? input.capHint : null,
+    input.coverageLabel,
+    input.unplacedNote,
+  ].filter((line): line is string => Boolean(line));
+}
 const GLOBE_ZOOM_MIN = 0.4;
 const GLOBE_ZOOM_MAX = 4;
 const FLAT_ZOOM_MIN = 0.000001;
@@ -602,7 +620,13 @@ export function createMapView(options: MapViewOptions): MapViewHandle {
     parts.push(h("span", { text: `· ${matches.length} of ${model.nodes.length} match filters`, attrs: { "data-testid": "graph-filter-count" } }));
     if (filtersActive()) parts.push(clearFiltersBtn);
     replaceChildren(counts, ...parts);
-    const lines = [legend.honesty, legend.nodesTruncated ? options.capHint : null, legend.coverageLabel].filter((line): line is string => Boolean(line));
+    const lines = composeMapNoteLines({
+      honesty: legend.honesty,
+      nodesTruncated: legend.nodesTruncated,
+      capHint: options.capHint,
+      coverageLabel: legend.coverageLabel,
+      unplacedNote: options.unplacedNote,
+    });
     note.textContent = lines.join(" ");
     note.hidden = lines.length === 0;
     warnings.textContent = model.warnings.join(" ");

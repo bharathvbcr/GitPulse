@@ -24,7 +24,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
+use devmap_extract::paths::csr_path_for_store;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+
+use crate::csr::{CsrGraphReader, CsrHeader, DC_GRAPH_MAGIC, DC_GRAPH_VERSION};
 
 /// How the staged file was produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +49,14 @@ impl SeedMethod {
         }
     }
 }
+
+/// The sidecars that follow a store: its CSR graph and the artifact stamp the
+/// manifest writes beside it. Each describes the one store it sits beside.
+pub const STORE_SIDECARS: [&str; 2] = [".csr", ".artifacts.json"];
+
+/// The SQLite files that follow a store while it is open or after a crash.
+/// A left-over one is replayed into whatever store is next placed beside it.
+pub const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 /// `path` with `suffix` appended to its file name (`devmap.sqlite` + `-wal`).
 pub fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -99,15 +110,137 @@ impl Fingerprint {
 /// the lock in two. A private staged store's lock goes through
 /// [`remove_staged_writer_lock`].
 pub fn discard_staged(path: &Path) {
-    for file in [
-        path.to_path_buf(),
-        sidecar(path, "-wal"),
-        sidecar(path, "-shm"),
-        sidecar(path, "-journal"),
-        sidecar(path, ".csr"),
-        sidecar(path, ".artifacts.json"),
-    ] {
+    let sidecars = SQLITE_SIDECARS.into_iter().chain(STORE_SIDECARS);
+    for file in
+        std::iter::once(path.to_path_buf()).chain(sidecars.map(|suffix| sidecar(path, suffix)))
+    {
         let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Whether process `pid` exists. Conservative: a platform with no way to ask,
+/// or an answer other than "no such process", reports it alive, so nothing a
+/// live process might be using is ever swept.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 only checks that the process exists and may be signalled.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// What [`sweep_dead_staging`] removed, and what it could not.
+#[derive(Debug, Default)]
+pub struct StagingSweep {
+    pub removed: usize,
+    /// One line per entry (or directory read) that could not be cleared. A
+    /// failure never stops the sweep: the rest are still attempted.
+    pub failures: Vec<String>,
+}
+
+/// Remove the staging files a killed seed left beside `target`: every
+/// `<target>.seed-<pid>` (a staged store, with the sidecars and writer lock
+/// that follow it) and `<target>.seed-dir-<pid>` (a staged cache directory:
+/// for `resolution-reuse-N` that is `<state>/resolution-reuse-N.seed-dir-<pid>`,
+/// so pass the directory's own path) whose `pid` is no longer running. This
+/// process's own name is left to its caller, and a name whose pid cannot be
+/// read or is alive is left alone.
+///
+/// A staged store is only ever staged under the target's writer lock, so call
+/// this for a store target with that lock held: a live seed holds it, and none
+/// can be mid-staging while this runs. Staged directories carry no lock and are
+/// protected by the pid check alone.
+pub fn sweep_dead_staging(target: &Path) -> StagingSweep {
+    let mut sweep = StagingSweep::default();
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return sweep;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{name}.seed-");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return sweep,
+        Err(error) => {
+            sweep
+                .failures
+                .push(format!("cannot read {}: {error}", dir.display()));
+            return sweep;
+        }
+    };
+    let own = std::process::id();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                sweep.failures.push(format!(
+                    "cannot read an entry of {}: {error}",
+                    dir.display()
+                ));
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(rest) = file_name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let rest = rest.strip_prefix("dir-").unwrap_or(rest);
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(pid) = rest[..digits].parse::<u32>() else {
+            continue;
+        };
+        if pid == own || process_is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let outcome = std::fs::symlink_metadata(&path).and_then(|meta| {
+            // A directory is removed only as a real directory; a symlink is unlinked.
+            if meta.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+        });
+        match outcome {
+            Ok(()) => sweep.removed += 1,
+            Err(error) => sweep
+                .failures
+                .push(format!("cannot remove {}: {error}", path.display())),
+        }
+    }
+    sweep
+}
+
+/// Move `from` to `to` without ever replacing `to`: it fails with
+/// `AlreadyExists` if anything is there. Done as a hard link followed by an
+/// unlink, which refuses an existing name atomically on every platform with
+/// hard links; on a filesystem without them it falls back to an absence check
+/// and a rename, which is only as strong as whatever lock the caller holds.
+pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => std::fs::remove_file(from).inspect_err(|_| {
+            // Two names for one store would leave the staged one behind.
+            let _ = std::fs::remove_file(to);
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => match std::fs::symlink_metadata(to) {
+            Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::rename(from, to),
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -221,17 +354,16 @@ fn source_is_writable(path: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
-    if !meta.is_file() || meta.permissions().readonly() {
-        return false;
-    }
+    let writable = meta.is_file() && !meta.permissions().readonly();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o200 == 0 {
-            return false;
-        }
+        writable && meta.permissions().mode() & 0o200 != 0
     }
-    true
+    #[cfg(not(unix))]
+    {
+        writable
+    }
 }
 
 fn try_heal_or_pin_wal_and_clone(source: &Path, staged: &Path) -> Result<SeedMethod> {
@@ -350,6 +482,46 @@ pub fn seed_artifact(source: &Path, target: &Path) -> Result<Option<SeedMethod>>
     placed.map(Some)
 }
 
+/// File in a `resolution-reuse-*` directory that says which generation row its
+/// blobs were resolved for. Written by `devmap build`, last, and only while that
+/// generation is still the store's latest.
+pub const REUSE_BINDING_FILE: &str = "generation.json";
+
+/// [`seed_directory_cow`] for a `resolution-reuse-*` directory, from a donor
+/// whose writer lock the caller does not hold.
+///
+/// The donor's binding travels with the blobs, and stays true in the copy only
+/// when the donor did not write while it was copied: a build unbinds, rewrites
+/// blobs, then binds again. So the donor's binding is read before and after the
+/// copy and the copied binding is kept only when both reads are the same bytes.
+/// A binding that is absent, unreadable or changed is dropped from the copy,
+/// which makes the copy a cache that resolves every file once, never one that
+/// serves another generation's blobs. The decision is made on the staged
+/// directory, before it is renamed into place, so the target never holds a
+/// binding that was not checked; a binding that cannot be removed fails the
+/// seed (and the staged directory is discarded) rather than being placed.
+pub fn seed_reuse_directory(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
+    let binding = source_dir.join(REUSE_BINDING_FILE);
+    let before = std::fs::read(&binding).ok();
+    seed_directory_cow_with(source_dir, target_dir, &|staged| {
+        withdraw_unchecked_binding(staged, &binding, before.as_deref())
+    })
+}
+
+/// Drop the staged copy's binding unless the donor's binding at `donor_binding`
+/// is still exactly `before`, the bytes read before the copy began.
+fn withdraw_unchecked_binding(
+    staged: &Path,
+    donor_binding: &Path,
+    before: Option<&[u8]>,
+) -> Result<()> {
+    let after = std::fs::read(donor_binding).ok();
+    if before.is_none() || before != after.as_deref() {
+        remove_file_if_present(&staged.join(REUSE_BINDING_FILE))?;
+    }
+    Ok(())
+}
+
 /// Seed a flat cache directory (such as `resolution-reuse-1/`) via copy-on-write
 /// cloning when `target_dir` does not yet exist (`F9`).
 ///
@@ -357,6 +529,22 @@ pub fn seed_artifact(source: &Path, target: &Path) -> Result<Option<SeedMethod>>
 /// syscall; on filesystems without directory `clonefile`, creates a staged
 /// directory and clones/copies regular file entries atomically before rename.
 pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
+    seed_directory_cow_with(source_dir, target_dir, &|_| Ok(()))
+}
+
+/// [`seed_directory_cow`] with `before_place` run on the staged directory once
+/// it is complete and before it is renamed to `target_dir`. An error from it
+/// discards the staged directory and is returned.
+fn seed_directory_cow_with(
+    source_dir: &Path,
+    target_dir: &Path,
+    before_place: &dyn Fn(&Path) -> Result<()>,
+) -> Result<Option<SeedMethod>> {
+    // Whatever a killed seed staged for this directory under a pid that is gone.
+    let swept = sweep_dead_staging(target_dir);
+    for failure in &swept.failures {
+        eprintln!("devmap: could not clear old seed staging files: {failure}");
+    }
     match std::fs::symlink_metadata(target_dir) {
         Ok(_) => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -379,6 +567,10 @@ pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option
     let staged = sidecar(target_dir, &format!(".seed-dir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     if try_clone(source_dir, &staged) {
+        if let Err(error) = before_place(&staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
         if let Err(error) = std::fs::rename(&staged, target_dir) {
             let _ = std::fs::remove_dir_all(&staged);
             return Err(error).with_context(|| format!("cannot place {}", target_dir.display()));
@@ -399,6 +591,7 @@ pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option
                 method = SeedMethod::Copy;
             }
         }
+        before_place(&staged)?;
         std::fs::rename(&staged, target_dir)
             .with_context(|| format!("cannot place {}", target_dir.display()))?;
         Ok(())
@@ -563,6 +756,173 @@ pub fn rebind_staged(staged: &Path, root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Verify a staged SQLite database (e.g. unpacked from a remote cache archive)
+/// using SQLite defensive mode, `trusted_schema = OFF`, `cell_size_check = ON`,
+/// and `PRAGMA quick_check(1)` before it is ever rebound or swapped into place.
+pub fn verify_staged_integrity(staged: &Path) -> Result<()> {
+    let conn = Connection::open_with_flags(
+        staged,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "cannot open staged store {} for integrity check",
+            staged.display()
+        )
+    })?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .context("failed to enable SQLITE_DBCONFIG_DEFENSIVE on staged store")?;
+    conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;")
+        .context("failed to configure defensive pragmas on staged store")?;
+    let outcome: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .context("PRAGMA quick_check(1) failed on staged store")?;
+    if !outcome.eq_ignore_ascii_case("ok") {
+        bail!("staged store failed SQLite integrity check (PRAGMA quick_check): {outcome}");
+    }
+    conn.close().map_err(|(_, error)| error)?;
+    Ok(())
+}
+
+/// Scrub indexed string literals, docstrings, signatures, diagnostics, and
+/// raw extraction caches from a private staged snapshot before exporting a
+/// plaintext cache archive (C9).
+///
+/// Runs `PRAGMA secure_delete = ON`, deletes `payload_literals`,
+/// `generation_literals`, `extraction_cache`, and `extraction_cache_v4`, strips
+/// `literals` / `source_code` / `diagnostics` / symbol `docstring` & `signature`
+/// from every `file_payloads.extraction_json` document, and then executes
+/// `VACUUM INTO` a brand-new SQLite file so ZERO residual bytes survive in
+/// freed B-tree pages.
+pub fn strip_staged_literals(staged: &Path) -> Result<()> {
+    let vacuumed = sidecar(staged, ".vacuumed");
+    let _ = std::fs::remove_file(&vacuumed);
+    {
+        let mut conn = Connection::open(staged).with_context(|| {
+            format!(
+                "cannot open staged store {} to strip literals",
+                staged.display()
+            )
+        })?;
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA secure_delete = ON;")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in [
+            "payload_literals",
+            "generation_literals",
+            "extraction_cache",
+            "extraction_cache_v4",
+        ] {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            if exists > 0 {
+                tx.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+        }
+
+        let has_file_payloads: i64 = tx.query_row(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = 'file_payloads'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_file_payloads > 0 {
+            let mut updates: Vec<(i64, Vec<u8>, Vec<u8>)> = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT payload_id, parse_outcome_json, engine_json, extraction_json FROM file_payloads",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let payload_id: i64 = row.get(0)?;
+                    let parse_outcome_json: String = row.get(1)?;
+                    let engine_json: String = row.get(2)?;
+                    let json_cow = crate::payload_codec::decode_value(
+                        row.get_ref(3)?,
+                        "file_payloads.extraction_json",
+                    )?;
+                    let mut doc: serde_json::Value =
+                        serde_json::from_str(json_cow.as_ref()).with_context(|| {
+                            format!("failed to parse file_payloads row {payload_id} during literal scrub")
+                        })?;
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.remove("source_code");
+                        if let Some(lits) = obj.get_mut("literals") {
+                            *lits = serde_json::Value::Array(Vec::new());
+                        }
+                        if let Some(diags) = obj.get_mut("diagnostics") {
+                            *diags = serde_json::Value::Array(Vec::new());
+                        }
+                        if let Some(syms) = obj.get_mut("symbols").and_then(|v| v.as_array_mut()) {
+                            for sym in syms {
+                                if let Some(sobj) = sym.as_object_mut() {
+                                    sobj.remove("docstring");
+                                    sobj.remove("signature");
+                                }
+                            }
+                        }
+                        // Strip string-literal references emitted by entry_names.rs (`kind == "EntryName"`).
+                        if let Some(refs) = obj.get_mut("references").and_then(|v| v.as_array_mut())
+                        {
+                            refs.retain(|r| {
+                                r.get("kind").and_then(|k| k.as_str()) != Some("EntryName")
+                            });
+                        }
+                        // Strip literal prefixes from dynamic dispatch annotations.
+                        if let Some(dd) = obj
+                            .get_mut("dynamic_dispatch")
+                            .and_then(|v| v.as_array_mut())
+                        {
+                            for entry in dd {
+                                if let Some(dobj) = entry.as_object_mut() {
+                                    dobj.remove("name_prefix");
+                                }
+                            }
+                        }
+                    }
+                    let scrubbed_json = serde_json::to_string(&doc)?;
+                    let digest = crate::db::payload_digest(
+                        &parse_outcome_json,
+                        &engine_json,
+                        &scrubbed_json,
+                    )
+                    .to_vec();
+                    let compressed = crate::payload_codec::compress_document(&scrubbed_json)?;
+                    updates.push((payload_id, compressed, digest));
+                }
+            }
+            let mut upd = tx.prepare(
+                "UPDATE file_payloads SET extraction_json = ?1, payload_digest = ?2 WHERE payload_id = ?3",
+            )?;
+            for (payload_id, compressed, digest) in updates {
+                upd.execute(rusqlite::params![compressed, digest, payload_id])?;
+            }
+        }
+        tx.commit()?;
+
+        let target = vacuumed
+            .to_str()
+            .context("vacuumed staged store path is not valid UTF-8")?;
+        conn.execute("VACUUM INTO ?1", [target])
+            .with_context(|| format!("VACUUM INTO {target} failed after literal scrubbing"))?;
+        conn.close().map_err(|(_, error)| error)?;
+    }
+
+    for suffix in SQLITE_SIDECARS {
+        let _ = std::fs::remove_file(sidecar(staged, suffix));
+    }
+    let _ = std::fs::remove_file(staged);
+    std::fs::rename(&vacuumed, staged).with_context(|| {
+        format!(
+            "failed to replace staged store {} with vacuumed copy",
+            staged.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Convert a staged database into a sidecar-free, read-only (`chmod 0444`)
 /// immutable base snapshot suitable for `?immutable=1` (`OQ1`).
 pub fn prepare_immutable_snapshot(staged: &Path) -> Result<()> {
@@ -580,7 +940,7 @@ pub fn prepare_immutable_snapshot(staged: &Path) -> Result<()> {
         let _: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
         conn.close().map_err(|(_, error)| error)?;
     }
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_SIDECARS {
         let side = sidecar(staged, suffix);
         let _ = std::fs::remove_file(&side);
     }
@@ -615,6 +975,9 @@ pub fn set_file_writable(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         let mut perms = std::fs::metadata(path)?.permissions();
+        // The lint warns that this makes a Unix file world-writable. This arm is
+        // compiled off Unix only, where the readonly flag is the whole mode.
+        #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         std::fs::set_permissions(path, perms)
             .with_context(|| format!("cannot clear readonly {}", path.display()))?;
@@ -671,7 +1034,13 @@ pub fn settle_staged(staged: &Path) -> Result<()> {
         bail!("the staged store could not be checkpointed (busy)");
     }
     conn.close().map_err(|(_, error)| error)?;
-    for suffix in ["-wal", "-shm"] {
+    drop_empty_sidecars(staged)
+}
+
+/// Remove the SQLite sidecars beside `staged` that are empty, and refuse any
+/// that still hold data: what it holds would be replayed into the store.
+fn drop_empty_sidecars(staged: &Path) -> Result<()> {
+    for suffix in SQLITE_SIDECARS {
         let side = sidecar(staged, suffix);
         if let Ok(meta) = std::fs::symlink_metadata(&side) {
             if meta.len() != 0 {
@@ -681,6 +1050,100 @@ pub fn settle_staged(staged: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What became of a donor's CSR sidecar when it was staged beside a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DonorCsr {
+    /// The staged copy is a CSR stamped with the generation it was checked
+    /// against, and is kept.
+    Kept,
+    /// Nothing was placed: the donor has no regular CSR file, or a sidecar of
+    /// unknown generation already sits at the staged path.
+    Absent,
+    /// The staged copy was unreadable or stamped for another generation (an
+    /// orphan left by an earlier store at the donor's path) and was removed.
+    Rejected { reason: String },
+}
+
+/// Copy `donor_csr` to `staged_csr` and keep that copy only if it is a CSR
+/// stamped with `generation`. The copy, not the donor's path, is what is
+/// checked, so a donor renamed or rewritten after the copy cannot be placed
+/// unchecked. Readers accept a sidecar on its generation number alone, so a
+/// copy stamped for another store's generation would be served as this store's
+/// graph. A rejected copy is removed; the caller decides what replaces it.
+///
+/// This is the one place a donor CSR is copied: `devmap seed`,
+/// `build --seed-from` and the stacked base's provisioning all go through it.
+pub fn copy_donor_csr_checked(
+    donor_csr: &Path,
+    staged_csr: &Path,
+    generation: u32,
+) -> Result<DonorCsr> {
+    let copied = seed_artifact(donor_csr, staged_csr)
+        .with_context(|| format!("cannot stage CSR sidecar from {}", donor_csr.display()))?
+        .is_some();
+    if !copied {
+        return Ok(DonorCsr::Absent);
+    }
+    let reason = match CsrGraphReader::open_mmap(staged_csr) {
+        Ok(reader) if reader.generation() == u64::from(generation) => return Ok(DonorCsr::Kept),
+        Ok(reader) => format!(
+            "it is stamped for generation {}, not {generation}",
+            reader.generation()
+        ),
+        Err(error) => format!("it is unreadable ({error:#})"),
+    };
+    remove_file_if_present(staged_csr)?;
+    Ok(DonorCsr::Rejected { reason })
+}
+
+/// Give a staged store a CSR sidecar: the donor's when it passes
+/// [`copy_donor_csr_checked`], otherwise a fresh one written from the staged
+/// store. Returns what happened to the donor's, so the caller can say so.
+pub fn stage_donor_csr(
+    staged_store: &crate::Store,
+    donor_csr: &Path,
+    staged_db: &Path,
+) -> Result<DonorCsr> {
+    let Some(latest) = staged_store.latest_generation_id()? else {
+        return Ok(DonorCsr::Absent);
+    };
+    let outcome = copy_donor_csr_checked(donor_csr, &csr_path_for_store(staged_db), latest)?;
+    if outcome != DonorCsr::Kept {
+        staged_store.write_latest_csr_sidecar_strict()?;
+    }
+    Ok(outcome)
+}
+
+/// The generation a CSR sidecar is stamped with, read through the descriptor
+/// the caller holds (so a path swapped after the open cannot answer for it).
+///
+/// Only the header is read: the stamp is one field of it, and the callers that
+/// place a sidecar have already checked its content (a hash of the whole file,
+/// or a full open of the copy) before they ask whose generation it is.
+pub fn csr_generation_of_open_file(file: &std::fs::File) -> Result<u64> {
+    let mut header = [0u8; std::mem::size_of::<CsrHeader>()];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let n = read_file_at(file, &mut header[filled..], filled as u64)
+            .context("cannot read the CSR sidecar")?;
+        if n == 0 {
+            bail!("Buffer too small for CSR header: {filled} bytes");
+        }
+        filled += n;
+    }
+    // SAFETY: `header` holds exactly `size_of::<CsrHeader>()` initialised bytes
+    // and every bit pattern is a valid `CsrHeader` (integers and a byte array);
+    // `read_unaligned` makes no alignment assumption.
+    let header = unsafe { std::ptr::read_unaligned(header.as_ptr() as *const CsrHeader) };
+    if &header.magic != DC_GRAPH_MAGIC {
+        bail!("Invalid CSR graph magic bytes");
+    }
+    if header.version != DC_GRAPH_VERSION {
+        bail!("Unsupported CSR graph version: {}", header.version);
+    }
+    Ok(header.generation)
 }
 
 #[cfg(test)]
@@ -961,6 +1424,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(target_os = "macos")]
     fn sealed_snapshot_with_head(path: &Path, head: &str) {
         {
             let store = Store::open(path).unwrap();
@@ -1137,6 +1601,264 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644));
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn sweep_dead_staging_removes_only_what_a_dead_seed_left() {
+        let tmp = temp_test_dir("dead-staging");
+        let target = tmp.join("devmap.sqlite");
+        let dead = dead_pid();
+        let own = std::process::id();
+        let dead_name = format!("devmap.sqlite.seed-{dead}");
+        let dead_files: Vec<PathBuf> = [
+            "",
+            "-wal",
+            "-shm",
+            ".csr",
+            ".artifacts.json",
+            ".writer.lock",
+        ]
+        .iter()
+        .map(|suffix| tmp.join(format!("{dead_name}{suffix}")))
+        .collect();
+        for file in &dead_files {
+            std::fs::write(file, b"x").unwrap();
+        }
+        // Kept: this process's own staging, an unrelated store's, a final store,
+        // and a name whose pid cannot be read.
+        let kept: Vec<PathBuf> = [
+            format!("devmap.sqlite.seed-{own}"),
+            format!("other.sqlite.seed-{dead}"),
+            "devmap.sqlite".to_string(),
+            "devmap.sqlite.seed-notapid".to_string(),
+        ]
+        .iter()
+        .map(|name| tmp.join(name))
+        .collect();
+        for file in &kept {
+            std::fs::write(file, b"x").unwrap();
+        }
+        let swept = sweep_dead_staging(&target);
+        assert_eq!(swept.removed, dead_files.len());
+        assert!(swept.failures.is_empty(), "{:?}", swept.failures);
+        for file in &dead_files {
+            assert!(!file.exists(), "{} should be gone", file.display());
+        }
+        for file in &kept {
+            assert!(file.exists(), "{} must survive", file.display());
+        }
+        assert_eq!(sweep_dead_staging(&target).removed, 0, "idempotent");
+        let absent = sweep_dead_staging(&tmp.join("absent-dir").join("x.sqlite"));
+        assert_eq!((absent.removed, absent.failures.len()), (0, 0));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn reuse_donor(label: &str, binding: Option<&[u8]>) -> (PathBuf, PathBuf, PathBuf) {
+        let tmp = temp_test_dir(label);
+        let source = tmp.join("src").join("resolution-reuse-1");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("blob.json"), b"{}").unwrap();
+        if let Some(bytes) = binding {
+            std::fs::write(source.join(REUSE_BINDING_FILE), bytes).unwrap();
+        }
+        let target = tmp.join("dst").join("resolution-reuse-1");
+        (tmp, source, target)
+    }
+
+    #[test]
+    fn a_donor_binding_unchanged_across_the_copy_is_placed_and_an_absent_one_is_not() {
+        let (tmp, source, target) = reuse_donor("reuse-binding-kept", Some(b"A"));
+        assert!(seed_reuse_directory(&source, &target).unwrap().is_some());
+        assert_eq!(
+            std::fs::read(target.join(REUSE_BINDING_FILE)).unwrap(),
+            b"A"
+        );
+        assert!(target.join("blob.json").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (tmp, source, target) = reuse_donor("reuse-binding-absent", None);
+        assert!(seed_reuse_directory(&source, &target).unwrap().is_some());
+        assert!(target.join("blob.json").is_file());
+        assert!(!target.join(REUSE_BINDING_FILE).exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The donor's binding is rewritten after the copy began and before the
+    /// staged directory is placed: the blobs may belong to either binding, so the
+    /// target keeps the blobs and no binding.
+    #[test]
+    fn a_donor_binding_that_changes_during_the_copy_leaves_the_target_unbound() {
+        let (tmp, source, target) = reuse_donor("reuse-binding-changed", Some(b"A"));
+        let binding = source.join(REUSE_BINDING_FILE);
+        let before = std::fs::read(&binding).ok();
+        let placed = seed_directory_cow_with(&source, &target, &|staged| {
+            std::fs::write(&binding, b"B")?;
+            withdraw_unchecked_binding(staged, &binding, before.as_deref())
+        })
+        .unwrap();
+        assert!(placed.is_some());
+        assert!(target.join("blob.json").is_file());
+        assert!(
+            !target.join(REUSE_BINDING_FILE).exists(),
+            "a binding that changed during the copy must not be placed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A staged binding that cannot be removed fails the seed: the staged
+    /// directory is discarded and no target directory is left.
+    #[test]
+    fn a_staged_binding_that_cannot_be_removed_fails_the_seed_and_leaves_no_target() {
+        let (tmp, source, target) = reuse_donor("reuse-binding-stuck", Some(b"A"));
+        let binding = source.join(REUSE_BINDING_FILE);
+        let result = seed_directory_cow_with(&source, &target, &|staged| {
+            // A non-empty directory where the file was: remove_file refuses it.
+            let staged_binding = staged.join(REUSE_BINDING_FILE);
+            std::fs::remove_file(&staged_binding)?;
+            std::fs::create_dir_all(staged_binding.join("held"))?;
+            withdraw_unchecked_binding(staged, &binding, None)
+        });
+        assert!(result.is_err(), "the removal error must be returned");
+        assert!(!target.exists(), "no target directory is left");
+        let staged = sidecar(&target, &format!(".seed-dir-{}", std::process::id()));
+        assert!(!staged.exists(), "the staged directory is discarded");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The name `seed_directory_cow` really stages under is
+    /// `<state>/resolution-reuse-N.seed-dir-<pid>`, and it is that name a later
+    /// call clears when the pid is gone.
+    #[test]
+    fn a_dead_seeds_staged_cache_directory_is_cleared_by_the_next_directory_seed() {
+        let tmp = temp_test_dir("dead-staged-dir");
+        let source = tmp.join("src").join("resolution-reuse-1");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("entry"), b"cache").unwrap();
+        let target = tmp.join("dst").join("resolution-reuse-1");
+        let dead = dead_pid();
+        let stale = sidecar(&target, &format!(".seed-dir-{dead}"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("partial"), b"x").unwrap();
+        // pid 1 is always running (signalling it is refused, not "no such process").
+        let live = sidecar(&target, ".seed-dir-1");
+        std::fs::create_dir_all(&live).unwrap();
+
+        // The producer's own name is what the sweep is matched against.
+        assert_eq!(
+            stale.file_name().unwrap().to_string_lossy(),
+            format!("resolution-reuse-1.seed-dir-{dead}")
+        );
+        seed_directory_cow(&source, &target)
+            .unwrap()
+            .expect("seeded");
+        assert!(
+            !stale.exists(),
+            "the dead seed's staged directory is cleared"
+        );
+        assert!(
+            target.join("entry").is_file(),
+            "the seed itself still lands"
+        );
+        assert!(
+            live.exists(),
+            "a name this sweep cannot show dead is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// One entry that cannot be removed must not hide the rest.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_dead_staging_continues_past_a_failed_removal_and_reports_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = temp_test_dir("dead-staging-fail");
+        let target = tmp.join("devmap.sqlite");
+        let dead = dead_pid();
+        // A directory that cannot be emptied: its parent entry cannot be removed
+        // from a read-only directory.
+        let locked = tmp.join(format!("devmap.sqlite.seed-{dead}-wal"));
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inner"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let removable: Vec<PathBuf> = (0..3)
+            .map(|n| tmp.join(format!("devmap.sqlite.seed-{dead}.part{n}")))
+            .collect();
+        for file in &removable {
+            std::fs::write(file, b"x").unwrap();
+        }
+        let swept = sweep_dead_staging(&target);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Running as root defeats the permission; then there is nothing to assert.
+        if swept.failures.is_empty() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        assert_eq!(swept.failures.len(), 1, "{:?}", swept.failures);
+        assert!(swept.failures[0].contains(&locked.display().to_string()));
+        assert_eq!(
+            swept.removed,
+            removable.len(),
+            "the others were still removed"
+        );
+        for file in &removable {
+            assert!(!file.exists());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rename_no_replace_never_replaces_an_existing_target() {
+        let tmp = temp_test_dir("no-replace");
+        let (from, to) = (tmp.join("staged"), tmp.join("final"));
+        std::fs::write(&from, b"new").unwrap();
+        rename_no_replace(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+
+        std::fs::write(&from, b"newer").unwrap();
+        let error = rename_no_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&to).unwrap(),
+            b"new",
+            "the target is untouched"
+        );
+        assert_eq!(
+            std::fs::read(&from).unwrap(),
+            b"newer",
+            "the source is kept"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// SQLite itself consumes a stale journal while the staged store is opened
+    /// for its checkpoint, so `settle_staged` cannot be handed one; the check
+    /// that refuses a sidecar holding data after the connection closed is
+    /// exercised directly.
+    #[test]
+    fn a_staged_sidecar_that_holds_data_after_the_checkpoint_is_refused() {
+        let tmp = temp_test_dir("settle-journal");
+        let staged = tmp.join("devmap.sqlite.seed-1");
+        std::fs::write(&staged, b"store").unwrap();
+        let journal = sidecar(&staged, "-journal");
+        std::fs::write(&journal, b"a hot journal").unwrap();
+        let error = drop_empty_sidecars(&staged).unwrap_err();
+        assert!(
+            error.to_string().contains("-journal"),
+            "the refusal names the journal: {error}"
+        );
+        assert!(journal.exists(), "the journal is left where it was found");
+        std::fs::write(&journal, b"").unwrap();
+        drop_empty_sidecars(&staged).expect("an empty journal is swept");
+        assert!(!journal.exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

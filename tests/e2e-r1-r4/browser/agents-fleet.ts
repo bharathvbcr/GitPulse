@@ -177,10 +177,16 @@ const settle = async (ms = 40) => {
   await tick();
 };
 
+const timedOutWaits: string[] = [];
 const until = async (pred: () => boolean, label: string, timeoutMs = 5000) => {
   const end = Date.now() + timeoutMs;
   while (!pred() && Date.now() < end) await settle(25);
-  return pred();
+  const ok = pred();
+  if (!ok) {
+    timedOutWaits.push(label);
+    dataSummary.timedOutWaitingFor = [...timedOutWaits];
+  }
+  return ok;
 };
 
 const results: { name: string; pass: boolean; detail?: string }[] = [];
@@ -249,18 +255,25 @@ try {
     }),
   );
 
+  const claudeDetail =
+    scenario === "narrow"
+      ? `Allow Bash: ${"argsegment".repeat(22)}done`
+      : "Allow Bash: git push --dry-run";
+  const agyDetail = "Completed plan synthesis cleanly";
+  dataSummary.detailLength = claudeDetail.length;
+
   sessionActivity.announce({
     session: "pty-claude-block",
     channel: "hook",
     event: "permission_prompt",
-    detail: "Allow Bash: git push --dry-run",
+    detail: claudeDetail,
   });
 
   sessionActivity.announce({
     session: "pty-agy-info",
     channel: "hook",
     event: scenario === "claude-vs-agy" ? "turn_finished" : "agent_completed",
-    detail: "Completed plan synthesis cleanly",
+    detail: agyDetail,
   });
 
   view = mount(AgentsView, { target: stage });
@@ -296,7 +309,10 @@ try {
   );
 
   check("rows render LauncherIcon SVGs for Claude and Antigravity", () =>
-    Boolean(claudeRow?.querySelector("svg") && agyRow?.querySelector("svg")),
+    Boolean(
+      claudeRow?.querySelector('[data-launcher-icon="claude"]') &&
+        agyRow?.querySelector('[data-launcher-icon="agy"]'),
+    ),
   );
 
   check("attention cells use semantic gp-chip badges with data-tone", () =>
@@ -308,8 +324,8 @@ try {
 
   check("inline detail previews are rendered in the table", () =>
     Boolean(
-      claudeRow?.textContent?.includes("Allow Bash: git push --dry-run") &&
-        agyRow?.textContent?.includes("Completed plan synthesis cleanly"),
+      claudeRow?.textContent?.includes(claudeDetail.slice(0, 60)) &&
+        agyRow?.textContent?.includes(agyDetail),
     ),
   );
 
@@ -342,7 +358,9 @@ try {
 
   if (scenario === "dismiss") {
     const dismissBtn = [...(row("agy-info")?.querySelectorAll("button") ?? [])].find((b) =>
-      /dismiss|acknowledge|clear/i.test(b.textContent?.trim() ?? b.getAttribute("aria-label") ?? ""),
+      /dismiss|acknowledge|clear/i.test(
+        `${b.textContent ?? ""} ${b.getAttribute("aria-label") ?? ""} ${b.getAttribute("title") ?? ""}`.trim(),
+      ),
     ) as HTMLButtonElement | undefined;
     dataSummary.hasDismissButton = Boolean(dismissBtn);
     if (dismissBtn) {
@@ -350,7 +368,7 @@ try {
       await settle(40);
     }
     check("dismiss action clears informational notification while keeping live row", () =>
-      Boolean(dismissBtn && row("agy-info") && !row("agy-info")?.textContent?.includes("Completed plan synthesis cleanly")),
+      Boolean(dismissBtn && row("agy-info") && !row("agy-info")?.textContent?.includes(agyDetail)),
     );
   }
 
@@ -372,6 +390,41 @@ try {
     check("narrow viewport fits without horizontal overflow", () =>
       stage.scrollWidth <= stage.clientWidth + 1 &&
       (root()?.scrollWidth ?? 0) <= (root()?.clientWidth ?? 0) + 1,
+    );
+
+    const detailPrefix = claudeDetail.slice(0, 40);
+    const liveClaudeRow = row("claude-block");
+    const detailLeaf = liveClaudeRow
+      ? [...liveClaudeRow.querySelectorAll<HTMLElement>("*")].reverse().find((el) =>
+          el.textContent?.includes(detailPrefix),
+        )
+      : undefined;
+    const stageRect = stage.getBoundingClientRect();
+    const detailRect = detailLeaf?.getBoundingClientRect();
+    const detailCell = detailLeaf?.closest("td, th") ?? null;
+    const detailCellRect = detailCell?.getBoundingClientRect();
+    const detailStyle = detailLeaf ? getComputedStyle(detailLeaf) : null;
+    const wrapsOrTruncates = Boolean(
+      detailLeaf &&
+        detailRect &&
+        detailCell &&
+        detailCellRect &&
+        detailStyle &&
+        detailRect.width > 0 &&
+        detailRect.width <= stageRect.width * 0.5 &&
+        detailRect.left >= detailCellRect.left - 1 &&
+        detailRect.right <= detailCellRect.right + 1 &&
+        detailLeaf.scrollWidth <= detailLeaf.clientWidth + 1 &&
+        (detailRect.height >= 24 ||
+          detailStyle.overflowX === "hidden" ||
+          detailLeaf.scrollHeight > detailLeaf.clientHeight ||
+          detailStyle.textOverflow === "ellipsis" ||
+          (detailLeaf.textContent?.length ?? 0) < claudeDetail.length),
+    );
+    dataSummary.narrowDetailRendered = Boolean(detailLeaf && detailRect && detailRect.width > 0);
+    dataSummary.narrowDetailBounded = wrapsOrTruncates;
+    check("narrow viewport truncates or wraps >200-char detail without overflowing stage", () =>
+      claudeDetail.length > 200 && wrapsOrTruncates,
     );
   }
 

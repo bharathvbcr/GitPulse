@@ -1,5 +1,5 @@
 //! AppKit's own quit requests: the app menu's Quit item (Cmd-Q), Dock → Quit,
-//! a Quit Apple event (`osascript -e 'quit app id "com.gitpulse.desktop"'`),
+//! a Quit Apple event (`osascript -e 'quit app id "dev.vbcr.gitpulse"'`),
 //! and logout or restart.
 //!
 //! TAO's application delegate implements `applicationWillTerminate:` but not

@@ -63,9 +63,12 @@
 //! # Across a reboot
 //!
 //! When the sampler starts and finds a ring written under a different boot id,
-//! it renames it to `host-load-trace.prev.v1` (replacing an older one) before
-//! starting a new ring, so the readings from before a crash are kept for one
-//! boot. A file that is short, has the wrong magic or version, or fails its
+//! it renames it to `host-load-trace.prev.v1` before starting a new ring, after
+//! moving the older previous rings down one place (`prev` to `prev2`, `prev2`
+//! to `prev3`, dropping the old `prev3`). The last three boots are kept because
+//! a hang is often followed by more than one quick reboot: on 2026-11-24 the
+//! second reboot replaced the hang's readings when only one was kept. Health
+//! reads `prev`; the older two are for whoever investigates. A file that is short, has the wrong magic or version, or fails its
 //! header checksum is a typed [`TraceError`], is never decoded, and is
 //! replaced.
 //!
@@ -97,6 +100,13 @@ use std::time::{Duration, Instant};
 
 pub const TRACE_FILE_NAME: &str = "host-load-trace.v1";
 pub const PREV_TRACE_FILE_NAME: &str = "host-load-trace.prev.v1";
+/// The previous boots' rings, newest first. A new boot moves each one down a
+/// place and drops the last.
+pub const PREVIOUS_TRACE_FILE_NAMES: [&str; 3] = [
+    PREV_TRACE_FILE_NAME,
+    "host-load-trace.prev2.v1",
+    "host-load-trace.prev3.v1",
+];
 const MAGIC: [u8; 4] = *b"GPHT";
 const VERSION: u32 = 1;
 /// Records the ring holds: three hours at one every 10 s.
@@ -613,8 +623,7 @@ impl TraceWriter {
                 Ok((header, _)) if header.boot_id != boot_id => {
                     // Another boot: keep it as the one before this.
                     drop(existing);
-                    std::fs::rename(&path, dir.join(PREV_TRACE_FILE_NAME))
-                        .map_err(|e| format!("could not keep the previous trace: {e}"))?;
+                    keep_previous(dir, &path)?;
                 }
                 // A different capacity in this boot, or a file that is torn,
                 // short or foreign: never decoded, replaced.
@@ -706,6 +715,24 @@ impl TraceSink for TraceWriter {
 /// Opens the sink for a boot in a directory. Run on the feed's thread, never
 /// on the sampler's: opening can rename the previous boot's ring and syncs.
 pub type TraceOpener = Arc<dyn Fn(&Path, u64) -> Result<Box<dyn TraceSink>, String> + Send + Sync>;
+
+/// Moves another boot's ring at `current` to the newest previous place, after
+/// moving each older previous ring down one place; the oldest is replaced.
+/// Moved from the oldest end first, so a failure part way never overwrites a
+/// ring that was not yet moved: it is reported and the new ring is not opened,
+/// as a failure to keep the previous ring always was.
+fn keep_previous(dir: &Path, current: &Path) -> Result<(), String> {
+    for to in (1..PREVIOUS_TRACE_FILE_NAMES.len()).rev() {
+        let from = PREVIOUS_TRACE_FILE_NAMES[to - 1];
+        match std::fs::rename(dir.join(from), dir.join(PREVIOUS_TRACE_FILE_NAMES[to])) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("could not keep an older trace ({from}): {e}")),
+        }
+    }
+    std::fs::rename(current, dir.join(PREV_TRACE_FILE_NAME))
+        .map_err(|e| format!("could not keep the previous trace: {e}"))
+}
 
 /// The opener the app uses: the ring file in the directory.
 pub fn file_opener() -> TraceOpener {

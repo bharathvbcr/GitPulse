@@ -1378,7 +1378,18 @@ pub(super) fn collect_scope_locals(
 ) -> Vec<(String, String)> {
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
+    let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if walk_deadline_passed() {
+                break;
+            }
+        }
+        if walk_overran() {
+            break;
+        }
         // A charged statement declares no scope of its own: its locals and its
         // lambdas' belong to nothing the file declares.
         if in_charged_region(node) {

@@ -222,6 +222,12 @@ pub(super) fn post(
     sound: bool,
     category: &str,
 ) -> Result<bool, WorkbenchError> {
+    if native.is_empty() {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Notification identifier cannot be empty.",
+        ));
+    }
     let center = center()?;
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(heading));
@@ -318,6 +324,12 @@ mod tests {
 
     #[test]
     fn unbundled_center_and_notification_calls_fail_closed_with_unsupported() {
+        assert_eq!(
+            post("", "Claude", "Needs input", false, SESSION_CATEGORY)
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
         if NSBundle::mainBundle().bundleIdentifier().is_some() {
             return;
         }

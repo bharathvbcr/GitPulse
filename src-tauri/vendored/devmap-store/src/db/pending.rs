@@ -256,6 +256,19 @@ impl Store {
         let Some(owner) = owner else {
             return Ok(RepoRootOwner::Unbound);
         };
+        // Every writer records an absolute, canonical root. A relative one was
+        // not written by one: resolving it here would read it against *this*
+        // process's working directory, so the same row would name a different
+        // worktree (or this one) depending on where `devmap` was started.
+        // Which worktree owns the store cannot be told, and a store that might
+        // serve a live worktree is never taken over.
+        if !Path::new(&owner).is_absolute() {
+            return Err(refusal(format!(
+                "DevMap store records its owner as the relative path {owner:?}, so which \
+                 worktree it belongs to cannot be told; it was not written by devmap. Delete \
+                 this store (or its state directory) and run `devmap build`"
+            )));
+        }
         let owner = Self::normalized_repo_root(Path::new(&owner))?;
         if owner == root {
             return Ok(RepoRootOwner::Same);
@@ -383,6 +396,17 @@ impl Store {
     ///
     /// The connection is immutable when no `-wal` exists, so the peek itself
     /// does not create `-wal` or `-shm`.
+    ///
+    /// **Not atomic with the open.** The peek and [`Store::open`] are two
+    /// connections, and no lock spans them: a store that is unbound or the
+    /// caller's own when it is read can be bound to another live worktree by the
+    /// time it is opened. The open then migrates and heals that worktree's file
+    /// (the write this check exists to prevent), and only the owner check inside
+    /// `bind_repo_root`, which every writer makes next, refuses. Ownership of
+    /// the rows is never lost; the migration is the damage the window allows. A
+    /// test pins both halves (`the_ownership_peek_is_not_atomic_with_the_open`).
+    /// Closing it needs the owner read inside the migration's own writer
+    /// transaction, which is a change to the open path rather than to this read.
     pub fn refuse_a_live_foreign_owner_before_open(db_path: &Path, root: &Path) -> Result<()> {
         let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
@@ -412,14 +436,44 @@ impl Store {
             Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
             Err(_) => return Ok(()),
         };
-        if stamped == 0 || !Self::schema_is_migratable(stamped) {
+        if !Self::schema_is_migratable(stamped) {
             return Ok(());
         }
-        let owner = Self::stored_repo_root(&conn, stamped)?;
+        let Some(owner_schema) = Self::owner_schema_of(&conn, stamped)? else {
+            return Ok(());
+        };
+        let owner = Self::stored_repo_root(&conn, owner_schema)?;
         match Self::classify_owner(owner, &root)? {
             RepoRootOwner::Live(owner) => Err(Self::live_owner_refusal(&owner, &root)),
             RepoRootOwner::Unbound | RepoRootOwner::Same | RepoRootOwner::Gone(_) => Ok(()),
         }
+    }
+
+    /// The schema whose owner record to read for a file stamped `stamped`, or
+    /// `None` when the file records no owner.
+    ///
+    /// Stamp 0 is "no schema yet", and `Store::open` builds one into it. It is
+    /// not "no owner": a file whose stamp was reset, or that was left half
+    /// created, can hold a `pending_state` row naming a live worktree, and the
+    /// open heals such a file in place. So a stamp-0 file is asked what tables
+    /// it has, from `sqlite_master` alone, and the newest owner record found is
+    /// the one read. A file with no owner table is empty, and passes.
+    pub(super) fn owner_schema_of(conn: &Connection, stamped: i32) -> Result<Option<i32>> {
+        if stamped != 0 {
+            return Ok(Some(stamped));
+        }
+        let has = |sql: &str| -> Result<bool> {
+            Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))? > 0)
+        };
+        if has("SELECT count(*) FROM sqlite_master WHERE name = 'pending_state'")? {
+            return Ok(Some(20));
+        }
+        if has(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'generations' AND sql LIKE '%repo_root%'",
+        )? {
+            return Ok(Some(7));
+        }
+        Ok(None)
     }
 
     /// The worktree a store of schema `stamped` records as its owner, if it

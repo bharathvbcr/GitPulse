@@ -827,6 +827,36 @@ export function createGraphStore(
       cacheLimit = Math.max(1, Math.floor(next));
       trim();
     },
+    /**
+     * Releases every cached commit graph (including the currently visible
+     * repository's row array) when the window is hidden and deep-shedding.
+     * Selection, page-size limits, and `visiblePath` stay intact so waking
+     * reloads cleanly behind the graph skeleton.
+     */
+    shedAll: (): number => {
+      const dropped = cache.size;
+      if (dropped === 0) return 0;
+      for (const [path, entry] of cache) {
+        shed.set(path, {
+          query: entry.query,
+          revision: entry.revision,
+          refScope: entry.refScope,
+          maxCommits: entry.maxCommits,
+          selectedCommitId: entry.selectedCommit?.id ?? null,
+        });
+      }
+      cache.clear();
+      if (visiblePath !== null) {
+        const path = visiblePath;
+        update((s) => ({
+          ...s,
+          rows: [],
+          isLoading: false,
+          visiblePath: path,
+        }));
+      }
+      return dropped;
+    },
     /** Everything held for a closed tab: rows, the shed view, and the ordering state. */
     evict: (path: string) => {
       cache.delete(path);

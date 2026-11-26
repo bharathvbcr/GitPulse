@@ -355,17 +355,20 @@ fn claiming_a_trusted_repository_does_not_make_a_directory_a_member() {
 #[test]
 fn included_configuration_is_denied_before_git_reads_it() {
     let repo = fixture();
+    std::fs::write(repo.path().join(".gitattributes"), "file filter=probe\n").unwrap();
     std::fs::write(repo.path().join("file"), "data\n").unwrap();
-    git(repo.path(), &["add", "file"]);
+    git(repo.path(), &["add", ".gitattributes", "file"]);
+    git(repo.path(), &["commit", "-q", "-m", "attrs"]);
     let hook = repo.path().join(".git/hook");
-    std::fs::write(&hook, "#!/bin/sh\ntouch included-hook\nprintf 'token\\0'\n").unwrap();
+    std::fs::write(&hook, "#!/bin/sh\n: > included-hook\ncat\n").unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
         repo.path().join(".git/included"),
-        format!("[core]\n fsmonitor = {}\n", hook.display()),
+        format!("[filter \"probe\"]\n clean = {}\n", hook.display()),
     )
     .unwrap();
     git(repo.path(), &["config", "include.path", "included"]);
+    std::fs::write(repo.path().join("file"), "changed\n").unwrap();
     assert!(GitReader::get_status(repo.path().to_str().unwrap()).is_err());
     assert!(!repo.path().join("included-hook").exists());
     approve(repo.path());
@@ -622,11 +625,10 @@ fn status_read_does_not_execute_an_untrusted_repository_fsmonitor() {
     let status = GitReader::get_status(repo.to_str().unwrap()).unwrap();
     assert!(status.iter().any(|file| file.path == "tracked.txt"));
     assert!(
-        repo.join("fsmonitor-executed").exists(),
-        "trusted helpers remain supported"
+        !repo.join("fsmonitor-executed").exists(),
+        "core.fsmonitor hooks must stay disabled even on trusted status reads"
     );
     repository_trust::revoke(repo.to_str().unwrap()).unwrap();
-    std::fs::remove_file(repo.join("fsmonitor-executed")).unwrap();
     assert!(GitReader::get_status(repo.to_str().unwrap()).is_err());
     assert!(!repo.join("fsmonitor-executed").exists());
 }

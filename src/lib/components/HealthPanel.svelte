@@ -1007,8 +1007,23 @@
     };
   });
 
-  $effect(() => {
-    const path = $currentRepoPath;
+  /**
+   * Brings the panel to the repository that is open now: drops what belongs to
+   * the one just left, hydrates what is cached for this one, and starts or
+   * schedules its scan.
+   *
+   * It runs from the store's own subscription, at the moment the repository
+   * changes, not from an `$effect`. On CI (Frontend ubuntu, f00a5be) the
+   * report's children re-rendered while `report` was already null, inside the
+   * `{:else if report}` that should have removed them: `summary.tone` and
+   * `report.npm_cli_present` threw, and the throw cut that update short, which
+   * is how a repository only passed through could still be scanned. It did
+   * not reproduce locally, so the cause is inferred: Svelte applies a write
+   * made inside an effect in a later update than the one that rendered the
+   * old repository, and this reset was such a write. Here it joins the
+   * repository switch's own update.
+   */
+  function followRepository(path: string | null) {
     if (!path) {
       stopPending();
       inflight?.cancel();
@@ -1128,7 +1143,10 @@
     // Launch also fetches these; this call joins that in-flight request or
     // hydrates from its cache so opening Health after a warning is not empty.
     if ($interfaceStore.autoScanGithubAlerts && !github) void scanDependabot(path);
-  });
+  }
+
+  // Declared last: the first call runs synchronously, during this script.
+  onDestroy(currentRepoPath.subscribe((path) => untrack(() => followRepository(path))));
 
   async function openExternal(url: string) {
     // The shared opener throws on failure (no window.open fallback: inside a

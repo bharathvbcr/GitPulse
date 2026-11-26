@@ -40,6 +40,7 @@ export const AGENTS_ACTION_ID = "agents";
 export interface NativeMenuHandlers {
   canDispatch?: (event: NativeEvent) => boolean;
   activateRepo: (path: string) => void;
+  focusAgent: (id: string) => void;
   clearRecents: () => void;
   checkUpdates: () => void;
   stageAll: () => void;
@@ -109,6 +110,10 @@ export function dispatchNativeMenu(
     case "activate-repo":
       if (!payload.path) return false;
       handlers.activateRepo(payload.path);
+      return true;
+    case "focus-agent":
+      if (!payload.path) return false;
+      handlers.focusAgent(payload.path);
       return true;
     case "clear-recents":
       handlers.clearRecents();

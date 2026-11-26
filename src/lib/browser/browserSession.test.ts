@@ -295,3 +295,22 @@ describe("element picker formatting and cropping", () => {
     expect(computeElementCropBox({ x: 0, y: 0, width: 0, height: 20 }, 400, 300, 800, 600)).toBeNull();
   });
 });
+
+describe("termination event and local server discovery", () => {
+  it("parses web content process termination events", () => {
+    expect(parsePageEvent({ id: "t1", kind: "terminated" })).toEqual({
+      id: "t1",
+      kind: "terminated",
+    });
+  });
+
+  it("invokes cmd_browser_discover_local_servers with optional repoPath", async () => {
+    invoke.mockClear();
+    await browserIpc.discoverLocalServers("/tmp/repo");
+    await browserIpc.discoverLocalServers();
+    expect(invoke.mock.calls).toEqual([
+      ["cmd_browser_discover_local_servers", { repoPath: "/tmp/repo" }],
+      ["cmd_browser_discover_local_servers", { repoPath: null }],
+    ]);
+  });
+});

@@ -8,7 +8,7 @@
   },
   "homepage": "https://gitpulse.vbcr.dev",
   "repository": "https://github.com/bharathvbcr/GitPulse",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "logo": "assets/logo.svg",
   "keywords": [
     "git",

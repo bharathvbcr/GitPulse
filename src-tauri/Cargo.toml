@@ -5,7 +5,7 @@ description = "High-performance native Git desktop client, code intelligence eng
 authors = ["GitPulse Team"]
 edition = "2021"
 rust-version = "1.100"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/bharathvbcr/GitPulse"
 keywords = ["git", "git-client", "tauri", "devtools", "local-first"]
 categories = ["development-tools", "gui"]
@@ -179,6 +179,10 @@ markdev-vault = { path = "vendored/markdev-vault" }
 tree-sitter = "0.26"
 tree-sitter-javascript = "0.25"
 tauri-plugin-autostart = "2.7.0"
+# In-process working-tree status (`engine::gix_status`): eliminates per-scan
+# `git status` spawns and `fsmonitor--daemon.ipc` hangs while falling back cleanly
+# to `git` on unsupported edge cases. Keep `default-features = false` (no `fsmonitor`).
+gix = { version = "0.90.0", default-features = false, features = ["status", "sha1", "sha256", "parallel", "pack-cache-lru-static", "pack-cache-lru-dynamic"] }
 
 # Process-group control for children we spawn (`src/procguard`).
 #
@@ -269,11 +273,25 @@ proptest = { version = "1.11", default-features = false, features = ["std"] }
 # [dependencies] — and it is what lets tests drive commands through the real
 # IPC bridge instead of calling the functions directly.
 tauri = { path = "framework/tauri", features = ["test"] }
+# Native-engine regression runner (`examples/webview_regressions.rs`) and
+# Windows runtime smoke test (`tests/windows_runtime.rs`) drive the exact same
+# vendored `framework/tao` and `framework/wry` crates Tauri links (via
+# `[patch.crates-io]` below), adding zero packages to the dependency graph.
+tao = { version = "0.37.0", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.57.0", default-features = false, features = ["os-webview"] }
 
 # Exercise the same GTK/GLib instance used by Tauri on its real main thread.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gtk = "0.19"
 async-channel = "2.5"
+
+[[example]]
+name = "webview_regressions"
+path = "examples/webview_regressions.rs"
+
+[[example]]
+name = "e2e_seed_trust"
+path = "examples/e2e_seed_trust.rs"
 
 # `build_native_menu` can only run on the process main thread (muda creates
 # NSMenuItem there and panics anywhere else), and a libtest harness runs every
@@ -295,6 +313,10 @@ harness = false
 
 [[test]]
 name = "gtk_runtime"
+harness = false
+
+[[test]]
+name = "windows_runtime"
 harness = false
 
 [[test]]

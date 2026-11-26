@@ -265,6 +265,9 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             "dcStoreSchemaVersion": dc_store::SCHEMA_VERSION,
             "workbenchSchemaVersion": dc_store::workbench::WORKBENCH_SCHEMA,
             "extractionSchemaVersion": extraction_schema_version(),
+            // The stack-lease format this build reads and writes, so the parity
+            // check can ask the installed binary (devmap prints it in --version).
+            "stackLeaseFormatVersion": devmap_query::STACK_FORMAT_VERSION,
             "protocolVersion": super::PROTOCOL_VERSION,
             "legacyVersions": super::LEGACY_VERSIONS,
             // Derived from the tool annotations, so it cannot claim "read-only"
@@ -886,6 +889,10 @@ mod tests {
             .parse()
             .expect("the extraction schema is a whole number");
         assert_eq!(parsed["extractionSchemaVersion"], json!(extract));
+        assert_eq!(
+            parsed["stackLeaseFormatVersion"],
+            json!(devmap_query::STACK_FORMAT_VERSION)
+        );
     }
 
     #[test]

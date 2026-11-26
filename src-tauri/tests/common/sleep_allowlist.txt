@@ -99,6 +99,9 @@ site | src/desktop/instance_tests.rs | the_pool_never_starts_more_threads_than_t
 site | src/desktop/popover.rs | wait_for | 0 | bounded-poll
 
 # src/devmap/cli.rs
+# Each of four readers holds a read slot for 5 ms so the two-slot budget is
+# always full with a user read waiting; the length is not asserted.
+site | src/devmap/cli.rs | a_steady_flood_of_user_reads_cannot_defer_a_probe_forever | 0 | hold
 site | src/devmap/cli.rs | wait_test_status_delay | 0 | bounded-poll
 
 # src/devmap/live.rs

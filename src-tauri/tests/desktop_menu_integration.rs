@@ -63,6 +63,8 @@ fn added_menu_commands_emit_the_exact_frontend_payload_once() {
         "stage-all",
         "activate-repo:/not-open",
         "open-recent:/not-recent",
+        "focus-agent:",
+        "focus-agent:not-waiting",
     ] {
         handle_menu_event(app.handle(), id);
     }

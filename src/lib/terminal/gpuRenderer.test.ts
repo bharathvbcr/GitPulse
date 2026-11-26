@@ -1,14 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import { MAX_VISIBLE_SESSIONS } from "./attendance";
 import {
+  attachWebglAddon,
   createGpuRenderer,
   createGpuSlots,
   GPU_HIDE_GRACE_MS,
+  GPU_LOSS_BUDGET,
   GPU_RECOVER_DELAY_MS,
   gpuPolicy,
+  isRecoverableWebglAttachError,
+  WebglContextLostAttachError,
   type GpuAddon,
   type GpuSlots,
   type GpuState,
+  type WebglHostCanvas,
+  type WebglHostContainer,
 } from "./gpuRenderer";
 
 /** A fake addon that records its disposal and can fire its context loss. */
@@ -161,5 +167,361 @@ describe("terminal GPU renderer lifecycle", () => {
     expect(slots.held()).toBe(0);
     expect(slots.take()).toBe(true);
     expect(slots.take()).toBe(false);
+  });
+});
+
+function fakeCanvas(classes: string[] = []): WebglHostCanvas & {
+  removed: boolean;
+  contextLost: boolean;
+  getContextCalls: number;
+} {
+  const canvas = {
+    classList: classes,
+    removed: false,
+    contextLost: false,
+    getContextCalls: 0,
+    getContext(kind: "webgl2") {
+      canvas.getContextCalls += 1;
+      if (kind !== "webgl2" || classes.some((name) => name.endsWith("-layer"))) return null;
+      return {
+        isContextLost: () => canvas.contextLost,
+        getExtension: (name: "WEBGL_lose_context") =>
+          name === "WEBGL_lose_context" ? { loseContext: () => { canvas.contextLost = true; } } : null,
+      };
+    },
+    remove() {
+      canvas.removed = true;
+    },
+  };
+  return canvas;
+}
+
+describe("attachWebglAddon", () => {
+  it("returns the non-layer WebGL canvas and forwards addon methods on success", () => {
+    const canvases: ReturnType<typeof fakeCanvas>[] = [];
+    const linkCanvas = fakeCanvas(["xterm-link-layer"]);
+    const glCanvas = fakeCanvas([]);
+    const addon = Object.assign(fakeAddon(), {
+      cleared: 0,
+      clearTextureAtlas() {
+        this.cleared += 1;
+      },
+    });
+    const handle = attachWebglAddon(
+      {
+        element: { querySelectorAll: () => canvases },
+        loadAddon() {
+          canvases.push(linkCanvas, glCanvas);
+        },
+      },
+      () => addon,
+    );
+
+    expect(handle.canvas).toBe(glCanvas);
+    handle.clearTextureAtlas?.();
+    expect(addon.cleared).toBe(1);
+    handle.dispose();
+    expect(addon.disposed).toBe(1);
+  });
+
+  it("finds the WebGL canvas in the screen, not the atlas scratch canvas parked on the root ahead of it", () => {
+    // addon-webgl's shared glyph atlas puts a classless 2D canvas on the root
+    // of whichever terminal last rasterized a glyph; here it comes first in
+    // document order, so a root search would pick it.
+    const atlasScratch = fakeCanvas([]);
+    const linkCanvas = fakeCanvas(["xterm-link-layer"]);
+    const glCanvas = fakeCanvas([]);
+    const root: ReturnType<typeof fakeCanvas>[] = [];
+    const screen: ReturnType<typeof fakeCanvas>[] = [];
+    const handle = attachWebglAddon(
+      {
+        element: { querySelectorAll: () => root },
+        screenElement: { querySelectorAll: () => screen },
+        loadAddon() {
+          root.push(atlasScratch, linkCanvas, glCanvas);
+          screen.push(linkCanvas, glCanvas);
+        },
+      },
+      () => fakeAddon(),
+    );
+
+    expect(handle.canvas).toBe(glCanvas);
+  });
+
+  it("cleans up orphaned canvases and disposes the addon when loadAddon throws mid-constructor", () => {
+    const existing = fakeCanvas([]);
+    const linkCanvas = fakeCanvas(["xterm-link-layer"]);
+    const glCanvas = fakeCanvas([]);
+    const canvases = [existing];
+    const addon = fakeAddon();
+    const boom = new Error("value must not be falsy");
+
+    expect(() =>
+      attachWebglAddon(
+        {
+          element: { querySelectorAll: () => canvases },
+          loadAddon() {
+            // Mirrors @xterm/addon-webgl WebglRenderer appending its link-layer
+            // and WebGL canvases before _initializeWebGLState() throws.
+            canvases.push(linkCanvas, glCanvas);
+            throw boom;
+          },
+        },
+        () => addon,
+      ),
+    ).toThrow(boom);
+
+    expect(addon.disposed).toBe(1);
+    expect(existing.removed).toBe(false);
+    expect(existing.contextLost).toBe(false);
+    expect(linkCanvas.removed).toBe(true);
+    expect(linkCanvas.getContextCalls).toBe(0);
+    expect(glCanvas.removed).toBe(true);
+    expect(glCanvas.contextLost).toBe(true);
+  });
+
+  it("still removes orphaned canvases and rethrows the original error if dispose() throws", () => {
+    const glCanvas = fakeCanvas([]);
+    const canvases: ReturnType<typeof fakeCanvas>[] = [];
+    const originalError = new Error("shader compile failed");
+
+    expect(() =>
+      attachWebglAddon(
+        {
+          element: { querySelectorAll: () => canvases },
+          loadAddon() {
+            canvases.push(glCanvas);
+            throw originalError;
+          },
+        },
+        () => ({
+          ...fakeAddon(),
+          dispose() {
+            throw new Error("dispose failed");
+          },
+        }),
+      ),
+    ).toThrow(originalError);
+
+    expect(glCanvas.removed).toBe(true);
+    expect(glCanvas.contextLost).toBe(true);
+  });
+
+  it("silences orphaned webglcontextlost and webglcontextrestored listeners via capture reparenting", () => {
+    const targetCalls: string[] = [];
+    const targetListeners = new Map<string, Array<(event: { stopPropagation(): void }) => void>>();
+    const graveyards: Array<{
+      captureListeners: Map<string, Array<(event: { stopPropagation(): void }) => void>>;
+      children: unknown[];
+    }> = [];
+
+    let parent: {
+      captureListeners: Map<string, Array<(event: { stopPropagation(): void }) => void>>;
+      children: unknown[];
+    } | null = null;
+    const removedFromHost = { value: false };
+    const dispatchOnCanvas = (type: "webglcontextlost" | "webglcontextrestored") => {
+      let stopped = false;
+      const event = {
+        stopPropagation() {
+          stopped = true;
+        },
+      };
+      // DOM CAPTURING_PHASE on parent container runs before AT_TARGET on canvas.
+      for (const listener of parent?.captureListeners.get(type) ?? []) {
+        listener(event);
+      }
+      if (stopped) return;
+      for (const listener of targetListeners.get(type) ?? []) {
+        listener(event);
+      }
+    };
+
+    interface SilencedCanvas extends WebglHostCanvas<SilencedCanvas> {
+      contextLost: boolean;
+    }
+    const glCanvas: SilencedCanvas = {
+      classList: [],
+      contextLost: false,
+      ownerDocument: {
+        createElement() {
+          const container = {
+            captureListeners: new Map<string, Array<(event: { stopPropagation(): void }) => void>>(),
+            children: [] as unknown[],
+          };
+          graveyards.push(container);
+          const host: WebglHostContainer<SilencedCanvas> = {
+            addEventListener(type, listener, capture) {
+              if (!capture) return;
+              const list = container.captureListeners.get(type) ?? [];
+              list.push(listener);
+              container.captureListeners.set(type, list);
+            },
+            appendChild(node) {
+              removedFromHost.value = true;
+              parent = container;
+              container.children.push(node);
+              return node;
+            },
+          };
+          return host;
+        },
+      },
+      getContext(kind: "webgl2") {
+        if (kind !== "webgl2") return null;
+        return {
+          isContextLost: () => glCanvas.contextLost,
+          getExtension: (name: "WEBGL_lose_context") =>
+            name === "WEBGL_lose_context"
+              ? {
+                  loseContext: () => {
+                    glCanvas.contextLost = true;
+                    // Browser queues webglcontextlost directly on the canvas.
+                    dispatchOnCanvas("webglcontextlost");
+                  },
+                }
+              : null,
+        };
+      },
+      remove() {
+        removedFromHost.value = true;
+      },
+    };
+
+    const canvases: SilencedCanvas[] = [];
+    const boom = new Error("non-loss shader error");
+
+    expect(() =>
+      attachWebglAddon(
+        {
+          element: { querySelectorAll: () => canvases },
+          loadAddon() {
+            // Mirror WebglRenderer binding target listeners on this._canvas
+            // before _initializeWebGLState() throws.
+            targetListeners.set("webglcontextlost", [() => targetCalls.push("lost")]);
+            targetListeners.set("webglcontextrestored", [() => targetCalls.push("restored")]);
+            canvases.push(glCanvas);
+            throw boom;
+          },
+        },
+        () => fakeAddon(),
+      ),
+    ).toThrow(boom);
+
+    // Neither the loseContext() event nor a subsequent browser restore event reaches WebglRenderer.
+    dispatchOnCanvas("webglcontextlost");
+    dispatchOnCanvas("webglcontextrestored");
+
+    expect(removedFromHost.value).toBe(true);
+    expect(glCanvas.contextLost).toBe(true);
+    expect(graveyards).toHaveLength(1);
+    expect(graveyards[0].children).toEqual([glCanvas]);
+    expect(targetCalls).toEqual([]);
+  });
+
+  it("wraps lost-context attach failures in WebglContextLostAttachError for bounded recovery", () => {
+    const linkCanvas = fakeCanvas(["xterm-link-layer"]);
+    const glCanvas = fakeCanvas([]);
+    const canvases: ReturnType<typeof fakeCanvas>[] = [];
+    const addon = fakeAddon();
+    const boom = new Error("Could not get value");
+
+    let caught: unknown;
+    try {
+      attachWebglAddon(
+        {
+          element: { querySelectorAll: () => canvases },
+          loadAddon() {
+            canvases.push(linkCanvas, glCanvas);
+            // GPU process lost the context before/during shader compilation.
+            glCanvas.contextLost = true;
+            throw boom;
+          },
+        },
+        () => addon,
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(WebglContextLostAttachError);
+    expect(isRecoverableWebglAttachError(caught)).toBe(true);
+    expect((caught as WebglContextLostAttachError).cause).toBe(boom);
+    expect(addon.disposed).toBe(1);
+    expect(linkCanvas.removed).toBe(true);
+    expect(glCanvas.removed).toBe(true);
+  });
+
+  it("recovers after a transient WebglContextLostAttachError and still finalizes once lossBudget is exceeded", () => {
+    vi.useFakeTimers();
+    try {
+      const slots = createGpuSlots();
+      const changes: GpuState[] = [];
+      let attempts = 0;
+      let failAsLost = true;
+      const renderer = createGpuRenderer({
+        attach: (): GpuAddon => {
+          attempts += 1;
+          if (failAsLost) throw new WebglContextLostAttachError(new Error("Could not get value"));
+          return fakeAddon();
+        },
+        slots,
+        policy: { ...gpuPolicy, hideGraceMs: GPU_HIDE_GRACE_MS },
+        onChange: (state) => changes.push(state),
+      });
+
+      // Transient loss during wake/GPU reset moves to reset, not permanently lost.
+      expect(renderer.sync(true)).toBe("reset");
+      expect(slots.held()).toBe(0);
+      expect(attempts).toBe(1);
+
+      // Once the GPU process is back, the scheduled retry attaches WebGL cleanly.
+      failAsLost = false;
+      vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
+      expect(renderer.state()).toBe("webgl");
+      expect(attempts).toBe(2);
+      expect(changes).toEqual(["reset", "webgl"]);
+      renderer.dispose();
+
+      // Bounded: repeated lost-context attach failures still finalize after GPU_LOSS_BUDGET.
+      const brokenChanges: GpuState[] = [];
+      let brokenAttempts = 0;
+      const broken = createGpuRenderer({
+        attach: (): GpuAddon => {
+          brokenAttempts += 1;
+          throw new WebglContextLostAttachError(new Error("Could not get value"));
+        },
+        slots,
+        policy: { ...gpuPolicy, hideGraceMs: GPU_HIDE_GRACE_MS },
+        onChange: (state) => brokenChanges.push(state),
+      });
+
+      expect(broken.sync(true)).toBe("reset");
+      for (let i = 0; i < GPU_LOSS_BUDGET; i += 1) {
+        vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
+      }
+      expect(broken.state()).toBe("lost");
+      expect(brokenAttempts).toBe(GPU_LOSS_BUDGET + 1);
+      expect(slots.held()).toBe(0);
+      expect(brokenChanges).toEqual(["reset", "lost"]);
+
+      // Does not keep retrying after finalizing.
+      vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS * 5);
+      expect(brokenAttempts).toBe(GPU_LOSS_BUDGET + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("handles a terminal with no element cleanly", () => {
+    const addon = fakeAddon();
+    const handle = attachWebglAddon(
+      {
+        element: null,
+        loadAddon() {},
+      },
+      () => addon,
+    );
+    expect(handle.canvas).toBeUndefined();
   });
 });

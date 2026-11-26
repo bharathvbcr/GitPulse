@@ -140,21 +140,21 @@ impl Store {
     /// zero bytes did exactly that one level up. "Not in this store" and
     /// "indexed no files" are different facts and only one of them is an
     /// answer.
+    ///
+    /// The existence check and the select are one deferred snapshot
+    /// ([`Self::generation_snapshot`]): a prune that commits between them,
+    /// from another connection, is invisible to the select, so a generation
+    /// the check found is listed with the files it had, never as `[]`.
     pub fn list_generation_paths(&self, generation_id: u32) -> Result<Vec<String>> {
         let conn = lock_conn(&self.conn)?;
-        let present: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
-            params![generation_id],
-            |row| row.get::<_, i64>(0).map(|found| found != 0),
-        )?;
-        if !present {
+        let Some(snapshot) = Self::generation_snapshot(&conn, generation_id)? else {
             return Err(refusal(format!(
                 "generation {generation_id} is not in this store — it was pruned \
                  or never written — so the files it indexed are unknown, not none; \
                  re-read the latest generation id and ask again"
             )));
-        }
-        let mut stmt = conn.prepare(
+        };
+        let mut stmt = snapshot.prepare(
             "SELECT DISTINCT p.path FROM generation_nodes n
              JOIN paths p ON p.id = n.file_id
              WHERE n.generation_id = ?1",

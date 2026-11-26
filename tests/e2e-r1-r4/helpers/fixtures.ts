@@ -1,7 +1,9 @@
 import type { PlaneProbe, PlaneTask, PlaneTerminal, TaskProbe } from "../../../src/lib/agents/plane";
-import type { MenuState } from "../../../src/lib/desktop/menuState";
+import type { MenuAgentRequest, MenuState } from "../../../src/lib/desktop/menuState";
 import type { InsightsSnapshot } from "../../../src/lib/insights/types";
-import type { FileStatus, RepoOperation } from "../../../src/lib/repos/storeTypes";
+import { ledgerStatus } from "../../../src/lib/ledger/types";
+import type { RepoOperation } from "../../../src/lib/repos/operation";
+import type { FileStatus } from "../../../src/lib/repos/storeTypes";
 
 // ---------------------------------------------------------------------------
 // 1. Claude Code Hook Payloads
@@ -125,6 +127,7 @@ export interface AgyHookPayloadOptions {
   error?: string;
   toolName?: string;
   toolSummary?: string;
+  invocationNum?: number;
 }
 
 const DEFAULT_AGY_UUID = "91a8ef12-3456-4789-abcd-ef0123456789";
@@ -142,6 +145,7 @@ export function agyPreInvocation(opts: AgyHookPayloadOptions = {}) {
     hookEventName: "PreInvocation",
     conversationId: opts.conversationId ?? DEFAULT_AGY_UUID,
     cwd: opts.cwd ?? DEFAULT_CWD,
+    ...(opts.invocationNum !== undefined ? { invocationNum: opts.invocationNum } : {}),
   };
 }
 
@@ -229,33 +233,55 @@ const DEFAULT_ENABLED_ACTIONS = [
   "section:insights:pulse",
 ];
 
-export interface MenuAgentRequestFixture {
-  id: string;
-  sessionId?: string;
-  agent?: string;
-  kind?: string;
-  label?: string;
-  repoPath?: string;
-  repoLabel?: string;
-  urgency?: string;
-  event?: string;
-  detail?: string;
-  at?: number;
+export type MenuAgentRequestFixture = MenuAgentRequest;
+
+export type MenuStateFixture = MenuState;
+
+export function makeMenuAgentRequest(
+  overrides: Partial<MenuAgentRequest> = {},
+): MenuAgentRequest {
+  const provider = overrides.provider ?? "claude";
+  const urgency = overrides.urgency ?? "blocking";
+  const defaultAgentLabel =
+    provider === "agy"
+      ? "Antigravity"
+      : provider === "codex"
+        ? "Codex"
+        : provider === "claude"
+          ? "Claude Code"
+          : provider === "manvi"
+            ? "Manvi"
+            : provider === "grok"
+              ? "Grok"
+              : provider === "shell"
+                ? "Terminal"
+                : "Agent";
+  return {
+    id: overrides.id ?? "term:req-1",
+    source: overrides.source ?? "terminal",
+    provider,
+    agentLabel: overrides.agentLabel ?? defaultAgentLabel,
+    repoLabel: overrides.repoLabel ?? "GitPulse",
+    repoPath: overrides.repoPath !== undefined ? overrides.repoPath : "/Projects/GitPulse",
+    urgency,
+    reason:
+      overrides.reason ??
+      (urgency === "error"
+        ? "Stopped on an error"
+        : urgency === "informational"
+          ? "Notification"
+          : "Needs your permission"),
+    detail: overrides.detail !== undefined ? overrides.detail : "Allow Bash: git status",
+    atMs: overrides.atMs !== undefined ? overrides.atMs : Date.now() - 10_000,
+  };
 }
 
-export type MenuStateFixture = MenuState & {
-  agentRequests?: MenuAgentRequestFixture[];
-  agentRequestsHidden?: number;
-  agentsRunning?: number;
-  agentsInformational?: number;
-};
-
 export function makeMenuState(
-  overrides: Partial<MenuStateFixture> & { statusOverrides?: Partial<MenuState["status"]> } = {},
-): MenuStateFixture {
+  overrides: Partial<MenuState> & { statusOverrides?: Partial<MenuState["status"]> } = {},
+): MenuState {
   const { statusOverrides, ...rest } = overrides;
   const activePath = rest.activePath !== undefined ? rest.activePath : "/Projects/GitPulse";
-  const base: MenuStateFixture = {
+  const base: MenuState = {
     enabled: [...DEFAULT_ENABLED_ACTIONS],
     checked: ["theme-dark", "tab-work", "section:work:overview"],
     labels: [
@@ -303,6 +329,10 @@ export function makeMenuState(
     },
     trayDetail: activePath ? "GitPulse · main" : "GitPulse",
     agentsWaiting: 0,
+    agentRequests: [],
+    agentRequestsHidden: 0,
+    agentsRunning: 0,
+    agentsInformational: 0,
     status: {
       repository: "GitPulse",
       branch: activePath ? "main" : "",
@@ -330,19 +360,21 @@ export function makeMenuState(
 }
 
 export function makeMenuStateWithRequests(
-  requests: MenuAgentRequestFixture[],
+  requests: MenuAgentRequest[],
   opts: {
+    agentsWaiting?: number;
     agentsRunning?: number;
     agentsInformational?: number;
     agentRequestsHidden?: number;
     conflicts?: number;
   } = {},
-): MenuStateFixture {
+): MenuState {
   const conflicts = opts.conflicts ?? 0;
+  const hidden = opts.agentRequestsHidden ?? 0;
   return makeMenuState({
-    agentsWaiting: requests.length,
+    agentsWaiting: opts.agentsWaiting ?? requests.length + hidden,
     agentRequests: requests,
-    agentRequestsHidden: opts.agentRequestsHidden ?? 0,
+    agentRequestsHidden: hidden,
     agentsRunning: opts.agentsRunning ?? 1,
     agentsInformational: opts.agentsInformational ?? 0,
     traySummary: {
@@ -585,7 +617,7 @@ export function makeInsightsSnapshot(
       sessions_ok: true,
       sessions_error: "",
     },
-    ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
+    ledger: ledgerStatus({ recording: true, path: "", dropped: 0, error: "", error_code: "" }),
     codeintel: { available: false, db_path: "" },
   };
 }

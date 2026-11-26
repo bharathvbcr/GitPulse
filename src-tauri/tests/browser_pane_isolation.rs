@@ -873,12 +873,15 @@ mod mac {
 
         // 11. An agent's `gitpulse_browser_open`, as the single-instance
         //     mailbox hands it to the app, reaches the page as the event the
-        //     frontend listens for (`browseRequests.ts`).
+        //     frontend listens for (`browseRequests.ts`). Events for "main"
+        //     wait until its page says it is ready (`cmd_main_ready`, which
+        //     `App.svelte` calls on mount), so the page says so first.
         let listening = on_main(app, |app| {
             let main = app.get_webview_window("main").expect("main window");
             main.eval(
                 r#"(async () => {
   const r = { who: 'browse', events: [] };
+  await window.__TAURI_INTERNALS__.invoke('cmd_main_ready');
   const handler = window.__TAURI_INTERNALS__.transformCallback((e) => r.events.push(e.payload));
   await window.__TAURI_INTERNALS__.invoke('plugin:event|listen', { event: 'gitpulse-browse', target: { kind: 'Any' }, handler });
   await fetch('/report', { method: 'POST', body: JSON.stringify({ who: 'browse-ready' }) });
@@ -965,6 +968,8 @@ mod mac {
                 gitpulse_lib::browser::commands::cmd_browser_go,
                 gitpulse_lib::browser::commands::cmd_browser_close,
                 gitpulse_lib::browser::commands::cmd_browser_snapshot,
+                // What the app's page calls on mount (step 11).
+                gitpulse_lib::desktop::hibernate::cmd_main_ready,
             ])
             .setup(move |app| {
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?.build()?;

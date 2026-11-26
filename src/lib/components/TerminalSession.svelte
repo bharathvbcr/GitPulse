@@ -130,7 +130,7 @@
   import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
-  import { AlertCircle, AlertTriangle, Check, Clipboard, Copy, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink, FileText, Send, Terminal } from "@lucide/svelte";
+  import { AlertCircle, AlertTriangle, Check, Clipboard, Columns, Copy, Eye, FileCode, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink, FileText, Send, Terminal } from "@lucide/svelte";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
@@ -175,7 +175,8 @@
   import { reportAttentionAnswered, terminalAttendance } from "../stores/sessionAlertsStore";
   import { PEER_QUIESCENCE_MS, canAutoWakePeerInbox, clean, sessionActivity } from "../terminal/sessionActivity";
   import { bindTerminalRunThread } from "../workbench/client";
-  import { createGpuRenderer, type GpuRenderer, type GpuState } from "../terminal/gpuRenderer";
+  import { attachWebglAddon, createGpuRenderer, type GpuRenderer, type GpuState } from "../terminal/gpuRenderer";
+  import { xtermLogger } from "../terminal/xtermLogger";
   import { createFrameProbe, FRAME_PROBE_OSC, handleFrameProbeCommand } from "../diagnostics/frameProbe";
   import {
     clipEndedTail,
@@ -197,8 +198,24 @@
   import { isLoopbackUrl } from "../browser/browserSession";
   import { terminalLaunchRequests } from "../terminal/launchRequests";
   import { repoStore } from "../stores/repoStore";
-  import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
-  import { requestReveal } from "../files/revealRequests";
+  import { linksForRow, resolveLinkAction, type LinkBuffer, type LinkRange } from "../terminal/links";
+  import {
+    extractTerminalTokenAtCell,
+    isCellInTerminalRange,
+    isHtmlFile,
+    requestHtmlViewMode,
+    resolveTerminalHtmlCandidate,
+    type HtmlViewMode,
+    type TerminalHtmlTarget,
+  } from "../files/htmlPreview";
+  import {
+    isSvgFile,
+    requestSvgViewMode,
+    resolveTerminalSvgCandidate,
+    type SvgViewMode,
+    type TerminalSvgTarget,
+  } from "../files/svgPreview";
+  import { consumeReveal, requestReveal } from "../files/revealRequests";
   import { openTaskForRun } from "../workbench/taskOpen";
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
@@ -413,6 +430,8 @@
   /** What the pointer is currently over, shown in the footer so the target is
    * readable before the click rather than only after it. */
   let hoveredLink = $state<string | null>(null);
+  let hoveredLinkRaw: string | null = null;
+  let hoveredLinkRange: LinkRange | null = null;
   /** Set once xterm is open in its container; a renderer can only attach after. */
   let opened = $state(false);
   /** How this session draws now; on the container as `data-renderer`. */
@@ -429,6 +448,8 @@
   let hasCompletedBlock = $state(false);
   let copiedLabel = $state<string | null>(null);
   let contextMenu = $state<{ x: number; y: number } | null>(null);
+  let contextHtmlTarget = $state<TerminalHtmlTarget | null>(null);
+  let contextSvgTarget = $state<TerminalSvgTarget | null>(null);
   let consumedInitialCommand = false;
   let suppressSelectToCopy = false;
   const copyFlash = createCopyFlash((on) => {
@@ -567,6 +588,7 @@
         if (!line) return null;
         const chars: string[] = [];
         const columns: number[] = [];
+        const widths: number[] = [];
         let column = 1;
         const width = Math.min(line.length, t.cols);
         for (let x = 0; x < width; x++) {
@@ -576,11 +598,14 @@
           if (cellWidth === 0) continue;
           // An untouched cell reads as the empty string and occupies a column.
           const text = cell.getChars() || " ";
-          for (let i = 0; i < text.length; i++) columns.push(column);
+          for (let i = 0; i < text.length; i++) {
+            columns.push(column);
+            widths.push(cellWidth);
+          }
           chars.push(text);
           column += cellWidth;
         }
-        return { isWrapped: line.isWrapped, text: chars.join(""), columns };
+        return { isWrapped: line.isWrapped, text: chars.join(""), columns, widths };
       },
     };
   }
@@ -673,11 +698,93 @@
     }
     if (action.kind === "file") {
       const at = action.line === null ? "" : ` (line ${action.line}${action.column === null ? "" : `, column ${action.column}`})`;
+      const verb = (isHtmlFile(action.path) || isSvgFile(action.path)) && action.line === null ? "Preview" : "Open";
       return onOpenFileSplit
-        ? `Open ${action.path}${at} beside terminal (${platformChord("⌘-click", "Ctrl+click", $hostPlatform.os)} for Code view)`
-        : `Open ${action.path}${at}`;
+        ? `${verb} ${action.path}${at} beside terminal (${platformChord("⌘-click", "Ctrl+click", $hostPlatform.os)} for Code view)`
+        : `${verb} ${action.path}${at}`;
     }
     return action.reason;
+  }
+
+  function pointerTerminalCell(event: MouseEvent): { row1: number; col1: number } | null {
+    const current = term;
+    const hostEl = container;
+    if (!current || !hostEl || current.cols <= 0 || current.rows <= 0) return null;
+    const screen = hostEl.querySelector<HTMLElement>(".xterm-screen") ?? hostEl;
+    const rect = screen.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const col0 = Math.floor(((event.clientX - rect.left) / rect.width) * current.cols);
+    const row0 = Math.floor(((event.clientY - rect.top) / rect.height) * current.rows);
+    if (col0 < 0 || col0 >= current.cols || row0 < 0 || row0 >= current.rows) return null;
+    return { row1: current.buffer.active.viewportY + row0 + 1, col1: col0 + 1 };
+  }
+
+  function tokenUnderTerminalPointer(cell: { row1: number; col1: number } | null): string | null {
+    const current = term;
+    if (!current || !cell) return null;
+    try {
+      return extractTerminalTokenAtCell(linkBuffer(current), cell.row1, cell.col1);
+    } catch {
+      return null;
+    }
+  }
+
+  async function openContextHtml(target: TerminalHtmlTarget, mode: HtmlViewMode) {
+    if (mode === "preview") {
+      consumeReveal(target.path);
+      if (target.fallbackPath) consumeReveal(target.fallbackPath);
+    }
+    requestHtmlViewMode(workPath, target.path, mode, Date.now(), target.fallbackPath);
+    const revealLine = mode === "preview" ? null : target.line;
+    const revealColumn = mode === "preview" ? null : target.column;
+    if (onOpenFileSplit?.(target.path, revealLine, revealColumn, target.fallbackPath)) {
+      return;
+    }
+    const state = get(repoStore);
+    const activePath = state.openTabs.find((tab) => tab.id === state.activeTabId)?.path ?? "";
+    if (checkout && activePath !== checkout) {
+      let ready = false;
+      const openedRepo = await repoStore.openRepo(checkout, { onReady: () => { ready = true; } });
+      if (!openedRepo || !ready) {
+        warning = `Couldn't open ${checkout.split(/[\\/]/).pop()} to show ${target.path}.`;
+        return;
+      }
+    } else if (!checkout && activePath !== repoPath) {
+      warning = "Switch to this terminal's repository to open its files.";
+      return;
+    }
+    if (revealLine !== null) requestReveal(target.path, revealLine, revealColumn);
+    repoStore.selectFilePath(target.path);
+    repoStore.setActiveTab("code", "explorer");
+  }
+
+  async function openContextSvg(target: TerminalSvgTarget, mode: SvgViewMode) {
+    if (mode === "preview") {
+      consumeReveal(target.path);
+      if (target.fallbackPath) consumeReveal(target.fallbackPath);
+    }
+    requestSvgViewMode(workPath, target.path, mode, Date.now(), target.fallbackPath);
+    const revealLine = mode === "preview" ? null : target.line;
+    const revealColumn = mode === "preview" ? null : target.column;
+    if (onOpenFileSplit?.(target.path, revealLine, revealColumn, target.fallbackPath)) {
+      return;
+    }
+    const state = get(repoStore);
+    const activePath = state.openTabs.find((tab) => tab.id === state.activeTabId)?.path ?? "";
+    if (checkout && activePath !== checkout) {
+      let ready = false;
+      const openedRepo = await repoStore.openRepo(checkout, { onReady: () => { ready = true; } });
+      if (!openedRepo || !ready) {
+        warning = `Couldn't open ${checkout.split(/[\\/]/).pop()} to show ${target.path}.`;
+        return;
+      }
+    } else if (!checkout && activePath !== repoPath) {
+      warning = "Switch to this terminal's repository to open its files.";
+      return;
+    }
+    if (revealLine !== null) requestReveal(target.path, revealLine, revealColumn);
+    repoStore.selectFilePath(target.path);
+    repoStore.setActiveTab("code", "explorer");
   }
 
   /** Rows of history this session keeps: its kind's setting, see `terminalScrollbackFor`. */
@@ -695,6 +802,7 @@
       ...macOptionOptions(get(hostPlatform).os, get(interfaceStore).terminalOptionAsMeta),
       // The official search addon uses xterm's proposed decoration API.
       allowProposedApi: true,
+      logger: xtermLogger,
       cursorBlink: true,
       convertEol: false,
       theme: termTheme(),
@@ -762,8 +870,8 @@
             range: link.range,
             text: link.text,
             activate: (event, text) => { void activateLink(text, event); },
-            hover: () => { hoveredLink = linkTitle(link.text); },
-            leave: () => { hoveredLink = null; },
+            hover: () => { hoveredLinkRaw = link.text; hoveredLinkRange = link.range; hoveredLink = linkTitle(link.text); },
+            leave: () => { hoveredLinkRaw = null; hoveredLinkRange = null; hoveredLink = null; },
           })) : undefined);
         } catch {
           // A buffer read that races a reset must not break linkification for
@@ -1794,20 +1902,26 @@
           },
           onDismiss: () => {
             contextMenu = null;
+            contextHtmlTarget = null;
+            contextSvgTarget = null;
             if (active) term?.focus();
           },
         }
       : null,
   );
 
-  function closeContextMenu(then?: () => void) {
+  function closeContextMenu(then?: () => void, options: { focusTerminal?: boolean } = {}) {
     contextMenu = null;
+    contextHtmlTarget = null;
+    contextSvgTarget = null;
     then?.();
-    if (active) term?.focus();
+    if (options.focusTerminal !== false && active) term?.focus();
   }
 
   async function pasteFromContextMenu() {
     contextMenu = null;
+    contextHtmlTarget = null;
+    contextSvgTarget = null;
     const read = await readClipboardText();
     if (!read.ok) {
       warning =
@@ -2113,6 +2227,37 @@
       event.stopPropagation();
       hasActiveSelection = Boolean(term?.hasSelection());
       hasCompletedBlock = commandBlocks.lastCompletedBlock() !== null;
+      const selected = term?.hasSelection() ? term.getSelection() : null;
+      const pointerCell = pointerTerminalCell(event);
+      const pointerToken = tokenUnderTerminalPointer(pointerCell);
+      const hoveredAtPointer =
+        pointerCell && isCellInTerminalRange(hoveredLinkRange, pointerCell.row1, pointerCell.col1)
+          ? hoveredLinkRaw
+          : null;
+      // Resolve by pointer proximity first (hovered link -> cell token -> selection)
+      // so right-clicking an SVG token never loses to an unrelated HTML selection.
+      const hoveredHtml = resolveTerminalHtmlCandidate(hoveredAtPointer, workPath, activeCwdSubdir);
+      const hoveredSvg = hoveredHtml
+        ? null
+        : resolveTerminalSvgCandidate(hoveredAtPointer, workPath, activeCwdSubdir);
+      const tokenHtml =
+        hoveredHtml || hoveredSvg
+          ? null
+          : resolveTerminalHtmlCandidate(pointerToken, workPath, activeCwdSubdir);
+      const tokenSvg =
+        hoveredHtml || hoveredSvg || tokenHtml
+          ? null
+          : resolveTerminalSvgCandidate(pointerToken, workPath, activeCwdSubdir);
+      const selectedHtml =
+        hoveredHtml || hoveredSvg || tokenHtml || tokenSvg
+          ? null
+          : resolveTerminalHtmlCandidate(selected, workPath, activeCwdSubdir);
+      const selectedSvg =
+        hoveredHtml || hoveredSvg || tokenHtml || tokenSvg || selectedHtml
+          ? null
+          : resolveTerminalSvgCandidate(selected, workPath, activeCwdSubdir);
+      contextHtmlTarget = hoveredHtml ?? tokenHtml ?? selectedHtml;
+      contextSvgTarget = hoveredSvg ?? tokenSvg ?? selectedSvg;
       contextMenu = { x: event.clientX, y: event.clientY };
     };
     const pastePlainText = (raw: string, current: XTerm) => {
@@ -2261,29 +2406,7 @@
       if (t) scrollFeel = createScrollFeel(t, { enabled: () => get(interfaceStore).terminalSmoothWheel, onSample: wheelDiagnostic() });
       if (t) {
         gpu = createGpuRenderer({
-          attach: () => {
-            const addon = new WebglAddon();
-            t.loadAddon(addon);
-            // The addon exposes no canvas; its WebGL one is the only canvas
-            // on the screen without a `-layer` class (the link layer has one).
-            // The renderer loses its context on release (xterm.js #6068).
-            // Only the screen: the addon's glyph atlas, shared by terminals
-            // with the same config, parks its hidden 2D scratch canvas
-            // (`TextureAtlas._tmpCanvas`, also classless) on the root of
-            // whichever terminal last rasterized a glyph. Searched from the
-            // root, the WebGL canvas is found first only by document order;
-            // were that to change, release would lose nothing and the
-            // context would wait for the collector.
-            const canvas = [...(t.screenElement?.querySelectorAll("canvas") ?? [])].find(
-              (node) => ![...node.classList].some((name) => name.endsWith("-layer")),
-            );
-            return {
-              canvas,
-              dispose: () => addon.dispose(),
-              onContextLoss: (listener) => addon.onContextLoss(listener),
-              clearTextureAtlas: () => addon.clearTextureAtlas(),
-            };
-          },
+          attach: () => attachWebglAddon(t, () => new WebglAddon()),
           refresh: () => t.refresh(0, t.rows - 1),
           onChange: (state) => (renderer = state),
         });
@@ -2688,7 +2811,11 @@
     if (active) reveal();
     // A hover label left over from before the switch names a link the pointer
     // is no longer on, in a tab that may not even be visible.
-    else hoveredLink = null;
+    else {
+      hoveredLink = null;
+      hoveredLinkRaw = null;
+      hoveredLinkRange = null;
+    }
   });
 
   $effect(() => {
@@ -3128,6 +3255,97 @@
     aria-label="Terminal viewport actions"
     tabindex="-1"
   >
+    {#if contextHtmlTarget}
+      {@const htmlTarget = contextHtmlTarget}
+      <div class="px-2 py-1 text-micro text-textMuted font-mono truncate font-semibold" title={htmlTarget.path}>
+        {htmlTarget.path}
+      </div>
+      <button
+        type="button"
+        role="menuitem"
+        class="gp-menu-item"
+        data-testid="terminal-ctx-html-preview"
+        onclick={() => {
+          const target = htmlTarget;
+          closeContextMenu(() => { void openContextHtml(target, "preview"); }, { focusTerminal: false });
+        }}
+      >
+        <Eye size={12} class="shrink-0 text-accent" />
+        <span>Open as Preview</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        class="gp-menu-item"
+        data-testid="terminal-ctx-html-split"
+        onclick={() => {
+          const target = htmlTarget;
+          closeContextMenu(() => { void openContextHtml(target, "split"); }, { focusTerminal: false });
+        }}
+      >
+        <Columns size={12} class="shrink-0 text-accent" />
+        <span>Open Code &amp; Preview</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        class="gp-menu-item"
+        data-testid="terminal-ctx-html-code"
+        onclick={() => {
+          const target = htmlTarget;
+          closeContextMenu(() => { void openContextHtml(target, "code"); }, { focusTerminal: false });
+        }}
+      >
+        <FileCode size={12} class="shrink-0 text-textMuted" />
+        <span>Open HTML Code</span>
+      </button>
+      <div class="gp-menu-sep my-0.5" role="separator"></div>
+    {:else if contextSvgTarget}
+      {@const svgTarget = contextSvgTarget}
+      <div class="px-2 py-1 text-micro text-textMuted font-mono truncate font-semibold" title={svgTarget.path}>
+        {svgTarget.path}
+      </div>
+      <button
+        type="button"
+        role="menuitem"
+        class="gp-menu-item"
+        data-testid="terminal-ctx-svg-preview"
+        onclick={() => {
+          const target = svgTarget;
+          closeContextMenu(() => { void openContextSvg(target, "preview"); }, { focusTerminal: false });
+        }}
+      >
+        <Eye size={12} class="shrink-0 text-accent" />
+        <span>Open as Preview</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        class="gp-menu-item"
+        data-testid="terminal-ctx-svg-split"
+        onclick={() => {
+          const target = svgTarget;
+          closeContextMenu(() => { void openContextSvg(target, "split"); }, { focusTerminal: false });
+        }}
+      >
+        <Columns size={12} class="shrink-0 text-accent" />
+        <span>Open Code &amp; Preview</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        class="gp-menu-item"
+        data-testid="terminal-ctx-svg-code"
+        onclick={() => {
+          const target = svgTarget;
+          closeContextMenu(() => { void openContextSvg(target, "code"); }, { focusTerminal: false });
+        }}
+      >
+        <FileCode size={12} class="shrink-0 text-textMuted" />
+        <span>Open SVG Code</span>
+      </button>
+      <div class="gp-menu-sep my-0.5" role="separator"></div>
+    {/if}
     <button
       type="button"
       role="menuitem"

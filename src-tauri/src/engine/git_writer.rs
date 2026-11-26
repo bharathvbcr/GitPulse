@@ -5530,7 +5530,7 @@ mod tests {
                 &["merge", "--no-edit", "side"]
             };
             assert!(
-                !git_captured(repo, args).unwrap().success,
+                crate::test_support::git_merge_in(repo, args),
                 "{flavour}: the fixture merge should conflict"
             );
             GitWriter::rollback_failed_merge_locked(repo)
@@ -5554,11 +5554,10 @@ mod tests {
     fn rollback_leaves_unmerged_entries_with_no_marker_alone() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
         let before = std::fs::read_to_string(repo.join("f.txt")).unwrap();
         let refused = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
@@ -5578,11 +5577,10 @@ mod tests {
     fn rollback_is_not_run_when_the_gate_refuses_it() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         let mut asked = Vec::new();
         let refused = GitWriter::rollback_failed_merge_gated(
             repo,
@@ -5612,11 +5610,10 @@ mod tests {
     fn rollback_never_aborts_a_merge_it_did_not_start() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         let foreign = "b".repeat(40);
         let mut asked = Vec::new();
         let refused =
@@ -5655,11 +5652,10 @@ mod tests {
     fn rollback_that_cannot_restore_the_checkout_says_so() {
         let dir = conflicting_checkout();
         let repo = dir.path();
-        assert!(
-            !git_captured(repo, &["merge", "--no-edit", "side"])
-                .unwrap()
-                .success
-        );
+        assert!(crate::test_support::git_merge_in(
+            repo,
+            &["merge", "--no-edit", "side"]
+        ));
         let lock = repo.join(".git/index.lock");
         std::fs::write(&lock, "").unwrap();
         let failed = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
@@ -8389,14 +8385,9 @@ mod tests {
     }
 
     /// Installs an executable `name` hook in `dir`'s default hooks directory.
-    #[cfg(unix)]
     fn install_hook(dir: &std::path::Path, name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let hooks = dir.join(".git/hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        let path = hooks.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join(".git/hooks").join(name);
+        crate::test_support::write_git_script(&path, &format!("#!/bin/sh\n{body}\n"), true);
     }
 
     fn head_oid(dir: &tempfile::TempDir) -> String {
@@ -8408,7 +8399,6 @@ mod tests {
 
     /// A hook that outlives the hook budget is stopped, and the error names
     /// the hook rather than calling it a git hang.
-    #[cfg(unix)]
     #[test]
     fn a_hook_past_its_budget_is_named_in_the_timeout() {
         let dir = init_repo_with_commit();
@@ -8448,7 +8438,6 @@ mod tests {
 
     /// The user can stop a slow hook from the UI; the commit does not land
     /// and the hook's process goes with git's.
-    #[cfg(unix)]
     #[test]
     fn a_running_hook_is_cancelled_on_request() {
         let dir = init_repo_with_commit();
@@ -8456,7 +8445,7 @@ mod tests {
         install_hook(
             dir.path(),
             "pre-commit",
-            &format!("touch '{}'\nsleep 30", marker.display()),
+            &format!("touch {}\nsleep 30", crate::test_support::sh_quote(&marker)),
         );
         std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
         git_in(dir.path(), &["add", "tracked.txt"]);

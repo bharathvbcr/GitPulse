@@ -83,6 +83,14 @@ pub fn nanos_since_epoch(time: std::time::SystemTime) -> i128 {
 /// `None` for absent, oversized, non-UTF-8, or not-a-regular-file, all of which
 /// mean the same thing to a caller: no memo, hash the bytes.
 pub fn read_bounded(path: &Path, cap: u64) -> Option<String> {
+    String::from_utf8(read_bounded_bytes(path, cap)?).ok()
+}
+
+/// [`read_bounded`] without the UTF-8 requirement: the file's bytes, under the
+/// same bound and the same refusal of anything that is not a regular file. For a
+/// caller whose format allows arbitrary bytes (git ref names, for one), where
+/// "not UTF-8" is not the same fact as "malformed".
+pub fn read_bounded_bytes(path: &Path, cap: u64) -> Option<Vec<u8>> {
     // Follows symlinks deliberately — a memo reached through one is still a
     // memo — but resolves to something that must be a regular file.
     let stat = std::fs::metadata(path).ok()?;
@@ -104,9 +112,9 @@ pub fn read_bounded(path: &Path, cap: u64) -> Option<String> {
     if !meta.is_file() || meta.len() > cap {
         return None;
     }
-    let mut text = String::new();
-    file.take(cap).read_to_string(&mut text).ok()?;
-    Some(text)
+    let mut bytes = Vec::new();
+    file.take(cap).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 #[cfg(test)]

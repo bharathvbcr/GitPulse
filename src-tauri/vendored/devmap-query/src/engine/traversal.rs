@@ -231,7 +231,9 @@ pub(super) fn indexed_traversal_starts(
     let mut symbol_fallback = false;
     match query {
         crate::query_match::StartQuery::Nothing => {}
-        crate::query_match::StartQuery::Qualified { file, symbol } => {
+        crate::query_match::StartQuery::Qualified { symbol, .. } => {
+            let trimmed = target.trim();
+            let mut matched_by_file_or_module = false;
             for (checked, (candidate, group)) in index.symbols(reverse).enumerate() {
                 cancel.check_every(checked)?;
                 if !crate::query_match::symbol_matches(candidate, symbol) {
@@ -243,10 +245,20 @@ pub(super) fn indexed_traversal_starts(
                     } else {
                         index.source_file(*id)
                     };
-                    if crate::query_match::path_matches(path, file) {
+                    if crate::query_match::qualified_file_or_module_matches(
+                        trimmed, candidate, path,
+                    ) {
+                        matched_by_file_or_module = true;
+                        ids.push(*id);
+                    } else if crate::query_match::scoped_symbol_matches(candidate, trimmed) {
                         ids.push(*id);
                     }
                 }
+            }
+            // A pure `Type::method` match (no file or module qualifier matched)
+            // behaves like `Type.method`: refuse when it names multiple files.
+            if !ids.is_empty() && !matched_by_file_or_module {
+                symbol_fallback = true;
             }
         }
         crate::query_match::StartQuery::Path(path) => {

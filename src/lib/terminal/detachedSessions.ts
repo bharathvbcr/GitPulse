@@ -34,9 +34,8 @@ import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
 import { askConfirm } from "../stores/modalStore";
 import { replaceProtection } from "./protection";
 
-export const DETACHED_STATUS = "Still running — not shown in any tab";
-/** A session whose terminal closed but whose process has not exited: stoppable, never shown. */
-export const ENDING_STATUS = "Ending — its process has not exited";
+import { DETACHED_STATUS, ENDING_STATUS } from "./sessionStatus";
+export { DETACHED_STATUS, ENDING_STATUS };
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 type Confirm = (options: { title: string; message: string; confirmLabel: string; destructive: boolean }) => Promise<boolean>;

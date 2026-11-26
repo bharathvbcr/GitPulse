@@ -251,6 +251,35 @@ fn vault_cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The cache keeps 8 repositories. Tests that measure what a resident
+/// snapshot saves hold this shared; eviction holds it exclusively, so it
+/// cannot evict resident snapshots midway through a measurement.
+fn cache_residency() -> &'static std::sync::RwLock<()> {
+    static RESIDENCY: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    &RESIDENCY
+}
+
+/// Evicts cold cached repository vaults under the residency lock without
+/// interrupting active readers (which already hold `Arc<CachedVault>`).
+///
+/// Entries with an active `load_vault` slot handle (`strong_count > 1`) are
+/// preserved; cold entries are removed and the backing map shrinks.
+pub fn trim_idle_cache() -> usize {
+    let _evicting = cache_residency()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(mut cache) = vault_cache().try_lock() else {
+        return 0;
+    };
+    let before = cache.len();
+    cache.retain(|_, entry| Arc::strong_count(&entry.slot) > 1);
+    let evicted = before.saturating_sub(cache.len());
+    if evicted > 0 {
+        cache.shrink_to_fit();
+    }
+    evicted
+}
+
 /// A detached/evicted slot can finish for its existing callers but cannot
 /// republish itself into the cache after invalidation. Work for a resident
 /// repository shares one slot instead of racing duplicate cold builds.
@@ -898,14 +927,6 @@ mod tests {
 
     /// Past the racy window, so every file the fixture wrote counts as settled.
     const SETTLED: Duration = Duration::from_secs(5);
-
-    /// The cache keeps 8 repositories. Tests that measure what a resident
-    /// snapshot saves hold this shared; the test that opens ten repositories
-    /// to prove eviction holds it exclusively, so it cannot evict them midway.
-    fn cache_residency() -> &'static std::sync::RwLock<()> {
-        static RESIDENCY: std::sync::RwLock<()> = std::sync::RwLock::new(());
-        &RESIDENCY
-    }
 
     fn resident() -> std::sync::RwLockReadGuard<'static, ()> {
         cache_residency()
@@ -1630,6 +1651,19 @@ mod tests {
         assert_eq!(reported.truncated, refreshed.truncated);
         assert_eq!(reported.skipped_oversized, refreshed.skipped_oversized);
         assert_eq!(reported.skipped_unreadable, refreshed.skipped_unreadable);
+    }
+
+    #[test]
+    fn trim_idle_cache_evicts_cold_vaults_without_breaking_queries_or_active_readers() {
+        let dir = fixture_repo();
+        let path = dir.path().to_str().unwrap();
+        let active = load_vault(path, true).unwrap();
+        let evicted = trim_idle_cache();
+        assert!(evicted >= 1, "expected >= 1 cached vault evicted");
+        // Existing Arc<CachedVault> reader continues working uninterrupted.
+        assert!(!active.vault.search("Plan", 10).is_empty());
+        // Next query transparently rebuilds into the cache.
+        assert!(!search(path, "Plan", 10).unwrap().is_empty());
     }
 }
 

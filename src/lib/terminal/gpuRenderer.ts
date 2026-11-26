@@ -190,6 +190,189 @@ export function loseWebglContext(canvas: GpuCanvas | null | undefined): boolean 
   }
 }
 
+/** Minimal detached container used to silence events on an orphaned WebGL canvas. */
+export interface WebglHostContainer<TNode> {
+  addEventListener(
+    type: "webglcontextlost" | "webglcontextrestored",
+    listener: (event: { stopPropagation(): void }) => void,
+    capture?: boolean,
+  ): void;
+  appendChild(node: TNode): unknown;
+}
+
+/** The slice of a canvas element needed to identify and clean up a WebGL addon canvas. */
+export interface WebglHostCanvas<TSelf = never> extends GpuCanvas {
+  readonly classList: Iterable<string>;
+  remove(): void;
+  readonly ownerDocument?: {
+    createElement(tagName: "div"): WebglHostContainer<TSelf>;
+  } | null;
+}
+
+/** The slice of a terminal's root element needed to inspect canvases around addon activation. */
+export interface WebglHostElement<TCanvas extends WebglHostCanvas<TCanvas> = WebglHostCanvas> {
+  querySelectorAll(selector: "canvas"): Iterable<TCanvas>;
+}
+
+/**
+ * Thrown by {@link attachWebglAddon} when a WebGL2 context was created but
+ * already lost during addon initialization (for example during wake from sleep,
+ * GPU process restart, or WebKit context eviction). Unlike an unsupported
+ * environment where `getContext("webgl2")` returns `null`, this failure is
+ * transient and eligible for bounded recovery in {@link createGpuRenderer}.
+ */
+export class WebglContextLostAttachError extends Error {
+  readonly recoverable = true as const;
+  override readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("WebGL2 context lost during addon initialization");
+    this.name = "WebglContextLostAttachError";
+    this.cause = cause;
+  }
+}
+
+export function isRecoverableWebglAttachError(error: unknown): boolean {
+  return (
+    error instanceof WebglContextLostAttachError
+    || (typeof error === "object" && error !== null && (error as { recoverable?: unknown }).recoverable === true)
+  );
+}
+
+function isLayerCanvas(node: { readonly classList: Iterable<string> }): boolean {
+  for (const name of node.classList) {
+    if (name.endsWith("-layer")) return true;
+  }
+  return false;
+}
+
+function isWebglContextLost(canvas: GpuCanvas): boolean {
+  try {
+    const gl = canvas.getContext("webgl2");
+    return Boolean(gl && gl.isContextLost());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detaches an orphaned WebGL canvas from the terminal and silences any queued
+ * `webglcontextlost` / `webglcontextrestored` events targeting it.
+ *
+ * When `WebglRenderer`'s constructor throws in `_initializeWebGLState()`, its
+ * `webglcontextlost` and `webglcontextrestored` listeners are already bound
+ * directly to the canvas and never disposed (because `WebglAddon` never
+ * assigned `this._renderer`). Simply calling `node.remove()` still lets a
+ * queued `webglcontextlost` reach that target listener, which calls
+ * `e.preventDefault()` and logs `"xterm.js: webgl context not restored"` 3s
+ * later (or invokes `_initializeWebGLState()` uncaught on restore). Moving the
+ * canvas into a fresh detached `<div>` with capture-phase `stopPropagation()`
+ * listeners both removes it from `.xterm-screen` and intercepts both events in
+ * `CAPTURING_PHASE` before `AT_TARGET`, while remaining GC-able with the canvas.
+ */
+function silenceAndDetachCanvas<TCanvas extends WebglHostCanvas<TCanvas>>(node: TCanvas): void {
+  const doc = node.ownerDocument;
+  if (doc) {
+    try {
+      const graveyard = doc.createElement("div");
+      const stop = (event: { stopPropagation(): void }) => event.stopPropagation();
+      graveyard.addEventListener("webglcontextlost", stop, true);
+      graveyard.addEventListener("webglcontextrestored", stop, true);
+      graveyard.appendChild(node);
+      return;
+    } catch {
+      // Fall back to plain removal on non-DOM test doubles.
+    }
+  }
+  node.remove();
+}
+
+/**
+ * Loads a WebGL addon into a terminal and returns the `GpuAddon` handle with
+ * its WebGL canvas.
+ *
+ * `@xterm/addon-webgl`'s `WebglRenderer` appends both its link-layer canvas
+ * and its WebGL canvas to `.xterm-screen` before compiling shaders, and only
+ * registers its DOM-removal disposable afterwards. When shader compilation or
+ * program linking fails (for example on a context lost during wake or GPU
+ * process restart), `loadAddon` throws after appending those canvases and
+ * registering the addon in xterm's `AddonManager`. Disposing the addon,
+ * silencing and detaching every canvas added during the failed attach, and
+ * freeing any still-live partial WebGL context keeps the DOM renderer
+ * unobstructed and prevents orphaned context-loss timers from firing later.
+ */
+export function attachWebglAddon<
+  TAddon extends GpuAddon,
+  TCanvas extends WebglHostCanvas<TCanvas> = WebglHostCanvas,
+>(
+  terminal: {
+    element?: WebglHostElement<TCanvas> | null;
+    screenElement?: WebglHostElement<TCanvas> | null;
+    loadAddon(addon: NoInfer<TAddon>): void;
+  },
+  createAddon: () => TAddon,
+): GpuAddon {
+  const addon = createAddon();
+  const before = new Set<TCanvas>(terminal.element?.querySelectorAll("canvas") ?? []);
+  try {
+    terminal.loadAddon(addon);
+  } catch (error) {
+    const added: TCanvas[] = [];
+    for (const node of terminal.element?.querySelectorAll("canvas") ?? []) {
+      if (!before.has(node)) added.push(node);
+    }
+    // Check whether the GPU process had already lost the context BEFORE
+    // `addon.dispose()` or `loseWebglContext()` deliberately loses it.
+    let contextLostDuringAttach = false;
+    for (const node of added) {
+      if (!isLayerCanvas(node) && isWebglContextLost(node)) {
+        contextLostDuringAttach = true;
+      }
+    }
+    try {
+      addon.dispose();
+    } catch {
+      // A partially-activated addon may not be cleanly disposable; still remove orphaned canvases.
+    }
+    for (const node of added) {
+      if (isLayerCanvas(node)) {
+        node.remove();
+      } else {
+        // Silence and detach BEFORE calling loseWebglContext so neither the
+        // host's capture listener nor WebglRenderer's orphaned target listener
+        // receives the synthetic webglcontextlost event.
+        silenceAndDetachCanvas(node);
+        if (!contextLostDuringAttach) loseWebglContext(node);
+      }
+    }
+    if (contextLostDuringAttach) {
+      throw new WebglContextLostAttachError(error);
+    }
+    throw error;
+  }
+  // The addon exposes no canvas; its WebGL one is the only canvas on the
+  // screen without a `-layer` class (the link layer has one). The renderer
+  // loses its context on release (xterm.js #6068).
+  // Searched from the screen, not the root: the addon's glyph atlas, shared by
+  // terminals with the same config, parks its hidden 2D scratch canvas
+  // (`TextureAtlas._tmpCanvas`, also classless) on the root of whichever
+  // terminal last rasterized a glyph. From the root the WebGL canvas is found
+  // first only by document order; were that to change, release would lose
+  // nothing and the context would wait for the collector. The root is the
+  // fallback only for a terminal that has no screen element yet.
+  const host = terminal.screenElement ?? terminal.element;
+  const canvases = [...(host?.querySelectorAll("canvas") ?? [])];
+  const canvas =
+    canvases.find((node) => !before.has(node) && !isLayerCanvas(node))
+    ?? canvases.find((node) => !isLayerCanvas(node));
+  return {
+    canvas,
+    dispose: () => addon.dispose(),
+    onContextLoss: (listener) => addon.onContextLoss(listener),
+    clearTextureAtlas: () => addon.clearTextureAtlas?.(),
+  };
+}
+
 /** The shared count of live WebGL contexts. */
 export interface GpuSlots {
   /**
@@ -241,6 +424,21 @@ export interface GpuSlots {
    * can be taken over; returns a function that stops the wait.
    */
   wait(retry: () => void): () => void;
+  /**
+   * Immediately releases all hidden (idle-held) contexts without waiting for
+   * their hide grace timers. Returns how many hidden contexts were released.
+   */
+  releaseIdle?(): number;
+  /**
+   * Suspends or resumes WebGL allocation across the whole window (Stage 1B
+   * deep-shed). While suspended, active sessions drop cleanly to DOM without
+   * counting as GPU losses and re-attach when resumed.
+   */
+  setSuspended?(suspended: boolean): void;
+  /** Whether WebGL allocation is currently suspended. */
+  isSuspended?(): boolean;
+  /** Registers an active renderer so `setSuspended(true)` can release it cleanly. */
+  onSuspend?(release: () => void): () => void;
 }
 
 export function createGpuSlots(
@@ -263,6 +461,8 @@ export function createGpuSlots(
   /** Hidden holders, longest-hidden first (a Set keeps insertion order). */
   const idles = new Set<() => void>();
   const waiters = new Set<() => void>();
+  const suspendListeners = new Set<() => void>();
+  let suspended = false;
   /** Above zero while a take is freeing a slot for itself: nobody else may have it. */
   let reclaiming = 0;
   let notifying = false;
@@ -303,12 +503,12 @@ export function createGpuSlots(
   };
 
   const notify = () => {
-    if (notifying) return;
+    if (notifying || suspended) return;
     notifying = true;
     try {
       // Each retry either takes the slot, which ends the loop's condition, or
       // is final; a waiter that is refused again re-registers behind the loop.
-      while (waiters.size > 0 && active() < hardCap) {
+      while (!suspended && waiters.size > 0 && active() < hardCap) {
         const [next] = waiters;
         waiters.delete(next);
         next();
@@ -320,7 +520,7 @@ export function createGpuSlots(
 
   return {
     take() {
-      if (active() >= hardCap) return false;
+      if (suspended || active() >= hardCap) return false;
       // A terminal on screen always gets its context: the budget is spent on
       // hidden holders first, longest-hidden first.
       const limit = allowed(active() + 1);
@@ -360,6 +560,37 @@ export function createGpuSlots(
       waiters.add(retry);
       return () => {
         waiters.delete(retry);
+      };
+    },
+    releaseIdle() {
+      let released = 0;
+      while (idles.size > 0) {
+        reclaimOldest();
+        released += 1;
+      }
+      return released;
+    },
+    setSuspended(next) {
+      if (suspended === next) return;
+      suspended = next;
+      if (suspended) {
+        while (idles.size > 0) reclaimOldest();
+        for (const listener of [...suspendListeners]) {
+          try {
+            listener();
+          } catch {
+            // One renderer failing to yield must not stop the rest from releasing GPU memory.
+          }
+        }
+      } else {
+        notify();
+      }
+    },
+    isSuspended: () => suspended,
+    onSuspend(listener) {
+      suspendListeners.add(listener);
+      return () => {
+        suspendListeners.delete(listener);
       };
     },
   };
@@ -506,9 +737,16 @@ export function createGpuRenderer(deps: {
     let created: GpuAddon;
     try {
       created = deps.attach();
-    } catch {
-      // No WebGL2, or a context the GPU process refused: as final as a loss.
+    } catch (error) {
       slots.give();
+      if (isRecoverableWebglAttachError(error)) {
+        // A context lost mid-attach (wake from sleep, GPU process restart,
+        // WebKit eviction) is recoverable under the same bounded loss budget
+        // as a runtime context loss, rather than stranding the pane on DOM.
+        recordLoss();
+        return;
+      }
+      // No WebGL2, or a context the GPU process refused: as final as a loss.
       finalize();
       return;
     }
@@ -538,20 +776,8 @@ export function createGpuRenderer(deps: {
     }, wait);
   };
 
-  const lose = (source?: unknown) => {
-    // Nothing held: the late event of a context released on purpose.
-    if (!addon) return;
-    if (source && addon.canvas && source !== addon.canvas) return;
-    // A context held only for warmth is the one both engines evict first (it
-    // drew least recently). Losing it ends the hold early; it is not a fault
-    // on a session anyone is looking at, so it neither counts against the
-    // budget nor schedules a recovery: the next show attaches afresh.
-    const wasHeld = holding;
-    release();
-    if (wasHeld) {
-      set("dom");
-      return;
-    }
+  const recordLoss = () => {
+    if (closed || final) return;
     const now = Date.now();
     lastLossAt = now;
     losses = losses.filter((at) => now - at < policy().lossWindowMs);
@@ -572,6 +798,23 @@ export function createGpuRenderer(deps: {
     scheduleRecover();
   };
 
+  const lose = (source?: unknown) => {
+    // Nothing held: the late event of a context released on purpose.
+    if (!addon) return;
+    if (source && addon.canvas && source !== addon.canvas) return;
+    // A context held only for warmth is the one both engines evict first (it
+    // drew least recently). Losing it ends the hold early; it is not a fault
+    // on a session anyone is looking at, so it neither counts against the
+    // budget nor schedules a recovery: the next show attaches afresh.
+    const wasHeld = holding;
+    release();
+    if (wasHeld) {
+      set("dom");
+      return;
+    }
+    recordLoss();
+  };
+
   const beginHold = () => {
     holding = true;
     holdTimer = setTimeout(() => {
@@ -587,6 +830,15 @@ export function createGpuRenderer(deps: {
     if (addon && holding) withdrawOffer = withdraw;
     else withdraw();
   };
+
+  const stopSuspend = slots.onSuspend?.(() => {
+    if (closed) return;
+    const shouldReattach = wanted && !final;
+    toDom();
+    if (shouldReattach) {
+      stopWaiting ??= slots.wait(retry);
+    }
+  }) ?? null;
 
   return {
     sync(want, enabled = true) {
@@ -632,6 +884,7 @@ export function createGpuRenderer(deps: {
     dispose() {
       closed = true;
       wanted = false;
+      stopSuspend?.();
       clearRecover();
       clearWait();
       release();

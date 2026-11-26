@@ -14,7 +14,18 @@ use super::*;
 /// looks at the rules themselves. It is moved by hand, and a resolver change
 /// that alters any file's edges without moving it is reused as if current.
 /// Moving it costs each store one full resolve (no re-parse) on its next build.
-pub const RESOLUTION_REUSE_EPOCH: &str = "2";
+///
+/// 3: the binding changes of commit 7767f7cf (bare-name candidates, receiver
+/// types, the sibling-field fallbacks) altered edges while this stayed at 2.
+/// 4: a bare call in a plain `.c` file no longer binds a method namesake, so a
+/// stored `UniqueGlobal` edge to a C++/ObjC/CUDA method is stale; and a Java
+/// bare call reaches an inherited in-repo member before the global rung
+/// (ft-0e6cc90f).
+/// 5: JS/TS factory-returned object calls and member references (singletons,
+/// local factory bindings, aliases, chained calls, and composed local-factory
+/// spreads) resolve against `"<factory>()"` object facts while deferring when a
+/// factory declares an explicit nominal class/interface return type.
+pub const RESOLUTION_REUSE_EPOCH: &str = "5";
 
 /// One file's resolution before the whole-tree post-pass.
 ///
@@ -1114,19 +1125,30 @@ impl Resolver {
 
                     // 2a''. A member of a module-scope JS/TS const object built
                     // by spread, `Object.assign`, an alias or a forwarding
-                    // property (`debugLogger.warn()` for `{ ...core }`): the
-                    // member's own declaration, by JavaScript's last-write-wins
-                    // order. A receiver the call's scope rebinds is not the
-                    // module's object, and a member no step can be proven to
-                    // define falls through to the rungs below unchanged.
+                    // property (`debugLogger.warn()` for `{ ...core }`), OR a
+                    // member of an object literal returned by a JS/TS factory
+                    // function (`interfaceStore.applyPreset()`, `counts.report()`):
+                    // resolved by JavaScript's last-write-wins order. A receiver
+                    // the call's scope rebinds shadows module-scope objects,
+                    // while a local initialized from a factory resolves through
+                    // its own initializer.
                     if resolution.is_none() && family == LangFamily::JsTs {
                         if let Some(recv) = call.receiver_expr.as_deref() {
                             let first = recv.split('.').next().unwrap_or(recv);
-                            let shadowed = ext.local_binding_at(call.span.start_byte, first).is_some()
+                            let first_binding = ext.local_binding_at(call.span.start_byte, first);
+                            let exact_binding = if first == recv {
+                                first_binding
+                            } else {
+                                ext.local_binding_at(call.span.start_byte, recv)
+                            };
+                            let shadowed = first_binding.is_some()
+                                || exact_binding.is_some()
                                 || call.caller_symbol.as_deref().is_some_and(|scope| {
                                     self.scope_declares_local(&ext.file_path, scope, first)
                                 });
-                            if !shadowed {
+                            let chained_call =
+                                Self::is_chained_factory_receiver(ext, &call.span, recv);
+                            let answer = if !shadowed {
                                 let use_at = call
                                     .caller_symbol
                                     .is_none()
@@ -1137,31 +1159,53 @@ impl Resolver {
                                     &call.callee_name,
                                     use_at,
                                 ) {
-                                    jsobjects::ObjectMember::Bound(target_file, target_symbol) => {
-                                        resolution = Some(Arc::new(if target_file == ext.file_path {
-                                            Resolution::SameFile { target_symbol, target_file }
-                                        } else {
-                                            Resolution::ImportScoped {
-                                                target_symbol,
-                                                target_file,
-                                                imported_from: recv.to_string(),
-                                            }
-                                        }));
-                                    }
-                                    // The object is known and some step that
-                                    // may define this member is not readable:
-                                    // a later rung would answer with a
-                                    // namesake the object does not have.
-                                    jsobjects::ObjectMember::Abstain => {
-                                        resolution = Some(Arc::new(Resolution::Unresolved {
-                                            reason: format!(
-                                                "the receiver is an object whose member {:?} is written by a step that cannot be read",
-                                                call.callee_name
-                                            ),
-                                        }));
-                                    }
-                                    jsobjects::ObjectMember::Absent => {}
+                                    jsobjects::ObjectMember::Absent => self.factory_member_target(
+                                        &ext.file_path,
+                                        call.caller_symbol.as_deref(),
+                                        recv,
+                                        None,
+                                        chained_call,
+                                        &call.callee_name,
+                                    ),
+                                    decided => decided,
                                 }
+                            } else if exact_binding.is_some() {
+                                self.factory_member_target(
+                                    &ext.file_path,
+                                    call.caller_symbol.as_deref(),
+                                    recv,
+                                    exact_binding,
+                                    false,
+                                    &call.callee_name,
+                                )
+                            } else {
+                                jsobjects::ObjectMember::Absent
+                            };
+                            match answer {
+                                jsobjects::ObjectMember::Bound(target_file, target_symbol) => {
+                                    resolution = Some(Arc::new(if target_file == ext.file_path {
+                                        Resolution::SameFile { target_symbol, target_file }
+                                    } else {
+                                        Resolution::ImportScoped {
+                                            target_symbol,
+                                            target_file,
+                                            imported_from: recv.to_string(),
+                                        }
+                                    }));
+                                }
+                                // The object is known and some step that
+                                // may define this member is not readable:
+                                // a later rung would answer with a
+                                // namesake the object does not have.
+                                jsobjects::ObjectMember::Abstain => {
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: format!(
+                                            "the receiver is an object whose member {:?} is written by a step that cannot be read",
+                                            call.callee_name
+                                        ),
+                                    }));
+                                }
+                                jsobjects::ObjectMember::Absent => {}
                             }
                         }
                     }
@@ -1709,8 +1753,23 @@ impl Resolver {
                     // another file, or a supertype's. Asked before the module's
                     // free functions, because a member shadows a function of the
                     // same name.
+                    //
+                    // Java reads the same way: a bare call inside a class is
+                    // first a member of that class or of a supertype
+                    // (ft-0e6cc90f). It must be asked before the global rung,
+                    // whose guard abstains for any class whose chain reaches a
+                    // base the index does not declare (`extends Service`), so
+                    // an in-repo member inherited through such a chain would
+                    // otherwise have no edge at all.
+                    //
+                    // Kotlin is parked (ft-87b28bb6f7ee8702a35b06117e7efc0b):
+                    // inside a lambda with receiver (`build { helper() }`,
+                    // `build(block: Other.() -> Unit)`) the bare call names
+                    // the lambda's receiver, and the extraction records no
+                    // lambda-literal spans, so the rung would bind the
+                    // enclosing class's member at ReceiverType 1.0 wrongly.
                     if resolution.is_none()
-                        && family == LangFamily::Swift
+                        && matches!(family, LangFamily::Swift | LangFamily::Java)
                         && call.receiver_expr.is_none()
                         && ext
                             .local_binding_at(call.span.start_byte, &call.callee_name)
@@ -1733,11 +1792,23 @@ impl Resolver {
                                 caller,
                                 &call.callee_name,
                             ) {
-                                resolution = Some(Arc::new(Resolution::ReceiverType {
-                                    target_symbol,
-                                    target_file,
-                                    receiver_type,
-                                }));
+                                if family == LangFamily::Swift
+                                    || self.jvm_bare_member_is_provable(
+                                        &ext.file_path,
+                                        family,
+                                        caller,
+                                        &call.callee_name,
+                                        &target_file,
+                                        &target_symbol,
+                                        &receiver_type,
+                                    )
+                                {
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol,
+                                        target_file,
+                                        receiver_type,
+                                    }));
+                                }
                             }
                         }
                     }
@@ -1829,7 +1900,12 @@ impl Resolver {
                     // to `classify_unresolved`, which names the evidence.
                     if resolution.is_none()
                         && call.receiver_expr.is_none()
-                        && !self.bare_name_has_other_evidence(&ext.file_path, family, &call.callee_name)
+                        && !self.bare_name_has_other_evidence(
+                            &ext.file_path,
+                            family,
+                            &call.callee_name,
+                            call.caller_symbol.as_deref(),
+                        )
                     {
                         let in_type = self.call_is_inside_a_type(
                             &ext.file_path,
@@ -1873,6 +1949,13 @@ impl Resolver {
                                     target_identity,
                                 );
                             if !out_of_scope
+                                && !self.plain_c_caller_declines_method(
+                                    family,
+                                    &ext.file_path,
+                                    &call.callee_name,
+                                    target_f,
+                                    target_identity,
+                                )
                                 && !self.rust_unique_rung_declines(
                                     family,
                                     &ext.file_path,

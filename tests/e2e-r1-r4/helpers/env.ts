@@ -235,6 +235,9 @@ export async function runGitPulseHookWithSocket(
   const replyPayload = options.reply ?? '{"ok":true}\n';
 
   const server = net.createServer((socket) => {
+    socket.on("error", () => {
+      // Ignore client disconnects (ECONNRESET/EPIPE) on short-lived hook connections.
+    });
     const chunks: Buffer[] = [];
     socket.on("data", (chunk: Buffer) => chunks.push(chunk));
     socket.on("end", () => {
@@ -289,7 +292,7 @@ export async function runGitPulseHookWithSocket(
       timeoutMs: options.timeoutMs ?? 15_000,
     });
 
-    const dropFiles = collectFilesRecursive(logDir);
+    const dropFiles = collectFilesRecursive(dir).filter((f) => f.path.endsWith(".drops"));
 
     return {
       exitCode: proc.exitCode,
@@ -316,7 +319,7 @@ export interface CargoTestResult {
   stderr: string;
 }
 
-export async function runCargoTest(
+export async function execCargoSuite(
   args: string[],
   options: { timeoutMs?: number; env?: Record<string, string | undefined> } = {},
 ): Promise<CargoTestResult> {
@@ -335,6 +338,29 @@ export async function runCargoTest(
     stdout: res.stdout,
     stderr: res.stderr,
   };
+}
+
+export function assertCargoPassed(res: CargoTestResult, label: string): void {
+  const combined = `${res.stdout}\n${res.stderr}`;
+  if (!res.ok || res.exitCode !== 0) {
+    throw new Error(`${label} failed (exit ${res.exitCode}):\n${combined}`);
+  }
+  const summaries = [
+    ...combined.matchAll(/test result:\s*(\w+)\.\s*(\d+)\s+passed;\s*(\d+)\s+failed;/g),
+  ];
+  if (summaries.length === 0) {
+    throw new Error(`${label} produced no Cargo "test result:" summary:\n${combined}`);
+  }
+  for (const match of summaries) {
+    const status = match[1];
+    const passed = Number(match[2]);
+    const failed = Number(match[3]);
+    if (status !== "ok" || passed <= 0 || failed !== 0) {
+      throw new Error(
+        `${label} had invalid Cargo summary "${match[0]}" (expected status=ok, passed>0, failed=0):\n${combined}`,
+      );
+    }
+  }
 }
 
 export interface PngInfo {
@@ -384,4 +410,165 @@ export function repoPath(relPath: string): string {
 
 export function readRepoFile(relPath: string): string {
   return readFileSync(repoPath(relPath), "utf8");
+}
+
+export function stripRustCommentsAndStrings(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/"(?:\\.|[^"\\])*"/g, '""');
+}
+
+export function extractRustFn(src: string, fnName: string): string | null {
+  const idx = src.search(new RegExp(`\\bfn\\s+${fnName}\\s*(?:<[^>]*>)?\\s*\\(`));
+  if (idx === -1) return null;
+  const openBrace = src.indexOf("{", idx);
+  if (openBrace === -1) return null;
+  let depth = 0;
+  for (let i = openBrace; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return src.slice(idx, i + 1);
+    }
+  }
+  return null;
+}
+
+function findBalancedBlockEnd(src: string, openBrace: number): number {
+  let depth = 0;
+  for (let i = openBrace; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+function findTopLevelStmtEnd(src: string, startIdx: number): number {
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  for (let i = startIdx; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "{") braceDepth += 1;
+    else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
+    else if (ch === "(") parenDepth += 1;
+    else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+    else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (ch === ";" && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) {
+      return i + 1;
+    }
+  }
+  return -1;
+}
+
+export function collectPulseIconScope(prodCode: string): string {
+  const pulseCode = extractRustFn(prodCode, "pulse_icon");
+  if (!pulseCode) {
+    throw new Error("src-tauri/src/desktop/tray.rs missing fn pulse_icon(");
+  }
+
+  const fnMap = new Map<string, string>();
+  const constMap = new Map<string, string>();
+  const topLevelRanges: Array<[number, number]> = [];
+
+  const fnDeclRe = /\bfn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:<[^>]*>)?\s*\(/g;
+  for (const match of prodCode.matchAll(fnDeclRe)) {
+    const name = match[1];
+    const start = match.index;
+    if (!name || start === undefined) continue;
+    const openBrace = prodCode.indexOf("{", start);
+    if (openBrace === -1) continue;
+    const end = findBalancedBlockEnd(prodCode, openBrace);
+    if (end === -1) continue;
+    if (!fnMap.has(name)) {
+      fnMap.set(name, prodCode.slice(start, end));
+    }
+    topLevelRanges.push([start, end]);
+  }
+
+  const isInsideFn = (idx: number) =>
+    topLevelRanges.some(([start, end]) => idx >= start && idx < end);
+
+  const constDeclRe =
+    /\b(?:const|static(?:\s+mut)?)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g;
+  for (const match of prodCode.matchAll(constDeclRe)) {
+    const name = match[1];
+    const start = match.index;
+    if (!name || start === undefined || isInsideFn(start)) continue;
+    const end = findTopLevelStmtEnd(prodCode, start);
+    if (end === -1) continue;
+    if (!constMap.has(name)) {
+      constMap.set(name, prodCode.slice(start, end));
+    }
+  }
+
+  const collected: string[] = [pulseCode];
+  const visitedFns = new Set<string>(["pulse_icon"]);
+  const visitedConsts = new Set<string>();
+  const queue: string[] = [pulseCode];
+  const callRe = /(?:^|[^.\w])(?:Self::)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:::<[^>]*>\s*)?\(/g;
+
+  while (queue.length > 0) {
+    const chunk = queue.shift()!;
+    for (const match of chunk.matchAll(callRe)) {
+      const callee = match[1];
+      if (!callee || visitedFns.has(callee)) continue;
+      const body = fnMap.get(callee);
+      if (body) {
+        visitedFns.add(callee);
+        collected.push(body);
+        queue.push(body);
+      }
+    }
+    for (const identMatch of chunk.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g)) {
+      const ident = identMatch[1];
+      if (!ident || visitedConsts.has(ident)) continue;
+      const stmt = constMap.get(ident);
+      if (stmt) {
+        visitedConsts.add(ident);
+        collected.push(stmt);
+        queue.push(stmt);
+      }
+    }
+  }
+
+  return collected.join("\n");
+}
+
+export function assertTrayPulseIconUpdated(trayRs: string): void {
+  const testIdx = trayRs.indexOf("#[cfg(test)]");
+  const prodSrc = testIdx > -1 ? trayRs.slice(0, testIdx) : trayRs;
+  const prodCode = stripRustCommentsAndStrings(prodSrc);
+  const pulseCode = extractRustFn(prodCode, "pulse_icon");
+  if (!pulseCode) {
+    throw new Error("src-tauri/src/desktop/tray.rs missing fn pulse_icon(");
+  }
+  const pulseScope = collectPulseIconScope(prodCode);
+
+  // Legacy 6-point polyline vertices must be removed from pulse_icon code.
+  for (const legacyPoint of [
+    "(5i32 * SUPER as i32, 19i32 * SUPER as i32)",
+    "(15 * SUPER as i32, 9 * SUPER as i32)",
+    "(21 * SUPER as i32, 28 * SUPER as i32)",
+  ]) {
+    if (pulseCode.includes(legacyPoint)) {
+      throw new Error(`pulse_icon still contains legacy polyline point ${legacyPoint}`);
+    }
+  }
+
+  // Non-vacuous G-ring + heartbeat + node rasterization signal in pulse_icon (and its helpers/consts).
+  const gRingCodeRe =
+    /(?:\.|::)(?:cos|sin|sin_cos|atan2|sqrt|hypot|to_radians)\s*\(|\b(?:atan2|sin_cos|to_radians|TAU|PI|FRAC_PI_2|r_inner|inner_r|r_outer|outer_r)\b|\b(?:24\.04|9\.25|10\.5|26\.5|22\.6|20\.2|16\.8|14\.4|11\.8)\b|(?:^|[^a-zA-Z0-9])(?:arc|draw_arc)(?:[^a-zA-Z0-9]|$)/;
+  const gRingIdentifierRe =
+    /(?:^|[^a-zA-Z0-9])(?:g[-_ ]?ring|ring_arc|commit_node|heartbeat|crossbar)(?:[^a-zA-Z0-9]|$)/i;
+  if (!gRingCodeRe.test(pulseScope) && !gRingIdentifierRe.test(pulseScope)) {
+    throw new Error("tray.rs pulse_icon lacks G-ring + heartbeat code after comment stripping");
+  }
 }

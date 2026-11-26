@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyText, createCopyFlash, readClipboardText, type WebClipboard } from "./clipboard";
+import { copyImageBlob, copyText, createCopyFlash, readClipboardText, type WebClipboard } from "./clipboard";
 
 function fakeDocument(execResult: boolean) {
   const removed: string[] = [];
@@ -107,5 +107,65 @@ describe("createCopyFlash", () => {
     flash.dispose();
     vi.advanceTimersByTime(5000);
     expect(seen).toEqual([true]);
+  });
+});
+
+describe("copyImageBlob", () => {
+  it("writes a ClipboardItem for both immediate blobs and gesture-scoped promises", async () => {
+    const written: unknown[] = [];
+    class FakeItem {
+      readonly items: Record<string, Blob | PromiseLike<Blob>>;
+      constructor(items: Record<string, Blob | PromiseLike<Blob>>) {
+        this.items = items;
+      }
+    }
+    const clipboard = { write: async (items: unknown[]) => void written.push(...items) };
+    const blob = new Blob(["png-bytes"], { type: "image/png" });
+
+    expect(await copyImageBlob(blob, "image/png", { clipboard, ClipboardItemCtor: FakeItem })).toBe(true);
+    expect(await copyImageBlob(Promise.resolve(blob), "image/png", { clipboard, ClipboardItemCtor: FakeItem })).toBe(true);
+    expect(written).toHaveLength(2);
+  });
+
+  it("returns false cleanly when ClipboardItem or clipboard.write is missing or rejects", async () => {
+    const blob = new Blob(["png"], { type: "image/png" });
+    expect(await copyImageBlob(blob, "image/png", { clipboard: null, ClipboardItemCtor: null })).toBe(false);
+    expect(await copyImageBlob(Promise.reject(new Error("raster fail")), "image/png", { clipboard: null, ClipboardItemCtor: null })).toBe(false);
+    class FakeItem {
+      constructor(public items: Record<string, Blob | PromiseLike<Blob>>) {}
+    }
+    expect(
+      await copyImageBlob(blob, "image/png", {
+        clipboard: { write: async () => Promise.reject(new Error("denied")) },
+        ClipboardItemCtor: FakeItem,
+      }),
+    ).toBe(false);
+  });
+
+  it("falls back to resolving the blob when ClipboardItem rejects Promise entries", async () => {
+    const written: Array<Record<string, Blob | PromiseLike<Blob>>> = [];
+    class ConcreteOnlyItem {
+      readonly items: Record<string, Blob | PromiseLike<Blob>>;
+      constructor(items: Record<string, Blob | PromiseLike<Blob>>) {
+        for (const val of Object.values(items)) {
+          if (val instanceof Promise) throw new TypeError("Promise values unsupported");
+        }
+        this.items = items;
+      }
+    }
+    const clipboard = {
+      write: async (items: unknown[]) => {
+        for (const item of items) written.push((item as ConcreteOnlyItem).items);
+      },
+    };
+    const blob = new Blob(["png-bytes"], { type: "image/png" });
+    expect(
+      await copyImageBlob(Promise.resolve(blob), "image/png", {
+        clipboard,
+        ClipboardItemCtor: ConcreteOnlyItem,
+      }),
+    ).toBe(true);
+    expect(written).toHaveLength(1);
+    expect(written[0]["image/png"]).toBe(blob);
   });
 });

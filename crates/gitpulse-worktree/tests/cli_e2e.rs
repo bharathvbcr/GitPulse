@@ -47,6 +47,69 @@ fn approve_subprocess_fixture_helper() {
     gitpulse_lib::repository_trust::grant(&repo, &view.identity, true).unwrap();
 }
 
+#[test]
+#[ignore = "subprocess helper invoked by exhaust_budget_in_isolated_home"]
+fn exhaust_budget_subprocess_helper() {
+    // Zero is fine: the record may already be spent (see with_budget_kept_spent).
+    gitpulse_lib::engine::process::exhaust_per_user_record().expect("spend the record");
+}
+
+/// Leaves the isolated profile's per-user git spawn budget empty, as a storm
+/// does: every CLI run in `home` then finds the shared bucket at zero.
+fn try_exhaust_budget_in_isolated_home(home: &Path) -> bool {
+    fs::create_dir_all(home).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "exhaust_budget_subprocess_helper", "--ignored"])
+        .envs(profile_env(home))
+        .env(gitpulse_lib::engine::process::EXHAUST_RECORD_MARKER, home)
+        .status_locked();
+    matches!(status, Ok(status) if status.success())
+}
+
+/// [`try_exhaust_budget_in_isolated_home`], retried: one failed helper start
+/// (a loaded host) is not a failed test.
+fn exhaust_budget_in_isolated_home(home: &Path) {
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if try_exhaust_budget_in_isolated_home(home) {
+            return;
+        }
+    }
+    panic!("exhausting the isolated budget failed after 5 attempts");
+}
+
+/// Runs `body` while a second thread keeps the isolated profile's per-user git
+/// spawn budget spent: the shared bucket refills at a few tokens a second, so
+/// one spend followed by a slow start (a loaded host) would hand the command
+/// under test a budget it should not have had, and a test of "not shed when
+/// the budget is spent" would pass on code that sheds.
+fn with_budget_kept_spent<T>(home: &Path, body: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Stops the keeper however `body` ends, so a panicking body fails the test
+    /// instead of leaving the scope waiting on a keeper that never stops.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    exhaust_budget_in_isolated_home(home);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                // A helper that failed to start is retried on the next pass.
+                try_exhaust_budget_in_isolated_home(home);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+        let _stop = Stop(&stop);
+        body()
+    })
+}
+
 fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(repo)
@@ -383,6 +446,152 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
         "no devmap build ran in {} before create returned; devmap saw:\n{seen}",
         wt.display()
     );
+}
+
+/// The inline refresh of a create is the user's own one-shot command, so it is
+/// not shed when the per-user git spawn budget is empty (a loaded host, or
+/// agents spending it): it builds, and the answer says `built`, not
+/// `deferred` with exit 3 (card ft-63446aee, criterion C5). This is the
+/// load-proof form of the assertion in
+/// `cli_create_seeds_the_worktree_store_and_builds_it_in_place`: the budget is
+/// spent first instead of left to whatever else is running.
+/// A trusted monorepo in an isolated profile whose devmap stub builds, with
+/// the profile's per-user git spawn budget not yet spent.
+#[cfg(unix)]
+fn spent_budget_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let anchor = workspace.path().join("monorepo");
+    fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["config", "user.name", "E2E Agent"]);
+    git(&anchor, &["config", "user.email", "agent@example.com"]);
+    seed_monorepo_with_devmap_and_csr(&anchor);
+    approve_in_isolated_home(&anchor, home.path());
+    let stub = devmap_stub_path(home.path());
+    fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         if [ \"$1\" = status ]; then printf '%s\\n' '{\"is_fresh\":false,\"schema_outdated\":false}'; exit 0; fi\n\
+         if [ \"$1\" = build ]; then printf '%s\\n' '{\"ok\":true}'; exit 0; fi\n\
+         exit 2\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    (home, workspace, anchor)
+}
+
+/// Runs the CLI with the budget kept spent and asserts the one-shot command
+/// was not shed: the seeded store built and the exit status is 0.
+#[cfg(unix)]
+fn assert_built_with_the_budget_spent(home: &Path, args: &[&str]) -> Value {
+    let out = with_budget_kept_spent(home, || run_cli(home, args));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let answer: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+    assert_eq!(
+        answer["devmap_refresh"]["kind"], "built",
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    answer
+}
+
+/// The inline refresh of a create is the user's own one-shot command, so it is
+/// not shed when the per-user git spawn budget is empty (a loaded host, or
+/// agents spending it): it builds, and the answer says `built`, not
+/// `deferred` with exit 3 (card ft-63446aee, criterion C5). This is the
+/// load-proof form of the assertion in
+/// `cli_create_seeds_the_worktree_store_and_builds_it_in_place`: the budget is
+/// kept spent for the whole run instead of left to whatever else is running.
+#[cfg(unix)]
+#[test]
+fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+    let (home, workspace, anchor) = spent_budget_fixture();
+    // Copy-mode provisioning rebuilds a missing anchor CSR sidecar, which needs
+    // a git read (`check-ignore`) on a thread of its own.
+    let anchor_csr = Store::csr_sidecar_path(&devmap_query::paths::store_path(
+        anchor.canonicalize().unwrap(),
+    ));
+    fs::remove_file(&anchor_csr).expect("the fixture seeds an anchor CSR");
+    let wt = workspace.path().join("wt-spent-budget");
+    assert_built_with_the_budget_spent(
+        home.path(),
+        &[
+            "create",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/spent-budget",
+            "--target",
+            wt.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        anchor_csr.is_file(),
+        "the anchor CSR sidecar was not rebuilt: its thread was shed"
+    );
+}
+
+/// `switch --create` makes a worktree like `create` does and is admitted the same way.
+#[cfg(unix)]
+#[test]
+fn cli_switch_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+    let (home, _workspace, anchor) = spent_budget_fixture();
+    let answer = assert_built_with_the_budget_spent(
+        home.path(),
+        &[
+            "switch",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/spent-switch",
+            "--create",
+            "--json",
+        ],
+    );
+    assert_eq!(answer["created"], true, "{answer}");
+}
+
+/// `isolate` provisions the caches and the devmap store of an existing
+/// worktree on two threads of its own; they carry the command's admission
+/// class, so a spent budget does not shed them (they start in the process
+/// default, background).
+#[cfg(unix)]
+#[test]
+fn cli_isolate_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+    let (home, workspace, anchor) = spent_budget_fixture();
+    let wt = workspace.path().join("wt-spent-isolate");
+    git(
+        &anchor,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/spent-isolate",
+            wt.to_str().unwrap(),
+        ],
+    );
+    let answer = assert_built_with_the_budget_spent(
+        home.path(),
+        &[
+            "isolate",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--worktree",
+            wt.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(answer["devmap_seeded"], true, "{answer}");
 }
 
 /// A refresh that did not bring the seeded store to the worktree's tree is not
@@ -847,11 +1056,8 @@ fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
             "feat: squash merge agent/lane-a",
         ],
     );
-    assert_eq!(merged["ok"], true);
-    assert_eq!(
-        merged["worktree_removed"], true,
-        "merge kept the worktree: {merged}"
-    );
+    assert_eq!(merged["ok"], true, "merge result: {merged}");
+    assert_eq!(merged["worktree_removed"], true, "merge result: {merged}");
     assert!(!wt_a_target.exists(), "merged worktree must be removed");
     assert!(
         fs::read_to_string(anchor.join("packages/app/main.rs"))
@@ -1092,10 +1298,7 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
             "main",
         ],
     );
-    assert_eq!(
-        merged["worktree_removed"], true,
-        "merge kept the worktree: {merged}"
-    );
+    assert_eq!(merged["worktree_removed"], true, "merge result: {merged}");
 
     let post_merge_status = run_cli_json_ok(home.path(), &["status", "--repo", anchor_str]);
     let remaining_agents: Vec<&str> = post_merge_status["active_lanes"]

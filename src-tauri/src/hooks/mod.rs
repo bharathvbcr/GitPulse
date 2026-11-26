@@ -200,7 +200,14 @@ pub fn read_for(
     argument: Option<&str>,
     reader: impl std::io::Read + Send + 'static,
 ) -> Result<HookInput, String> {
-    if matches!(subcommand, "peer-inbox" | "stop-or-notify") {
+    if subcommand == "stop-or-notify" {
+        return notify_input::read_stop_notify_input_within(
+            reader,
+            notify_input::MAX_READ_BYTES,
+            PEER_INBOX_BUDGET,
+        );
+    }
+    if subcommand == "peer-inbox" {
         return notify_input::read_notify_input_within(
             reader,
             notify_input::MAX_READ_BYTES,
@@ -7324,19 +7331,29 @@ done
         collision_guard_with(input, BUDGET, |job| Some(job()))
     }
 
-    /// Where each directory's spawn log stood, to count only what follows.
+    /// Where each directory's spawn log and in-process status log stood, to
+    /// count only what follows.
     #[cfg(unix)]
-    fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<usize> {
+    fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<(usize, usize)> {
         dirs.iter()
-            .map(|dir| crate::engine::process::spawn_log::spawns_in(dir).len())
+            .map(|dir| {
+                (
+                    crate::engine::process::spawn_log::spawns_in(dir).len(),
+                    crate::engine::worktree::status_reads::in_dir(dir).len(),
+                )
+            })
             .collect()
     }
 
-    /// Git children one burst of guarded edits started, by what they ran.
+    /// Git reads one burst of guarded edits made, by what they ran.
     #[cfg(unix)]
     #[derive(Debug)]
     struct SpawnCost {
         worktree_list: usize,
+        /// Status reads by either backend: a `git status` child, or an
+        /// unfiltered read made in-process by `gix` (no child, so the spawn
+        /// log alone would count it as nothing). A read that fell back to git
+        /// is counted once, by its child.
         status: usize,
         /// Everything else: the symbol check's `ls-files`, `rev-parse`, `diff`.
         other: usize,
@@ -7349,23 +7366,31 @@ done
         }
     }
 
-    /// Git children started in `dirs` since `marks`.
+    /// Git children started, and in-process status reads made, in `dirs`
+    /// since `marks`.
     #[cfg(unix)]
-    fn spawn_cost(dirs: &[std::path::PathBuf], marks: &[usize]) -> SpawnCost {
+    fn spawn_cost(dirs: &[std::path::PathBuf], marks: &[(usize, usize)]) -> SpawnCost {
+        use crate::engine::worktree::status_reads::{self, StatusBackend};
         let argvs: Vec<Vec<String>> = dirs
             .iter()
             .zip(marks)
-            .flat_map(|(dir, mark)| {
+            .flat_map(|(dir, (mark, _))| {
                 crate::engine::process::spawn_log::spawns_in(dir)[*mark..].to_vec()
             })
             .collect();
+        let in_process = dirs
+            .iter()
+            .zip(marks)
+            .flat_map(|(dir, (_, mark))| status_reads::in_dir(dir)[*mark..].to_vec())
+            .filter(|(backend, _)| *backend == StatusBackend::Gix)
+            .count();
         let has = |argv: &[String], word: &str| argv.iter().any(|arg| arg == word);
         let worktree_list = argvs.iter().filter(|a| has(a, "worktree")).count();
-        let status = argvs.iter().filter(|a| has(a, "status")).count();
+        let status_children = argvs.iter().filter(|a| has(a, "status")).count();
         SpawnCost {
             worktree_list,
-            status,
-            other: argvs.len() - worktree_list - status,
+            status: status_children + in_process,
+            other: argvs.len() - worktree_list - status_children,
         }
     }
 
@@ -7813,24 +7838,26 @@ done
         );
     }
 
-    /// S3-09. With 40 overlapping files, the repo-wide items cap cuts at 32
-    /// (`truncated: true`), while asking the hook about the 40th file still
-    /// returns `Ask`.
+    /// S3-09. With more overlapping files than `MAX_COLLISION_ITEMS`, the
+    /// repo-wide items cap cuts (`truncated: true`), while asking the hook
+    /// about the last file still returns `Ask`.
     #[cfg(unix)]
     #[test]
     fn forty_overlapping_files_still_ask_for_the_fortieth_in_the_hook() {
+        let total = insights::MAX_COLLISION_ITEMS + 8;
+        let last = format!("f{:03}.txt", total - 1);
         let farm = farm_bound(false, false, 1);
-        for n in 0..40usize {
-            let name = format!("f{n:02}.txt");
+        for n in 0..total {
+            let name = format!("f{n:03}.txt");
             std::fs::write(Path::new(&farm.repo).join(&name), format!("here {n}\n")).unwrap();
             std::fs::write(farm.sibling_dirs[0].join(&name), format!("there {n}\n")).unwrap();
         }
         let risk = insights::collision_risk(&farm.repo);
         assert!(risk.ok, "{}", risk.error);
-        assert_eq!(risk.items.len(), 32);
+        assert_eq!(risk.items.len(), insights::MAX_COLLISION_ITEMS);
         assert!(risk.truncated);
 
-        let output = guard_here(&edit_call(&farm.repo, &format!("{}/f39.txt", farm.repo)));
+        let output = guard_here(&edit_call(&farm.repo, &format!("{}/{last}", farm.repo)));
         assert!(asks(&output), "{:?}", output.render());
         assert!(
             reason_of(&output).contains("sibling-0"),
@@ -7964,14 +7991,15 @@ done
     }
 
     /// The scan cap does apply to the path-limited read: at most
-    /// `MAX_COLLISION_SCANS` (16) worktrees get their status read, the rest are
+    /// `MAX_COLLISION_SCANS` worktrees get their status read, the rest are
     /// counted unscanned and the answer says so. A holder in the unread tail is
     /// therefore reported as a partial scan, not as a finding, and never as
     /// silence; a holder inside the cap is a finding.
     #[cfg(unix)]
     #[test]
     fn the_scan_cap_leaves_a_tail_unread_and_says_so() {
-        let farm = farm_bound(false, false, 18);
+        let siblings = insights::MAX_COLLISION_SCANS + 2;
+        let farm = farm_bound(false, false, siblings);
         let held = |n: usize| {
             std::fs::write(farm.sibling_dirs[n].join("seed.txt"), "theirs").unwrap();
             let output = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
@@ -7981,10 +8009,17 @@ done
         let inside = held(2);
         assert!(asks(&inside), "{:?}", inside.render());
         let risk = insights::scan_holders_of_path(&farm.repo, "seed.txt", None);
-        assert_eq!(risk.scanned_worktrees, 16, "{risk:?}");
         assert_eq!(
-            risk.unscanned_worktrees, 3,
-            "19 worktrees, 16 reads: {risk:?}"
+            risk.scanned_worktrees,
+            insights::MAX_COLLISION_SCANS as u32,
+            "{risk:?}"
+        );
+        assert_eq!(
+            risk.unscanned_worktrees,
+            3,
+            "{} worktrees, {} reads: {risk:?}",
+            siblings + 1,
+            insights::MAX_COLLISION_SCANS
         );
         assert!(risk.truncated);
         // The last worktree in git's listing order is one of the three unread.

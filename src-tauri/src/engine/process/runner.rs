@@ -1115,6 +1115,11 @@ pub(crate) fn forced_failure_active() -> bool {
 }
 
 #[cfg(test)]
+pub(super) fn forced_deferral_active() -> bool {
+    FORCE_DEFERRAL.get()
+}
+
+#[cfg(test)]
 fn forced_failure_matches(cmd: &Command) -> bool {
     FORCED_FAILURE_ARG.with(|slot| {
         slot.borrow()

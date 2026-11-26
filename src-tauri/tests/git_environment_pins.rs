@@ -146,10 +146,11 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
     let serial = common::env::env_serial();
     let dir = repo();
     commit_file(dir.path(), "base.txt", "base");
-    // Windows cannot hold a `*` in a file name; `f[a].txt` is glob magic that
-    // matches the bystander `fa.txt` just as `f*.txt` does.
-    let named = if cfg!(windows) { "f[a].txt" } else { "f*.txt" };
-    std::fs::write(dir.path().join(named), "star").unwrap();
+    // `*` is not a legal Windows NTFS filename character; `[a]` is legal on
+    // Windows and is still a glob metacharacter to git that would match
+    // `fa.txt` if literal pathspecs or the ambient pathspec strips broke.
+    let glob_name = if cfg!(windows) { "f[a].txt" } else { "f*.txt" };
+    std::fs::write(dir.path().join(glob_name), "star").unwrap();
     std::fs::write(dir.path().join("fa.txt"), "other").unwrap();
     trust_repo(dir.path());
     let path = dir.path().to_str().unwrap();
@@ -163,9 +164,9 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
     for name in names {
         pins = pins.set(name, "1");
     }
-    let staged = GitWriter::stage_file(path, named);
+    let staged = GitWriter::stage_file(path, glob_name);
     drop(pins);
-    staged.expect("stage the one file named by the glob-looking name");
+    staged.expect("stage the one glob-named file literally");
 
     let cached = Command::new("git")
         .args(["diff", "--cached", "--name-only", "-z"])
@@ -174,7 +175,7 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
         .expect("git diff --cached");
     assert_eq!(
         String::from_utf8_lossy(&cached.stdout).trim_end_matches('\0'),
-        named,
+        glob_name,
         "staging touched something other than the file named"
     );
 }
@@ -200,19 +201,43 @@ fn log_date_does_not_change_the_commit_dates() {
     );
 }
 
+/// Forward-slash path spelling usable inside `#!/bin/sh` Git hooks and
+/// `textconv` scripts on both Unix and Git for Windows's MSYS2 `sh`.
+fn sh_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let plain = match text.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => rest.to_string(),
+        },
+        None => text.into_owned(),
+    };
+    plain.replace('\\', "/")
+}
+
+/// Single-quoted POSIX shell token so temp directories with spaces or
+/// apostrophes never split inside `#!/bin/sh` hooks or `diff.<driver>.textconv`.
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", sh_path(path).replace('\'', "'\\''"))
+}
+
 /// Executable `body` (a `/bin/sh` script) written at `path`.
-#[cfg(unix)]
 fn write_script(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create script parent");
+    }
     std::fs::write(path, body).expect("write script");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
 }
 
 /// A user's `diff.<driver>.textconv` ran on repository bytes for `diff`, `show`,
 /// `log -p` and `blame`: the converter's text came back as the "patch" and as
 /// the blamed lines. The converter here writes a marker file when it runs, so
 /// the test sees both that it did not run and that git's own output came back.
-#[cfg(unix)]
 #[test]
 fn textconv_drivers_never_run_for_diffs_or_blame() {
     // Every test takes the environment turn: a spawned child inherits an edit.
@@ -224,17 +249,13 @@ fn textconv_drivers_never_run_for_diffs_or_blame() {
     write_script(
         &converter,
         &format!(
-            "#!/bin/sh\n: > '{}'\necho CONVERTED-BY-TEXTCONV\n",
-            marker.display()
+            "#!/bin/sh\n: > {}\necho CONVERTED-BY-TEXTCONV\n",
+            sh_quote(&marker)
         ),
     );
     run_git(
         dir.path(),
-        &[
-            "config",
-            "diff.x.textconv",
-            &converter.display().to_string(),
-        ],
+        &["config", "diff.x.textconv", &sh_quote(&converter)],
     );
     std::fs::write(dir.path().join(".gitattributes"), "*.bin diff=x\n").unwrap();
     run_git(dir.path(), &["add", "--", ".gitattributes"]);
@@ -278,7 +299,6 @@ fn textconv_drivers_never_run_for_diffs_or_blame() {
 
 /// The contents of the environment variables a hook saw, one `NAME=value` line
 /// each (`<unset>` for a name the hook did not inherit).
-#[cfg(unix)]
 fn commit_and_record_hook_locale(dir: &Path) -> String {
     let record = dir.join(".git").join("hook-locale.txt");
     write_script(
@@ -286,8 +306,8 @@ fn commit_and_record_hook_locale(dir: &Path) -> String {
         &format!(
             "#!/bin/sh\nprintf 'LC_ALL=%s\\nLC_CTYPE=%s\\nLANG=%s\\nLC_MESSAGES=%s\\nLANGUAGE=%s\\n' \
              \"${{LC_ALL-<unset>}}\" \"${{LC_CTYPE-<unset>}}\" \"${{LANG-<unset>}}\" \
-             \"${{LC_MESSAGES-<unset>}}\" \"${{LANGUAGE-<unset>}}\" > '{}'\n",
-            record.display()
+             \"${{LC_MESSAGES-<unset>}}\" \"${{LANGUAGE-<unset>}}\" > {}\n",
+            sh_quote(&record)
         ),
     );
     run_git(dir, &["config", "user.name", "Test User"]);
@@ -296,13 +316,14 @@ fn commit_and_record_hook_locale(dir: &Path) -> String {
     run_git(dir, &["add", "--", "hooked.txt"]);
     trust_repo(dir);
     GitWriter::commit(dir.to_str().unwrap(), "from gitpulse", false).expect("commit");
-    std::fs::read_to_string(&record).expect("the pre-commit hook ran and recorded its env")
+    std::fs::read_to_string(&record)
+        .expect("the pre-commit hook ran and recorded its env")
+        .replace("\r\n", "\n")
 }
 
 /// A hook run from GitPulse's commit path sees the user's `LANG`, not
 /// `LC_ALL=C` (which Ruby reads as US-ASCII), while git's messages are pinned
 /// to English by `LC_MESSAGES` and `LANGUAGE`.
-#[cfg(unix)]
 #[test]
 fn a_hook_sees_the_users_lang_and_no_lc_all() {
     let serial = common::env::env_serial();
@@ -322,7 +343,6 @@ fn a_hook_sees_the_users_lang_and_no_lc_all() {
 /// A parent `LC_ALL` with no `LANG`/`LC_CTYPE` is the user's only statement of
 /// an encoding: it moves to `LC_CTYPE` (and `LC_ALL` goes) so the hook keeps it.
 /// Messages stay English through `LC_MESSAGES`/`LANGUAGE`, which the hook sees.
-#[cfg(unix)]
 #[test]
 fn an_lc_all_only_parent_reaches_the_hook_as_lc_ctype() {
     let serial = common::env::env_serial();
@@ -428,28 +448,20 @@ fn parsers_read_english_under_a_german_parent() {
 
 /// `git stash show -p` prints a patch through the same diff machinery, so a
 /// `diff.<driver>.textconv` runs on it unless `--no-textconv` is passed.
-#[cfg(unix)]
 #[test]
 fn stash_show_never_runs_a_textconv_driver() {
-    use std::os::unix::fs::PermissionsExt;
     let _serial = common::env::env_serial();
     let dir = repo_with_identity();
     let tools = tempfile::tempdir().expect("tools");
     let marker = tools.path().join("ran");
     let converter = tools.path().join("convert.sh");
-    std::fs::write(
+    write_script(
         &converter,
-        format!("#!/bin/sh\n: > '{}'\necho CONVERTED\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&converter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\n: > {}\necho CONVERTED\n", sh_quote(&marker)),
+    );
     run_git(
         dir.path(),
-        &[
-            "config",
-            "diff.x.textconv",
-            &converter.display().to_string(),
-        ],
+        &["config", "diff.x.textconv", &sh_quote(&converter)],
     );
     std::fs::write(dir.path().join(".gitattributes"), "*.bin diff=x\n").unwrap();
     run_git(dir.path(), &["add", "--", ".gitattributes"]);

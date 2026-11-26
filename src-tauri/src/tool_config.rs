@@ -646,6 +646,42 @@ fn is_default_profile(choice: &crate::sysload::ProfileChoice) -> bool {
     *choice == crate::sysload::ProfileChoice::default()
 }
 
+/// How aggressively GitPulse sheds caches and hibernates the main WebView when idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleMemoryMode {
+    Off,
+    Aggressive,
+    #[default]
+    #[serde(other)]
+    Balanced,
+}
+
+/// Settings payload for Idle Memory Efficiency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleMemorySettings {
+    #[serde(default)]
+    pub mode: IdleMemoryMode,
+}
+
+fn lenient_idle_memory_mode<'de, D>(deserializer: D) -> Result<IdleMemoryMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable idle_memory_mode, keeping balanced: {error}"
+        );
+        IdleMemoryMode::Balanced
+    }))
+}
+
+fn is_default_idle_memory_mode(mode: &IdleMemoryMode) -> bool {
+    *mode == IdleMemoryMode::default()
+}
+
 /// Whether builds take a slot (`sysload::lease`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1650,6 +1686,13 @@ pub struct ToolConfig {
         skip_serializing_if = "ManviStewardSettings::is_default"
     )]
     pub manvi_steward: ManviStewardSettings,
+    /// Idle memory efficiency mode (`off`, `balanced`, `aggressive`).
+    #[serde(
+        default,
+        deserialize_with = "lenient_idle_memory_mode",
+        skip_serializing_if = "is_default_idle_memory_mode"
+    )]
+    pub idle_memory_mode: IdleMemoryMode,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -1679,6 +1722,7 @@ impl Default for ToolConfig {
             host_load_leases: HostLoadLeases::default(),
             host_load_idle: HostLoadIdle::default(),
             manvi_steward: ManviStewardSettings::default(),
+            idle_memory_mode: IdleMemoryMode::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -2465,6 +2509,32 @@ pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
         cfg.lappi = next;
         Ok(())
     })
+}
+
+/// Stored idle memory efficiency mode (`balanced` by default).
+pub fn idle_memory_mode() -> IdleMemoryMode {
+    load().map(|cfg| cfg.idle_memory_mode).unwrap_or_default()
+}
+
+/// Stored idle memory efficiency settings (`balanced` by default).
+pub fn idle_memory_settings() -> IdleMemorySettings {
+    IdleMemorySettings {
+        mode: idle_memory_mode(),
+    }
+}
+
+/// Saves idle memory efficiency settings atomically to `tools.json`.
+pub fn save_idle_memory_settings(next: IdleMemorySettings) -> Result<IdleMemorySettings, String> {
+    update(|cfg| {
+        cfg.idle_memory_mode = next.mode;
+        Ok(())
+    })?;
+    Ok(idle_memory_settings())
+}
+
+/// Saves idle memory efficiency mode atomically to `tools.json`.
+pub fn save_idle_memory_mode(mode: IdleMemoryMode) -> Result<IdleMemoryMode, String> {
+    Ok(save_idle_memory_settings(IdleMemorySettings { mode })?.mode)
 }
 
 /// Host-wide and per-repository Manvi system steward settings, or defaults.
@@ -3896,6 +3966,63 @@ mod tests {
             invalidate_cache();
             let loaded = load().unwrap();
             assert_eq!(loaded.manvi.source_root.as_deref(), Some("/good/root"));
+        });
+    }
+
+    #[test]
+    fn idle_memory_mode_defaults_to_balanced_falls_back_on_unknown_and_round_trips() {
+        assert_eq!(IdleMemoryMode::default(), IdleMemoryMode::Balanced);
+        assert_eq!(
+            serde_json::from_str::<IdleMemoryMode>(r#""turbo_invalid""#).unwrap(),
+            IdleMemoryMode::Balanced
+        );
+
+        with_temp_config(|path| {
+            assert_eq!(idle_memory_mode(), IdleMemoryMode::Balanced);
+            assert_eq!(
+                idle_memory_settings(),
+                IdleMemorySettings {
+                    mode: IdleMemoryMode::Balanced
+                }
+            );
+
+            for mode in [
+                IdleMemoryMode::Off,
+                IdleMemoryMode::Balanced,
+                IdleMemoryMode::Aggressive,
+            ] {
+                let saved = save_idle_memory_settings(IdleMemorySettings { mode }).unwrap();
+                assert_eq!(saved.mode, mode);
+                invalidate_cache();
+                assert_eq!(idle_memory_mode(), mode);
+                assert_eq!(idle_memory_settings().mode, mode);
+            }
+
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["idle_memory_mode"], "aggressive");
+
+            save_idle_memory_mode(IdleMemoryMode::Balanced).unwrap();
+            let stored_default: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                stored_default.get("idle_memory_mode").is_none(),
+                "default balanced mode is omitted from tools.json"
+            );
+
+            for raw in [r#""future_mode""#, "42", r#"{"nested":true}"#] {
+                write_raw(
+                    path,
+                    &format!(
+                        r#"{{"version":1,"host_load":{{"enabled":false}},"idle_memory_mode":{raw}}}"#
+                    ),
+                );
+                assert_eq!(idle_memory_mode(), IdleMemoryMode::Balanced, "{raw}");
+                assert!(
+                    !host_load_settings().enabled,
+                    "unreadable idle_memory_mode ({raw}) must not discard other settings"
+                );
+            }
         });
     }
 }

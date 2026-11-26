@@ -11,7 +11,7 @@
     animated = true,
     hold = false,
   }: {
-    variant?: "text" | "rect" | "circle" | "card" | "tree-row" | "code-lines";
+    variant?: "text" | "rect" | "circle" | "card" | "tree-row" | "code-lines" | "graph-rows" | "diff-hunks" | "terminal-replay" | "pane-shell";
     count?: number;
     width?: string;
     height?: string;
@@ -108,6 +108,73 @@
           style="width: {i % 4 === 0 ? '70%' : i % 3 === 0 ? '40%' : i % 2 === 0 ? '85%' : '55%'};"
         ></div>
       </div>
+    {:else if variant === "graph-rows"}
+      <div
+        class="flex items-center gap-3 py-1.5 px-3 w-full {animated ? 'animate-pulse' : ''}"
+      >
+        <div class="w-6 flex items-center justify-center shrink-0">
+          <div class="w-2.5 h-2.5 rounded-full bg-surfaceHover/90 border border-edgeSoft"></div>
+        </div>
+        {#if i % 3 === 0}
+          <div class="h-4 w-14 rounded-full bg-surfaceHover/80 border border-edgeSoft shrink-0"></div>
+        {/if}
+        <div
+          class="h-3 rounded-full bg-surfaceHover/80"
+          style="width: {i % 4 === 0 ? '48%' : i % 3 === 0 ? '62%' : i % 2 === 0 ? '38%' : '54%'};"
+        ></div>
+        <div class="ml-auto flex items-center gap-2 shrink-0">
+          <div class="h-2.5 w-14 rounded-full bg-surfaceHover/50"></div>
+          <div class="h-2.5 w-10 rounded-full bg-surfaceHover/40"></div>
+        </div>
+      </div>
+    {:else if variant === "diff-hunks"}
+      <div class="flex flex-col gap-1.5 w-full {animated ? 'animate-pulse' : ''}">
+        {#if i === 0}
+          <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surfaceHover/60 border border-edgeSoft">
+            <div class="h-2.5 w-28 rounded-full bg-surfaceHover/90"></div>
+            <div class="h-2.5 w-12 rounded-full bg-surfaceHover/60 ml-auto"></div>
+          </div>
+        {/if}
+        <div class="flex items-center gap-3 py-0.5 px-3 w-full font-mono">
+          <div class="w-7 h-2.5 bg-surfaceHover/40 rounded shrink-0"></div>
+          <div class="w-7 h-2.5 bg-surfaceHover/40 rounded shrink-0"></div>
+          <div
+            class="h-2.5 bg-surfaceHover/75 rounded-full"
+            style="width: {i % 4 === 0 ? '72%' : i % 3 === 0 ? '42%' : i % 2 === 0 ? '84%' : '58%'};"
+          ></div>
+        </div>
+      </div>
+    {:else if variant === "terminal-replay"}
+      {#if i === 0}
+        <div class="flex flex-col gap-2 w-full">
+          <div class="h-0.5 w-full overflow-hidden rounded-full bg-surfaceHover/50">
+            <div class="h-full w-1/3 rounded-full bg-accent/70 {animated ? 'gp-indeterminate' : ''}"></div>
+          </div>
+          <div class="flex items-center gap-2 px-3 py-1 text-xs text-textMuted">
+            <div class="w-2 h-2 rounded-full bg-accent/70 {animated ? 'animate-pulse' : ''}"></div>
+            <span>Reattaching terminal…</span>
+          </div>
+        </div>
+      {/if}
+    {:else if variant === "pane-shell"}
+      {#if i === 0}
+        <div class="flex flex-col gap-3 p-4 w-full {animated ? 'animate-pulse' : ''}">
+          <div class="flex items-center gap-3">
+            <div class="h-4 w-36 rounded-full bg-surfaceHover/90"></div>
+            <div class="h-4 w-20 rounded-full bg-surfaceHover/60 ml-auto"></div>
+          </div>
+          <div class="grid grid-cols-1 gap-2.5">
+            <div class="rounded-xl bg-surface border border-edgeSoft p-3.5 space-y-2">
+              <div class="h-3 w-1/3 rounded-full bg-surfaceHover/85"></div>
+              <div class="h-2.5 w-2/3 rounded-full bg-surfaceHover/60"></div>
+            </div>
+            <div class="rounded-xl bg-surface border border-edgeSoft p-3.5 space-y-2">
+              <div class="h-3 w-2/5 rounded-full bg-surfaceHover/85"></div>
+              <div class="h-2.5 w-3/4 rounded-full bg-surfaceHover/60"></div>
+            </div>
+          </div>
+        </div>
+      {/if}
     {:else}
       <!-- Default Text Variant -->
       <div
