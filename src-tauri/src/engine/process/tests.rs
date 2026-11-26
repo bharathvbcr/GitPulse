@@ -2041,7 +2041,7 @@ fn run_captured_does_not_report_a_zero_deadline_as_a_timed_out_run() {
         MAX_OUTPUT_BYTES,
     );
     assert!(
-        matches!(outcome, Err(_)),
+        outcome.is_err(),
         "a refused zero deadline is not a run that timed out: {outcome:?}"
     );
 }
