@@ -106,7 +106,7 @@ fn fixture_with(setup: impl FnOnce(&Path)) -> Fixture {
     let origin = tempfile::tempdir().unwrap();
     git_in(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
     let main = tempfile::tempdir().unwrap();
-    let root = main.path().canonicalize().unwrap();
+    let root = crate::engine::process::canonicalize_plain(main.path()).unwrap();
     git_in(&root, &["init", "-q", "-b", "main"]);
     fs::write(root.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
     setup(&root);
@@ -133,7 +133,7 @@ fn fixture_with(setup: impl FnOnce(&Path)) -> Fixture {
     }
 }
 
-fn trusted() -> Fixture {
+fn fixture() -> Fixture {
     let fixture = fixture_with(|_| {});
     crate::test_support::trust_repo(&fixture.root);
     fixture
@@ -163,7 +163,7 @@ fn created_from(cwd: &Path, name: &str) -> PathBuf {
 
 #[test]
 fn creates_at_claude_codes_path_on_its_branch_from_the_local_default() {
-    let fixture = trusted();
+    let fixture = fixture();
     let gate = Recorder::answering(PolicyStatus::Allowed);
     let marker = progress();
 
@@ -221,7 +221,7 @@ fn creates_at_claude_codes_path_on_its_branch_from_the_local_default() {
 
 #[test]
 fn the_base_falls_back_to_head_when_the_default_branch_is_not_local() {
-    let fixture = trusted();
+    let fixture = fixture();
     // origin/HEAD still names `main`, which no longer exists locally.
     git_in(&fixture.root, &["branch", "-q", "-m", "main", "renamed"]);
     assert_eq!(local_default_base(&fixture.root), None);
@@ -282,7 +282,7 @@ fn an_untrusted_repository_is_handed_back_to_plain_git_untouched() {
 
 #[test]
 fn a_policy_refusal_creates_nothing_and_does_not_fall_back() {
-    let fixture = trusted();
+    let fixture = fixture();
     let gate = Recorder::answering(PolicyStatus::Blocked);
 
     let finished = create(
@@ -302,7 +302,7 @@ fn a_policy_refusal_creates_nothing_and_does_not_fall_back() {
 
 #[test]
 fn a_gate_that_could_not_run_is_a_gitpulse_failure_plain_git_recovers_from() {
-    let fixture = trusted();
+    let fixture = fixture();
     let gate = Recorder {
         status: PolicyStatus::Unchecked,
         detail_code: "timeout",
@@ -330,7 +330,7 @@ fn a_gate_that_could_not_run_is_a_gitpulse_failure_plain_git_recovers_from() {
 
 #[test]
 fn a_git_failure_is_told_apart_from_a_gitpulse_failure() {
-    let fixture = trusted();
+    let fixture = fixture();
     // The branch Claude Code's name maps to already exists: git refuses.
     git_in(&fixture.root, &["branch", "worktree-taken"]);
     let gate = Recorder::answering(PolicyStatus::Allowed);
@@ -351,7 +351,7 @@ fn a_git_failure_is_told_apart_from_a_gitpulse_failure() {
 
 #[test]
 fn names_that_could_escape_or_break_the_branch_are_refused() {
-    let fixture = trusted();
+    let fixture = fixture();
     let gate = Recorder::answering(PolicyStatus::Allowed);
     for name in [
         "", "../x", "a/b", ".hidden", "-flag", "a..b", "x.lock", "dot.", "sp ace", "ü",
@@ -370,7 +370,7 @@ fn names_that_could_escape_or_break_the_branch_are_refused() {
 #[cfg(unix)]
 #[test]
 fn a_container_that_is_a_link_is_refused() {
-    let fixture = trusted();
+    let fixture = fixture();
     let elsewhere = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(elsewhere.path(), fixture.root.join(".gitpulse")).unwrap();
     let gate = Recorder::answering(PolicyStatus::Allowed);
@@ -387,7 +387,7 @@ fn a_container_that_is_a_link_is_refused() {
 
 #[test]
 fn caches_and_the_include_are_copied_as_for_an_app_created_worktree() {
-    let fixture = trusted();
+    let fixture = fixture();
     fs::create_dir_all(fixture.root.join("node_modules/pkg")).unwrap();
     fs::write(fixture.root.join("node_modules/pkg/index.js"), "x").unwrap();
     fs::write(fixture.root.join(".worktreeinclude"), ".env\n").unwrap();
@@ -522,7 +522,7 @@ fn a_failed_post_create_hook_keeps_the_worktree_and_says_so() {
 #[test]
 fn a_second_run_for_the_same_name_hands_over_the_first_ones_worktree() {
     // The plugin's registration and a settings copy both run for one worktree.
-    let fixture = trusted();
+    let fixture = fixture();
     let gate = Recorder::answering(PolicyStatus::Allowed);
     let input = input_for_create(&fixture.root, "twice");
 
@@ -541,7 +541,7 @@ fn a_second_run_for_the_same_name_hands_over_the_first_ones_worktree() {
 
 #[test]
 fn two_runs_at_once_make_one_worktree_and_both_hand_it_over() {
-    let fixture = trusted();
+    let fixture = fixture();
     let gate = Recorder::answering(PolicyStatus::Allowed);
     let input = input_for_create(&fixture.root, "racing");
 
@@ -562,7 +562,7 @@ fn two_runs_at_once_make_one_worktree_and_both_hand_it_over() {
 
 #[test]
 fn something_else_at_the_path_is_never_handed_over() {
-    let fixture = trusted();
+    let fixture = fixture();
     let path = created(&fixture, "moved-on");
     // The worktree now holds another branch: not what this hook made.
     git_in(&path, &["checkout", "-q", "-b", "elsewhere"]);
@@ -590,7 +590,7 @@ fn something_else_at_the_path_is_never_handed_over() {
 
 #[test]
 fn only_a_worktree_git_registered_counts_as_ready() {
-    let fixture = trusted();
+    let fixture = fixture();
     let (_, common) = crate::repository_trust::git_directories(&fixture.root).unwrap();
     let path = created(&fixture, "registered");
     assert!(is_ready(&path, &common));
@@ -605,7 +605,7 @@ fn only_a_worktree_git_registered_counts_as_ready() {
     let bare = fixture.root.join(".gitpulse/worktrees/bare");
     fs::create_dir_all(&bare).unwrap();
     assert!(!is_ready(&bare, &common));
-    let other = trusted();
+    let other = self::fixture();
     let (_, other_common) = crate::repository_trust::git_directories(&other.root).unwrap();
     assert!(!is_ready(&path, &other_common));
 }
@@ -624,7 +624,7 @@ fn removing(path: &Path, discard: bool) -> (Finished, Recorder) {
 
 #[test]
 fn a_clean_worktree_is_removed_through_the_app_path_with_its_branch() {
-    let fixture = trusted();
+    let fixture = fixture();
     let path = created(&fixture, "clean");
     // Ignored files are not work: a copied .env does not hold the removal up.
     fs::write(path.join(".env"), "SECRET=1").unwrap();
@@ -651,7 +651,7 @@ fn work_in_a_removed_worktree_is_discarded_as_claude_code_confirmed_and_said() {
     // sends `discard_changes` to the hook, so a removal that arrives is a
     // confirmed one: forced, with `-D`, and the discarded work is named.
     type MakeWork<'a> = &'a dyn Fn(&Path);
-    let fixture = trusted();
+    let fixture = fixture();
     let cases: [(&str, MakeWork<'_>); 3] = [
         ("dirty", &|p: &Path| {
             fs::write(p.join("local.txt"), "edited\n").unwrap()
@@ -698,7 +698,7 @@ fn a_work_check_that_cannot_run_is_never_read_as_nothing_to_lose() {
 
 #[test]
 fn a_commit_another_branch_holds_is_not_work_lost() {
-    let fixture = trusted();
+    let fixture = fixture();
     let path = created(&fixture, "merged-elsewhere");
     commit(&path, "work.txt", "work\n", "kept by a branch");
     git_in(
@@ -714,7 +714,7 @@ fn a_commit_another_branch_holds_is_not_work_lost() {
 
 #[test]
 fn discard_changes_removes_the_work_and_the_branch() {
-    let fixture = trusted();
+    let fixture = fixture();
     let path = created(&fixture, "discarded");
     commit(&path, "work.txt", "work\n", "only here");
     fs::write(path.join("local.txt"), "edited\n").unwrap();
@@ -734,7 +734,7 @@ fn a_session_inside_a_linked_worktree_gets_its_worktree_under_the_main_checkout(
     // the main checkout, never nested in the linked worktree the session was
     // started in, here a GitPulse task lane. The hook anchors there whatever
     // `cwd` the payload carries.
-    let fixture = trusted();
+    let fixture = fixture();
     let lane = fixture.root.join(".gitpulse/worktrees/lane-1");
     git_in(
         &fixture.root,
@@ -790,7 +790,7 @@ fn the_branch_to_delete_is_named_by_the_innermost_claude_worktree() {
 
 #[test]
 fn plan_create_uses_shared_engine_worktree_path_resolver() {
-    let fixture = trusted();
+    let fixture = fixture();
     let expected = crate::engine::worktree::resolve_worktree_path(
         &fixture.root,
         "shared-slug",
@@ -821,7 +821,7 @@ fn plan_create_uses_shared_engine_worktree_path_resolver() {
 
 #[test]
 fn the_main_checkout_and_a_refused_removal_are_kept() {
-    let fixture = trusted();
+    let fixture = fixture();
     let (finished, gate) = removing(&fixture.root, true);
     assert_eq!(finished.exit_code, EXIT_FAILED, "{finished:?}");
     assert!(gate.seen().is_empty());

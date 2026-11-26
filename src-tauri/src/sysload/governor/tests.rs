@@ -88,7 +88,13 @@ fn replay(counters: &[(u64, u64)], level: Level, written: u64, read: u64) -> Inp
     }
     let mut writer = SnapshotWriter::elect(dir.path()).unwrap().unwrap();
     writer.publish(&snap).unwrap();
-    let (report, snap) = snapshot::report(&dir.path().join(SNAPSHOT_FILE_NAME), clock(read));
+    // Read as a reader that has a sensor, on any host: this is the governor's
+    // replay, not a test of what a sensorless platform's reader says.
+    let (report, snap) = snapshot::report_on(
+        Platform::Governed,
+        &dir.path().join(SNAPSHOT_FILE_NAME),
+        clock(read),
+    );
     Input::from_report(&report, snap.as_ref(), true, Thresholds::default())
 }
 
@@ -496,9 +502,19 @@ fn an_ungoverned_process_platform_or_switch_admits_without_shedding() {
     );
     assert!(seen.verdict.admit && seen.verdict.reason == Reason::SensorUnavailable);
 
-    // No sample yet: fail open, with a warning.
+    // No sample yet: fail open. Where this platform is governed (macOS) the
+    // sensor that has not run is said so, with a warning; Linux is advised on
+    // and never governed (`Platform::Advise`), so there it admits as not
+    // governed, with nothing to warn about, exactly like the input above.
     let v = Governor::default().verdict(Instant::now());
-    assert!(v.admit && !v.warnings.is_empty());
+    if Platform::current() == Platform::Governed {
+        assert!(
+            v.admit && v.reason == Reason::SensorUnavailable && !v.warnings.is_empty(),
+            "{v:?}"
+        );
+    } else {
+        assert!(v.admit && v.reason == Reason::NotGoverned, "{v:?}");
+    }
     // This test process runs no governor at all.
     assert_eq!(report().verdict.reason, Reason::NotGoverned);
     assert_eq!(shed(), Shed::default());

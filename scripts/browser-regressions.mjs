@@ -1,6 +1,6 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
 import path from "node:path";
@@ -9,7 +9,8 @@ import { promisify } from "node:util";
 import { createServer } from "vite";
 
 const run = promisify(execFile);
-export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-requests", "search", "conflicts", "uncommitted", "diff-history", "reflog", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "scroll-cue", "agents", "agent-capacity", "repo-churn", "diff", "file-tree", "file-viewer", "github-panel", "fleet", "tab-switch", "send-to-agent", "frame-rate", "mutation-routing", "browser-session", "primitives", "settings", "appearance", "hidden-pane", "overview"]);
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-requests", "search", "conflicts", "uncommitted", "diff-history", "reflog", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "html-preview", "svg-preview", "repo-tabs", "scroll-cue", "agents", "agent-capacity", "repo-churn", "diff", "file-tree", "file-viewer", "github-panel", "fleet", "tab-switch", "send-to-agent", "frame-rate", "mutation-routing", "browser-session", "primitives", "settings", "appearance", "hidden-pane", "overview"]);
 
 /**
  * How long one page may take, from server start to verdict.
@@ -31,16 +32,27 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-r
  * 44370388488: verdicts at 56.8, 56.7, 69.2 and 60.5 s), which a minute cannot
  * hold. `tasks` is 688 sequential checks, each behind real settled waits: 141 s
  * on the development Mac and 168 s (focus on) and 194 s (focus off) on the CI
- * runner, with every section within the same ratio of its local time. A page that is long by design gets
+ * runner, with every section within the same ratio of its local time. `repo-tabs`
+ * runs 191 sequential checks plus a 12-phase rAF measurement loop (~45-62 s on
+ * headless software WebKitGTK), and `terminal` reaches ~188-206 s under software
+ * WebKitGTK. A page that is long by design gets
  * its own number here; the rest keep the minute, so a hang anywhere else is
  * still caught as fast.
  */
 export const DEFAULT_DEADLINE_SECONDS = 60;
-export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 300, health: 120, "tab-switch": 120, terminal: 210, coverage: 120 }));
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 300, health: 120, "tab-switch": 120, terminal: 240, coverage: 120, "repo-tabs": 120 }));
 
-/** @param {string} harness */
-export function harnessDeadlineSeconds(harness) {
-  return HARNESS_DEADLINE_SECONDS[harness] ?? DEFAULT_DEADLINE_SECONDS;
+/**
+ * @param {string} harness
+ * @param {Record<string, string | undefined>} [env]
+ */
+export function harnessDeadlineSeconds(harness, env = process.env) {
+  const base = HARNESS_DEADLINE_SECONDS[harness] ?? DEFAULT_DEADLINE_SECONDS;
+  const rawScale = env.GITPULSE_HARNESS_DEADLINE_SCALE;
+  if (!rawScale) return base;
+  const scale = Number(rawScale);
+  if (!Number.isFinite(scale) || scale < 1 || scale > 5) return base;
+  return Math.min(590, Math.ceil(base * scale));
 }
 
 /** A missing/partial verdict is a failure, even when Chrome exits normally.
@@ -75,6 +87,106 @@ export function chromeBinary() {
   return process.env.CHROME_BIN || (process.platform === "darwin"
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "google-chrome");
+}
+
+/**
+ * Which browser engine executes the harness pages:
+ * - `chrome`: headless Chromium/Chrome (cross-platform baseline)
+ * - `webkit`: macOS system WKWebView via `scripts/webkit-regressions.swift`
+ * - `webview`: GitPulse's Rust `tao`+`wry` runner (`examples/webview_regressions.rs`),
+ *   driving WebKitGTK 4.1 on Linux (X11/Xvfb or headless Wayland) and WebView2 on Windows
+ *
+ * `--native` picks the OS's real shipping webview engine (`webkit` on macOS,
+ * `webview` on Linux and Windows).
+ *
+ * @typedef {"chrome" | "webkit" | "webview"} BrowserEngine
+ * @param {string[]} argv
+ * @param {NodeJS.Platform} [platform]
+ * @returns {BrowserEngine}
+ */
+export function resolveEngine(argv, platform = process.platform) {
+  const webkit = argv.includes("--webkit");
+  const native = argv.includes("--native");
+  const webview = argv.includes("--webview");
+  const engineIndex = argv.indexOf("--engine");
+  const explicit = engineIndex === -1 ? null : argv[engineIndex + 1];
+  const flags = [webkit && "--webkit", native && "--native", webview && "--webview", explicit !== null && "--engine"].filter(Boolean);
+  if (flags.length > 1) throw new Error(`Use at most one engine selector (${flags.join(", ")})`);
+  if (explicit !== null) {
+    if (explicit === "chrome") return "chrome";
+    if (explicit === "webkit") {
+      if (platform !== "darwin") throw new Error("The WebKit regression runner requires macOS");
+      return "webkit";
+    }
+    if (explicit === "webview") return "webview";
+    if (explicit === "native") return platform === "darwin" ? "webkit" : "webview";
+    throw new Error(`Unknown browser engine ${JSON.stringify(explicit)}; use chrome, webkit, webview, or native`);
+  }
+  if (webkit) {
+    if (platform !== "darwin") throw new Error("The WebKit regression runner requires macOS");
+    return "webkit";
+  }
+  if (webview) return "webview";
+  if (native) return platform === "darwin" ? "webkit" : "webview";
+  return "chrome";
+}
+
+/**
+ * Human-readable engine name for error messages and CI annotations.
+ * @param {BrowserEngine} engine
+ * @param {NodeJS.Platform} [platform]
+ */
+export function engineDisplayName(engine, platform = process.platform) {
+  if (engine === "chrome") return "Chrome";
+  if (engine === "webkit") return "WebKit";
+  if (platform === "linux") return "WebKitGTK";
+  if (platform === "win32") return "WebView2";
+  if (platform === "darwin") return "WKWebView (wry)";
+  return "WebView";
+}
+
+/**
+ * Path to the compiled `webview_regressions` example binary.
+ * Honors `GITPULSE_WEBVIEW_RUNNER_BIN` and `CARGO_TARGET_DIR`.
+ *
+ * @param {NodeJS.Platform} [platform]
+ * @param {Record<string, string | undefined>} [env]
+ * @param {string} [repoRoot]
+ */
+export function nativeRunnerBinary(platform = process.platform, env = process.env, repoRoot = REPO_ROOT) {
+  if (env.GITPULSE_WEBVIEW_RUNNER_BIN) return path.resolve(env.GITPULSE_WEBVIEW_RUNNER_BIN);
+  const exe = platform === "win32" ? "webview_regressions.exe" : "webview_regressions";
+  const targetDir = env.CARGO_TARGET_DIR
+    ? path.resolve(repoRoot, env.CARGO_TARGET_DIR)
+    : path.join(repoRoot, "src-tauri", "target");
+  return path.join(targetDir, "debug", "examples", exe);
+}
+
+/**
+ * Ensures the Rust `tao`+`wry` regression runner is built once before the
+ * harness loop runs.
+ * @param {boolean} rebuild
+ */
+async function ensureNativeRunner(rebuild = false) {
+  const binary = nativeRunnerBinary();
+  if (!rebuild && existsSync(binary)) return binary;
+  if (process.env.GITPULSE_WEBVIEW_RUNNER_BIN) {
+    throw new Error(`GITPULSE_WEBVIEW_RUNNER_BIN does not exist: ${binary}`);
+  }
+  console.log("Building native webview runner (src-tauri example webview_regressions)...");
+  await new Promise((resolve, reject) => {
+    const child = spawn(
+      "cargo",
+      ["build", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--example", "webview_regressions"],
+      { cwd: REPO_ROOT, stdio: "inherit" },
+    );
+    child.once("error", reject);
+    child.once("exit", (code) => (code === 0 ? resolve(undefined) : reject(new Error(`cargo build --example webview_regressions exited ${code}`))));
+  });
+  if (!existsSync(binary)) {
+    throw new Error(`Expected built native webview runner at ${binary}, but it was not found`);
+  }
+  return binary;
 }
 
 /** How Chrome is started. Chrome is its own process group, so its helpers can
@@ -194,11 +306,12 @@ const STDERR_KEPT = 2000;
 /** The error for a browser that ended before writing a verdict. It carries
  * what the runner printed: the WebKit runner refuses a host it cannot measure
  * (Reduce Motion on) with a reason, and a bare exit code hid it.
- * @param {string} engine @param {number | null} code @param {string} stderr
+ * @param {string} engine @param {number | null} code @param {string} stderr @param {NodeJS.Signals | null} [signal]
  */
-export function browserExitMessage(engine, code, stderr) {
+export function browserExitMessage(engine, code, stderr, signal = null) {
   const said = stderr.trim();
-  return `${engine} exited before the verdict (${code})${said ? `: ${said}` : ""}`;
+  const status = code !== null ? String(code) : signal ? `signal ${signal}` : "null";
+  return `${engine} exited before the verdict (${status})${said ? `: ${said}` : ""}`;
 }
 
 /** What a signal or an uncaught error must still undo: the live browser and
@@ -214,12 +327,88 @@ function undoLive() {
   live.clear();
 }
 
-/** @param {string} harness @param {boolean} webkit */
-async function runHarness(harness, webkit) {
+/** Terminates a child process and its process group/tree (Unix PGID or Windows `taskkill /T`).
+ * @param {import('node:child_process').ChildProcess | undefined} child
+ * @param {boolean} groupLeader
+ */
+function killBrowserProcess(child, groupLeader) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (groupLeader && typeof child.pid === "number" && child.pid > 1) {
+    if (process.platform === "win32") {
+      try {
+        const res = spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore", timeout: 5_000 });
+        if (res.status === 0) return;
+      } catch { /* fall through to direct kill */ }
+    } else {
+      try { process.kill(-child.pid, "SIGKILL"); return; } catch { /* fall through to direct kill */ }
+    }
+  }
+  try { child.kill("SIGKILL"); } catch { /* already gone */ }
+}
+
+/**
+ * Waits for a killed child process to close without hanging forever if an
+ * escaped grandchild (e.g. WebKitGTK/bwrap helper) still holds the stderr pipe.
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {number} [graceMs]
+ * @param {number} [maxWaitMs]
+ */
+export function waitForProcessClose(child, graceMs = 250, maxWaitMs = 3_000) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    child.stderr?.destroy();
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let exitTimer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(exitTimer);
+      clearTimeout(hardTimer);
+      child.off("close", finish);
+      child.off("exit", onExit);
+      child.stderr?.destroy();
+      resolve(undefined);
+    };
+    const onExit = () => {
+      exitTimer = setTimeout(finish, graceMs);
+      exitTimer.unref?.();
+    };
+    const hardTimer = setTimeout(finish, maxWaitMs);
+    hardTimer.unref?.();
+    child.once("close", finish);
+    child.once("exit", onExit);
+  });
+}
+
+/**
+ * Removes an ephemeral temp directory. On Windows, `msedgewebview2.exe` can hold
+ * profile file handles briefly after teardown, so retry patiently and warn
+ * rather than failing an already-passing run on lingering EBUSY/EPERM.
+ * @param {string} targetPath
+ */
+async function removeTempDirSafe(targetPath) {
+  try {
+    await rm(targetPath, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+  } catch (error) {
+    const code = /** @type {NodeJS.ErrnoException} */ (error)?.code;
+    if (process.platform === "win32" && (code === "EBUSY" || code === "EPERM" || code === "ENOTEMPTY")) {
+      console.warn(`Warning: could not fully remove temp dir ${targetPath} (${code}); continuing.`);
+      return;
+    }
+    throw error;
+  }
+}
+
+/** @param {string} harness @param {BrowserEngine} engine @param {string | null} [nativeBinary] @param {string | null} [sharedViteCacheDir] */
+async function runHarness(harness, engine, nativeBinary = null, sharedViteCacheDir = null) {
   const seconds = harnessDeadlineSeconds(harness);
   const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-browser-"));
+  const detachedGroup = engine === "chrome" || engine === "webview";
   const undo = () => {
-    if (browser && browser.exitCode === null && browser.signalCode === null) browser.kill("SIGKILL");
+    killBrowserProcess(browser, detachedGroup);
     rmSync(profile, { recursive: true, force: true, maxRetries: 3 });
   };
   live.add(undo);
@@ -240,8 +429,18 @@ async function runHarness(harness, webkit) {
   let listening = "";
   /** @type {import('vite').Plugin} */
   const receiver = { name: "gitpulse-browser-verdict" };
+  /** @type {(err: Error) => void} */
+  let rejectCompleted = () => {};
+  const startDeadline = () => {
+    clearTimeout(deadline);
+    deadline = setTimeout(
+      () => rejectCompleted(new Error(`Browser did not finish within ${seconds} seconds (${requests} HTTP requests; last: ${lastRequest}; ${progress.last ? `page progress: ${progress.last}` : "the page reported no check"}${listening ? `; server listening at ${listening}s` : "; server not yet listening"})`)),
+      seconds * 1000,
+    );
+  };
   const completed = new Promise((resolve, reject) => {
-    deadline = setTimeout(() => reject(new Error(`Browser did not finish within ${seconds} seconds (${requests} HTTP requests; last: ${lastRequest}; ${progress.last ? `page progress: ${progress.last}` : "the page reported no check"}${listening ? `; server listening at ${listening}s` : "; server not yet listening"})`)), seconds * 1000);
+    rejectCompleted = reject;
+    if (engine !== "webview") startDeadline();
     receiver.configureServer = (server) => {
       server.middlewares.use((request, _response, next) => { requests++; lastRequest = request.url ?? "unknown"; next(); });
       server.middlewares.use(reportPath.replace("/__gp_result/", "/__gp_progress/"), (request, response) => {
@@ -278,43 +477,90 @@ async function runHarness(harness, webkit) {
   // Attach a handler before server startup can fail or exceed the deadline.
   void completed.catch(() => {});
   try {
+    const sharedCache = Boolean(process.env.GITPULSE_VITE_CACHE_DIR || sharedViteCacheDir);
+    const optimizeEntries = process.env.GITPULSE_HARNESS_ENTRIES_ONLY === "1"
+      ? [`harness/${harness}.html`]
+      : sharedCache
+        ? ["harness/*.html", "src/lib/components/**/*.svelte"]
+        : [`harness/${harness}.html`, "src/lib/components/**/*.svelte"];
     server = await createServer({
       plugins: [receiver],
-      cacheDir: path.join(profile, "vite-cache"),
+      cacheDir: process.env.GITPULSE_VITE_CACHE_DIR || sharedViteCacheDir || path.join(profile, "vite-cache"),
       // Production has explicit entry points, and fixtures select components
       // dynamically. Discover their dependencies before any fixture starts.
       optimizeDeps: {
-        entries: [`harness/${harness}.html`, "src/lib/components/**/*.svelte"],
+        entries: optimizeEntries,
       },
-      server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false },
+      // One-shot regression harnesses never use HMR; disabling the watcher keeps
+      // chokidar out of large scratch target directories and nested worktrees.
+      server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false, watch: null },
     });
     await server.listen();
     listening = since();
     const address = server.httpServer?.address();
     if (!address || typeof address === "string") throw new Error("Vite did not bind a test port");
+    // Wait for Vite's cold dependency optimizer before loading the harness HTML
+    // in the native webview, draining each warmup response body so sockets are
+    // never left half-open. The page deadline starts once warmup finishes.
+    if (engine === "webview") {
+      try {
+        const htmlRes = await fetch(`http://127.0.0.1:${address.port}/harness/${harness}.html`, {
+          signal: AbortSignal.timeout(180_000),
+        });
+        const htmlText = await htmlRes.text();
+        const extraWarmPaths = ["/src/app.css"];
+        if (/<script\b[^>]*type=["']module["'][^>]*>(?!\s*<\/script>)/i.test(htmlText)
+          && !/<script\b[^>]*type=["']module["'][^>]*\bsrc=/i.test(htmlText)) {
+          extraWarmPaths.unshift(`/harness/${harness}.html?html-proxy&index=0.js`);
+        }
+        for (const warmPath of extraWarmPaths) {
+          const res = await fetch(`http://127.0.0.1:${address.port}${warmPath}`, {
+            signal: AbortSignal.timeout(180_000),
+          });
+          await res.text();
+        }
+        await server.waitForRequestsIdle?.();
+      } catch {
+        // Warmup is best-effort; the browser load and verdict still govern pass/fail.
+      }
+      startDeadline();
+    }
     const chrome = chromeBinary();
-    const version = await run(webkit ? "xcrun" : chrome, webkit ? ["swift", "--version"] : ["--version"], { timeout: 10_000 });
+    const runnerBin = engine === "webview" ? (nativeBinary ?? nativeRunnerBinary()) : "";
+    const version = engine === "webkit"
+      ? await run("xcrun", ["swift", "--version"], { timeout: 10_000 })
+      : engine === "webview"
+        ? await run(runnerBin, ["--version"], { timeout: 10_000 })
+        : await run(chrome, ["--version"], { timeout: 10_000 });
     console.log(version.stdout.trim());
     const url = `http://127.0.0.1:${address.port}/harness/${harness}.html?check=1&report=${reportPath}`;
     /** The runner's own words, kept so an early exit can say why. */
     let stderr = "";
-    if (webkit) {
+    if (engine === "webkit") {
       // The Swift runner ends itself five seconds after this page's deadline.
       browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url, String(seconds + 5)],
         { timeout: (seconds + 5) * 1000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
       browser.stderr?.on("data", chunk => { stderr = (stderr + chunk).slice(-STDERR_KEPT); });
+    } else if (engine === "webview") {
+      browser = spawn(runnerBin, [url, String(seconds + 5)], {
+        stdio: ["ignore", "ignore", "pipe"],
+        detached: process.platform !== "win32",
+        env: { ...process.env, GITPULSE_WEBVIEW_PROFILE: path.join(profile, "webview-profile") },
+      });
+      browser.stderr?.on("data", chunk => { stderr = (stderr + chunk).slice(-STDERR_KEPT); });
     } else {
       browser = startChrome(chrome, profile, url);
     }
-    const engine = webkit ? "WebKit" : "Chrome";
+    const label = engineDisplayName(engine);
     const exited = new Promise((_, reject) => {
       browser?.once("error", reject);
       // `close` fires after the stderr pipe has drained, so the reason the
       // runner printed is in hand; a grandchild still holding the pipe must
       // not hold the report back, so `exit` reports anyway a moment later.
-      const report = (/** @type {number | null} */ code) => reject(new Error(browserExitMessage(engine, code, stderr)));
+      const report = (/** @type {number | null} */ code, /** @type {NodeJS.Signals | null} */ signal = null) =>
+        reject(new Error(browserExitMessage(label, code, stderr, signal)));
       browser?.once("close", report);
-      browser?.once("exit", code => setTimeout(() => report(code), 1000).unref());
+      browser?.once("exit", (code, signal) => setTimeout(() => report(code, signal), 1000).unref());
     });
     const verdict = await Promise.race([completed, exited]);
     // Where each page's time goes, so a deadline is set from a measurement.
@@ -322,14 +568,17 @@ async function runHarness(harness, webkit) {
   } finally {
     clearTimeout(deadline);
     // A browser ended by a signal has no exit code; waiting for its `close`
-    // again would wait forever.
+    // again would wait forever — and an escaped grandchild holding stderr open
+    // must not block teardown either.
     if (browser && browser.exitCode === null && browser.signalCode === null) {
-      const closed = new Promise(resolve => browser?.once("close", resolve));
-      browser.kill("SIGKILL");
+      const closed = waitForProcessClose(browser);
+      killBrowserProcess(browser, detachedGroup);
       await closed;
+    } else {
+      browser?.stderr?.destroy();
     }
     await server?.close();
-    await rm(profile, { recursive: true, force: true, maxRetries: 3 });
+    await removeTempDirSafe(profile);
     live.delete(undo);
   }
 }
@@ -371,28 +620,46 @@ export function annotation(title, message) {
  * was runnable and failing for a release while no caller named it.
  */
 async function main() {
-  const webkit = process.argv.includes("--webkit");
-  if (webkit && process.platform !== "darwin") throw new Error("The WebKit regression runner requires macOS");
+  const engine = resolveEngine(process.argv.slice(2));
+  const nativeBinary = engine === "webview" ? await ensureNativeRunner(process.argv.includes("--rebuild-native")) : null;
+  const label = engineDisplayName(engine);
   const harnessIndex = process.argv.indexOf("--harness");
   if (process.argv.includes("--all")) {
     if (harnessIndex !== -1) throw new Error("Use either --all or --harness, not both");
+    // Share one ephemeral Vite dependency cache across the sweep when the
+    // caller did not pass GITPULSE_VITE_CACHE_DIR so Vite optimizes deps once
+    // rather than 47 times.
+    const ownedViteCache = process.env.GITPULSE_VITE_CACHE_DIR
+      ? null
+      : await mkdtemp(path.join(tmpdir(), "gitpulse-vite-cache-"));
+    const cleanupCache = () => {
+      if (ownedViteCache) rmSync(ownedViteCache, { recursive: true, force: true, maxRetries: 3 });
+    };
+    if (ownedViteCache) live.add(cleanupCache);
     // Every harness runs. Stopping at the first failure hid every later one:
     // a run that failed in `branches` said nothing about `tasks`.
     /** @type {string[]} */
     const failed = [];
-    for (const harness of BROWSER_HARNESSES) {
-      console.log(`--- ${harness} ---`);
-      try {
-        await runHarness(harness, webkit);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(message);
-        failed.push(harness);
-        if (process.env.GITHUB_ACTIONS) {
-          const checks = /** @type {any} */ (error)?.failedChecks;
-          const detail = Array.isArray(checks) && checks.length ? checks.join("\n") : message.slice(0, 2000);
-          console.log(annotation(`${webkit ? "WebKit" : "Chrome"} ${harness}`, detail));
+    try {
+      for (const harness of BROWSER_HARNESSES) {
+        console.log(`--- ${harness} ---`);
+        try {
+          await runHarness(harness, engine, nativeBinary, ownedViteCache);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(message);
+          failed.push(harness);
+          if (process.env.GITHUB_ACTIONS) {
+            const checks = /** @type {any} */ (error)?.failedChecks;
+            const detail = Array.isArray(checks) && checks.length ? checks.join("\n") : message.slice(0, 2000);
+            console.log(annotation(`${label} ${harness}`, detail));
+          }
         }
+      }
+    } finally {
+      if (ownedViteCache) {
+        await removeTempDirSafe(ownedViteCache);
+        live.delete(cleanupCache);
       }
     }
     if (failed.length) throw new Error(`Browser regressions failed in: ${failed.join(", ")}`);
@@ -400,7 +667,7 @@ async function main() {
   }
   const harness = harnessIndex === -1 ? "diagnostics" : process.argv[harnessIndex + 1];
   if (!BROWSER_HARNESSES.includes(harness)) throw new Error(`Unknown browser harness; use ${BROWSER_HARNESSES.join(", ")}`);
-  await runHarness(harness, webkit);
+  await runHarness(harness, engine, nativeBinary);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

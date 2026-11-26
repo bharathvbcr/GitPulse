@@ -66,6 +66,18 @@ impl Channel {
             Self::Osc99 => "osc99",
         }
     }
+
+    pub fn urgency(self) -> super::bridge::Urgency {
+        match self {
+            Self::Bell | Self::Osc9 | Self::Osc777 | Self::Osc99 => {
+                super::bridge::Urgency::Informational
+            }
+        }
+    }
+
+    pub fn is_bare_bell(self) -> bool {
+        matches!(self, Self::Bell)
+    }
 }
 
 /// Largest OSC payload assembled before the sequence is abandoned.
@@ -145,14 +157,22 @@ impl HerdrState {
         }
     }
 
+    pub fn urgency(self) -> super::bridge::Urgency {
+        match self {
+            Self::Working | Self::Idle => super::bridge::Urgency::Clear,
+            Self::Blocked => super::bridge::Urgency::Blocking,
+            Self::Done => super::bridge::Urgency::Informational,
+            Self::Error => super::bridge::Urgency::Error,
+        }
+    }
+
     /// Maps a Herdr state onto the closed [`super::bridge::EVENTS`] vocabulary
     /// so terminal-emitted agent statuses update GitPulse's native notifications
     /// and Agents attention store without widening the wire event table.
     pub fn bridge_event(self) -> &'static str {
         match self {
-            Self::Working => "prompt_submitted",
+            Self::Working | Self::Idle => "prompt_submitted",
             Self::Blocked => "agent_needs_input",
-            Self::Idle => "turn_finished",
             Self::Done => "agent_completed",
             Self::Error => "error",
         }
@@ -1293,10 +1313,49 @@ mod tests {
             HerdrState::Error,
         ] {
             let name = state.bridge_event();
-            assert!(
-                crate::alerts::bridge::event(name).is_some(),
-                "Herdr state {state:?} mapped to unknown bridge event {name}"
-            );
+            let ev = crate::alerts::bridge::event(name).unwrap_or_else(|| {
+                panic!("Herdr state {state:?} mapped to unknown bridge event {name}")
+            });
+            assert_eq!(ev.urgency, state.urgency(), "{state:?}");
+        }
+        assert_eq!(HerdrState::Working.bridge_event(), "prompt_submitted");
+        assert_eq!(HerdrState::Idle.bridge_event(), "prompt_submitted");
+        assert_eq!(HerdrState::Blocked.bridge_event(), "agent_needs_input");
+        assert_eq!(HerdrState::Done.bridge_event(), "agent_completed");
+        assert_eq!(HerdrState::Error.bridge_event(), "error");
+
+        assert_eq!(
+            HerdrState::Working.urgency(),
+            super::super::bridge::Urgency::Clear
+        );
+        assert_eq!(
+            HerdrState::Idle.urgency(),
+            super::super::bridge::Urgency::Clear
+        );
+        assert_eq!(
+            HerdrState::Blocked.urgency(),
+            super::super::bridge::Urgency::Blocking
+        );
+        assert_eq!(
+            HerdrState::Done.urgency(),
+            super::super::bridge::Urgency::Informational
+        );
+        assert_eq!(
+            HerdrState::Error.urgency(),
+            super::super::bridge::Urgency::Error
+        );
+
+        assert!(Channel::Bell.is_bare_bell());
+        for osc in [Channel::Osc9, Channel::Osc777, Channel::Osc99] {
+            assert!(!osc.is_bare_bell());
+        }
+        for ch in [
+            Channel::Bell,
+            Channel::Osc9,
+            Channel::Osc777,
+            Channel::Osc99,
+        ] {
+            assert_eq!(ch.urgency(), super::super::bridge::Urgency::Informational);
         }
     }
 

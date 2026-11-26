@@ -133,9 +133,18 @@ impl ObjectQuarantine {
             )));
         }
         // `join_paths` refuses a path holding the platform's list separator,
-        // which git could not read back as one directory.
+        // which git could not read back as one directory. On Windows it does
+        // not refuse a `;`: it wraps the path in quotes, which git reads as a
+        // C-style string, where each `\` of the path starts an escape and the
+        // result names another directory. That is refused here instead.
         let alternates = std::env::join_paths([&objects])
             .map_err(|e| QuarantineError::Setup(format!("alternates: {e}")))?;
+        if cfg!(windows) && objects.to_string_lossy().contains(';') {
+            return Err(QuarantineError::Setup(format!(
+                "alternates: {} holds the list separator ';'",
+                objects.display()
+            )));
+        }
         // A crash or a SIGKILL skips the Drop guard and leaves a directory
         // behind; the next quarantine clears the old ones. Best effort: a
         // sweep that cannot finish never stops this one from being made.

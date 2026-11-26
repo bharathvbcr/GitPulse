@@ -525,6 +525,21 @@ impl WorkbenchState {
         body(store)
     }
 
+    /// Best-effort, non-blocking idle trim of the already-open workbench SQLite
+    /// connection (`PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);`).
+    pub(crate) fn trim_idle(&self) -> bool {
+        let Ok(guard) = self.0.store.try_lock() else {
+            return false;
+        };
+        let Some(store) = guard.as_ref() else {
+            return false;
+        };
+        store
+            .connection()
+            .execute_batch("PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);")
+            .is_ok()
+    }
+
     pub(crate) fn request(&self, method: &str, input: &str) -> Result<Value, WorkbenchError> {
         self.check_open()?;
         if input.len() > MAX_INPUT || method.len() > 64 {
@@ -845,17 +860,66 @@ impl WorkbenchState {
             provider,
             destination,
             complete: std::sync::Arc::new(move |params| {
-                state
-                    .worker_call(
+                let answer = state.worker(Some(selection.clone())).and_then(|worker| {
+                    let answer = state.call_worker(
+                        Arc::clone(&worker),
                         crate::ai::OP_ASSIST_COMPLETE,
                         params,
-                        Some(selection.clone()),
-                    )
-                    .map_err(|e| crate::ai::ManviError {
-                        code: e.code,
-                        message: e.message,
-                    })
+                    );
+                    if let Err(error) = &answer {
+                        state.on_assist_failure(&worker, &error.code);
+                    }
+                    answer
+                });
+                answer.map_err(|e| crate::ai::ManviError {
+                    code: e.code,
+                    message: e.message,
+                })
             }),
+        }
+    }
+
+    /// A Claude worker got its key at spawn and keeps it, so once Anthropic
+    /// refuses that key (`E_PROVIDER_AUTH`) every later call through it would
+    /// be refused too, even after the person fixed their account in
+    /// `~/.anthropic-accounts`, which nothing in GitPulse hears about. The
+    /// worker is stopped, and the next call starts one with the credential as
+    /// it is then.
+    ///
+    /// Only the worker that was refused, and only while it is still the live
+    /// Claude worker: one started since (after a key save) is not this call's
+    /// to stop, and a local model's refusal is not about the Claude key. A
+    /// worker hosting a managed run is kept, because a stdio child takes its
+    /// runs with it and a run never had this key (Manvi withholds it from what
+    /// it starts); the first refusal after the runs end stops it. A worker too
+    /// busy to say what it hosts is kept for the same reason.
+    fn on_assist_failure(
+        &self,
+        refused_by: &Arc<crate::harness::sidecar::ProfileConnection>,
+        code: &str,
+    ) {
+        if code != crate::ai::MANVI_PROVIDER_AUTH {
+            return;
+        }
+        let refused = {
+            let mut guard = crate::supervisor::lock_or_recover(&self.0.worker);
+            let live_and_claude = matches!(
+                guard.as_ref(),
+                Some((Some(crate::harness::sidecar::ModelSelection::Claude { .. }), live))
+                    if Arc::ptr_eq(live, refused_by)
+            );
+            // The slot is taken while `refused_by` is checked, as `worker()`
+            // retires a previous worker under the same lock.
+            if live_and_claude && refused_by.hosted_runs().is_some_and(|runs| runs.is_empty()) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, worker)) = refused {
+            if !worker.retire() {
+                log::warn!(target: "workbench", "refused Claude worker retire could not acquire the active request; it stops when that request ends");
+            }
         }
     }
 
@@ -989,7 +1053,9 @@ impl WorkbenchState {
                     hosting,
                 )
                 .map_err(|error| worker_error(&path, error))?;
-                *guard = Some((fingerprint, Arc::new(connection)));
+                let connection = Arc::new(connection);
+                reconcile::watch_lost_runs(self, &connection);
+                *guard = Some((fingerprint, connection));
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)
         };
@@ -1538,6 +1604,157 @@ mod tests {
 
     fn worker_absent(host: &WorkbenchState) -> bool {
         host.0.worker.lock().unwrap().is_none()
+    }
+
+    /// A worker keeps the key it was spawned with, so once Anthropic refuses it
+    /// the worker must go: the next call then starts with the credential as it
+    /// is now (the live proof is `harness::steward::live_key_tests`).
+    ///
+    /// Driven through [`WorkbenchState::assist_route`], the path every AI
+    /// feature takes, with a registry account (`~/.anthropic-accounts` and a
+    /// stand-in `anthropic-account`) so no Keychain is read. The stand-in
+    /// Manvi answers each assist call with the code in `answer`, or succeeds
+    /// when it is empty, and counts its spawns.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_claude_worker_whose_key_anthropic_refused_is_stopped() {
+        use crate::harness::sidecar::{bind_test_binary, test_serial, ModelSelection};
+        use crate::test_support::env::{bind_env, env_serial};
+        use std::os::unix::fs::PermissionsExt;
+        let serial = test_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            home.join(crate::harness::anthropic_account::REGISTRY),
+            "main\n",
+        )
+        .unwrap();
+        let executable = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        executable(
+            &bin.join(crate::harness::anthropic_account::PROGRAM),
+            r#"#!/bin/sh
+case "$1" in
+  which) printf '{"account":"main","source":"default","registry":"r","fallback":null,"workspace":"wrkspc_01Test"}\n' ;;
+  exec) while [ "$1" != "--" ]; do shift; done; shift; exec "$@" ;;
+  *) exit 2 ;;
+esac
+"#,
+        );
+        let answer = dir.path().join("answer");
+        let spawns = dir.path().join("spawns");
+        let manvi = dir.path().join("manvi");
+        executable(
+            &manvi,
+            &format!(
+                r#"#!/bin/sh
+promise='"withholds_provider_credentials":true,"withheld_provider_env":["ANTHROPIC_API_KEY"]'
+if [ "$1" = version ]; then printf '{{%s}}\n' "$promise"; exit 0; fi
+echo spawn >> '{spawns}'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{{"id":"\([0-9]*\)".*/\1/p')
+  case "$line" in
+    *'"op":"hello"'*) printf '{{"id":"%s","ok":true,"result":{{"protocol":1,"ops":["hello","work.assist.complete","work.runs.managed.prepare","work.runs.managed.stop"],"posture":"host",%s}}}}\n' "$id" "$promise" ;;
+    *) code=$(cat '{answer}' 2>/dev/null)
+       if [ -n "$code" ]; then printf '{{"id":"%s","ok":false,"error":{{"code":"%s","message":"refused","retryable":false}}}}\n' "$id" "$code"
+       else printf '{{"id":"%s","ok":true,"result":{{"ok":true,"provider":"anthropic","model":"m","text":"ok"}}}}\n' "$id"; fi ;;
+  esac
+done
+"#,
+                spawns = spawns.display(),
+                answer = answer.display(),
+            ),
+        );
+        let _binary = bind_test_binary(&serial, manvi.to_str().unwrap());
+        let env = env_serial();
+        // The stand-in comes first on PATH, ahead of any real
+        // `anthropic-account`, which would read the machine's Keychain.
+        let mut path = std::ffi::OsString::from(&bin);
+        path.push(":/usr/bin:/bin");
+        let _home = bind_env(&env).set("HOME", &home).set("PATH", &path);
+        let host = WorkbenchState::for_profile(&dir.path().join("profile.sqlite"));
+        let spawned = || {
+            std::fs::read_to_string(&spawns)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let call = |selection: &ModelSelection, code: &str| {
+            std::fs::write(&answer, code).unwrap();
+            (host.assist_route(selection.clone()).complete)(json!({ "user": "u" }))
+        };
+        let claude = ModelSelection::Claude {
+            model: "claude-sonnet-5-5".into(),
+        };
+        let local = ModelSelection::Local {
+            base_url: "http://127.0.0.1:8000/v1".into(),
+            model: "m".into(),
+        };
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outage = call(&claude, "E_DEPENDENCY").unwrap_err();
+            assert_eq!(outage.code, "E_DEPENDENCY", "{}", outage.message);
+            assert!(!worker_absent(&host), "an outage is not a refused key");
+            assert_eq!(spawned(), 1);
+
+            // A worker hosting a managed run keeps it: stopping the child
+            // would end the run, which never had the key.
+            let managed = |op: &str| {
+                std::fs::write(&answer, "").unwrap();
+                host.worker_call(op, json!({ "id": "run-1" }), Some(claude.clone()))
+                    .unwrap_or_else(|e| panic!("{op}: {} {}", e.code, e.message));
+            };
+            managed("work.runs.managed.prepare");
+            call(&claude, crate::ai::MANVI_PROVIDER_AUTH).unwrap_err();
+            assert!(
+                !worker_absent(&host),
+                "a refused key stopped the worker hosting a run"
+            );
+            managed("work.runs.managed.stop");
+            assert_eq!(spawned(), 1);
+
+            let refused = call(&claude, crate::ai::MANVI_PROVIDER_AUTH).unwrap_err();
+            assert_eq!(refused.code, crate::ai::MANVI_PROVIDER_AUTH);
+            assert!(
+                worker_absent(&host),
+                "the worker holding the refused key still serves"
+            );
+            // The person fixes their account: the next call starts a worker
+            // with the credential as it is now, and is answered.
+            call(&claude, "").expect("a fresh worker answers");
+            assert_eq!(spawned(), 2, "the refused worker was reused");
+
+            // A refusal answered by a worker that has since been replaced
+            // (a key save started a new one) does not stop the new one.
+            let replaced = Arc::new(
+                crate::harness::sidecar::ProfileConnection::new(
+                    dir.path().join("profile.sqlite"),
+                    Some(claude.clone()),
+                )
+                .unwrap(),
+            );
+            host.on_assist_failure(&replaced, crate::ai::MANVI_PROVIDER_AUTH);
+            assert!(
+                !worker_absent(&host),
+                "a stale refusal stopped the worker that replaced it"
+            );
+
+            call(&local, crate::ai::MANVI_PROVIDER_AUTH).unwrap_err();
+            assert!(
+                !worker_absent(&host),
+                "a local model's refusal is not about the Claude key"
+            );
+            assert_eq!(spawned(), 3);
+            host.shutdown();
+        }));
+        if let Err(panic) = outcome {
+            host.shutdown();
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]

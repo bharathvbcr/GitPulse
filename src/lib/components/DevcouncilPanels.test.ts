@@ -8,6 +8,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const suite = readFileSync(join(here, "DevcouncilSuitePanel.svelte"), "utf8");
 const integration = readFileSync(join(here, "AgentIntegrationPanel.svelte"), "utf8");
 const settings = readFileSync(join(here, "SettingsModal.svelte"), "utf8");
+const externalTools = readFileSync(join(here, "ExternalToolsPanel.svelte"), "utf8");
 
 describe("DevcouncilSuitePanel", () => {
   it("compiles", () => {
@@ -111,5 +112,10 @@ describe("Settings → Agents", () => {
     // Appearance tab would cost a user who never looks at this section.
     const mount = settings.slice(settings.indexOf("<DevcouncilSuitePanel"));
     expect(mount).toContain('activeSection === "agents"');
+  });
+
+  it("displays Manvi's BrandMark on the manvi CLI row", () => {
+    expect(externalTools).toContain('import BrandMark from "./BrandMark.svelte"');
+    expect(externalTools).toMatch(/\{#if row\.tool === "manvi"\}\s*<BrandMark mark="manvi"/);
   });
 });

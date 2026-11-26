@@ -22,6 +22,7 @@ use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::sysload::{
     Binding, Clock, PublishedVerdict, Reading, Snapshot, SnapshotWriter, Tier, WriterIdentity,
 };
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -38,12 +39,22 @@ echo "start $TAG verb=$1 held=$GITPULSE_LEASE_HELD shim=$CARGO_SLOT_HELD jobs=$C
 if [ -n "$SIGPIPE_FILE" ]; then
   perl -e 'print defined($SIG{PIPE}) ? $SIG{PIPE} : "DEFAULT"' > "$SIGPIPE_FILE"
 fi
+# This build ends on its own when the test that started it cannot release it:
+# the test process (OWNER) is gone, which is how a gate that is stopped part
+# way leaves it, or the test's temp root (ROOT) is gone, or a deadline passes.
+# Without a release nobody is going to write, it would poll for ever.
+alive() { kill -0 "$OWNER" 2>/dev/null && [ -d "$ROOT" ]; }
 if [ -n "$DAEMON_PID_FILE" ]; then
-  sleep 120 &
+  ( n=0; while alive && [ "$n" -lt 1200 ]; do sleep 0.1; n=$((n+1)); done ) &
   echo $! > "$DAEMON_PID_FILE"
 fi
 if [ -z "$NO_WAIT" ]; then
-  while [ ! -e "$RELEASE" ]; do sleep 0.1; done
+  n=0
+  while [ ! -e "$RELEASE" ]; do
+    n=$((n+1))
+    if [ "$n" -gt "${FAKE_CARGO_MAX_TICKS:-3000}" ] || ! alive; then exit 70; fi
+    sleep 0.1
+  done
 fi
 echo "stop $TAG" >> "$LOG"
 "#;
@@ -58,6 +69,8 @@ fn config_dir(home: &Path) -> PathBuf {
 
 struct World {
     _root: tempfile::TempDir,
+    /// The temp root every file of this world lives under.
+    root: PathBuf,
     home: PathBuf,
     tmp: PathBuf,
     bin: PathBuf,
@@ -66,6 +79,8 @@ struct World {
     tools: PathBuf,
     next: usize,
     running: Vec<Child>,
+    /// The process group each launched wrapper leads (its pid).
+    groups: Vec<i32>,
 }
 
 impl World {
@@ -93,6 +108,7 @@ impl World {
         Self {
             log: base.join("log"),
             release: base.join("release"),
+            root: base,
             _root: root,
             home,
             tmp,
@@ -100,6 +116,7 @@ impl World {
             tools,
             next: 0,
             running: Vec::new(),
+            groups: Vec::new(),
         }
     }
 
@@ -135,16 +152,28 @@ impl World {
             .env("LOG", &self.log)
             .env("RELEASE", &self.release)
             .env("TAG", tag)
+            .env("OWNER", std::process::id().to_string())
+            .env("ROOT", &self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+            .process_group(0);
         (command, stderr_path)
     }
 
+    /// Spawns a command from [`World::command`] and remembers the process group
+    /// it leads, so [`Drop`] can end everything it started, however the test
+    /// holds the `Child`.
+    fn launch(&mut self, mut command: Command) -> Child {
+        let child = command.spawn_locked().expect("spawn gitpulse-hook");
+        self.groups.push(child.id() as i32);
+        child
+    }
+
     fn start(&mut self, tag: &str) -> PathBuf {
-        let (mut command, stderr) = self.command(tag, &["build"]);
-        self.running
-            .push(command.spawn_locked().expect("spawn gitpulse-hook"));
+        let (command, stderr) = self.command(tag, &["build"]);
+        let child = self.launch(command);
+        self.running.push(child);
         stderr
     }
 
@@ -192,7 +221,23 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        // Children this test started, by pid: nothing else is touched.
+        // A release first, so a build that is waiting can finish by itself.
+        // The root may be gone already, which is fine.
+        let _ = std::fs::write(&self.release, "go");
+        // Then the process group of every wrapper this test launched, by its
+        // pgid: the wrapper, the build it became, and anything the build
+        // started (the daemon). The leader's pid stays reserved while any
+        // member lives, so a live group is always the one this test made; a
+        // group that is gone answers ESRCH, which is ignored.
+        for &pgid in &self.groups {
+            // SAFETY: killpg only signals; pgid is a pid this test spawned
+            // with `process_group(0)`, and is never this process's own group.
+            if pgid > 1 && pgid != unsafe { libc::getpgrp() } {
+                unsafe {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+        }
         for child in &mut self.running {
             let _ = child.kill();
             let _ = child.wait();
@@ -206,6 +251,251 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+// ---- Nothing a test starts outlives it (ft-11437bb1) ------------------------
+
+/// Whether `pid` is a live process: a zombie (ended, not yet reaped) is not.
+fn is_running(pid: i32) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output_locked()
+        .expect("run ps");
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// Waits (generously, polling) for every pid to end; the ones still running at
+/// the deadline are ended by their explicit pid, so a failing run does not
+/// leave them behind, and returned.
+fn survivors_after_wait(pids: &[i32]) -> Vec<i32> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && pids.iter().any(|pid| is_running(*pid)) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let left: Vec<i32> = pids.iter().copied().filter(|p| is_running(*p)).collect();
+    for pid in &left {
+        // SAFETY: a pid this test recorded from a process it started.
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
+        }
+    }
+    left
+}
+
+#[test]
+fn a_world_that_panics_mid_build_leaves_no_build_behind() {
+    let mut pids: Vec<i32> = Vec::new();
+    let mut held: Option<Child> = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut world = World::new(r#"{"slots":2}"#);
+        world.start("a");
+        wait_for("a to hold the slot", || world.started() == ["a"]);
+        // One the test holds itself, as the full-disk test does: it is not in
+        // `running`, so only the process group reaches it.
+        let (command, _) = world.command("b", &["build"]);
+        let child = held.insert(world.launch(command));
+        pids.push(child.id() as i32);
+        wait_for("b to hold the second slot", || world.started().len() == 2);
+        pids.push(world.running[0].id() as i32);
+        panic!("a test failed mid-build");
+    }));
+    assert!(result.is_err());
+    let left = survivors_after_wait(&pids);
+    if let Some(mut held) = held {
+        let _ = held.wait();
+    }
+    assert!(left.is_empty(), "builds outlived their test: {left:?}");
+}
+
+#[test]
+fn a_world_dropped_before_its_build_started_leaves_nothing_behind() {
+    let (pid, mut held) = {
+        let mut world = World::new(r#"{"slots":1}"#);
+        let (command, _) = world.command("a", &["build"]);
+        let held = world.launch(command);
+        (held.id() as i32, held)
+    };
+    let left = survivors_after_wait(&[pid]);
+    let _ = held.wait();
+    assert!(left.is_empty(), "a wrapper outlived its test: {left:?}");
+}
+
+#[test]
+fn a_world_dropped_after_its_root_was_deleted_still_ends_its_builds() {
+    let mut world = World::new(r#"{"slots":1}"#);
+    world.start("a");
+    wait_for("a to hold the slot", || world.started() == ["a"]);
+    let pid = world.running[0].id() as i32;
+    std::fs::remove_dir_all(&world.root).unwrap();
+    drop(world);
+    let left = survivors_after_wait(&[pid]);
+    assert!(left.is_empty(), "a build outlived its root: {left:?}");
+}
+
+#[test]
+fn dropping_after_everything_finished_is_a_no_op() {
+    let mut world = World::new(r#"{"slots":2}"#);
+    world.start("a");
+    world.start("b");
+    wait_for("both to start", || world.started().len() == 2);
+    world.release();
+    assert!(world.finish().iter().all(|code| *code == Some(0)));
+    // A second release and a drop with nothing left running.
+    world.release();
+    drop(world);
+}
+
+#[test]
+fn a_daemon_a_build_left_behind_ends_with_its_world() {
+    let mut world = World::new(r#"{"slots":1}"#);
+    let pidfile = world.tmp.join("daemon.pid");
+    let (mut command, _) = world.command("a", &["build"]);
+    command.env("DAEMON_PID_FILE", &pidfile).env("NO_WAIT", "1");
+    let mut first = world.launch(command);
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+    wait_for("the daemon's pid", || {
+        std::fs::read_to_string(&pidfile).is_ok_and(|text| text.trim().parse::<i32>().is_ok())
+    });
+    let daemon: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(is_running(daemon), "the daemon is up while its world is");
+    drop(world);
+    let left = survivors_after_wait(&[daemon]);
+    assert!(left.is_empty(), "the daemon outlived its world: {left:?}");
+}
+
+/// Not a test of its own: the body a test process is killed in, by
+/// `a_test_process_killed_outright_leaves_no_build_behind`.
+#[test]
+fn killed_owner_child_mode() {
+    let Some(report) = std::env::var_os("BL_KILLED_OWNER_REPORT") else {
+        return;
+    };
+    let mut world = World::new(r#"{"slots":1}"#);
+    // b starts only once a holds the slot: both wrappers race for it, and an
+    // instrumented (coverage) hook starts slowly enough for b to win, which
+    // left a waiting for a slot that b held and this wait never satisfied.
+    world.start("a");
+    wait_for("a to hold the slot", || world.started() == ["a"]);
+    world.start("b");
+    wait_for("b to queue behind a", || world.queued() == 1);
+    let mut lines: Vec<String> = world.running.iter().map(|c| c.id().to_string()).collect();
+    lines.push(world.root.display().to_string());
+    let report = PathBuf::from(report);
+    let partial = report.with_extension("partial");
+    std::fs::write(&partial, lines.join("\n")).unwrap();
+    std::fs::rename(&partial, &report).unwrap();
+    // Waits to be killed: Drop never runs.
+    std::thread::sleep(Duration::from_secs(600));
+}
+
+#[test]
+fn a_test_process_killed_outright_leaves_no_build_behind() {
+    let dir = tempfile::Builder::new()
+        .prefix("blk")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let report = dir.path().join("report");
+    let mut owner = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "killed_owner_child_mode",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("BL_KILLED_OWNER_REPORT", &report)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn_locked()
+        .expect("start the test process to kill");
+    let reported = std::panic::catch_unwind(|| {
+        wait_for("the owner to report its builds", || report.exists());
+    });
+    if reported.is_err() {
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        panic!("the test process to kill never reported its builds");
+    }
+    let text = std::fs::read_to_string(&report).unwrap();
+    let mut lines = text.lines();
+    let pids: Vec<i32> = lines.by_ref().take(2).map(|l| l.parse().unwrap()).collect();
+    let root = PathBuf::from(lines.next().unwrap());
+    // SIGKILL: no Drop, no cleanup, which is how a gate that is stopped part
+    // way ends a test.
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    let left = survivors_after_wait(&pids);
+    // The killed owner's temp root is the test's to remove, as its Drop would.
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        left.is_empty(),
+        "builds outlived the test process that started them: {left:?}"
+    );
+}
+
+/// Runs the fake cargo itself with `extra` env and waits for it to end on its
+/// own; one still running at the deadline is killed by its pid and reported.
+fn fake_cargo_ends_by_itself(world: &World, extra: &[(&str, &std::ffi::OsStr)]) -> Option<i32> {
+    let mut command = Command::new(world.bin.join("cargo"));
+    command
+        .arg("build")
+        .env_clear()
+        .env("LOG", &world.log)
+        .env("RELEASE", world.root.join("never-released"))
+        .env("TAG", "x")
+        .env("OWNER", std::process::id().to_string())
+        .env("ROOT", &world.root)
+        .stdin(Stdio::null());
+    for (name, value) in extra {
+        command.env(name, value);
+    }
+    let mut child = command.spawn_locked().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.code();
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("the fake cargo was still waiting for a release nobody will write");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn the_fake_cargo_gives_up_when_its_test_process_is_gone() {
+    let world = World::new(r#"{"slots":1}"#);
+    let mut gone = Command::new("/usr/bin/true").spawn_locked().unwrap();
+    gone.wait().unwrap();
+    let owner = gone.id().to_string();
+    let code = fake_cargo_ends_by_itself(&world, &[("OWNER", std::ffi::OsStr::new(&owner))]);
+    assert_eq!(code, Some(70));
+}
+
+#[test]
+fn the_fake_cargo_gives_up_when_its_temp_root_is_gone() {
+    let world = World::new(r#"{"slots":1}"#);
+    let missing = world.root.join("deleted");
+    let code = fake_cargo_ends_by_itself(&world, &[("ROOT", missing.as_os_str())]);
+    assert_eq!(code, Some(70));
+}
+
+#[test]
+fn the_fake_cargo_gives_up_after_its_deadline() {
+    let world = World::new(r#"{"slots":1}"#);
+    let code = fake_cargo_ends_by_itself(
+        &world,
+        &[("FAKE_CARGO_MAX_TICKS", std::ffi::OsStr::new("3"))],
+    );
+    assert_eq!(code, Some(70));
 }
 
 fn settle() {
@@ -318,7 +608,7 @@ fn the_lock_dies_with_cargo_not_its_daemon_child() {
     let pidfile = world.tmp.join("daemon.pid");
     let (mut first, _) = world.command("a", &["build"]);
     first.env("DAEMON_PID_FILE", &pidfile).env("NO_WAIT", "1");
-    let mut first = first.spawn_locked().unwrap();
+    let mut first = world.launch(first);
     // The daemon holds an inherited descriptor to the slot file after cargo
     // has exited. A flock would be held by it; a record lock is not.
     assert_eq!(first.wait().unwrap().code(), Some(0));
@@ -331,7 +621,7 @@ fn the_lock_dies_with_cargo_not_its_daemon_child() {
     assert!(daemon > 1);
     let (mut second, _) = world.command("b", &["build"]);
     second.env("NO_WAIT", "1");
-    let mut second = second.spawn_locked().unwrap();
+    let mut second = world.launch(second);
     wait_for("the second build to start behind the daemon", || {
         world.started() == ["a", "b"]
     });
@@ -352,7 +642,7 @@ fn an_unusable_dir_runs_and_says_not_leased() {
     std::fs::set_permissions(world.lease_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut command, stderr) = world.command("a", &["build"]);
     command.env("NO_WAIT", "1");
-    let status = command.spawn_locked().unwrap().wait().unwrap();
+    let status = world.launch(command).wait().unwrap();
     assert_eq!(status.code(), Some(0), "the build ran");
     assert_eq!(world.started(), ["a"]);
     let said = std::fs::read_to_string(stderr).unwrap();
@@ -432,7 +722,7 @@ fn a_nested_call_and_a_verb_that_builds_nothing_never_wait() {
         if nested {
             command.env("GITPULSE_LEASE_HELD", "1");
         }
-        let status = command.spawn_locked().unwrap().wait().unwrap();
+        let status = world.launch(command).wait().unwrap();
         assert_eq!(status.code(), Some(0), "{tag}");
     }
     assert_eq!(
@@ -466,7 +756,7 @@ fn a_leased_build_does_not_inherit_an_ignored_sigpipe() {
     let seen = world.tmp.join("sigpipe");
     let (mut command, _stderr) = world.command("a", &["build"]);
     command.env("NO_WAIT", "1").env("SIGPIPE_FILE", &seen);
-    let status = command.spawn_locked().unwrap().wait().unwrap();
+    let status = world.launch(command).wait().unwrap();
     assert_eq!(status.code(), Some(0));
     assert_eq!(
         std::fs::read_to_string(&seen).unwrap(),
@@ -514,6 +804,8 @@ fn shell_build(world: &World, path: &std::ffi::OsStr, tag: &str) -> std::process
         .env("LOG", &world.log)
         .env("RELEASE", &world.release)
         .env("TAG", tag)
+        .env("OWNER", std::process::id().to_string())
+        .env("ROOT", &world.root)
         .env("NO_WAIT", "1")
         .stdin(Stdio::null())
         .output_locked()
@@ -659,7 +951,7 @@ fn start_on_a_full_disk(world: &mut World, tag: &str) -> Child {
             Ok(())
         });
     }
-    command.spawn_locked().expect("spawn gitpulse-hook")
+    world.launch(command)
 }
 
 #[test]
@@ -717,7 +1009,7 @@ fn an_unleased_build_that_cannot_be_counted_says_so() {
     let mut world = world;
     let (mut command, stderr) = world.command("a", &["build"]);
     command.env("NO_WAIT", "1");
-    let status = command.spawn_locked().unwrap().wait().unwrap();
+    let status = world.launch(command).wait().unwrap();
     assert_eq!(status.code(), Some(0), "the build ran");
     assert_eq!(world.started(), ["a"]);
     let said = std::fs::read_to_string(stderr).unwrap();
@@ -725,5 +1017,117 @@ fn an_unleased_build_that_cannot_be_counted_says_so() {
     assert!(
         said.contains("could NOT be counted"),
         "a miss Health cannot count is said, not dropped: {said}"
+    );
+}
+
+#[test]
+fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config_opt_out() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut world = World::new(r#"{"mode":"off","wait_max_s":15,"wait_hard_s":60}"#);
+    // Slowing is opt-in; this person switched it on.
+    std::fs::write(
+        &world.tools,
+        r#"{"version":1,"host_load_leases":{"mode":"off","wait_max_s":15,"wait_hard_s":60},"manvi_steward":{"slow_critical":true}}"#,
+    )
+    .unwrap();
+    // The steward names the trusted repositories a lease covers; the hook runs
+    // from this test's working directory, inside this repository.
+    let here = std::env::current_dir().unwrap();
+    let covered = gitpulse_lib::harness::steward::canonical_common_dir(here.to_str().unwrap())
+        .expect("the test runs inside a Git checkout");
+    let steward_dir = config_dir(&world.home).join("steward");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&steward_dir)
+        .unwrap();
+    let active_path = steward_dir.join("active.json");
+    // A lease the steward could issue: readers refuse one longer than 15
+    // minutes or dated in the future.
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let active_json = serde_json::json!({
+        "version": 2,
+        "writer_pid": std::process::id(),
+        "writer_start_us": gitpulse_lib::sysload::process_start_us(std::process::id()).unwrap_or(0),
+        "issued_at_ms": now_ms,
+        "expires_at_ms": now_ms + 900_000,
+        "tier": "severe",
+        "binding": "swap",
+        "reason": "swap pressure",
+        "pace_ms": 500u64,
+        "repositories": [covered],
+    });
+    let write_active = |path: &Path| {
+        std::fs::write(path, serde_json::to_vec(&active_json).unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    write_active(&active_path);
+
+    // 1. Even with `host_load_leases.mode = "off"`, an active steward critical slowdown
+    //    forces `gitpulse-hook lease -- cargo build` into the queue at 0 refusing slots.
+    let stderr_a = world.start("a");
+    wait_for("a to queue under steward slowdown", || world.queued() == 1);
+    settle();
+    assert!(
+        world.started().is_empty(),
+        "build ran while steward critical slowdown held capacity at 0: {:?}",
+        world.lines()
+    );
+    let said_a = std::fs::read_to_string(&stderr_a).unwrap_or_default();
+    assert!(
+        said_a.contains("Manvi system steward critical slowdown is active"),
+        "expected steward slowdown announcement on stderr, got: {said_a}"
+    );
+
+    // A build in a repository the lease does not name is not held: the
+    // steward only covers repositories it found trusted.
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(elsewhere.path())
+        .status_locked()
+        .unwrap()
+        .success());
+    let (mut cmd_u, _stderr_u) = world.command("u", &["build"]);
+    cmd_u.current_dir(elsewhere.path()).env("NO_WAIT", "1");
+    let mut child_u = cmd_u.spawn_locked().unwrap();
+    wait_for("u, outside the lease, to run while a is held", || {
+        world.started() == ["u"]
+    });
+    assert_eq!(child_u.wait().unwrap().code(), Some(0));
+
+    // Clearing `active.json` unblocks the queued build immediately.
+    std::fs::remove_file(&active_path).unwrap();
+    wait_for("a to start after active.json removal", || {
+        world.started() == ["u", "a"]
+    });
+    world.release();
+    assert_eq!(world.finish(), [Some(0)]);
+
+    // 2. Re-publish `active.json`, then disable `manvi_steward` in `GITPULSE_TOOL_CONFIG`
+    //    (outside `config_dir(&world.home)`). The hook subprocess must honor
+    //    `GITPULSE_TOOL_CONFIG` and pass straight through without queueing.
+    write_active(&active_path);
+    std::fs::write(
+        &world.tools,
+        r#"{"version":1,"host_load_leases":{"mode":"off","wait_max_s":15,"wait_hard_s":60},"manvi_steward":{"enabled":false}}"#,
+    )
+    .unwrap();
+    let (mut cmd_b, _stderr_b) = world.command("b", &["build"]);
+    cmd_b.env("NO_WAIT", "1");
+    let status_b = cmd_b.spawn_locked().unwrap().wait().unwrap();
+    assert_eq!(status_b.code(), Some(0));
+    assert_eq!(
+        world.started(),
+        ["u", "a", "b"],
+        "GITPULSE_TOOL_CONFIG opt-out must let build b run immediately: {:?}",
+        world.lines()
     );
 }

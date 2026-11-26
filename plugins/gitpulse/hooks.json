@@ -5,11 +5,16 @@
         "type": "command",
         "command": "gitpulse-hook --host=agy session-brief",
         "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "gitpulse-hook --host=agy peer-inbox",
+        "timeout": 5
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -22,19 +27,21 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "gitpulse-hook --host=agy notify prompt_submitted",
+        "command": "gitpulse-hook --host=agy peer-inbox",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook --host=agy peer-inbox",
         "timeout": 5
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "gitpulse-hook --host=agy notify turn_finished",
-        "timeout": 5
-      },
-      {
-        "type": "command",
-        "command": "gitpulse-hook --host=agy deliver",
+        "command": "gitpulse-hook --host=agy stop-or-notify",
         "timeout": 5
       }
     ]

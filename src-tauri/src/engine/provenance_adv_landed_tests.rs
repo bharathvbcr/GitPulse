@@ -20,10 +20,13 @@ impl R {
         r
     }
 
-    /// A repository whose directory name contains the list separator.
+    /// A repository whose directory name contains the list separator: `:`, or
+    /// `;` where `:` is a drive and cannot be in a name.
+    const SEPARATED: &'static str = if cfg!(windows) { "a;b" } else { "a:b" };
+
     fn with_colon() -> Self {
         let parent = tempfile::tempdir().expect("tempdir");
-        let dir = parent.path().join("a:b");
+        let dir = parent.path().join(Self::SEPARATED);
         std::fs::create_dir(&dir).unwrap();
         // Keep `parent` alive by leaking it into the struct's tempdir: the
         // repository lives under it, so its removal removes both.
@@ -62,7 +65,7 @@ impl R {
     }
 
     fn work(&self) -> PathBuf {
-        let colon = self.path().join("a:b");
+        let colon = self.path().join(Self::SEPARATED);
         if colon.is_dir() {
             colon
         } else {
@@ -606,7 +609,10 @@ fn promisor_repo(config_text: &str) -> (R, String, PathBuf) {
     let script = r.path().join("helper.sh");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexit 1\n",
+            marker.display().to_string().replace('\\', "/")
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -621,8 +627,11 @@ fn promisor_repo(config_text: &str) -> (R, String, PathBuf) {
     let config = r.work().join(".git/config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str(&format!(
-        "[protocol \"ext\"]\n\tallow = always\n[remote \"origin\"]\n\turl = ext::{}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n{config_text}",
-        script.display()
+        "[protocol \"ext\"]\n\tallow = always\n[remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n{config_text}",
+        crate::test_support::env::git_config_value(&format!(
+            "ext::{}",
+            script.display().to_string().replace('\\', "/")
+        ))
     ));
     std::fs::write(&config, text).unwrap();
     (r, tip, marker)

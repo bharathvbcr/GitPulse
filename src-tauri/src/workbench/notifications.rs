@@ -478,6 +478,30 @@ pub(crate) fn responses() -> Result<ResponseTap, String> {
         .map_err(|error| error.message)
 }
 
+fn deliver_notification_activation(opening: &tauri::AppHandle, session: Option<String>) {
+    if let Err(error) = crate::desktop::reveal_main(opening) {
+        log::warn!(target: "workbench", "notification window activation: {error}");
+    }
+    if crate::desktop::is_main_ready(opening) {
+        let emitted = match &session {
+            Some(key) => opening.emit("gitpulse-session-notification-open", key.clone()),
+            None => opening.emit("workbench-notification-open", ()),
+        };
+        if let Err(error) = emitted {
+            log::warn!(target: "workbench", "notification activation wake: {error}");
+        }
+    } else {
+        let (event, payload) = match &session {
+            Some(key) => (
+                "gitpulse-session-notification-open",
+                serde_json::Value::String(key.clone()),
+            ),
+            None => ("workbench-notification-open", serde_json::Value::Null),
+        };
+        crate::desktop::queue_main_event(opening, event, payload);
+    }
+}
+
 fn run(
     host: WorkbenchState,
     app: tauri::AppHandle,
@@ -594,16 +618,13 @@ fn run(
                     }
                 }
                 let opening = app.clone();
-                if let Err(error)=app.run_on_main_thread(move||{
-                    if let Some(window)=opening.get_webview_window("main") {
-                        for result in [window.show(),window.unminimize(),window.set_focus()] {if let Err(error)=result {log::warn!(target:"workbench","notification window activation: {error}");}}
+                if let Err(error) = app.run_on_main_thread(move || {
+                    deliver_notification_activation(&opening, session);
+                }) {
+                    if let Ok(mut current) = status.lock() {
+                        current.error = Some(error.to_string());
                     }
-                    let emitted = match &session {
-                        Some(key) => opening.emit("gitpulse-session-notification-open", key.clone()),
-                        None => opening.emit("workbench-notification-open", ()),
-                    };
-                    if let Err(error)=emitted {log::warn!(target:"workbench","notification activation wake: {error}");}
-                }) {if let Ok(mut current)=status.lock(){current.error=Some(error.to_string());}}
+                }
             }
             Ok(Event::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1299,8 +1320,14 @@ mod tests {
         } else {
             "/checkout"
         };
-        let checkout_git = format!("{checkout}/.git");
-        call(&host,"repositories.put",json!({"id":"m","request_id":"m","expected_revision":0,"name":"m","identity_key":"local:/checkout/.git"})).unwrap();
+        // Spelled as the platform spells it, and the same in the registered
+        // identity and in the run's common directory, which must agree.
+        let checkout_git = if cfg!(windows) {
+            r"C:\checkout\.git"
+        } else {
+            "/checkout/.git"
+        };
+        call(&host,"repositories.put",json!({"id":"m","request_id":"m","expected_revision":0,"name":"m","identity_key":format!("local:{checkout_git}")})).unwrap();
         call(&host,"items.put",json!({"id":"t","request_id":"t","expected_revision":0,"title":"private","repository_ids":["m"],"primary_repository_id":"m"})).unwrap();
         call(&host,"runs.prepare",json!({"id":"run","request_id":"prepare","expected_revision":0,"kind":"managed","task_id":"t","source_revision":1,"repository_id":"m","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":checkout,"git_dir":checkout_git,"git_common_dir":checkout_git,"head_oid":"0123456789abcdef0123456789abcdef01234567","head_ref":"refs/heads/main","max_active_runs":1})).unwrap();
         call(&host,"runs.claim",json!({"id":"run","request_id":"claim","expected_revision":1,"owner_id":"owner","session_id":"session","kind":"managed"})).unwrap();
@@ -1607,5 +1634,109 @@ mod tests {
         let rm_json: Value = serde_json::from_slice(&rm_line).unwrap();
         assert_eq!(rm_json["op"], "remove");
         assert_eq!(rm_json["key"], expected_key);
+    }
+
+    #[test]
+    fn bundled_notification_icons_and_plugin_logo_match_current_brand() {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        const LEGACY_PLUGIN_LOGO_SHA256: &str =
+            "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tauri_conf_raw = std::fs::read_to_string(manifest_dir.join("tauri.conf.json"))
+            .expect("read tauri.conf.json");
+        let tauri_conf: Value =
+            serde_json::from_str(&tauri_conf_raw).expect("parse tauri.conf.json");
+
+        let icons = tauri_conf["bundle"]["icon"]
+            .as_array()
+            .expect("bundle.icon array");
+        let icon_strs: Vec<&str> = icons.iter().filter_map(Value::as_str).collect();
+        for expected in [
+            "icons/32x32.png",
+            "icons/128x128.png",
+            "icons/128x128@2x.png",
+            "icons/icon.icns",
+            "icons/icon.ico",
+        ] {
+            assert!(
+                icon_strs.contains(&expected),
+                "tauri.conf.json bundle.icon missing {expected}"
+            );
+        }
+        assert_eq!(
+            tauri_conf["bundle"]["resources"]["../plugins/gitpulse/"],
+            json!("plugin/")
+        );
+
+        let icns = std::fs::read(manifest_dir.join("icons/icon.icns")).expect("read icon.icns");
+        assert!(icns.starts_with(b"icns"), "icon.icns missing icns header");
+
+        let read_png_ihdr = |path: &std::path::Path| -> (u32, u32, u8, u8, Vec<u8>) {
+            let bytes =
+                std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert!(
+                bytes.len() >= 26,
+                "PNG {} too short ({} bytes)",
+                path.display(),
+                bytes.len()
+            );
+            assert_eq!(
+                &bytes[0..8],
+                &PNG_MAGIC,
+                "bad PNG magic in {}",
+                path.display()
+            );
+            assert_eq!(
+                &bytes[12..16],
+                b"IHDR",
+                "missing IHDR in {}",
+                path.display()
+            );
+            let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+            let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+            let bit_depth = bytes[24];
+            let color_type = bytes[25];
+            (width, height, bit_depth, color_type, bytes)
+        };
+
+        for (rel, expected_w, expected_h) in [
+            ("icons/32x32.png", 32, 32),
+            ("icons/128x128.png", 128, 128),
+            ("icons/128x128@2x.png", 256, 256),
+            ("icons/icon.png", 512, 512),
+        ] {
+            let (w, h, _, _, _) = read_png_ihdr(&manifest_dir.join(rel));
+            assert_eq!(
+                (w, h),
+                (expected_w, expected_h),
+                "unexpected size for {rel}"
+            );
+        }
+
+        let (logo_w, logo_h, bit_depth, color_type, logo_bytes) =
+            read_png_ihdr(&manifest_dir.join("../plugins/gitpulse/assets/logo.png"));
+        assert_eq!((logo_w, logo_h), (256, 256));
+        assert_eq!(bit_depth, 8, "plugin logo must be 8-bit");
+        assert_eq!(color_type, 6, "plugin logo must be RGBA");
+
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(&logo_bytes) {
+            let _ = write!(digest, "{byte:02x}");
+        }
+        assert_ne!(
+            digest, LEGACY_PLUGIN_LOGO_SHA256,
+            "plugins/gitpulse/assets/logo.png still matches legacy Sep-14 pulse-only PNG"
+        );
+    }
+
+    #[test]
+    fn session_host_routes_through_session_category_and_preserves_activity_heading() {
+        assert_eq!(ACTIVITY_HEADING, "GitPulse activity");
+        assert_eq!(platform::SESSION_CATEGORY, "gitpulse-session");
+        assert_eq!(crate::alerts::NATIVE_PREFIX, "gitpulse.session.");
     }
 }

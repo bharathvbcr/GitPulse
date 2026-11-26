@@ -3,9 +3,10 @@
 //! Upstream `devmap_serve::mcp::TOOL_NAMES` is the published surface of the
 //! standalone `devmap mcp` server. GitPulse does not vendor that crate (it
 //! pulls `hyper` / HTTP transport crates GitPulse does not otherwise need);
-//! instead this module owns the same ordered name list and the in-process
-//! dispatch through [`crate::codeintel`], so `tools/list` cannot silently drop
-//! a tool the global server still advertises.
+//! instead this module serves a subset of it (11 of upstream's tools) with
+//! in-process dispatch through [`crate::codeintel`]. That every name served
+//! here is one upstream publishes is checked by `scripts/check-schema-parity.mjs`
+//! against `TOOL_NAMES` at the DevCouncil commit vendored in VENDOR.json.
 //!
 //! Every call still requires GitPulse's `repo_path` — this process mediates
 //! many repositories. The standalone `devmap mcp` server accepts the same
@@ -19,10 +20,15 @@ use crate::codeintel::{NameQueryOptions, WalkBounds, MCP_DEFAULT_WALK_DEPTH};
 use super::validate::{tool_args, Spec, ToolArgs, Unit};
 use super::{budget_spec, parse, path_spec, repo_spec, tool, BudgetArgs, RepoArgs, MAX_ARG_CHARS};
 
-/// Ordered tool names matching `devmap_serve::mcp::TOOL_NAMES`.
+/// The `devmap_*` tools GitPulse serves: a subset of
+/// `devmap_serve::mcp::TOOL_NAMES` (upstream publishes more), listed in the
+/// order GitPulse advertises them.
 ///
-/// Keep this list identical to upstream. The parity test fails when either
-/// side grows without the other.
+/// GitPulse does not vendor devmap-serve, so nothing in this crate can read
+/// upstream's list. The test below only checks `tool_definitions()` against
+/// this list. That every name here is one upstream publishes is checked by the
+/// tool-list row of `scripts/check-schema-parity.mjs` (`bun run
+/// check:schema-parity`), at the DevCouncil commit vendored in VENDOR.json.
 pub const TOOL_NAMES: &[&str] = &[
     "devmap_status",
     "devmap_search",
@@ -648,6 +654,9 @@ pub fn handle(name: &str, arguments: &Value) -> Result<Value, CommandError> {
 mod tests {
     use super::*;
 
+    // Checks only that `tool_definitions()` advertises exactly this module's
+    // `TOOL_NAMES`, in order, and that there are 11. It cannot see upstream's
+    // list; that comparison is in `scripts/check-schema-parity.mjs`.
     #[test]
     fn advertised_names_match_upstream_tool_names() {
         let definitions = tool_definitions();
@@ -948,21 +957,19 @@ mod tests {
         assert!(out["reason"].is_string(), "{out}");
     }
 
-    /// `answer` without `verified_age_ms`, which is the time since the freshness
-    /// walk and so differs between two otherwise identical answers.
-    fn without_verified_age(mut answer: Value) -> Value {
-        fn strip(value: &mut Value) {
-            match value {
-                Value::Object(map) => {
-                    map.remove("verified_age_ms");
-                    map.values_mut().for_each(strip);
-                }
-                Value::Array(items) => items.iter_mut().for_each(strip),
-                _ => {}
+    /// Drops every `source_freshness.verified_age_ms`: the milliseconds since
+    /// the store's cached walk, which grow between two otherwise identical
+    /// asks (1 then 2 when a millisecond boundary falls between them), so two
+    /// answers are compared on what the arguments decide.
+    fn without_verification_age(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("verified_age_ms");
+                object.values_mut().for_each(without_verification_age);
             }
+            Value::Array(items) => items.iter_mut().for_each(without_verification_age),
+            _ => {}
         }
-        strip(&mut answer);
-        answer
     }
 
     /// The validator calls `5.0` an integer, so the handler has to answer it as
@@ -988,7 +995,9 @@ mod tests {
                 args.as_object_mut()
                     .unwrap()
                     .extend(base.as_object().unwrap().clone());
-                without_verified_age(ask(name, args))
+                let mut out = ask(name, args);
+                without_verification_age(&mut out);
+                out
             };
             assert_eq!(answer(json!(5.0)), answer(json!(5)), "{name}");
             assert_eq!(answer(json!(1.0)), answer(json!(1)), "{name}");
@@ -1217,12 +1226,29 @@ mod tests {
     #[test]
     fn search_and_explore_verify_whole_tree_freshness() {
         let repo = crate::codeintel::tests::freshness_audit_matching_source_fixture();
-        // A walk that matches a base the current analyzer did not write reads
-        // `fresh: null` (resolver-stale base), so this fixture must describe a
-        // store the current analyzer and resolver wrote before `true` can mean
-        // the tree was verified.
-        crate::codeintel::tests::stamp_current_payload_identity(repo.path());
         let root = repo.path().to_string_lossy().into_owned();
+        // The fixture's payloads carry stamps no current analyzer wrote. The
+        // tree matches the stored hashes, but the index is not the one this
+        // build would write (a resolver-stale base), so the walk certifies
+        // nothing and says why rather than answering `true`.
+        let obsolete = ask(
+            "devmap_search",
+            json!({ "repo_path": root, "query": "probe_caller" }),
+        );
+        assert_eq!(
+            obsolete["source_freshness"]["fresh"],
+            Value::Null,
+            "{obsolete}"
+        );
+        assert!(
+            obsolete["source_freshness"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolver-stale base")),
+            "{obsolete}"
+        );
+        // Restamped as the current analyzer and resolver wrote it, the same
+        // matching tree is verified fresh.
+        crate::codeintel::tests::stamp_current_payload_identity(repo.path());
         let search = ask(
             "devmap_search",
             json!({ "repo_path": root, "query": "probe_caller" }),

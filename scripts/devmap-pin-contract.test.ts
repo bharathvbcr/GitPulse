@@ -25,7 +25,7 @@ export function devmapPinProblems(ci: string): string[] {
   const problems: string[] = [];
 
   const pins = [...ci.matchAll(/^ {2}DEVMAP_REV: (\S+)\s*$/gm)].map((m) => m[1]);
-  if (pins.length !== 1) problems.push(`expected exactly one DEVMAP_REV in ci.yml, found ${pins.length}`);
+  if (pins.length !== 1) problems.push(`expected exactly one DEVMAP_REV in the workflow, found ${pins.length}`);
   else if (!/^[0-9a-f]{40}$/.test(pins[0])) problems.push(`DEVMAP_REV ${pins[0]} is not a full 40-character commit SHA`);
 
   for (const line of ci.split("\n").filter((l) => l.includes("cargo install --git"))) {
@@ -52,18 +52,42 @@ export function devmapPinProblems(ci: string): string[] {
     // `actions/cache` saves in a post step that runs only if the whole job passed. These jobs'
     // suites are red on a runner more often than not, so the verified build is saved on its own.
     if (/uses: actions\/cache@/.test(job)) problems.push(`${id} caches devmap with actions/cache, which saves only when the whole job succeeds`);
-    const save = job.indexOf("actions/cache/save@");
+    // The save whose key is devmap's: a job may save other builds too (manvi).
+    const save = [...job.matchAll(/actions\/cache\/save@[^\n]*\n(?:(?! {6}- name:)[^\n]*\n)*?\s+key: devmap-/g)][0]?.index ?? -1;
     if (save === -1) problems.push(`${id} never saves its devmap build with actions/cache/save`);
     else if (check !== -1 && save < check) problems.push(`${id} saves its devmap build before check:vendor-schema has passed`);
   }
   return problems;
 }
 
+/** The workflow's one `DEVMAP_REV`, or undefined. */
+export function devmapPin(workflow: string): string | undefined {
+  return /^ {2}DEVMAP_REV: (\S+)\s*$/m.exec(workflow)?.[1];
+}
+
+/** The instrumented lib suite drives the CLI too, so devmap must be installed before it runs. */
+export function coverageOrderProblems(coverage: string): string[] {
+  // The step, not the words: a comment near the top already mentions `cargo llvm-cov`.
+  const install = coverage.indexOf("name: Install devmap");
+  const suite = coverage.indexOf("name: Generate Rust Coverage");
+  if (suite === -1) return ["coverage.yml has no 'Generate Rust Coverage' step; this contract needs updating"];
+  if (install === -1 || install > suite) return ["coverage.yml runs the instrumented suite before it installs devmap"];
+  return [];
+}
+
 describe("devmap pin contract", () => {
   const ci = read(".github/workflows/ci.yml");
+  // The coverage workflow runs the same lib suite, so it installs the same CLI.
+  const coverage = read(".github/workflows/coverage.yml");
 
   it("pins devmap to one full commit, installs it from that pin, and checks it against the vendored schema", () => {
     expect(devmapPinProblems(ci)).toEqual([]);
+  });
+
+  it("holds the coverage workflow to the same rules and the same pin as ci.yml", () => {
+    expect(devmapPinProblems(coverage)).toEqual([]);
+    expect(devmapPin(coverage), "coverage.yml builds devmap from another commit than ci.yml").toBe(devmapPin(ci));
+    expect(coverageOrderProblems(coverage)).toEqual([]);
   });
 
   it("builds from the commit the vendored devmap-store schema number comes from", () => {
@@ -73,6 +97,15 @@ describe("devmap pin contract", () => {
     const stated = /DevCouncil commit `devmap` is built from[\s\S]*?store schema (\d+)/.exec(ci)?.[1];
     expect(vendored, "vendored schema number not found").toBeDefined();
     expect(stated, `ci.yml states schema ${stated}, the vendored crates are at ${vendored}`).toBe(vendored);
+  });
+
+  it("the coverage ordering rule fails on a job that installs devmap late or never", () => {
+    const missing = coverage.replace("name: Install devmap", "name: Fetch devmap");
+    expect(missing).not.toBe(coverage);
+    expect(coverageOrderProblems(missing)).toEqual(["coverage.yml runs the instrumented suite before it installs devmap"]);
+    const noSuite = coverage.replace("name: Generate Rust Coverage", "name: Something else");
+    expect(noSuite).not.toBe(coverage);
+    expect(coverageOrderProblems(noSuite)[0]).toContain("this contract needs updating");
   });
 
   describe("the rules fail on the shapes they are for", () => {
@@ -109,7 +142,9 @@ describe("devmap pin contract", () => {
     });
     it("a build that is restored but never saved, or saved before it is checked", () => {
       has(broken(/\n {6}- name: Keep the verified devmap build\n[\s\S]*?\n\n/, "\n\n"), "never saves its devmap build");
-      has(broken(/(\n {6}- name: Cache devmap\n)/, "\n      - name: Early\n        uses: actions/cache/save@x\n$1"), "before check:vendor-schema has passed");
+      has(broken(/(\n {6}- name: Cache devmap\n)/, "\n      - name: Early\n        uses: actions/cache/save@x\n        with:\n          path: ~/.cache/gitpulse-ci/devmap\n          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}\n$1"), "before check:vendor-schema has passed");
+      // Another build's save does not stand in for devmap's.
+      has(broken(/\n {6}- name: Keep the verified devmap build\n[\s\S]*?\n\n/, "\n\n      - name: Keep another build\n        uses: actions/cache/save@x\n        with:\n          path: ~/.cache/other\n          key: other-1\n\n"), "never saves its devmap build");
     });
   });
 });

@@ -101,7 +101,6 @@ thread_local! {
 /// Runs `body` with this thread's hook budget shortened to `budget`, so a
 /// test can reach the deadline without waiting out twenty minutes.
 #[cfg(test)]
-#[cfg(unix)]
 pub(crate) fn with_hook_timeout<T>(budget: Duration, body: impl FnOnce() -> T) -> T {
     HOOK_TIMEOUT_OVERRIDE.set(Some(budget));
     let _reset = std::mem::DropGuard::new((), |()| {

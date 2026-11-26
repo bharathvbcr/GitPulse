@@ -4,7 +4,6 @@
 
 use crate::engine::git_cli::git_text;
 use crate::engine::merge_tree::HeldReason;
-#[cfg(unix)]
 use crate::engine::worktree::merge_and_teardown_requiring;
 use crate::engine::worktree::{
     add_worktree_extended, merge_and_teardown_worktree, MergeTeardownError, MergeTeardownResult,
@@ -290,18 +289,13 @@ fn a_sibling_checkout_that_cannot_be_read_refuses() {
     assert!(lane.exists() && branch_exists(dir.path(), "feature-y"));
 }
 
-#[cfg(unix)]
 fn write_hook(repo: &Path, name: &str, body: &str, executable: bool) {
-    use std::os::unix::fs::PermissionsExt;
     let hook = repo.join(".git/hooks").join(name);
-    std::fs::write(&hook, body).unwrap();
-    let mode = if executable { 0o755 } else { 0o644 };
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(mode)).unwrap();
+    crate::test_support::write_git_script(&hook, body, executable);
 }
 
 /// `commit-tree` runs no hooks. The wave does not land a commit behind a
 /// pre-commit hook (a secret scanner, say); it holds with a typed reason.
-#[cfg(unix)]
 #[test]
 fn the_wave_refuses_a_commit_that_would_skip_an_active_hook() {
     let (dir, lane) = lane_fixture();
@@ -341,18 +335,21 @@ fn the_wave_refuses_a_commit_that_would_skip_an_active_hook() {
 }
 
 /// The hook check follows what git would run: a hook without the executable
-/// bit is not active, and `core.hooksPath` replaces the default directory.
-#[cfg(unix)]
+/// bit is not active on Unix, and `core.hooksPath` replaces the default
+/// directory on every platform.
 #[test]
 fn active_hooks_follow_the_executable_bit_and_hooks_path() {
     let (dir, _lane) = lane_fixture();
     let repo = dir.path();
-    write_hook(repo, "pre-commit", "#!/bin/sh\nexit 1\n", false);
-    assert!(
-        crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all)
-            .unwrap()
-            .is_empty()
-    );
+    #[cfg(unix)]
+    {
+        write_hook(repo, "pre-commit", "#!/bin/sh\nexit 1\n", false);
+        assert!(
+            crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all)
+                .unwrap()
+                .is_empty()
+        );
+    }
     write_hook(repo, "commit-msg", "#!/bin/sh\nexit 1\n", true);
     assert_eq!(
         crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all).unwrap(),
@@ -364,7 +361,7 @@ fn active_hooks_follow_the_executable_bit_and_hooks_path() {
         &[
             "config",
             "core.hooksPath",
-            elsewhere.path().to_str().unwrap(),
+            &crate::test_support::sh_path(elsewhere.path()),
         ],
     );
     assert!(
@@ -372,12 +369,11 @@ fn active_hooks_follow_the_executable_bit_and_hooks_path() {
             .unwrap()
             .is_empty()
     );
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let hook = elsewhere.path().join("pre-merge-commit");
-        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_git_script(
+        &elsewhere.path().join("pre-merge-commit"),
+        "#!/bin/sh\nexit 0\n",
+        true,
+    );
     assert_eq!(
         crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all).unwrap(),
         ["pre-merge-commit"]
@@ -386,7 +382,6 @@ fn active_hooks_follow_the_executable_bit_and_hooks_path() {
 
 /// A fast-forward records no commit, so there is nothing a hook would have
 /// judged: an active hook does not stop it.
-#[cfg(unix)]
 #[test]
 fn a_fast_forward_lands_past_an_active_hook() {
     let (dir, lane) = lane_fixture();
@@ -407,7 +402,6 @@ fn a_fast_forward_lands_past_an_active_hook() {
 
 /// The panel is not left without a way to merge: with an active hook it takes
 /// the in-checkout merge, which runs the hook, and says so.
-#[cfg(unix)]
 #[test]
 fn the_panel_merges_in_the_checkout_when_a_hook_is_active() {
     let (dir, lane) = lane_fixture();
@@ -416,7 +410,10 @@ fn the_panel_merges_in_the_checkout_when_a_hook_is_active() {
     write_hook(
         repo,
         "pre-commit",
-        &format!("#!/bin/sh\necho ran > '{}'\nexit 0\n", marker.display()),
+        &format!(
+            "#!/bin/sh\necho ran > {}\nexit 0\n",
+            crate::test_support::sh_quote(&marker)
+        ),
         true,
     );
     let result = merge(repo, lane.path(), "main", true, &mut allow_all).unwrap();
@@ -430,7 +427,6 @@ fn the_panel_merges_in_the_checkout_when_a_hook_is_active() {
 
 /// And when that hook refuses the commit, the squash stays staged for the
 /// person to finish or undo, the lane is kept, and nothing is torn down.
-#[cfg(unix)]
 #[test]
 fn a_hook_that_refuses_the_panels_squash_keeps_the_lane() {
     let (dir, lane) = lane_fixture();

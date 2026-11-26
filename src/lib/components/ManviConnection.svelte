@@ -24,6 +24,7 @@
     Gauge,
   } from "@lucide/svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
+  import BrandMark from "./BrandMark.svelte";
 
   let {
     onNavigate,
@@ -79,7 +80,10 @@
   <!-- Policy connection -->
   <section id={manviSectionId("harness")} tabindex="-1" class="gp-card p-4 space-y-2">
     <div class="flex items-center justify-between gap-2">
-      <h3 class="gp-label">Manvi policy</h3>
+      <div class="flex items-center gap-2 min-w-0">
+        <BrandMark mark="manvi" size={16} class="shrink-0" />
+        <h3 class="gp-label">Manvi policy</h3>
+      </div>
       <button
         onclick={() => harnessStore.reconnect()}
         class="gp-btn"

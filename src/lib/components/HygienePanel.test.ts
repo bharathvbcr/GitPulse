@@ -28,3 +28,14 @@ describe("HygienePanel failure reporting", () => {
     expect(source).toMatch(/catch \(e\) \{ error = formatError\(e\); \}/);
   });
 });
+
+describe("HygienePanel profile backups", () => {
+  it("previews a confirm-only entry under the backup target, never as a cache", () => {
+    expect(source).toContain('preview(`${entry.confirm_only ? "backup" : "cache"}:${entry.id}`)');
+  });
+
+  it("shows the age of an entry that has one", () => {
+    expect(source).toMatch(/entry\.modified_at !== null/);
+    expect(source).toMatch(/days old/);
+  });
+});

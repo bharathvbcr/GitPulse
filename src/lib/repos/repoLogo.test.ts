@@ -186,6 +186,18 @@ describe("rankLogoCandidates", () => {
     const junk = ["", "x".repeat(2000) + ".png", "assets\\logo.png"] as string[];
     expect(rankLogoCandidates(junk, 5)).toEqual(["assets/logo.png"]);
   });
+
+  it("picks published *-mark assets (such as Manvi's) without beating GitPulse's Tauri icon or false-matching words", () => {
+    expect(
+      rankLogoCandidates(["assets/manvi-mark.png", "assets/manvi-mark.svg", "docs/screenshot.png", "README.md"], 2),
+    ).toEqual(["assets/manvi-mark.svg", "assets/manvi-mark.png"]);
+    expect(
+      rankLogoCandidates(["public/gitpulse-mark.svg", "art/brand/mark.png", "src-tauri/icons/128x128.png"], 1),
+    ).toEqual(["src-tauri/icons/128x128.png"]);
+    for (const nonLogo of ["benchmark.png", "bookmark.png", "watermark.png", "markdown.png"]) {
+      expect(scoreLogoPath(nonLogo)).toBeNull();
+    }
+  });
 });
 
 describe("logoDataUrl", () => {

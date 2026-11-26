@@ -42,6 +42,18 @@ fn injected() -> Value {
     .expect("the injected settings build")
 }
 
+/// The command line a handler runs: its `command` in shell form, and the
+/// `command` followed by its `args` in the exec form Windows injects, where
+/// the subcommand words are not part of `command`.
+pub(super) fn command_line(handler: &Value) -> String {
+    let mut line = handler["command"].as_str().unwrap_or_default().to_owned();
+    for word in handler["args"].as_array().into_iter().flatten() {
+        line.push(' ');
+        line.push_str(word.as_str().unwrap_or_default());
+    }
+    line
+}
+
 /// Every `(host hook, matcher, reported event)` among the `notify` handlers of
 /// a `hooks` object, in the order met.
 fn routes_of(hooks: &Value) -> Vec<(String, String, String)> {
@@ -50,7 +62,7 @@ fn routes_of(hooks: &Value) -> Vec<(String, String, String)> {
         for group in groups.as_array().into_iter().flatten() {
             let matcher = group["matcher"].as_str().unwrap_or_default();
             for handler in group["hooks"].as_array().into_iter().flatten() {
-                let command = handler["command"].as_str().unwrap_or_default();
+                let command = command_line(handler);
                 if let Some((_, event)) = command.split_once(" notify ") {
                     found.push((hook.clone(), matcher.to_owned(), event.trim().to_owned()));
                 }
@@ -129,11 +141,7 @@ fn notify_positions(hooks: &Value) -> Vec<(String, usize, usize)> {
     for (hook, groups) in hooks.as_object().unwrap() {
         for (g, group) in groups.as_array().unwrap().iter().enumerate() {
             for (h, handler) in group["hooks"].as_array().unwrap().iter().enumerate() {
-                if handler["command"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains(" notify ")
-                {
+                if command_line(handler).contains(" notify ") {
                     at.push((hook.clone(), g, h));
                 }
             }
@@ -151,6 +159,11 @@ fn delete_entry(hooks: &mut Value, (hook, g, h): &(String, usize, usize)) {
 }
 
 fn retarget_entry(hooks: &mut Value, (hook, g, h): &(String, usize, usize), to: &str) {
+    // Exec form: the event is the last of the words in `args`.
+    if let Some(words) = hooks[hook.as_str()][*g]["hooks"][*h]["args"].as_array_mut() {
+        *words.last_mut().expect("a notify event word") = json!(to);
+        return;
+    }
     let command = hooks[hook.as_str()][*g]["hooks"][*h]["command"]
         .as_str()
         .unwrap()

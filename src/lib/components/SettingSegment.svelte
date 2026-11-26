@@ -11,6 +11,7 @@
     value,
     onselect,
     size = "default",
+    disabled = false,
   }: {
     /** Group name for screen readers, e.g. "Theme appearance". */
     ariaLabel: string;
@@ -19,6 +20,7 @@
     onselect?: (next: T) => void;
     /** "sm" sets the labels in metadata type for a control inside a field or a narrow rail. */
     size?: "default" | "sm";
+    disabled?: boolean;
   } = $props();
 </script>
 
@@ -26,7 +28,10 @@
   {#each options as option (option.value)}
     <button
       type="button"
-      onclick={() => onselect?.(option.value)}
+      onclick={() => {
+        if (!disabled) onselect?.(option.value);
+      }}
+      {disabled}
       aria-pressed={value === option.value}
       data-active={value === option.value ? "true" : "false"}
       class="gp-seg-btn"

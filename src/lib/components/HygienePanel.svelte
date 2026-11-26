@@ -235,17 +235,18 @@
   </details>
   {#if inventory}
     <div class="space-y-3">
-      <h4 class="text-xs font-semibold text-textSecondary">Shared caches · measured {new Date(inventory.measured_at * 1000).toLocaleString()}</h4>
+      <h4 class="text-xs font-semibold text-textSecondary">Shared caches and profile backups · measured {new Date(inventory.measured_at * 1000).toLocaleString()}</h4>
       {#each previewSlice(inventory.entries, expandedLists.entries, LIST_PREVIEW_ROWS) as entry (entry.id)}
         <div class="rounded-xl bg-surface/60 p-3 text-xs space-y-1">
           <div class="flex items-center justify-between gap-2"><strong>{entry.label}</strong><span class="font-mono">{entry.bytes === null ? "Not measured" : humanBytes(entry.bytes)}</span></div>
           {#if entry.path}<p class="break-all font-mono text-textMuted">{entry.path}</p>{/if}
+          {#if entry.modified_at !== null}<p class="text-textMuted">Modified {new Date(entry.modified_at * 1000).toLocaleString()} · {Math.max(0, Math.floor((Date.now() / 1000 - entry.modified_at) / 86400))} days old</p>{/if}
           <p class="text-textSecondary">{entry.note}</p>
           {#if entry.error}<p class="text-warn">Unavailable: {entry.error}</p>{/if}
-          {#if entry.action}<button class="gp-btn mt-2" disabled={busy || executing || scanning} onclick={() => preview(`cache:${entry.id}`)}>{entry.action}…</button>{/if}
+          {#if entry.action}<button class="gp-btn mt-2" disabled={busy || executing || scanning} onclick={() => preview(`${entry.confirm_only ? "backup" : "cache"}:${entry.id}`)}>{entry.action}…</button>{/if}
         </div>
       {/each}
-      <ListPreviewToggle total={inventory.entries.length} noun="shared caches" bind:expanded={expandedLists.entries} />
+      <ListPreviewToggle total={inventory.entries.length} noun="entries" bind:expanded={expandedLists.entries} />
     </div>
   {/if}
   <details class="text-xs text-textMuted">

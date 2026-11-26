@@ -12,7 +12,8 @@ pub mod schema;
 pub mod seed;
 
 pub use delta::{
-    DeltaDamaged, DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore, DeltaSymbolRecord,
+    DeltaBusy, DeltaDamaged, DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore,
+    DeltaSymbolRecord, DEFAULT_READ_WAIT,
 };
 
 pub use coverage::{

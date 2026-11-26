@@ -14,12 +14,14 @@ import {
   shouldLoadMore,
   stepRow,
   toggleHistoryView,
+  toggleTurnsView,
 } from "./historyRail";
 
 describe("toggleHistoryView", () => {
   it("opens a collapsed rail straight onto History, whichever tab it had", () => {
     expect(toggleHistoryView({ open: false, tab: "files" })).toEqual({ open: true, tab: "history" });
     expect(toggleHistoryView({ open: false, tab: "history" })).toEqual({ open: true, tab: "history" });
+    expect(toggleHistoryView({ open: true, tab: "turns" })).toEqual({ open: true, tab: "history" });
   });
 
   it("moves an open rail from Files to History", () => {
@@ -28,6 +30,14 @@ describe("toggleHistoryView", () => {
 
   it("returns from History to Files without collapsing the rail", () => {
     expect(toggleHistoryView({ open: true, tab: "history" })).toEqual({ open: true, tab: "files" });
+  });
+});
+
+describe("toggleTurnsView", () => {
+  it("opens Turns and toggles back to Files", () => {
+    expect(toggleTurnsView({ open: false, tab: "files" })).toEqual({ open: true, tab: "turns" });
+    expect(toggleTurnsView({ open: true, tab: "history" })).toEqual({ open: true, tab: "turns" });
+    expect(toggleTurnsView({ open: true, tab: "turns" })).toEqual({ open: true, tab: "files" });
   });
 });
 

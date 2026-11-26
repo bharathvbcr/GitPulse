@@ -137,7 +137,9 @@ describe("the attention filter and the headline", () => {
     expect(headline).toContain("1 need attention");
     expect(headline).toContain("2 not fully read");
     expect(plane.attention).toEqual({ needing: 1, unread: 2 });
+    expect(plane.notifications).toBe(0);
     expect(applyAgentFilter(plane.rows, "attention")).toHaveLength(plane.attention.needing + plane.attention.unread);
+    expect(applyAgentFilter(plane.rows, "gaps")).toHaveLength(3);
   });
 });
 

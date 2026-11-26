@@ -86,9 +86,49 @@ pub struct Policy {
 /// What the wrapper reads from outside itself while it waits.
 pub trait Ports {
     fn load(&mut self) -> Load;
+    /// Active Manvi system steward critical slowdown reason for this build's
+    /// working directory, when in force. Holds capacity at 0 refusing slots
+    /// even if `host_load.govern_launches == false` or `LeaseMode::Off`.
+    fn steward_refusal(&mut self) -> Option<String> {
+        None
+    }
     fn now_ns(&self) -> u64;
     fn sleep(&mut self, how_long: Duration);
     fn say(&mut self, line: &str);
+}
+
+pub(crate) fn steward_refusal_note(
+    record: &crate::harness::steward::ActiveThrottleRecord,
+) -> String {
+    format!(
+        "Manvi system steward critical slowdown is active ({} load: {})",
+        record.tier, record.reason
+    )
+}
+
+/// Whether an agent session launched by GitPulse should have `lease-bin`
+/// prepended to its `PATH`. True when build leases are `On`, and also when
+/// `LeaseMode::Off` while Manvi steward critical slowdown is enabled so
+/// non-hook agents (such as Codex) pass straight through while calm (`0` slots
+/// overhead) and still obey `steward/active.json` if critical pressure hits.
+#[must_use]
+pub fn should_inject_lease_bin(mode: LeaseMode, steward_any_slow: bool) -> bool {
+    mode == LeaseMode::On || steward_any_slow
+}
+
+/// Decides whether `run` enters the build-lease queue rather than `exec`-ing
+/// straight through. Even when `LeaseMode::Off`, an active Manvi steward
+/// critical slowdown lease gates heavy `cargo`/`go` builds for non-hook agents
+/// (such as Codex or direct CLI subshells).
+#[must_use]
+pub fn should_enter_wrapper(
+    nested: bool,
+    booked: bool,
+    is_leased_cmd: bool,
+    mode: LeaseMode,
+    steward_active: bool,
+) -> bool {
+    !nested && !booked && is_leased_cmd && (mode == LeaseMode::On || steward_active)
 }
 
 /// How a wait ended.
@@ -223,7 +263,16 @@ pub fn acquire(
             say_record_error(ports, &ticket);
         }
         let load = ports.load();
-        let cap = capacity(policy.slots, &load);
+        let mut cap = capacity(policy.slots, &load);
+        if let Some(note) = ports.steward_refusal() {
+            cap = LeaseCapacity {
+                configured: cap.configured,
+                slots: 0,
+                refuses: true,
+                tier: Some(crate::sysload::Tier::Severe),
+                note: Some(note),
+            };
+        }
         let own = ticket.own();
         let mut board = dir.board(&own);
         board.waiters.push(LeaseWaiter {
@@ -456,7 +505,9 @@ fn say_stderr(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
-struct LivePorts;
+struct LivePorts {
+    cwd: String,
+}
 
 impl Ports for LivePorts {
     fn load(&mut self) -> Load {
@@ -468,6 +519,12 @@ impl Ports for LivePorts {
                 why
             }),
         }
+    }
+
+    fn steward_refusal(&mut self) -> Option<String> {
+        crate::harness::steward::active_throttle_for_cwd(&self.cwd)
+            .as_ref()
+            .map(steward_refusal_note)
     }
 
     fn now_ns(&self) -> u64 {
@@ -600,10 +657,18 @@ fn run(program: &str, args: &[OsString]) -> i32 {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
 
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let nested = std::env::var_os(HELD_ENV).is_some() || std::env::var_os(SHIM_HELD_ENV).is_some();
     let booked = std::env::var_os("MAC_HEAVY_LABEL").is_some_and(|v| !v.is_empty());
     let settings = crate::tool_config::host_load_leases();
-    if nested || booked || settings.mode == LeaseMode::Off || !leased(program, &words) {
+    let is_leased = leased(program, &words);
+    let steward_active = is_leased
+        && !nested
+        && !booked
+        && crate::harness::steward::active_throttle_for_cwd(&cwd).is_some();
+    if !should_enter_wrapper(nested, booked, is_leased, settings.mode, steward_active) {
         return finish(exec(&real, program, args, base_env()), &real);
     }
 
@@ -624,7 +689,9 @@ fn run(program: &str, args: &[OsString]) -> i32 {
         poll: env_ms(POLL_ENV, Duration::from_secs(2), 5, 10_000),
         announce: env_ms(ANNOUNCE_ENV, Duration::from_secs(30), 5, 3_600_000),
     };
-    let mut ports = LivePorts;
+    let mut ports = LivePorts {
+        cwd: tpl.cwd.clone(),
+    };
     let acquired = match acquire(&dir, &tpl, &policy, &mut ports) {
         Ok(acquired) => acquired,
         Err(why) => return unleased(&real, program, args, &why),
@@ -640,6 +707,8 @@ fn run(program: &str, args: &[OsString]) -> i32 {
         if settings.incremental_off {
             set.push(("CARGO_INCREMENTAL", "0".into()));
         }
+    } else if program == "go" && steward_active {
+        defaults.push(("GOMAXPROCS", jobs_for(cpus, settings.slots).to_string()));
     }
     let grant = match acquired {
         Acquired::Granted {

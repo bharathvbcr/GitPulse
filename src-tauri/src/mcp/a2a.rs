@@ -9,7 +9,7 @@
 //! - `desktop::instance::Request::AgentDeliver` (`#[cfg(target_os = "macos")]` when
 //!   a live GitPulse GUI owner is running).
 
-use crate::agent_mailbox::{EnvelopeProvenance, Mailbox};
+use crate::agent_mailbox::{EnvelopeProvenance, Mailbox, MailboxError, PeerDeposit};
 use crate::engine::agent_bus::{
     self, AgentBusMessage, ClaimConflict, PeerResolutionError, PeerUpsert,
 };
@@ -179,19 +179,43 @@ pub(crate) fn dispatch_kickoff_spawn(
 pub(crate) fn handle_agent_register(a: super::AgentRegisterArgs) -> Result<Value, String> {
     crate::repository_trust::require(Path::new(&a.repo_path))
         .map_err(CommandError::into_message)?;
+
+    if let Some(ref explicit_provider) = a.provider {
+        agent_bus::require_agent_sender(explicit_provider).map_err(CommandError::into_message)?;
+    }
+    if let Some(ref explicit_id) = a.peer_id {
+        agent_bus::require_agent_sender(explicit_id).map_err(CommandError::into_message)?;
+    }
+    if let Some(ref explicit_role) = a.role {
+        agent_bus::require_role_not_steward(explicit_role).map_err(CommandError::into_message)?;
+    }
+
     crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
 
-    let family = crate::engine::worktree::resolve_worktree_family(&a.repo_path, &a.repo_path)
-        .map_err(CommandError::into_message)?;
-    let worktree_path = family.worktree.to_string_lossy().into_owned();
+    let worktree_pb =
+        match crate::engine::worktree::resolve_worktree_family(&a.repo_path, &a.repo_path) {
+            Ok(family) => family.worktree,
+            Err(err) if err.origin() == Some(crate::ipc_error::IpcErrorKind::DeferredUnderLoad) => {
+                let pair = crate::engine::worktree::admit_worktree_pair(&a.repo_path, &a.repo_path)
+                    .map_err(CommandError::into_message)?;
+                let registered = pair.best_effort_registered_checkouts();
+                if !registered.iter().any(|p| p == pair.repo_path()) {
+                    return Err(err.into_message());
+                }
+                pair.repo_path().to_path_buf()
+            }
+            Err(err) => return Err(err.into_message()),
+        };
+    let worktree_path = worktree_pb.to_string_lossy().into_owned();
     let branch = a.branch.clone().or_else(|| {
-        crate::engine::worktree::list_worktrees(&a.repo_path)
+        crate::engine::worktree::list_worktrees_lite(&a.repo_path)
             .ok()
             .and_then(|wts| {
                 wts.into_iter()
                     .find(|w| w.path == worktree_path)
                     .and_then(|w| w.branch)
             })
+            .or_else(|| crate::engine::worktree::head_branch_from_metadata(&worktree_pb))
     });
 
     let mut peer_id = a.peer_id.clone();
@@ -353,48 +377,208 @@ pub(crate) fn handle_agent_peers(a: super::AgentPeersArgs) -> Result<Value, Stri
     }))
 }
 
+/// Puts the envelope in the target session's mailbox and says what happened, so the send
+/// result never claims a delivery the mailbox did not take.
+fn deposit_into_mailbox(
+    session: Option<&str>,
+    msg_id: &str,
+    preview: &str,
+    provenance: EnvelopeProvenance,
+) -> Value {
+    let report = |deposited: bool,
+                  reason: Option<&str>,
+                  detail: Option<String>,
+                  duplicate: bool,
+                  overflow_notice: bool| {
+        json!({
+            "deposited": deposited,
+            "reason": reason,
+            "detail": detail,
+            "duplicate": duplicate,
+            "overflow_notice": overflow_notice,
+        })
+    };
+    let Some(sid) = session.filter(|s| crate::workbench::terminal_command::is_canonical_uuid(s))
+    else {
+        return report(
+            false,
+            Some("no_session"),
+            Some(
+                "The target has no Claude session id, so there is no mailbox to deposit into."
+                    .into(),
+            ),
+            false,
+            false,
+        );
+    };
+    let mb = match Mailbox::at_default() {
+        Ok(mb) => mb,
+        Err(e) => {
+            return report(
+                false,
+                Some("unavailable"),
+                Some(e.to_string()),
+                false,
+                false,
+            )
+        }
+    };
+    match mb.deposit_peer_or_overflow(sid, msg_id, preview, provenance, SystemTime::now()) {
+        Ok(PeerDeposit::Deposited(d)) => report(true, None, None, d.duplicate, false),
+        Ok(PeerDeposit::Overflowed { notice }) => report(
+            false,
+            Some("full"),
+            Some(match &notice {
+                Ok(_) => "The session's mailbox is full of peer messages; the message is on the bus and an overflow notice points the recipient at gitpulse_agent_inbox.".to_string(),
+                Err(e) => format!("The session's mailbox is full of peer messages and the overflow notice could not be left: {e}"),
+            }),
+            false,
+            notice.is_ok(),
+        ),
+        Err(e @ MailboxError::Full(_)) => report(false, Some("full"), Some(e.to_string()), false, false),
+        Err(e @ MailboxError::Invalid(_)) => {
+            report(false, Some("refused"), Some(e.to_string()), false, false)
+        }
+        Err(e) => report(false, Some("unavailable"), Some(e.to_string()), false, false),
+    }
+}
+
+/// (repo, peer, msg_id, bus seq of the row).
+type DeliveryKey = (String, String, String, u64);
+
+/// Upper bound on remembered deliveries; the oldest knowledge is dropped wholesale past it, which
+/// only means a retry of a long-past send may wake its recipient once more.
+const MAX_REMEMBERED_DELIVERIES: usize = 1024;
+
+fn delivered_cache() -> &'static Mutex<std::collections::HashMap<DeliveryKey, String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<DeliveryKey, String>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The outcome of an earlier successful desktop delivery of (repo, peer, msg_id), if this
+/// process made one.
+fn delivered_outcome(key: &DeliveryKey) -> Option<String> {
+    delivered_cache().lock().ok()?.get(key).cloned()
+}
+
+fn remember_delivered(key: DeliveryKey, outcome: String) {
+    if let Ok(mut cache) = delivered_cache().lock() {
+        if cache.len() >= MAX_REMEMBERED_DELIVERIES {
+            cache.clear();
+        }
+        cache.insert(key, outcome);
+    }
+}
+
+/// Where a send goes: a registered peer, or the identity of an unregistered sender being
+/// answered, which has no session and so no mailbox.
+struct SendTarget {
+    peer_id: String,
+    branch: Option<String>,
+    session_id: Option<String>,
+    liveness: String,
+}
+
 pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String> {
     crate::repository_trust::require(Path::new(&a.repo_path))
         .map_err(CommandError::into_message)?;
     crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
 
-    let target = agent_bus::resolve_target_peer(&a.repo_path, &a.to_peer)
-        .map_err(|e| e.into_command_error().into_message())?;
+    // The message being answered is read first: it supplies the thread and the hop, and a
+    // reply to a message that is not on the bus is refused instead of sent unthreaded.
+    let answered = match a
+        .in_reply_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => {
+            if !crate::agent_mailbox::valid_request_id(id) {
+                return Err("in_reply_to must be 1 to 64 ASCII letters, digits, '-' or '_'".into());
+            }
+            let found = agent_bus::get_message_by_id(&a.repo_path, id)
+                .map_err(CommandError::into_message)?;
+            Some(found.ok_or_else(|| {
+                format!(
+                    "in_reply_to '{id}' names no message on the bus; it may have been evicted, so send without in_reply_to or name a retained msg_id"
+                )
+            })?)
+        }
+        None => None,
+    };
+    let thread_key: Option<String> = a
+        .thread_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| answered.as_ref().and_then(|m| m.thread_key.clone()));
+
+    let target = match agent_bus::resolve_target_peer(&a.repo_path, &a.to_peer) {
+        Ok(peer) => SendTarget {
+            peer_id: peer.record.peer_id,
+            branch: peer.record.branch,
+            session_id: peer.record.provider_session_id,
+            liveness: peer.liveness,
+        },
+        // A sender that never registered cannot be found as a peer, but a reply to it must
+        // still work: the message it sent is on the bus under that exact identity. Only an
+        // exact match counts, and an ambiguous peer stays an error.
+        Err(agent_bus::PeerResolutionError::NotFound { target }) => {
+            match agent_bus::find_bus_sender(&a.repo_path, &a.to_peer)
+                .map_err(CommandError::into_message)?
+            {
+                Some(identity) => SendTarget {
+                    peer_id: identity,
+                    branch: None,
+                    session_id: None,
+                    liveness: "unregistered".to_string(),
+                },
+                None => {
+                    return Err(agent_bus::PeerResolutionError::NotFound { target }
+                        .into_command_error()
+                        .into_message())
+                }
+            }
+        }
+        Err(e) => return Err(e.into_command_error().into_message()),
+    };
 
     // An MCP caller is always an agent: it is never the person using GitPulse, whatever
     // `from_peer` says. `post_peer_message` refuses the names reserved for a person.
     let origin = agent_bus::MessageOrigin::Agent;
-    let requested_hop = if let Some(explicit) = a.hop {
-        explicit
-    } else if let Some(ref tk) = a.thread_key {
-        agent_bus::read_thread_messages(&a.repo_path, Some(tk), None, 0)
-            .ok()
-            .and_then(|page| page.messages.last().map(|m| m.hop.unwrap_or(0) + 1))
-            .unwrap_or(1)
-    } else {
-        1
-    };
-    let hop = origin.effective_hop(requested_hop);
+    // The request only: the bus derives the stored hop and ceiling under its own lock from the
+    // thread and the answered row, so an explicit hop can raise the count but never lower it,
+    // and a reply can lower a ceiling but never raise it.
+    let hop = origin.effective_hop(a.hop.unwrap_or(1).max(1));
     let max_hops = a.max_hops.unwrap_or(agent_bus::DEFAULT_MAX_HOPS);
 
     let root_repo = crate::engine::git_cli::find_git_root(Path::new(&a.repo_path))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| a.repo_path.clone());
 
-    let message = agent_bus::post_peer_message(
+    let message = agent_bus::post_peer_message_in_reply_to(
         &a.repo_path,
         origin,
         &a.from_peer,
-        Some(&target.record.peer_id),
-        a.thread_key.as_deref(),
+        Some(&target.peer_id),
+        thread_key.as_deref(),
         a.kind.as_deref().unwrap_or("note"),
         &a.body,
-        target.record.branch.as_deref(),
+        target.branch.as_deref(),
         a.msg_id.as_deref(),
+        a.in_reply_to.as_deref(),
         hop,
         max_hops,
     )
     .map_err(CommandError::into_message)?;
+    // An exact retry returns the stored row, and a threaded retry recomputed a hop one past
+    // that row (the thread's last message is now the original). The stored row is the truth for
+    // the response, the mailbox provenance and the hop-limit decision; the mailbox refuses the
+    // same request id under different provenance, so a recomputed hop reported a delivered
+    // message as bus-only.
+    let hop = message.hop.unwrap_or(hop);
+    let max_hops = message.max_hops.unwrap_or(max_hops);
     let msg_id = message
         .msg_id
         .clone()
@@ -406,63 +590,134 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         .map(|(p, _)| p.to_string())
         .unwrap_or_else(|| "peer".to_string());
 
-    let mut truncated_in_mailbox = false;
-    if let Some(ref sid) = target.record.provider_session_id {
-        if crate::workbench::terminal_command::is_canonical_uuid(sid) {
-            if let Ok(mb) = Mailbox::at_default() {
-                let (preview, truncated) =
-                    crate::agent_mailbox::preview_for_mailbox(&message.body, &msg_id);
-                truncated_in_mailbox = truncated;
-                let provenance = EnvelopeProvenance::PeerAgent {
-                    msg_id: msg_id.clone(),
-                    from_peer: message.from_agent.clone(),
-                    provider: sender_provider,
-                    branch: message.branch.clone().unwrap_or_default(),
-                    thread_key: message.thread_key.clone().unwrap_or_default(),
-                    hop,
-                    max_hops,
-                    truncated_in_bus: truncated,
-                    repo_root: root_repo.clone(),
-                };
-                let _ = mb.deposit_with_provenance(
-                    sid,
-                    &msg_id,
-                    &preview,
-                    provenance,
-                    SystemTime::now(),
-                );
-            }
-        }
-    }
+    let (preview, truncated_in_mailbox) =
+        crate::agent_mailbox::preview_for_mailbox(&message.body, &msg_id);
+    let provenance = EnvelopeProvenance::PeerAgent {
+        msg_id: msg_id.clone(),
+        from_peer: message.from_agent.clone(),
+        provider: sender_provider,
+        branch: message.branch.clone().unwrap_or_default(),
+        thread_key: message.thread_key.clone().unwrap_or_default(),
+        hop,
+        max_hops,
+        truncated_in_bus: truncated_in_mailbox,
+        repo_root: root_repo.clone(),
+    };
+    // An envelope already at its hop limit is paused: the bus row is the record, and nothing is
+    // put where a hook or banner would push it to the recipient.
+    let at_limit = hop >= max_hops;
+    //
+    // A retry of a row that was already delivered is decided before anything is deposited: the
+    // recipient's claimed copy expires after ten minutes, so a deposit here would hand it the
+    // same message a second time.
+    let delivery_key = (
+        root_repo.clone(),
+        target.peer_id.clone(),
+        msg_id.clone(),
+        message.seq,
+    );
+    let cached_outcome = if at_limit {
+        None
+    } else {
+        delivered_outcome(&delivery_key)
+    };
+    let already_read = !at_limit && message.read_by.contains(&target.peer_id);
+    let mailbox = if at_limit {
+        json!({
+            "deposited": false,
+            "reason": "hop_limit",
+            "detail": "The message is at its hop limit, so it is recorded on the bus only and not deposited in the recipient's mailbox; the recipient can still read it with gitpulse_agent_inbox.",
+            "duplicate": false,
+            "overflow_notice": false,
+        })
+    } else if cached_outcome.is_some() || already_read {
+        json!({
+            "deposited": false,
+            "reason": "already_delivered",
+            "detail": "An earlier delivery of this exact message succeeded (or its recipient has read it), so a retry does not deposit it again.",
+            "duplicate": true,
+            "overflow_notice": false,
+        })
+    } else {
+        deposit_into_mailbox(target.session_id.as_deref(), &msg_id, &preview, provenance)
+    };
+    let deposited = mailbox["deposited"].as_bool().unwrap_or(false);
 
     notify_in_process_waiters();
 
-    let delivery_outcome = if hop >= max_hops {
+    // The mailbox is all the push paths read, so a message that never reached it can only
+    // be surfaced by an inbox or wait call. A desktop answer wins only when the desktop used
+    // a channel independent of the mailbox ("managed" run delivery or the "banner" event);
+    // its "mailbox" outcomes, and replies from an older desktop with no channel, describe
+    // the mailbox and say nothing when the deposit failed.
+    //
+    // An exact retry must not wake the recipient twice. The desktop is skipped only on recorded
+    // evidence that an earlier delivery of this very message succeeded: the bus row already
+    // lists the target as a reader (a managed delivery acknowledges it), or this process
+    // remembers the outcome of a successful delivery. A failed, timed-out or offline first
+    // attempt records nothing, so its retry still delivers.
+    //
+    // The cache key carries the row's seq, so a new row that reuses a caller-chosen msg_id after
+    // the old one was evicted or repaired away never replays the old row's outcome.
+    let mut replayed = false;
+    let mut already_delivered = false;
+    let desktop_outcome = if let Some(prior) = cached_outcome {
+        replayed = true;
+        Some(prior)
+    } else if already_read {
+        // Acknowledged by the target already (a managed delivery does that): delivered
+        // before, with no stored outcome to replay, so the result says only that.
+        already_delivered = true;
+        None
+    } else if !at_limit && target.liveness == "live" {
+        {
+            let outcome = match reach_desktop_agent_deliver(
+                &root_repo,
+                &target.peer_id,
+                &msg_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                Some(Ok(reply)) => {
+                    let independent =
+                        matches!(reply["channel"].as_str(), Some("managed" | "banner"));
+                    (independent || deposited).then(|| {
+                        reply["delivery_outcome"]
+                            .as_str()
+                            .unwrap_or("queued_for_hook_boundary")
+                            .to_string()
+                    })
+                }
+                _ => None,
+            };
+            if let Some(ref done) = outcome {
+                remember_delivered(delivery_key.clone(), done.clone());
+            }
+            outcome
+        }
+    } else {
+        None
+    };
+    let delivery_outcome = if at_limit {
         "paused_hop_limit".to_string()
+    } else if already_delivered {
+        "already_delivered".to_string()
+    } else if let Some(outcome) = desktop_outcome {
+        outcome
+    } else if !deposited {
+        "bus_only".to_string()
     } else if target.liveness != "live" {
         if target.liveness == "resumable" {
             "requires_resume".to_string()
         } else {
             "queued_for_hook_boundary".to_string()
         }
-    } else if let Some(Ok(reply)) = reach_desktop_agent_deliver(
-        &root_repo,
-        &target.record.peer_id,
-        &msg_id,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ) {
-        reply["delivery_outcome"]
-            .as_str()
-            .unwrap_or("queued_for_hook_boundary")
-            .to_string()
     } else {
         let listening = target
-            .record
-            .provider_session_id
+            .session_id
             .as_deref()
             .and_then(|sid| {
                 Mailbox::at_default()
@@ -481,12 +736,14 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         "ok": true,
         "repo_path": a.repo_path,
         "msg_id": msg_id,
-        "to_peer": target.record.peer_id,
+        "to_peer": target.peer_id,
         "liveness": target.liveness,
         "delivery_outcome": delivery_outcome,
+        "replayed": replayed,
         "hop": hop,
         "max_hops": max_hops,
         "truncated_in_mailbox": truncated_in_mailbox,
+        "mailbox": mailbox,
         "message": message,
     }))
 }
@@ -494,9 +751,20 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
 struct DedupedInboxResult {
     messages: Vec<AgentBusMessage>,
     latest_seq: u64,
+    /// Where to resume by sequence number: the last bus seq this page returned when the page was
+    /// cut (`has_more`), else `latest_seq`. Paging by `latest_seq` would skip the cut rows.
+    next_since_seq: u64,
+    /// Where to resume among envelopes the bus does not hold (a person's message, an evicted
+    /// peer row, an evicted steward row, which keeps a stale bus_seq that is no cursor): the
+    /// newest creation time this page returned, never past an envelope the page cut.
+    mailbox_cursor_ms: u64,
     dropped_before_seq: u64,
+    pinned_below_dropped_before_seq: Vec<u64>,
     has_more: bool,
     acked_count: usize,
+    /// Why acknowledging failed, when it did. The messages were already collected, so a failed
+    /// acknowledgement is reported beside them instead of discarding them.
+    ack_error: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -505,6 +773,7 @@ fn collect_deduped_peer_inbox(
     for_peer: &str,
     explicit_session_id: Option<&str>,
     since_seq: u64,
+    since_mailbox_ms: Option<u64>,
     thread_key: Option<&str>,
     include_broadcasts: bool,
     ack: bool,
@@ -523,8 +792,10 @@ fn collect_deduped_peer_inbox(
         .filter(|s| crate::workbench::terminal_command::is_canonical_uuid(s))
         .map(|s| s.to_ascii_lowercase());
 
-    if let Ok(reconciled) = agent_bus::list_reconciled_peers(repo_path) {
-        let matching: Vec<_> = reconciled
+    {
+        let reconciled = agent_bus::list_reconciled_peers(repo_path)
+            .map_err(|e| format!("peer_list_failed: {}", e.into_message()))?;
+        let mut matching: Vec<_> = reconciled
             .into_iter()
             .filter(|p| {
                 p.record.peer_id == clean_peer
@@ -537,6 +808,19 @@ fn collect_deduped_peer_inbox(
                         && p.record.provider_session_id == resolved_session_id)
             })
             .collect();
+        // A named session id is the disambiguator the refusal below asks for, so it narrows
+        // several matches down to the peer that owns that session.
+        if matching.len() > 1 && resolved_session_id.is_some() {
+            matching.retain(|p| p.record.provider_session_id == resolved_session_id);
+        }
+        if matching.len() > 1 {
+            let ids: Vec<&str> = matching.iter().map(|p| p.record.peer_id.as_str()).collect();
+            return Err(format!(
+                "ambiguous_peer: for_peer '{clean_peer}' matched {} peers [{}]; name one by peer_id or provider_session_id",
+                matching.len(),
+                ids.join(", ")
+            ));
+        }
         if matching.len() == 1 {
             let m = &matching[0].record;
             canonical_reader = m.peer_id.clone();
@@ -562,7 +846,7 @@ fn collect_deduped_peer_inbox(
         aliases.insert(sid.clone());
     }
 
-    let alias_vec: Vec<String> = aliases.into_iter().collect();
+    let alias_vec: Vec<String> = aliases.iter().cloned().collect();
     let bus_page = agent_bus::read_messages_for_peer(
         repo_path,
         &alias_vec,
@@ -573,6 +857,10 @@ fn collect_deduped_peer_inbox(
     )
     .map_err(CommandError::into_message)?;
 
+    // Seqs of returned rows that really are on the bus. A row rebuilt from a mailbox envelope
+    // (its bus row evicted) keeps its old seq, which can sit below `dropped_before_seq` without
+    // being a retained row, so only bus-backed rows may appear in the pinned list.
+    let mut on_bus: BTreeSet<u64> = bus_page.messages.iter().map(|m| m.seq).collect();
     let mut seen_ids = BTreeSet::new();
     let mut combined = Vec::new();
     for msg in bus_page.messages {
@@ -589,111 +877,303 @@ fn collect_deduped_peer_inbox(
         }
     }
 
-    // Merge direct mailbox envelopes (e.g. UI Send-to-Agent or pointer envelopes)
-    // and deduplicate by `msg_id` (`request_id`).
-    if let (Some(ref sid), Ok(mb)) = (&resolved_session_id, Mailbox::at_default()) {
+    // Merge direct mailbox envelopes (e.g. UI Send-to-Agent, steward directives, or
+    // pointer envelopes) and deduplicate by `msg_id` (`request_id`). Peek first and
+    // claim only returned envelopes below so `thread_key` filters, `since_seq` bounds,
+    // cross-repository scopes, and `limit` caps never consume unreturned mailbox messages.
+    let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
+    let caller_common = crate::harness::steward::canonical_common_dir(repo_path);
+    let mut mailbox_req_by_msg_id = std::collections::HashMap::<String, String>::new();
+    // Creation time of each returned-or-cut row that has no bus seq to page by.
+    let mut mailbox_only_ms = std::collections::HashMap::<String, u64>::new();
+    let mut ack_errors: Vec<String> = Vec::new();
+    if let Some(ref sid) = resolved_session_id {
+        let mb = Mailbox::at_default().map_err(|e| format!("mailbox_unavailable: {e}"))?;
         let now = SystemTime::now();
-        let envelopes = if ack {
-            mb.try_claim_batch(sid, limit.saturating_add(1), now)
-                .unwrap_or_default()
-        } else {
-            mb.peek_pending(sid, limit.saturating_add(1), now)
-                .unwrap_or_default()
-        };
+        let now_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        let envelopes = mb
+            .peek_pending(sid, crate::agent_mailbox::MAX_PENDING, now)
+            .map_err(|e| format!("mailbox_read_failed: {e}"))?;
         for env in envelopes {
+            let env_repo_root = match &env.provenance {
+                EnvelopeProvenance::PeerAgent { repo_root, .. }
+                | EnvelopeProvenance::SystemSteward { repo_root, .. }
+                    if !repo_root.trim().is_empty() =>
+                {
+                    Some(repo_root.trim())
+                }
+                _ => None,
+            };
+            if let (Some(ref want_common), Some(recorded_root)) = (&caller_common, env_repo_root) {
+                let matches_repo = crate::harness::steward::canonical_common_dir(recorded_root)
+                    .as_ref()
+                    == Some(want_common);
+                if !matches_repo {
+                    continue;
+                }
+            }
+
             let env_id = match &env.provenance {
-                EnvelopeProvenance::PeerAgent { msg_id, .. } => msg_id.clone(),
+                EnvelopeProvenance::PeerAgent { msg_id, .. }
+                | EnvelopeProvenance::SystemSteward { msg_id, .. } => msg_id.clone(),
                 EnvelopeProvenance::HumanConfirmed => env.claim.request_id.clone(),
             };
-            if !seen_ids.insert(env_id.clone()) {
-                continue;
-            }
-            if let EnvelopeProvenance::PeerAgent {
-                ref msg_id,
-                ref from_peer,
-                ref branch,
-                ref thread_key,
-                hop,
-                max_hops,
-                truncated_in_bus,
-                ..
-            } = env.provenance
-            {
-                let hydrated = if truncated_in_bus {
-                    agent_bus::get_message_by_id(repo_path, msg_id)
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                };
-                if let Some(full_msg) = hydrated {
-                    combined.push(full_msg);
-                } else {
-                    combined.push(AgentBusMessage {
-                        seq: bus_page.latest_seq,
-                        from_agent: from_peer.clone(),
-                        to_agent: Some(canonical_reader.clone()),
-                        kind: "note".to_string(),
-                        body: env.claim.text,
-                        branch: (!branch.is_empty()).then(|| branch.clone()),
-                        created_at_ms: now
-                            .duration_since(UNIX_EPOCH)
-                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0)),
-                        thread_key: (!thread_key.is_empty()).then(|| thread_key.clone()),
-                        msg_id: Some(env_id),
-                        read_by: Vec::new(),
-                        hop: Some(hop),
-                        max_hops: Some(max_hops),
-                    });
-                }
+            let env_created_ms = if env.created_at_ms > 0 {
+                env.created_at_ms
             } else {
-                combined.push(AgentBusMessage {
-                    seq: bus_page.latest_seq,
-                    from_agent: "developer".to_string(),
-                    to_agent: Some(canonical_reader.clone()),
-                    kind: "human".to_string(),
-                    body: env.claim.text,
-                    branch: None,
-                    created_at_ms: now
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0)),
-                    thread_key: None,
-                    msg_id: Some(env_id),
-                    read_by: Vec::new(),
-                    hop: Some(0),
-                    max_hops: Some(agent_bus::DEFAULT_MAX_HOPS),
-                });
+                now_ms
+            };
+            if !seen_ids.contains(&env_id) {
+                let (synthesized, from_bus, has_bus_seq) = match env.provenance {
+                    EnvelopeProvenance::PeerAgent {
+                        ref msg_id,
+                        ref from_peer,
+                        ref branch,
+                        ref thread_key,
+                        hop,
+                        max_hops,
+                        ..
+                    } => {
+                        match agent_bus::get_message_by_id(repo_path, msg_id)
+                            .map_err(CommandError::into_message)?
+                        {
+                            Some(bus_msg) => (bus_msg, true, true),
+                            None => (
+                                AgentBusMessage {
+                                    seq: bus_page.latest_seq,
+                                    from_agent: from_peer.clone(),
+                                    to_agent: Some(canonical_reader.clone()),
+                                    kind: "note".to_string(),
+                                    body: env.claim.text,
+                                    branch: (!branch.is_empty()).then(|| branch.clone()),
+                                    created_at_ms: env_created_ms,
+                                    thread_key: (!thread_key.is_empty())
+                                        .then(|| thread_key.clone()),
+                                    msg_id: Some(env_id.clone()),
+                                    read_by: Vec::new(),
+                                    hop: Some(hop),
+                                    max_hops: Some(max_hops),
+                                },
+                                false,
+                                false,
+                            ),
+                        }
+                    }
+                    EnvelopeProvenance::SystemSteward {
+                        ref msg_id,
+                        bus_seq,
+                        ..
+                    } => {
+                        match agent_bus::get_message_by_id(repo_path, msg_id)
+                            .map_err(CommandError::into_message)?
+                        {
+                            Some(bus_msg) => (bus_msg, true, true),
+                            None => (
+                                AgentBusMessage {
+                                    seq: if bus_seq > 0 {
+                                        bus_seq
+                                    } else {
+                                        bus_page.latest_seq
+                                    },
+                                    from_agent: agent_bus::STEWARD_SENDER.to_string(),
+                                    to_agent: None,
+                                    kind: agent_bus::STEWARD_MESSAGE_KIND.to_string(),
+                                    body: env.claim.text,
+                                    branch: None,
+                                    created_at_ms: env_created_ms,
+                                    thread_key: Some(agent_bus::STEWARD_THREAD_KEY.to_string()),
+                                    msg_id: Some(env_id.clone()),
+                                    read_by: Vec::new(),
+                                    hop: Some(0),
+                                    max_hops: Some(1),
+                                },
+                                false,
+                                bus_seq > 0,
+                            ),
+                        }
+                    }
+                    EnvelopeProvenance::HumanConfirmed => (
+                        AgentBusMessage {
+                            seq: bus_page.latest_seq,
+                            from_agent: "developer".to_string(),
+                            to_agent: Some(canonical_reader.clone()),
+                            kind: "human".to_string(),
+                            body: env.claim.text,
+                            branch: None,
+                            created_at_ms: env_created_ms,
+                            thread_key: None,
+                            msg_id: Some(env_id.clone()),
+                            read_by: Vec::new(),
+                            hop: Some(0),
+                            max_hops: Some(agent_bus::DEFAULT_MAX_HOPS),
+                        },
+                        false,
+                        false,
+                    ),
+                };
+                // A legacy bus row has no msg_id; give it the effective id the bus rows above carry,
+                // so the ack and claim below can name it.
+                let mut synthesized = synthesized;
+                if synthesized.msg_id.is_none() {
+                    synthesized.msg_id = Some(env_id.clone());
+                }
+                if from_bus && synthesized.read_by.iter().any(|r| aliases.contains(r)) {
+                    if ack {
+                        if let Err(e) = mb.mark_claimed_by_id(sid, &env.claim.request_id, now) {
+                            ack_errors.push(format!("mailbox claim {}: {e}", env.claim.request_id));
+                        }
+                    }
+                    continue;
+                }
+                // A row that is not on the bus pages by creation time: a person's or an evicted peer
+                // envelope always, and an evicted steward envelope (it keeps a bus_seq, but the
+                // seq is no cursor for a row the bus no longer holds) once the caller passes
+                // since_mailbox_ms. Without that argument it still honors since_seq.
+                let by_ms = !from_bus && (!has_bus_seq || since_mailbox_ms.is_some());
+                if !by_ms && synthesized.seq <= since_seq {
+                    continue;
+                }
+                if by_ms && since_mailbox_ms.is_some_and(|cursor| env_created_ms <= cursor) {
+                    continue;
+                }
+                if !from_bus {
+                    mailbox_only_ms.insert(env_id.clone(), env_created_ms);
+                }
+                if let Some(tk) = t_filter {
+                    if synthesized.thread_key.as_deref() != Some(tk) {
+                        continue;
+                    }
+                }
+                if from_bus {
+                    on_bus.insert(synthesized.seq);
+                }
+                mailbox_req_by_msg_id.insert(env_id.clone(), env.claim.request_id);
+                seen_ids.insert(env_id);
+                combined.push(synthesized);
+            } else {
+                mailbox_req_by_msg_id.insert(env_id, env.claim.request_id);
             }
         }
     }
 
+    let since_mailbox_floor = since_mailbox_ms.unwrap_or(0);
+    // Rows the bus holds come first in seq order, then the envelopes it does not hold. A
+    // mailbox envelope whose bus row was outside the bus read is appended after rows with a
+    // higher seq, so without the sort a cut could leave it behind them and pull
+    // `next_since_seq` below rows already returned.
+    let is_bus_row = |m: &AgentBusMessage| {
+        !m.msg_id
+            .as_ref()
+            .is_some_and(|id| mailbox_only_ms.contains_key(id))
+    };
+    combined.sort_by_key(|m| if is_bus_row(m) { (0, m.seq) } else { (1, 0) });
     let has_more = combined.len() > limit;
-    if has_more {
-        combined.truncate(limit);
-    }
+    let cut: Vec<AgentBusMessage> = if has_more {
+        combined.split_off(limit)
+    } else {
+        Vec::new()
+    };
+    let (next_since_seq, mailbox_cursor_ms) = if has_more {
+        // Resume just before the first cut row of each kind, never behind where the caller was.
+        let returned_seq = combined
+            .iter()
+            .filter(|m| is_bus_row(m))
+            .map(|m| m.seq)
+            .max()
+            .unwrap_or(since_seq);
+        let seq = cut
+            .iter()
+            .filter(|m| is_bus_row(m))
+            .map(|m| m.seq.saturating_sub(1))
+            .fold(returned_seq, u64::min)
+            .max(since_seq);
+        let ms_of = |m: &AgentBusMessage| m.msg_id.as_ref().and_then(|id| mailbox_only_ms.get(id));
+        let returned_ms = combined
+            .iter()
+            .filter_map(ms_of)
+            .copied()
+            .max()
+            .unwrap_or(since_mailbox_floor);
+        let ms = cut
+            .iter()
+            .filter_map(ms_of)
+            .map(|t| t.saturating_sub(1))
+            .fold(returned_ms, u64::min)
+            .max(since_mailbox_floor);
+        (seq, ms)
+    } else {
+        let returned_ms = combined
+            .iter()
+            .filter_map(|m| m.msg_id.as_ref().and_then(|id| mailbox_only_ms.get(id)))
+            .copied()
+            .max()
+            .unwrap_or(since_mailbox_floor);
+        (
+            bus_page.latest_seq.max(since_seq),
+            returned_ms.max(since_mailbox_floor),
+        )
+    };
+
+    // Listed from what is actually returned, so the list never names a row the page lacks.
+    let pinned_below_dropped_before_seq: Vec<u64> = combined
+        .iter()
+        .map(|m| m.seq)
+        .filter(|seq| *seq < bus_page.dropped_before_seq && on_bus.contains(seq))
+        .collect();
 
     let mut acked_count = 0usize;
     if ack && !combined.is_empty() {
         let returned_ids: Vec<String> = combined.iter().filter_map(|m| m.msg_id.clone()).collect();
-        acked_count =
-            agent_bus::ack_messages(repo_path, &canonical_reader, &returned_ids).unwrap_or(0);
-        if let (Some(ref sid), Ok(mb)) = (&resolved_session_id, Mailbox::at_default()) {
-            let now = SystemTime::now();
-            for mid in &returned_ids {
-                if mb.mark_claimed_by_id(sid, mid, now).unwrap_or(false) && acked_count == 0 {
-                    acked_count += 1;
+        let bus_acked = match agent_bus::ack_messages(repo_path, &canonical_reader, &returned_ids) {
+            Ok(n) => n,
+            Err(e) => {
+                ack_errors.push(format!("bus ack: {}", e.into_message()));
+                0
+            }
+        };
+        let mut mb_only_acked = 0usize;
+        if let Some(ref sid) = resolved_session_id {
+            match Mailbox::at_default() {
+                Ok(mb) => {
+                    let now = SystemTime::now();
+                    let mut claim = |id: &str| match mb.mark_claimed_by_id(sid, id, now) {
+                        Ok(claimed) => claimed,
+                        Err(e) => {
+                            ack_errors.push(format!("mailbox claim {id}: {e}"));
+                            false
+                        }
+                    };
+                    for mid in &returned_ids {
+                        let mut claimed = claim(mid);
+                        if let Some(req_id) = mailbox_req_by_msg_id.get(mid) {
+                            if req_id != mid {
+                                claimed |= claim(req_id);
+                            }
+                        }
+                        if claimed {
+                            mb_only_acked += 1;
+                        }
+                    }
                 }
+                Err(e) => ack_errors.push(format!("mailbox unavailable: {e}")),
             }
         }
+        acked_count = bus_acked.max(mb_only_acked);
     }
 
     Ok((
         DedupedInboxResult {
             messages: combined,
             latest_seq: bus_page.latest_seq,
+            next_since_seq,
+            mailbox_cursor_ms,
             dropped_before_seq: bus_page.dropped_before_seq,
+            pinned_below_dropped_before_seq,
             has_more,
             acked_count,
+            ack_error: (!ack_errors.is_empty()).then(|| ack_errors.join("; ")),
         },
         resolved_session_id,
     ))
@@ -702,13 +1182,16 @@ fn collect_deduped_peer_inbox(
 pub(crate) fn handle_agent_inbox(a: super::AgentInboxArgs) -> Result<Value, String> {
     crate::repository_trust::require(Path::new(&a.repo_path))
         .map_err(CommandError::into_message)?;
-    let ack = a.ack.unwrap_or(true);
+    // Reading is a peek unless the caller asks to acknowledge: any caller may name any peer in
+    // for_peer, so a default acknowledgement would let one agent consume another's messages.
+    let ack = a.ack.unwrap_or(false);
     let limit = a.limit.map(|l| l as usize).unwrap_or(50);
     let (res, _) = collect_deduped_peer_inbox(
         &a.repo_path,
         &a.for_peer,
         a.provider_session_id.as_deref(),
         a.since_seq.unwrap_or(0),
+        a.since_mailbox_ms,
         a.thread_key.as_deref(),
         a.include_broadcasts.unwrap_or(false),
         ack,
@@ -720,8 +1203,12 @@ pub(crate) fn handle_agent_inbox(a: super::AgentInboxArgs) -> Result<Value, Stri
         "for_peer": a.for_peer,
         "acked": ack,
         "acked_count": res.acked_count,
+        "ack_error": res.ack_error,
         "latest_seq": res.latest_seq,
+        "next_since_seq": res.next_since_seq,
+        "mailbox_cursor_ms": res.mailbox_cursor_ms,
         "dropped_before_seq": res.dropped_before_seq,
+        "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
         "has_more": res.has_more,
         "messages": res.messages,
     }))
@@ -743,6 +1230,7 @@ pub(crate) fn handle_agent_wait_with_counter(
     let ack = a.ack.unwrap_or(true);
     let limit = a.limit.map(|l| l as usize).unwrap_or(20);
     let since_seq = a.since_seq.unwrap_or(0);
+    let since_mailbox_ms = a.since_mailbox_ms;
     let include_broadcasts = a.include_broadcasts.unwrap_or(false);
     let started = Instant::now();
 
@@ -751,6 +1239,7 @@ pub(crate) fn handle_agent_wait_with_counter(
         &a.for_peer,
         a.provider_session_id.as_deref(),
         since_seq,
+        since_mailbox_ms,
         a.thread_key.as_deref(),
         include_broadcasts,
         ack,
@@ -758,18 +1247,14 @@ pub(crate) fn handle_agent_wait_with_counter(
     )?;
     if !initial.messages.is_empty() || effective_timeout_ms == 0 {
         let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
-        return Ok(json!({
-            "ok": true,
-            "repo_path": a.repo_path,
-            "for_peer": a.for_peer,
-            "timed_out": initial.messages.is_empty(),
-            "waited_ms": waited_ms,
-            "effective_timeout_ms": effective_timeout_ms,
-            "acked": ack,
-            "acked_count": initial.acked_count,
-            "latest_seq": initial.latest_seq,
-            "messages": initial.messages,
-        }));
+        return Ok(wait_response(
+            &a,
+            ack,
+            initial.messages.is_empty(),
+            waited_ms,
+            effective_timeout_ms,
+            initial,
+        ));
     }
 
     let messages_path =
@@ -813,6 +1298,7 @@ pub(crate) fn handle_agent_wait_with_counter(
         &a.for_peer,
         a.provider_session_id.as_deref(),
         since_seq,
+        since_mailbox_ms,
         a.thread_key.as_deref(),
         include_broadcasts,
         ack,
@@ -820,18 +1306,14 @@ pub(crate) fn handle_agent_wait_with_counter(
     )?;
     if !after_arm.messages.is_empty() {
         let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
-        return Ok(json!({
-            "ok": true,
-            "repo_path": a.repo_path,
-            "for_peer": a.for_peer,
-            "timed_out": false,
-            "waited_ms": waited_ms,
-            "effective_timeout_ms": effective_timeout_ms,
-            "acked": ack,
-            "acked_count": after_arm.acked_count,
-            "latest_seq": after_arm.latest_seq,
-            "messages": after_arm.messages,
-        }));
+        return Ok(wait_response(
+            &a,
+            ack,
+            false,
+            waited_ms,
+            effective_timeout_ms,
+            after_arm,
+        ));
     }
 
     let deadline = started + Duration::from_millis(effective_timeout_ms);
@@ -883,6 +1365,7 @@ pub(crate) fn handle_agent_wait_with_counter(
             &a.for_peer,
             a.provider_session_id.as_deref(),
             since_seq,
+            since_mailbox_ms,
             a.thread_key.as_deref(),
             include_broadcasts,
             ack,
@@ -890,32 +1373,54 @@ pub(crate) fn handle_agent_wait_with_counter(
         )?;
         if !polled.messages.is_empty() {
             let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
-            return Ok(json!({
-                "ok": true,
-                "repo_path": a.repo_path,
-                "for_peer": a.for_peer,
-                "timed_out": false,
-                "waited_ms": waited_ms,
-                "effective_timeout_ms": effective_timeout_ms,
-                "acked": ack,
-                "acked_count": polled.acked_count,
-                "latest_seq": polled.latest_seq,
-                "messages": polled.messages,
-            }));
+            return Ok(wait_response(
+                &a,
+                ack,
+                false,
+                waited_ms,
+                effective_timeout_ms,
+                polled,
+            ));
         }
     }
 
     let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(effective_timeout_ms);
-    Ok(json!({
+    Ok(wait_response(
+        &a,
+        ack,
+        true,
+        waited_ms,
+        effective_timeout_ms,
+        initial,
+    ))
+}
+
+/// Every return of a wait carries the same envelope as an inbox read, so a waiter can tell a
+/// capped page (`has_more`) or an evicted range (`dropped_before_seq`) from a complete one.
+fn wait_response(
+    a: &super::AgentWaitArgs,
+    ack: bool,
+    timed_out: bool,
+    waited_ms: u64,
+    effective_timeout_ms: u64,
+    res: DedupedInboxResult,
+) -> Value {
+    json!({
         "ok": true,
         "repo_path": a.repo_path,
         "for_peer": a.for_peer,
-        "timed_out": true,
+        "timed_out": timed_out,
         "waited_ms": waited_ms,
         "effective_timeout_ms": effective_timeout_ms,
         "acked": ack,
-        "acked_count": 0,
-        "latest_seq": initial.latest_seq,
-        "messages": Vec::<AgentBusMessage>::new(),
-    }))
+        "acked_count": res.acked_count,
+        "ack_error": res.ack_error,
+        "latest_seq": res.latest_seq,
+        "next_since_seq": res.next_since_seq,
+        "mailbox_cursor_ms": res.mailbox_cursor_ms,
+        "dropped_before_seq": res.dropped_before_seq,
+        "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
+        "has_more": res.has_more,
+        "messages": res.messages,
+    })
 }

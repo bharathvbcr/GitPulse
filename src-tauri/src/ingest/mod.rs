@@ -290,6 +290,34 @@ pub(crate) mod home_hidden {
     }
 }
 
+/// Thread-local override of `GITPULSE_TRANSCRIPT_ROOT` for tests that do not
+/// want to take the process-global `env_serial()` lock.
+#[cfg(test)]
+pub(crate) mod test_transcript_root {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<PathBuf> {
+        ROOT.with(|slot| slot.borrow().clone())
+    }
+
+    pub(crate) fn with<T>(root: &Path, f: impl FnOnce() -> T) -> T {
+        struct Reset(Option<PathBuf>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ROOT.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let prev = ROOT.with(|slot| slot.borrow_mut().replace(root.to_path_buf()));
+        let _reset = Reset(prev);
+        f()
+    }
+}
+
 fn event_belongs_to_worktree(
     event: &crate::ledger::LedgerEvent,
     ledger_repo: &str,
@@ -702,10 +730,26 @@ fn dir_id(meta: &std::fs::Metadata, _path: &std::path::Path) -> Option<DirId> {
     Some((meta.dev(), meta.ino()))
 }
 
-/// Without device and inode numbers the canonical path stands in for them.
+/// Without device and inode numbers a file is identified by the volume and file
+/// id its handle reports, so two hard links to one transcript are one file. A
+/// directory, or a file whose handle cannot say, falls back to its canonical
+/// path, which tells two names for one directory apart from two directories but
+/// not two links to one file.
 #[cfg(not(unix))]
-fn dir_id(_meta: &std::fs::Metadata, path: &std::path::Path) -> Option<DirId> {
+fn dir_id(meta: &std::fs::Metadata, path: &std::path::Path) -> Option<DirId> {
     use std::hash::{Hash, Hasher};
+    #[cfg(windows)]
+    if meta.is_file() {
+        let identity = std::fs::File::open(path)
+            .and_then(|file| crate::fs_entry::windows_file_identity(&file));
+        if let Ok((volume, id)) = identity {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut hasher);
+            return Some((volume, hasher.finish()));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = meta;
     let canonical = std::fs::canonicalize(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     canonical.hash(&mut hasher);

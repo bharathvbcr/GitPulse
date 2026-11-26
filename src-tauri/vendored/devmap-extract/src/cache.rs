@@ -869,7 +869,21 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// a free function (`file::name`, `Function`) instead of a method of the class
 /// (`file::T.name`, `Method`). A v100 row holds the method spelling, so a warm
 /// cache would keep serving it.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "101";
+///
+/// v102 fixes Svelte 5 template parsing and embedded expressions (`{@attach}`,
+/// attribute spread `{...props}`, and `{#each (xs as T[]) as item}`), adds
+/// error-localized same-width syntax repairs for TypeScript (`import("...").T`,
+/// `typeof import(...)`, predefined-type tuple labels, `< unique.`), Rust 2024
+/// (`unsafe extern`, `&raw`, `#[cfg(...)]` in struct patterns), and Shell
+/// (`${var:+ (...)}` inside double quotes), strips leading horizontal/vertical
+/// whitespace after Rust string line-continuation backslashes, extracts
+/// function-valued properties inside JS/TS factory-returned object literals and
+/// `export default { ... }` as `Method` symbols with matching call attribution,
+/// and records module-level JS/TS factory return shapes (`"<factory>()"`)
+/// including unmodified local factory spreads. A v101 cache row would keep
+/// stale `Partial` outcomes, missing factory methods, and unstripped Rust
+/// line-continuation literals.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "102";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

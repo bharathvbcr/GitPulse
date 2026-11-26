@@ -136,6 +136,16 @@ const ENTRY_LOCK_BUDGET: Duration = Duration::from_millis(100);
 /// Poll interval while waiting out [`CHILD_GRACE`].
 const LIVENESS_POLL: Duration = Duration::from_millis(10);
 
+/// How long a reap waits for a child whose kill the signal guard *refused*.
+///
+/// Applies only to a refused kill ([`Registration::kill_tree`] then
+/// deliberately skips the direct `Child::kill` backstop, so nothing is coming
+/// to end the child and an unbounded `wait` would hang every exit path that
+/// reaps). A kill that was delivered always makes the child collectable, so
+/// that reap blocks until it is. Four graces is generous and still well inside
+/// [`HANDOVER`].
+const REAP_BOUND: Duration = CHILD_GRACE.saturating_mul(4);
+
 /// How long [`exit`] waits for the shutdown watcher to finish its sweep.
 ///
 /// Comfortably more than [`CHILD_GRACE`] plus the syscalls around it, so the
@@ -324,6 +334,12 @@ impl Registration {
     /// kill stays as a backstop for a group the leader has already left, and
     /// on Windows the tree kill is all there is.
     pub fn kill_tree(&self, child: &mut Child) {
+        self.kill_tree_outcome(child);
+    }
+
+    /// [`Self::kill_tree`], reporting what it did so a reap can tell a kill
+    /// that is coming from one that never will.
+    fn kill_tree_outcome(&self, child: &mut Child) -> KillOutcome {
         let pid = lock(&self.slot.pid);
         match *pid {
             Some(pid) => {
@@ -334,6 +350,7 @@ impl Registration {
                         if !signalled {
                             let _ = child.kill();
                         }
+                        KillOutcome::Delivered
                     }
                     Err(error) => {
                         if is_refusal(&error) {
@@ -342,9 +359,11 @@ impl Registration {
                                 "kill_tree for {} (pid {pid}) REFUSED by signal guard: {error}; suppressing direct child.kill() backstop",
                                 self.slot.label
                             );
+                            KillOutcome::Refused
                         } else {
                             // System call failed unexpectedly; attempt direct kill as emergency fallback
                             let _ = child.kill();
+                            KillOutcome::Delivered
                         }
                     }
                 }
@@ -357,6 +376,7 @@ impl Registration {
                     "kill_tree skipped for {}: pid already reaped",
                     self.slot.label
                 );
+                KillOutcome::NothingToKill
             }
         }
     }
@@ -397,6 +417,18 @@ impl Registration {
         grace: Duration,
         wait: &mut dyn FnMut(Duration),
     ) -> io::Result<ExitStatus> {
+        self.stop_and_reap_bounded(child, grace, wait, REAP_BOUND)
+    }
+
+    /// [`Self::stop_and_reap_waiting`] with the bound on a refused kill's reap
+    /// as a parameter, so a test can shrink it.
+    fn stop_and_reap_bounded(
+        &self,
+        child: &mut Child,
+        grace: Duration,
+        wait: &mut dyn FnMut(Duration),
+        refused_bound: Duration,
+    ) -> io::Result<ExitStatus> {
         let deadline = Instant::now() + grace;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -405,8 +437,47 @@ impl Registration {
             }
             wait(remaining.min(LIVENESS_POLL));
         }
-        self.kill_tree(child);
-        self.reap(|| child.wait())
+        let outcome = self.kill_tree_outcome(child);
+        if outcome.bounds_reap() {
+            self.reap_within(child, refused_bound)
+        } else {
+            self.reap(|| child.wait())
+        }
+    }
+
+    /// Collects `child` without ever blocking past `bound`.
+    ///
+    /// Polls with `try_wait` so the entry's lock is held only for each poll. A
+    /// child that is not collectable by the deadline was **not reaped**: the
+    /// result is a `TimedOut` error, never a made-up exit status, and the pid
+    /// stays registered. That is what keeps [`Self::kill_tree`]'s rule — never
+    /// signal a cleared pid, it may be recycled — true, and what lets the exit
+    /// sweep report the child and the registration's drop retry it.
+    fn reap_within(&self, child: &mut Child, bound: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now() + bound;
+        loop {
+            match self.poll(|| child.try_wait()) {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    // A wait that fails has lost track of the child, so the
+                    // pid is forgotten, as [`Self::reap`] does.
+                    *lock(&self.slot.pid) = None;
+                    return Err(error);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{} was NOT reaped: still running {bound:?} after the kill (a refused or undelivered kill leaves the pid registered)",
+                        self.slot.label
+                    ),
+                ));
+            }
+            std::thread::sleep(remaining.min(LIVENESS_POLL));
+        }
     }
 
     /// [`Self::stop_and_reap`] for a child nobody has asked to stop yet: sends
@@ -1002,6 +1073,28 @@ enum Ask {
     Busy,
     /// The platform has no graceful step; the kill pass decides everything.
     NotSupported,
+}
+
+/// What [`Registration::kill_tree`] did to a child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillOutcome {
+    /// A kill was sent (to the group or straight to the child), so the child
+    /// becomes collectable and a blocking wait ends.
+    Delivered,
+    /// The signal guard refused the kill and the direct backstop was withheld:
+    /// nothing is coming to end the child.
+    Refused,
+    /// The pid was already cleared, so nothing was signalled; the following
+    /// wait is on a child that is already collected or collectable.
+    NothingToKill,
+}
+
+impl KillOutcome {
+    /// Whether the reap that follows must give up after a bound instead of
+    /// blocking: only when the kill was refused.
+    fn bounds_reap(self) -> bool {
+        self == Self::Refused
+    }
 }
 
 /// What one attempt to kill a registered child's group came to.
@@ -2903,6 +2996,41 @@ mod adv_keep_pid_tests {
         );
     }
 
+    /// A kill the signal guard refuses leaves the child running and unsignalled;
+    /// the reap that follows must give up at its bound, say the child was not
+    /// reaped, and leave the pid registered. Before, it was an unbounded
+    /// `wait` on a child nothing had signalled.
+    #[test]
+    fn a_refused_kill_leaves_a_bounded_reap_that_reports_not_reaped() {
+        let mut b = bystander();
+        let slot = slot_holding("adv-bounded-reap", b.id());
+        let registration = Registration {
+            key: next_key(),
+            slot: Arc::clone(&slot),
+        };
+        let started = Instant::now();
+        let outcome = registration.stop_and_reap(&mut b, Duration::ZERO);
+        let elapsed = started.elapsed();
+        let pid_after = *lock(&slot.pid);
+        let alive = b_alive(&b);
+        // Not in the global registry: forget the Registration's drop, then
+        // clean up the one pid this test started.
+        std::mem::forget(registration);
+        reap(b);
+        let error = outcome.expect_err("a child that was never signalled cannot have been reaped");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(error.to_string().contains("NOT reaped"), "{error}");
+        assert!(
+            elapsed < REAP_BOUND + CHILD_GRACE * 4,
+            "the reap took {elapsed:?}, past its {REAP_BOUND:?} bound"
+        );
+        assert!(alive, "the refused kill still signalled the child");
+        assert!(
+            pid_after.is_some(),
+            "a child that was not reaped had its pid forgotten"
+        );
+    }
+
     #[test]
     fn kill_tree_does_not_call_child_kill_when_pid_is_none() {
         let mut c = bystander();
@@ -2925,6 +3053,255 @@ mod adv_keep_pid_tests {
 
     fn b_alive(c: &Child) -> bool {
         unsafe { libc::kill(c.id() as i32, 0) == 0 }
+    }
+
+    // ---- Attacks on the bounded reap (REAP_BOUND) ----
+
+    fn registered_sh(script: &str, label: &str, piped: bool) -> (Child, Registration) {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).stdin(Stdio::null());
+        cmd.stdout(if piped { Stdio::piped() } else { Stdio::null() });
+        spawn(&mut cmd, label).expect("spawn")
+    }
+
+    /// Blocks (no polling, no sleep) until `pid` changes state in the way
+    /// `flags` names, without reaping it.
+    fn wait_for_state_unreaped(pid: u32, flags: libc::c_int) {
+        // SAFETY: `info` is a zeroed siginfo_t that waitid alone writes; WNOWAIT
+        // leaves the child collectable.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                flags | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(rc, 0, "waitid: {}", io::Error::last_os_error());
+    }
+
+    fn exit_code(status: ExitStatus) -> Option<i32> {
+        status.code()
+    }
+
+    #[test]
+    fn only_a_refused_kill_bounds_the_reap() {
+        assert!(KillOutcome::Refused.bounds_reap());
+        assert!(!KillOutcome::Delivered.bounds_reap());
+        assert!(!KillOutcome::NothingToKill.bounds_reap());
+    }
+
+    /// A delivered kill must be waited out however short the refused-kill
+    /// bound is: the child is reaped with its signal status and unregistered,
+    /// never reported NOT reaped and left a zombie.
+    #[test]
+    fn a_delivered_kill_is_reaped_by_a_blocking_wait_not_the_refused_bound() {
+        for _ in 0..8 {
+            let (mut child, guard) = registered_sh("exec sleep 30", "delivered-kill", false);
+            let status = guard
+                .stop_and_reap_bounded(&mut child, Duration::ZERO, &mut |_| {}, Duration::ZERO)
+                .expect("a delivered kill is waited out");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGKILL)
+            );
+            assert_eq!(guard.pid(), None, "a reaped child stayed registered");
+        }
+    }
+
+    /// ATTACK 2a: a child that already exited and was never waited on is a
+    /// zombie; the reap must collect it at once with its own status, not fall
+    /// into the bound.
+    #[test]
+    fn adv_reap_collects_an_already_exited_zombie_at_once() {
+        let (mut child, guard) = registered_sh("exit 3", "adv-zombie", false);
+        wait_for_state_unreaped(child.id(), libc::WEXITED);
+        let started = Instant::now();
+        let status = guard
+            .stop_and_reap(&mut child, Duration::ZERO)
+            .expect("a zombie is collectable");
+        let elapsed = started.elapsed();
+        assert_eq!(exit_code(status), Some(3), "the kill overwrote the status");
+        assert_eq!(guard.pid(), None, "a reaped zombie stayed registered");
+        assert!(
+            elapsed < crate::test_support::coverage_relaxed(REAP_BOUND),
+            "collecting a zombie took {elapsed:?}"
+        );
+    }
+
+    /// ATTACK 2b: a SIGSTOPped child that is then SIGKILLed must still be
+    /// collected inside the bound.
+    #[test]
+    fn adv_reap_collects_a_stopped_child() {
+        let (mut child, guard) = registered_sh("exec sleep 30", "adv-stopped", false);
+        // SAFETY: the pid is this test's own un-reaped child.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) }, 0);
+        wait_for_state_unreaped(child.id(), libc::WSTOPPED);
+        let status = guard
+            .stop_and_reap(&mut child, Duration::ZERO)
+            .expect("a stopped child dies to SIGKILL and is collected");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+        assert_eq!(guard.pid(), None);
+    }
+
+    /// ATTACK 2c: the leader exits while a descendant keeps the stdout pipe
+    /// open and nobody reads it. try_wait does not depend on the pipe, so the
+    /// reap is Ok, the leader's own status survives, and the descendant dies
+    /// with the group.
+    #[test]
+    fn adv_reap_does_not_depend_on_a_descendant_holding_the_pipe() {
+        use std::io::BufRead;
+        let (mut child, guard) = registered_sh("sleep 30 & echo $!; exit 0", "adv-pipe", true);
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.as_mut().expect("stdout"))
+            .read_line(&mut line)
+            .expect("helper pid");
+        let helper: i32 = line.trim().parse().expect("pid");
+        wait_for_state_unreaped(child.id(), libc::WEXITED);
+        let started = Instant::now();
+        let status = guard
+            .stop_and_reap(&mut child, Duration::ZERO)
+            .expect("reap with the pipe still held");
+        let elapsed = started.elapsed();
+        assert!(status.success(), "{status:?}");
+        assert!(
+            elapsed < crate::test_support::coverage_relaxed(REAP_BOUND),
+            "{elapsed:?}"
+        );
+        let until = Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        // SAFETY: signal 0 only probes.
+        while unsafe { libc::kill(helper, 0) } == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            unsafe { libc::kill(helper, 0) } != 0,
+            "the descendant survived the group kill"
+        );
+    }
+
+    /// ATTACK 2d: another path already reaped the child through `poll`; a later
+    /// stop_and_reap must hand back the cached status, not wait or time out.
+    #[test]
+    fn adv_reap_after_a_poll_already_reaped_returns_the_cached_status() {
+        let (mut child, guard) = registered_sh("exit 7", "adv-cached", false);
+        wait_for_state_unreaped(child.id(), libc::WEXITED);
+        let first = guard
+            .poll(|| child.try_wait())
+            .expect("try_wait")
+            .expect("exited");
+        assert_eq!(guard.pid(), None);
+        let started = Instant::now();
+        let second = guard
+            .stop_and_reap(&mut child, Duration::ZERO)
+            .expect("a reaped child reports its cached status");
+        assert_eq!(first, second);
+        assert_eq!(exit_code(second), Some(7));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(REAP_BOUND));
+    }
+
+    /// ATTACK 2e: someone outside the registration reaped the child (ECHILD).
+    /// The wait that fails has lost the child: the error comes back at once
+    /// (not TimedOut, not a hang) and the pid is forgotten.
+    #[test]
+    fn adv_reap_of_a_child_reaped_behind_its_back_fails_fast_and_forgets_the_pid() {
+        let (mut child, guard) = registered_sh("exit 0", "adv-echild", false);
+        wait_for_state_unreaped(child.id(), libc::WEXITED);
+        let mut raw = 0;
+        // SAFETY: reaps this test's own child; the Child is not waited again by std.
+        assert_eq!(
+            unsafe { libc::waitpid(child.id() as i32, &mut raw, 0) },
+            child.id() as i32
+        );
+        let started = Instant::now();
+        let outcome = guard.stop_and_reap(&mut child, Duration::ZERO);
+        let error = outcome.expect_err("the child was reaped by someone else");
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(guard.pid(), None, "a lost child stayed registered");
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(REAP_BOUND));
+    }
+
+    /// ATTACK 3a: the exit sweep running over the same entry while it is being
+    /// reaped. Whoever signals first, the reap is Ok, the pid ends forgotten,
+    /// and the sweep reports nothing failed (no signal after the pid cleared).
+    #[test]
+    fn adv_a_sweep_racing_the_reap_of_one_entry_neither_double_reaps_nor_fails() {
+        for round in 0..12 {
+            let (mut child, guard) = registered_sh("exec sleep 30", "adv-race", false);
+            let slot = lock(registry())
+                .get(&guard.key)
+                .cloned()
+                .expect("a spawned child is registered");
+            let stop = AtomicBool::new(false);
+            let mut failures: Vec<String> = Vec::new();
+            let outcome = std::thread::scope(|scope| {
+                let sweeper = scope.spawn(|| {
+                    let mut failed = Vec::new();
+                    while !stop.load(Ordering::Acquire) {
+                        let swept = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+                        failed.extend(swept.failed);
+                        failed.extend(swept.abandoned);
+                    }
+                    failed
+                });
+                let outcome = guard.stop_and_reap(&mut child, Duration::ZERO);
+                stop.store(true, Ordering::Release);
+                failures = sweeper.join().expect("sweeper");
+                outcome
+            });
+            let status = outcome.unwrap_or_else(|e| panic!("round {round}: {e}"));
+            let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+            assert!(
+                signal == Some(libc::SIGKILL) || signal == Some(libc::SIGTERM),
+                "round {round}: {status:?}"
+            );
+            assert_eq!(guard.pid(), None, "round {round}");
+            assert!(failures.is_empty(), "round {round}: {failures:?}");
+        }
+    }
+
+    /// ATTACK 3b: a reap that timed out, then the registration drops. The entry
+    /// must stay registered with its pid for the exit sweep, the sweep's retries
+    /// must stay bounded (MAX_KILL_ATTEMPTS, then abandoned), and the refused
+    /// child must never have been signalled.
+    #[test]
+    fn adv_drop_after_a_timed_out_reap_keeps_the_entry_and_retries_stay_bounded() {
+        let b = bystander();
+        let slot = slot_holding("adv-timeout-drop", b.id());
+        let key = next_key();
+        lock(registry()).insert(key, Arc::clone(&slot));
+        let registration = Registration {
+            key,
+            slot: Arc::clone(&slot),
+        };
+        let mut b = b;
+        let error = registration
+            .stop_and_reap(&mut b, Duration::ZERO)
+            .expect_err("a refused kill cannot be reaped");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        drop(registration);
+        let kept = lock(registry()).contains_key(&key);
+        let held = *lock(&slot.pid);
+        let failures_after_drop = slot.kill_failures.load(Ordering::Relaxed);
+        let mut abandoned = Vec::new();
+        for _ in 0..MAX_KILL_ATTEMPTS + 2 {
+            abandoned.extend(sweep(&[Arc::clone(&slot)], Duration::ZERO).abandoned);
+        }
+        let pid_after = *lock(&slot.pid);
+        let alive = b_alive(&b);
+        lock(registry()).remove(&key);
+        reap(b);
+        assert!(
+            kept && held.is_some(),
+            "drop lost the entry after a timeout"
+        );
+        assert_eq!(failures_after_drop, 1, "drop did not retry exactly once");
+        assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+        assert_eq!(pid_after, None, "the retries never gave up");
+        assert!(alive, "a refused pid was signalled by the retry path");
     }
 
     /// ATTACK 3a: a reused pid that is a non-leader in a DIFFERENT group from

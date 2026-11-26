@@ -99,6 +99,9 @@ site | src/desktop/instance_tests.rs | the_pool_never_starts_more_threads_than_t
 site | src/desktop/popover.rs | wait_for | 0 | bounded-poll
 
 # src/devmap/cli.rs
+# Each of four readers holds a read slot for 5 ms so the two-slot budget is
+# always full with a user read waiting; the length is not asserted.
+site | src/devmap/cli.rs | a_steady_flood_of_user_reads_cannot_defer_a_probe_forever | 0 | hold
 site | src/devmap/cli.rs | wait_test_status_delay | 0 | bounded-poll
 
 # src/devmap/live.rs
@@ -128,7 +131,6 @@ site | src/engine/git_cli/run_errors_adversarial_tests.rs | hold_lock | 0 | cloc
 
 # src/engine/process/budget_adversarial_tests.rs
 site | src/engine/process/budget_adversarial_tests.rs | a_local_bucket_waiter_does_not_spin_on_a_stale_shared_ask_time | 0 | race-widen
-site | src/engine/process/budget_adversarial_tests.rs | reactive_waiters_are_served_in_arrival_order | 0 | clock-seam-needed
 
 # src/engine/process/grace_adversarial_tests.rs
 site | src/engine/process/grace_adversarial_tests.rs | reap_leak | 0 | bounded-poll
@@ -316,6 +318,10 @@ site | src/terminal/host/client_tests.rs | a_failed_first_listing_is_retried_in_
 site | src/terminal/host/client_tests.rs | a_session_that_exited_is_no_longer_known | 0 | bounded-poll
 site | src/terminal/host/client_tests.rs | delivered_exits_are_not_vouched_for_while_their_recording_is_pending | 0 | bounded-poll
 
+# src/terminal/host/legacy_tests.rs
+site | src/terminal/host/legacy_tests.rs | Fake::on | 0 | unbounded-poll
+site | src/terminal/host/legacy_tests.rs | a_host_that_answers_a_byte_at_a_time_cannot_stretch_the_deadline | 0 | fixture-delay
+
 # src/terminal/incident.rs
 site | src/terminal/incident.rs | wait_until | 0 | bounded-poll
 
@@ -452,6 +458,7 @@ site | tests/logging_process.rs | wait_for_probe | 0 | bounded-poll
 
 # tests/mcp_stdio.rs
 site | tests/mcp_stdio.rs | run_with_args | 0 | bounded-poll
+site | tests/mcp_stdio.rs | run_one_shot_with | 0 | bounded-poll
 
 # tests/mcp_transport_stress.rs
 site | tests/mcp_transport_stress.rs | a_client_that_never_reads_ends_the_session_after_the_write_window | 0 | bounded-poll

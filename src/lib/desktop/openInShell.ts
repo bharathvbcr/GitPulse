@@ -19,6 +19,7 @@
  * instead of a silently dead menu item.
  */
 import { invoke } from "../ipc/invoke";
+import type { EditorChoice } from "./editorChoice";
 
 /** Opens a repo-relative path with the OS default application. */
 export async function openInDefaultApp(repo: string, relative: string): Promise<void> {
@@ -28,6 +29,28 @@ export async function openInDefaultApp(repo: string, relative: string): Promise<
 /** Reveals a repo-relative path in the OS file manager. */
 export async function revealInFileManager(repo: string, relative: string): Promise<void> {
   await invoke("cmd_reveal_worktree_path", { repo, relative });
+}
+
+/** Where in the file to land: 1-based, and a column needs a line. */
+export interface EditorPosition {
+  line?: number;
+  column?: number;
+}
+
+/**
+ * Hands a repo-relative file to an external editor, at a line when one is
+ * known. `editor` is the closed `EditorChoice` set, never a program name: the
+ * program and its flags live in Rust (`desktop::editor`), which also applies
+ * the containment and trust checks. Rejects with `editor_not_found` when the
+ * chosen editor is not installed; it never substitutes another.
+ */
+export async function openInEditor(
+  repo: string,
+  relative: string,
+  options: EditorPosition & { editor?: EditorChoice } = {},
+): Promise<void> {
+  const { line, column, editor } = options;
+  await invoke("cmd_open_in_editor", { repo, relative, line, column, editor });
 }
 
 /** Reveals the canonical Git root; file paths retain their stricter containment API. */

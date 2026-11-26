@@ -341,7 +341,7 @@ describe("documentation does not cite files that will not exist", () => {
 });
 
 describe("the MCP server's documented surface matches its code", () => {
-  const SKILL = "plugins/gitpulse/skills/gitpulse-insights/SKILL.md";
+  const SKILL = "plugins/gitpulse/skills/insights/SKILL.md";
   const MANIFESTS = [
     ".claude-plugin/marketplace.json",
     "plugins/gitpulse/plugin.json",

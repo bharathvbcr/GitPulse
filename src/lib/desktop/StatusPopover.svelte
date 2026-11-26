@@ -1,6 +1,10 @@
 <script lang="ts">
   import { slide } from "svelte/transition";
-  import { Activity, Archive, ArrowDown, ArrowUp, ArrowUpRight, Bot, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, Sun, Terminal } from "@lucide/svelte";
+  import { AlertCircle, Archive, ArrowDown, ArrowUp, ArrowUpRight, Bell, Bot, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, ShieldAlert, Sun, Terminal } from "@lucide/svelte";
+  import Logo from "../components/Logo.svelte";
+  import LauncherIcon from "../components/LauncherIcon.svelte";
+  import type { TabKind } from "../terminal/tabs";
+  import { formatAge } from "../storage/format";
   import type { MenuState } from "./menuState";
   import { formatFetchAge, statusDetailRows, statusInsights, statusKeyAction, statusShortcuts } from "./menuState";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -19,6 +23,26 @@
   });
   const card = $derived(snapshot?.status);
   const hasRepo = $derived(!!snapshot?.activePath);
+  const requests = $derived(snapshot?.agentRequests ?? []);
+  const requestsHidden = $derived(snapshot?.agentRequestsHidden ?? 0);
+  const agentsWaitingCount = $derived(Math.max(snapshot?.agentsWaiting ?? 0, requests.length));
+  const agentsRunning = $derived(snapshot?.agentsRunning ?? 0);
+  const agentsInformational = $derived(snapshot?.agentsInformational ?? 0);
+  const hasErrorRequest = $derived(requests.some((req) => req.urgency === "error"));
+  const MAX_DATE_MS = 8.64e15;
+  function safeIsoDatetime(atMs: number | null): string | undefined {
+    if (typeof atMs !== "number" || !Number.isFinite(atMs) || Math.abs(atMs) > MAX_DATE_MS) {
+      return undefined;
+    }
+    return new Date(atMs).toISOString();
+  }
+  function launcherKindFor(provider: string): TabKind {
+    const k = provider.trim().toLowerCase();
+    if (k === "claude" || k === "agy" || k === "codex" || k === "manvi" || k === "grok" || k === "shell") {
+      return k;
+    }
+    return "shell";
+  }
   const fetchCaption = $derived(
     !card || card.ahead === null || card.behind === null
       ? null
@@ -53,6 +77,37 @@
     onaction(id);
   }
   function handleKey(event: KeyboardEvent) {
+    if (
+      (event.key === "ArrowDown" || event.key === "ArrowUp") &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      document.activeElement instanceof HTMLElement &&
+      document.activeElement.closest('[data-testid="status-agent-requests"]')
+    ) {
+      const rows = [
+        ...document.querySelectorAll<HTMLButtonElement>(
+          '[data-testid="status-agent-requests"] .request-row:not(:disabled)',
+        ),
+      ];
+      const idx = rows.indexOf(document.activeElement as HTMLButtonElement);
+      if (idx !== -1 && rows.length > 0) {
+        event.preventDefault();
+        const nextIdx =
+          event.key === "ArrowDown"
+            ? (idx + 1) % rows.length
+            : (idx - 1 + rows.length) % rows.length;
+        rows[nextIdx]?.focus();
+        return;
+      }
+    }
+    if (
+      event.key === "Enter" &&
+      event.target instanceof HTMLElement &&
+      event.target.closest("button, a")
+    ) {
+      return;
+    }
     const next = statusKeyAction(event, snapshot, { choosing, expanded });
     if (!next) return;
     event.preventDefault();
@@ -68,7 +123,7 @@
 <div class="status-shell" class:reduce-motion={card?.reduceMotion} data-testid="status-popover" data-material={material} data-tone={card?.tone ?? "neutral"}>
   <section class="panel" aria-label="GitPulse status">
     <header>
-      <div class="mark" aria-hidden="true"><Activity size={21} strokeWidth={1.8} /></div>
+      <div class="mark" aria-hidden="true"><Logo size={24} variant="badge" /></div>
       <div class="identity">
         <button class="repository" onclick={() => choosing = !choosing} disabled={(snapshot?.repositories.length ?? 0) < 2}
           aria-expanded={choosing} aria-label="Choose repository" title={snapshot?.activePath ?? "GitPulse"}>
@@ -109,19 +164,155 @@
 
     <div class="content">
       {#if !snapshot}
-        <div class="empty"><div class="empty-mark"><Activity size={27} /></div><h1>{error ? "Status unavailable" : "Connecting…"}</h1>
+        <div class="empty"><div class="empty-mark" aria-hidden="true"><Logo size={32} variant="badge" /></div><h1>{error ? "Status unavailable" : "Connecting…"}</h1>
           <p>{error || "Getting your workspace status."}</p>
           {#if error}<button class="gp-btn w-full" data-variant="primary" data-size="md" data-testid="status-primary" onclick={() => act("retry")}>Try again</button>{/if}
         </div>
-      {:else if !hasRepo}
-        <div class="empty"><div class="empty-mark"><GitBranch size={29} strokeWidth={1.5} /></div>
-          <h1>Your work, at a glance</h1><p>Open a repository to see what needs attention.</p>
-          <button class="gp-btn w-full" data-variant="primary" data-size="md" data-testid="status-primary" disabled={pending} onclick={() => act("open")}>Open repository <ArrowUpRight size={15} /></button>
-          {#if enabled("clone")}
-            <button class="gp-btn mt-2 w-full" data-variant="ghost" data-size="md" data-testid="status-secondary" disabled={pending} onclick={() => act("clone")}>Clone repository</button>
-          {/if}
-        </div>
-      {:else if card}
+      {:else}
+        {#if requests.length > 0}
+          <section class="agent-requests" aria-label="Agents waiting for action" data-testid="status-agent-requests">
+            <div class="requests-head">
+              <span class="gp-chip" data-tone={hasErrorRequest ? "danger" : "warn"} data-kind="label">
+                {#if hasErrorRequest}<AlertCircle size={11} />{:else}<ShieldAlert size={11} />{/if}
+                <span>{agentsWaitingCount} waiting for action</span>
+              </span>
+              <button
+                type="button"
+                class="gp-btn"
+                data-size="sm"
+                data-testid="status-open-agents"
+                disabled={!enabled("agents")}
+                onclick={() => act("agents")}
+                title="Open Agents · A"
+              >Agents <ArrowUpRight size={11} /></button>
+            </div>
+            <div class="requests-list">
+              {#each requests as req (req.id)}
+                <button
+                  type="button"
+                  class="request-row"
+                  data-testid="status-agent-request"
+                  data-urgency={req.urgency}
+                  data-request-id={req.id}
+                  disabled={pending}
+                  onclick={() => act(`focus-agent:${req.id}`)}
+                  aria-label="Open {req.agentLabel}{req.repoLabel ? ` in ${req.repoLabel}` : ''}: {req.reason}"
+                >
+                  <span class="request-top">
+                    <LauncherIcon kind={launcherKindFor(req.provider)} size={13} />
+                    <span class="request-title">{req.agentLabel}</span>
+                    {#if req.repoLabel}
+                      <span class="request-workspace" title={req.repoPath ?? req.repoLabel}>{req.repoLabel}</span>
+                    {/if}
+                    {#if req.atMs && req.atMs > 0}
+                      {@const datetime = safeIsoDatetime(req.atMs)}
+                      <time class="request-age" {datetime}>{formatAge(req.atMs, clock)}</time>
+                    {/if}
+                  </span>
+                  <span class="request-meta">
+                    <span class="gp-chip" data-tone={req.urgency === "error" ? "danger" : "warn"} data-size="inline">
+                      {#if req.urgency === "error"}<AlertCircle size={10} />{:else}<ShieldAlert size={10} />{/if}
+                      <span>{req.reason}</span>
+                    </span>
+                    <ArrowUpRight size={11} />
+                  </span>
+                  {#if req.detail}
+                    <p class="request-detail" title={req.detail}>{req.detail}</p>
+                  {/if}
+                </button>
+              {/each}
+            </div>
+            {#if requestsHidden > 0}
+              <button
+                type="button"
+                class="gp-btn w-full mt-1.5"
+                data-variant="ghost"
+                data-size="sm"
+                data-testid="status-agent-requests-more"
+                disabled={!enabled("agents")}
+                onclick={() => act("agents")}
+              >+{requestsHidden} more in Agents <ArrowUpRight size={11} /></button>
+            {/if}
+          </section>
+        {:else if agentsWaitingCount > 0}
+          <section class="agent-requests" aria-label="Agents waiting for action" data-testid="status-agent-requests">
+            <div class="requests-head">
+              <span class="gp-chip" data-tone="warn" data-kind="label">
+                <ShieldAlert size={11} />
+                <span>{agentsWaitingCount} waiting for action</span>
+              </span>
+              <button
+                type="button"
+                class="gp-btn"
+                data-size="sm"
+                data-testid="status-open-agents"
+                disabled={!enabled("agents")}
+                onclick={() => act("agents")}
+                title="Open Agents · A"
+              >Agents <ArrowUpRight size={11} /></button>
+            </div>
+            <div class="requests-list">
+              <button
+                type="button"
+                class="request-row"
+                data-testid="status-agent-fallback"
+                data-urgency="blocking"
+                disabled={!enabled("agents")}
+                onclick={() => act("agents")}
+                aria-label="Open Agents for {agentsWaitingCount} waiting {agentsWaitingCount === 1 ? 'agent' : 'agents'}"
+              >
+                <span class="request-top">
+                  <Bot size={13} />
+                  <span class="request-title">{agentsWaitingCount} {agentsWaitingCount === 1 ? "agent" : "agents"} waiting in Agents</span>
+                </span>
+                <span class="request-meta">
+                  <span class="gp-chip" data-tone="warn" data-size="inline">
+                    <ShieldAlert size={10} />
+                    <span>Open Agents to review</span>
+                  </span>
+                  <ArrowUpRight size={11} />
+                </span>
+              </button>
+            </div>
+          </section>
+        {:else if agentsRunning > 0 || agentsInformational > 0}
+          <button
+            type="button"
+            class="agent-strip"
+            data-testid="status-agent-quiet"
+            data-has-notices={agentsInformational > 0}
+            disabled={!enabled("agents")}
+            onclick={() => act("agents")}
+            title="Open Agents · A"
+          >
+            <span class="gp-chip" data-tone={agentsInformational > 0 ? "info" : "ok"} data-size="inline">
+              {#if agentsInformational > 0}
+                <Bell size={10} />
+                <span>{agentsInformational} {agentsInformational === 1 ? "notice" : "notices"}</span>
+              {:else}
+                <Bot size={10} />
+                <span>{agentsRunning} running</span>
+              {/if}
+            </span>
+            <span class="agent-strip-text">
+              {#if agentsRunning > 0 && agentsInformational > 0}
+                {agentsRunning} running · none waiting
+              {:else}
+                No actions waiting
+              {/if}
+            </span>
+            <ArrowUpRight size={12} />
+          </button>
+        {/if}
+        {#if !hasRepo}
+          <div class="empty"><div class="empty-mark"><GitBranch size={29} strokeWidth={1.5} /></div>
+            <h1>Your work, at a glance</h1><p>Open a repository to see what needs attention.</p>
+            <button class="gp-btn w-full" data-variant="primary" data-size="md" data-testid="status-primary" disabled={pending} onclick={() => act("open")}>Open repository <ArrowUpRight size={15} /></button>
+            {#if enabled("clone")}
+              <button class="gp-btn mt-2 w-full" data-variant="ghost" data-size="md" data-testid="status-secondary" disabled={pending} onclick={() => act("clone")}>Clone repository</button>
+            {/if}
+          </div>
+        {:else if card}
         <div class="status-heading" aria-live="polite">
           <span class="status-dot" class:pulse={card.tone === "busy"}></span>
           <h1>{card.headline}</h1>
@@ -217,6 +408,7 @@
         {/if}
       {/if}
       {#if error && snapshot}<div class="error" role="alert"><CircleAlert size={14} /><span>{error}</span></div>{/if}
+      {/if}
     </div>
     <footer>
       <button class="open-app" onclick={() => act("show")}>Open GitPulse <ArrowUpRight size={12} /></button>
@@ -244,6 +436,7 @@
     --glass-blue:var(--c-pop-blue-glass);
     --glass-green:var(--c-pop-green-glass);
     --glass-amber:var(--c-pop-amber-glass);
+    --glass-red:var(--c-pop-red-glass);
     --bg:rgb(var(--base));
     --surface:rgb(var(--card-base));
     --soft:rgb(var(--c-pop-soft));
@@ -255,6 +448,7 @@
     --action-hover:var(--c-pop-action-hover);
     --green:var(--c-pop-green-solid);
     --amber:var(--c-pop-amber-solid);
+    --red:var(--c-pop-red-solid);
     /* The shared primitives (gp-btn, gp-chip, gp-icon-btn) read the app's
        tokens. Pointing those at the popover's own palette is what keeps them
        legible over a wallpaper, instead of restyling them. */
@@ -264,8 +458,10 @@
     --c-info:var(--blue);
     --c-ok:var(--green);
     --c-warn:var(--amber);
+    --c-danger:var(--red);
     --c-surface:var(--card-base);
     --c-surface-hover:var(--c-pop-soft);
+    --c-on-accent:var(--c-pop-on-action);
     --gp-edge:var(--line);
     --brand-gradient:linear-gradient(rgb(var(--action)), rgb(var(--action)));
     --shadow-glow:0 1px 2px rgb(var(--c-pop-shadow) / .07);
@@ -274,7 +470,7 @@
     line-height:normal;
     padding:8px; color:rgb(var(--text)); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:var(--text-xs); -webkit-font-smoothing:antialiased;
   }
-  .panel { background:var(--bg); border:1px solid var(--line); border-radius: var(--gp-r-xl); overflow:hidden; box-shadow:0 6px 20px rgb(var(--c-pop-shadow) / .07),0 1px 3px rgb(var(--c-pop-shadow) / .03); }
+  .panel { max-height:620px; display:flex; flex-direction:column; background:var(--bg); border:1px solid var(--line); border-radius: var(--gp-r-xl); overflow:hidden; box-shadow:0 6px 20px rgb(var(--c-pop-shadow) / .07),0 1px 3px rgb(var(--c-pop-shadow) / .03); }
   /* ── Liquid blur glass ──
      The native window server supplies desktop blur via NSVisualEffectView.
      On top of that the page paints the same hue field and glass fills as the
@@ -318,7 +514,7 @@
     --surface:rgb(var(--card-base) / .4);
     --soft:rgb(var(--card-base) / .28);
     --line:var(--glass-edge);
-    --muted:var(--glass-muted); --blue:var(--glass-blue); --green:var(--glass-green); --amber:var(--glass-amber);
+    --muted:var(--glass-muted); --blue:var(--glass-blue); --green:var(--glass-green); --amber:var(--glass-amber); --red:var(--glass-red);
     /* Hue field — scaled for the popover's small footprint. */
     background-image:
       radial-gradient(90% 80% at 2% 0%, rgb(var(--hue-a) / calc(.5 * var(--hue-gain))), rgb(var(--hue-a) / 0) 100%),
@@ -363,21 +559,21 @@
       inset 0 -1px 0 var(--glass-shade-bottom);
   }
   /* Inner surfaces thin so they read as glass cards inside the panel. */
-  .status-shell[data-material="native"] :is(.metric, .repositories, .gp-chip, .mark, .gp-btn:not([data-variant])),
-  .status-shell[data-material="preview"] :is(.metric, .repositories, .gp-chip, .mark, .gp-btn:not([data-variant])) {
+  .status-shell[data-material="native"] :is(.metric, .repositories, .gp-chip:not([data-tone]), .mark, .gp-btn:not([data-variant]), .request-row, .agent-strip),
+  .status-shell[data-material="preview"] :is(.metric, .repositories, .gp-chip:not([data-tone]), .mark, .gp-btn:not([data-variant]), .request-row, .agent-strip) {
     border-color:var(--glass-edge);
     background:var(--surface);
   }
   /* Liquid-ease transitions on interactive elements. */
   @media (prefers-reduced-motion: no-preference) {
-    .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut),
-    .status-shell[data-material="preview"]:not(.reduce-motion) :is(button, .metric, .shortcut) {
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut, .request-row, .agent-strip),
+    .status-shell[data-material="preview"]:not(.reduce-motion) :is(button, .metric, .shortcut, .request-row, .agent-strip) {
       transition-property:color, background-color, border-color, transform;
       transition-duration:var(--gp-dur-fast);
       transition-timing-function:var(--liquid-ease);
     }
-    .status-shell[data-material="native"]:not(.reduce-motion) :is(.metric, .shortcut):active:not(:disabled),
-    .status-shell[data-material="preview"]:not(.reduce-motion) :is(.metric, .shortcut):active:not(:disabled) {
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(.metric, .shortcut, .request-row):active:not(:disabled),
+    .status-shell[data-material="preview"]:not(.reduce-motion) :is(.metric, .shortcut, .request-row):active:not(:disabled) {
       transform:scale(0.97);
     }
   }
@@ -393,7 +589,7 @@
   @media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
     .status-shell[data-material] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); background-image:none; }
     .status-shell[data-material] .panel { -webkit-backdrop-filter:none; backdrop-filter:none; background-image:none; box-shadow:none; }
-    .status-shell[data-material] :is(.metric, .repositories, .gp-chip, .mark, .gp-btn:not([data-variant])) { background:var(--surface); border-color:var(--line); }
+    .status-shell[data-material] :is(.metric, .repositories, .gp-chip:not([data-tone]), .mark, .gp-btn:not([data-variant]), .request-row, .agent-strip) { background:var(--surface); border-color:var(--line); }
   }
   /* WKWebView does not implement prefers-reduced-transparency, so the query above
      never fires for the macOS Reduce Transparency setting. The native bridge
@@ -409,19 +605,42 @@
   button:not(.gp-btn, .gp-icon-btn, .gp-chip) { font:inherit; cursor:pointer; color:inherit; }
   button:disabled:not(.gp-btn, .gp-icon-btn) { cursor:default; }
   .gp-chip:disabled { opacity:.45; cursor:default; }
+  /* Tinted chips on .panel (.requests-head, .insights) sit directly on translucent
+     --bg rather than a --surface card; backing them with --surface keeps every
+     tone >= 4.5:1 across glass wallpapers and opaque hover states. */
+  .status-shell .gp-chip[data-tone="ok"] { background-color:color-mix(in srgb,rgb(var(--c-ok)) 10%,var(--surface)); }
+  .status-shell .gp-chip[data-tone="info"] { background-color:color-mix(in srgb,rgb(var(--c-info)) 10%,var(--surface)); }
+  .status-shell .gp-chip[data-tone="warn"] { background-color:color-mix(in srgb,rgb(var(--c-warn)) 10%,var(--surface)); }
+  .status-shell .gp-chip[data-tone="danger"] { background-color:color-mix(in srgb,rgb(var(--c-danger)) 10%,var(--surface)); }
   button:focus-visible,.details:focus-visible { outline:2px solid rgb(var(--blue)); outline-offset:3px; box-shadow:none; }
   /* The primary fill's hover, from the popover's own solved token rather than
      the shared brightness filter, which would walk the white label off 4.5:1. */
   .status-shell :global(.gp-btn[data-variant="primary"]:hover:not(:disabled)) { background-image:linear-gradient(rgb(var(--action-hover)), rgb(var(--action-hover))); filter:none; }
   .status-shell :global(.gp-btn:not([data-variant]):hover:not(:disabled)) { background:var(--soft); }
-  header { display:flex; align-items:center; gap:10px; padding:20px 20px 17px; }
+  header { flex-shrink:0; display:flex; align-items:center; gap:10px; padding:20px 20px 17px; }
   .mark { width:34px; height:34px; flex-shrink:0; display:grid; place-items:center; border:1px solid var(--line); border-radius: var(--gp-r-md); background:var(--surface); }
   .identity { min-width:0; flex:1; }
   .repository { display:flex; align-items:center; gap:6px; max-width:100%; font-weight:600; font-size:var(--text-base); letter-spacing:-.2px; text-align:left; }
   .repository span,.branch span,.upstream { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .repository:not(:disabled):hover { color:rgb(var(--blue)); }
   .branch { display:flex; align-items:center; gap:4px; margin-top:5px; color:rgb(var(--muted)); font-size:var(--text-meta); }
-  .content { padding:0 20px; }
+  .content { flex:1 1 auto; min-height:0; overflow-y:auto; padding:0 20px; }
+  .agent-requests { margin:0 0 14px; }
+  .requests-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+  .requests-list { display:flex; flex-direction:column; gap:6px; max-height:152px; overflow-y:auto; padding:2px; }
+  .request-row { display:flex; flex-direction:column; gap:5px; width:100%; text-align:left; padding:9px 10px; border:1px solid var(--line); background:var(--surface); border-radius:var(--gp-r-md); transition:background var(--gp-dur-fast),border-color var(--gp-dur-fast); }
+  .status-shell .request-row[data-urgency="blocking"] { border-color:color-mix(in srgb,rgb(var(--amber)) 40%,var(--line)); background:color-mix(in srgb,rgb(var(--amber)) 7%,var(--surface)); }
+  .status-shell .request-row[data-urgency="error"] { border-color:color-mix(in srgb,rgb(var(--red)) 40%,var(--line)); background:color-mix(in srgb,rgb(var(--red)) 7%,var(--surface)); }
+  .status-shell .request-row:hover:not(:disabled) { border-color:rgb(var(--blue)); background:var(--soft); }
+  .request-top { display:flex; align-items:center; gap:6px; min-width:0; width:100%; }
+  .request-title { font-weight:600; font-size:var(--text-xs); color:rgb(var(--text)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .request-workspace { font-size:var(--text-micro); color:rgb(var(--muted)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1 1 auto; }
+  .request-age { flex-shrink:0; margin-left:auto; font-size:var(--text-micro); color:rgb(var(--muted)); font-variant-numeric:tabular-nums; }
+  .request-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; color:rgb(var(--muted)); }
+  .request-detail { margin:0; font-size:var(--text-micro); color:rgb(var(--muted)); line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; }
+  .agent-strip { display:flex; align-items:center; gap:8px; width:100%; padding:8px 10px; margin:0 0 14px; border:1px solid var(--line); background:var(--surface); border-radius:var(--gp-r-md); text-align:left; font-size:var(--text-micro); color:rgb(var(--muted)); transition:background var(--gp-dur-fast),border-color var(--gp-dur-fast); }
+  .status-shell .agent-strip:hover:not(:disabled) { border-color:rgb(var(--blue)); background:var(--soft); color:rgb(var(--text)); }
+  .agent-strip-text { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .status-heading { display:flex; align-items:center; gap:7px; margin:0 0 16px; }
   h1 { font-size:var(--text-xs); font-weight:500; margin:0; letter-spacing:-.1px; }
   .status-dot { width:6px; height:6px; border-radius:50%; background:rgb(var(--muted)); flex-shrink:0; }
@@ -463,7 +682,7 @@
   .repository :global(.expanded) { transform:rotate(180deg); }
   footer>div { display:flex; }
   .metric.unknown strong { color:rgb(var(--muted)); }
-  footer { display:flex; justify-content:space-between; align-items:center; padding:8px 14px 8px 20px; }
+  footer { flex-shrink:0; display:flex; justify-content:space-between; align-items:center; padding:8px 14px 8px 20px; }
   .open-app { display:flex; align-items:center; gap:4px; color:rgb(var(--muted)); font-size:var(--text-micro); }
   .open-app:hover { color:rgb(var(--text)); }
   .repositories { max-height:180px; overflow:auto; border:1px solid var(--line); background:var(--surface); margin:0 20px 15px; padding:4px; border-radius: var(--gp-r-md); }

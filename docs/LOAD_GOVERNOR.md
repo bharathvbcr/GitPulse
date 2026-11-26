@@ -257,8 +257,12 @@ beside it, in the same directory, that keeps them.
   their count: a stall that runs into the reset shows as a trace that ends
   early, and the "ended" time is the last record's, not the reset's.
 - **Boot change.** When the trace thread opens the ring and the header's boot id differs
-  from this boot's, the file is renamed to `host-load-trace.prev.v1` (replacing
-  any older one) and a fresh ring starts. A restart inside the same boot resumes
+  from this boot's, the older previous rings move down one place (`prev` to
+  `prev2`, `prev2` to `prev3`, the old `prev3` dropped), the file is renamed to
+  `host-load-trace.prev.v1`, and a fresh ring starts. Three boots are kept
+  because a hang is often followed by more than one quick reboot: on
+  2026-11-24 the second reboot replaced the hang's readings when only one was
+  kept. Health reads `prev` only. A restart inside the same boot resumes
   the sequence. A short, torn or foreign file is a typed error, is never
   decoded, and is replaced.
 - **Where it shows.** `HostLoadStatus.previous_boot` carries the last 30
@@ -661,8 +665,8 @@ pass). It only reads; refreshing the cache is the host's plugin update.
 line right under its header, where the brief's 2,000-byte cap never cuts: tier and
 what binds it with the sensor's state, or `UNKNOWN (why)` and that heavy commands
 are not load-checked, and the Claude and Codex sessions launched and observed. It
-reads the same snapshot and never samples. The `gitpulse-load` skill
-(`plugins/gitpulse/skills/gitpulse-load`) says what to do with it and with a
+reads the same snapshot and never samples. The `gitpulse:load` skill
+(`plugins/gitpulse/skills/load`) says what to do with it and with a
 refusal; the terminal launch prompt names it, because `dc-store` owns the shared
 brief and does not.
 

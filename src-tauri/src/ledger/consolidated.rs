@@ -38,7 +38,7 @@ impl FileStamp {
             #[cfg(unix)]
             id: {
                 use std::os::unix::fs::MetadataExt;
-                Some(FileId(metadata.dev(), metadata.ino()))
+                Some(FileId(metadata.dev(), u128::from(metadata.ino())))
             },
             #[cfg(not(unix))]
             id: None,

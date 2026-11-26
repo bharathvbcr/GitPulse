@@ -32,6 +32,11 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "lcov", "json-summary"],
       reportsDirectory: "coverage",
+      // Vitest writes no report when a test fails unless told to, which left
+      // coverage/lcov.info missing and the floor gate reading "invalid report"
+      // instead of a number (ft-5cdbd8ce). The floor must be measured even when
+      // a test fails; the failing test still fails the run's own exit code.
+      reportOnFailure: true,
       thresholds: {
         lines: 90,
         statements: 90,

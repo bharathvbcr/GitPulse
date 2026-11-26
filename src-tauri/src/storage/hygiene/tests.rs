@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use super::execute_with_profile;
 use super::{
     cancel, exclusive, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
     prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
@@ -29,7 +31,7 @@ pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 /// storage cleaner exists to avoid, aimed at ourselves -- a check that never
 /// ran must not report the same result as a check that ran and failed. Every
 /// assertion is unchanged; only the failure count is now truthful.
-pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -108,6 +110,25 @@ fn age_sets_mtime_on_a_directory_and_a_file() {
 
 fn preview(repo: &Path) -> HygienePlan {
     prepare_with_activity(repo.to_str().unwrap(), "local:target", 30, |_| Ok(())).unwrap()
+}
+
+#[test]
+#[cfg(unix)]
+fn a_repository_target_never_shows_the_profile_backup_confirmation() {
+    let _serial = serial();
+    let (_temp, repo) = fixture();
+    let view = preview(&repo);
+    let (_, outcome) = execute_with_profile(
+        repo.to_str().unwrap(),
+        &view.id,
+        |_, _| Ok(()),
+        |_| Ok(()),
+        || Err("no profile for a repository target".into()),
+        |_, _| panic!("only a profile backup asks the person"),
+    )
+    .unwrap();
+    assert!(outcome.success, "{}", outcome.message);
+    assert!(!repo.join("target").exists());
 }
 
 #[test]
@@ -658,20 +679,36 @@ fn a_panic_under_any_hygiene_lock_does_not_disable_cleanup() {
 #[test]
 fn an_unrelated_build_tool_process_does_not_block_cleanup() {
     use crate::procguard::LockedSpawn;
-    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let artifact = temp.path().join("target");
     fs::create_dir(&artifact).unwrap();
     // A process whose command name is `uv`, with its cwd and files elsewhere.
+    // It is the sleeping test fixture under that name, not a copy of
+    // `/bin/sleep`: on Ubuntu 26.04 that is the rust-coreutils multicall
+    // binary, which exits at once when started as `uv`, and the check then
+    // ran with no such process at all.
     let elsewhere = tempfile::tempdir().unwrap();
     let uv = elsewhere.path().join("uv");
-    fs::copy("/bin/sleep", &uv).unwrap();
-    fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).unwrap();
+    let (exe, args) = crate::sysload::procscan::tests::fixture_command();
+    if fs::hard_link(&exe, &uv).is_err() {
+        fs::copy(&exe, &uv).unwrap();
+    }
+    let pidfile = elsewhere.path().join("uv.pid");
     let mut child = std::process::Command::new(&uv)
-        .arg("30")
+        .args(&args)
+        .env(
+            crate::sysload::procscan::tests::FIXTURE_ENV,
+            format!("sleep=30,pidfile={}", pidfile.display()),
+        )
         .current_dir(elsewhere.path())
+        .stdout(std::process::Stdio::null())
         .spawn_locked()
         .expect("start the stand-in uv process");
+    crate::sysload::procscan::tests::fixture_pid(&pidfile);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the stand-in uv process must be running while the check runs"
+    );
     let verdict = super::activity_check(&artifact);
     let _ = child.kill();
     let _ = child.wait();

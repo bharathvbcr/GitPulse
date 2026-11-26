@@ -5,6 +5,7 @@
   import { LAYERS } from "../ui/layers";
   import { motionExitMs, motionMs } from "../motion/tokens";
   import { focusStayedInside, notificationPile } from "../ui/notificationPile";
+  import Logo from "./Logo.svelte";
 
   const KIND_CONFIG: Record<
     ToastKind,
@@ -138,8 +139,9 @@
           out:fade={{ duration: motionExitMs("fast") }}
           class="toast pointer-events-auto gp-pop gp-card rounded-2xl p-3 border shadow-float flex items-start gap-2.5 bg-surface {config.border}"
         >
-          <div class="shrink-0 mt-0.5 {config.iconColor}" aria-hidden="true">
-            <Icon size={16} />
+          <div class="shrink-0 mt-0.5 flex items-center gap-1.5" aria-hidden="true">
+            <Logo size={18} variant="badge" />
+            <Icon size={15} class={config.iconColor} />
           </div>
 
           <div class="flex-1 min-w-0">

@@ -44,6 +44,9 @@ pub(crate) fn steps(terminals: &TerminalSessions, deadline: Duration, sweep: imp
     // Before anything that can stall, so a hung terminal shutdown cannot lose it.
     crate::logging::performance::flush();
     close_terminals_within(terminals, deadline);
+    // Restore any agent child processes placed into OS background throttle and
+    // remove `<config>/steward/active.json` before stopping Manvi workers.
+    crate::harness::steward::shutdown();
     // Managed runs in a hosted Manvi are stopped or left as the quit chose
     // (an exit nobody was asked about leaves them, like the terminals'), and
     // the connection to it is closed. Never the server: it is not procguard's

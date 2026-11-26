@@ -59,7 +59,12 @@ fn adv2_volume_of_missing_path_collapses_to_shared_key_zero() {
     // nearest existing ancestor; only a path with no ancestor shares key 0.
     let d = tempdir().unwrap();
     assert_eq!(volume_of(&d.path().join("nope")), volume_of(d.path()));
+    // Where the platform reads no volume identity (Windows) every path shares
+    // the one key, so concurrent copies are held to one pool of headroom.
+    #[cfg(unix)]
     assert_ne!(volume_of(d.path()), 0);
+    #[cfg(not(unix))]
+    assert_eq!(volume_of(d.path()), 0);
 }
 
 fn leftovers(dir: &Path) -> usize {
@@ -161,5 +166,12 @@ fn adv2_unreadable_recheck_continues_silently() {
     assert!(
         CALLS.load(Ordering::SeqCst) >= 2,
         "the copy never re-checked mid-copy"
+    );
+    assert_eq!(
+        fs::metadata(worktree.join("node_modules/f0"))
+            .map(|meta| meta.len())
+            .ok(),
+        Some(EVERY + 1),
+        "f0 was not copied whole after the unreadable re-check"
     );
 }

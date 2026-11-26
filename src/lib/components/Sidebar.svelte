@@ -58,9 +58,12 @@
   import WorktreesPanel from "./WorktreesPanel.svelte";
   import TrustExtensionBanner from "./TrustExtensionBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
+  import VirtualList from "./VirtualList.svelte";
   import LazyView from "./LazyView.svelte";
+  import SidebarViewSwitch from "./SidebarViewSwitch.svelte";
+  import { panelId, tabId } from "../dom/tablist";
   import { formatPathParts } from "../files/formatPath";
-  import { hasUnstagedChanges, statusForSide, summarizeStatuses } from "../files/fileStatus";
+  import { hasUnstagedChanges, statusForSide, summarizeStatuses, uniqueRowKeys } from "../files/fileStatus";
   import {
     layoutStore,
     loadSections,
@@ -219,9 +222,15 @@
     setSidebarExplorerDocked(false);
   });
 
-  // An agent can touch thousands of files in one pass; lists mount a window
-  // and grow on demand so the sidebar never becomes the bottleneck.
-  const FILE_LIST_STEP = 300;
+  // An agent can touch thousands of files in one pass. Each list is a
+  // VirtualList over fixed-height rows inside a box that grows with the list up
+  // to MAX_LIST_ROWS rows and then scrolls, so the DOM holds a window of rows
+  // however many files changed. CHANGE_ROW_HEIGHT includes the 2px gap the rows
+  // used to get from space-y-0.5; windowing positions rows by this number, so a
+  // row must not wrap or grow past it.
+  const CHANGE_ROW_HEIGHT = 30;
+  const MAX_LIST_ROWS = 14;
+  const listHeight = (count: number) => Math.min(count, MAX_LIST_ROWS) * CHANGE_ROW_HEIGHT;
 
   /* --- Persisted shell + section state ------------------------------------ */
 
@@ -298,8 +307,8 @@
   /* --- File filter + windowed lists ---------------------------------------- */
 
   let fileFilter = $state("");
-  let stagedLimit = $state(FILE_LIST_STEP);
-  let unstagedLimit = $state(FILE_LIST_STEP);
+  let stagedScroll = $state(0);
+  let unstagedScroll = $state(0);
 
   /* --- Resize drag ---------------------------------------------------------- */
 
@@ -381,16 +390,16 @@
 
   /* --- Repository switch -----------------------------------------------------
    * The sidebar is mounted once per window, so a tab switch re-points the store
-   * it reads and nothing else. The filter text, how far each list was grown and
-   * how far the body was scrolled belong to the repository being left; the
+   * it reads and nothing else. The filter text, how far each list was scrolled
+   * and how far the body was scrolled belong to the repository being left; the
    * persisted section flags and the width are the person's, and stay.
    */
   repoScope(
     () => $currentRepoPath,
     () => {
       fileFilter = "";
-      stagedLimit = FILE_LIST_STEP;
-      unstagedLimit = FILE_LIST_STEP;
+      stagedScroll = 0;
+      unstagedScroll = 0;
       if (bodyScroller) bodyScroller.scrollTop = 0;
     },
   );
@@ -435,30 +444,16 @@
       ? unstagedFiles.filter((f) => f.path.toLowerCase().includes(query))
       : unstagedFiles,
   );
-  let visibleStaged = $derived(filteredStaged.slice(0, stagedLimit));
-  let visibleUnstaged = $derived(filteredUnstaged.slice(0, unstagedLimit));
+  // Row identity for VirtualList's keyed each, unique even if a status source
+  // ever reports one path twice in a list (see uniqueRowKeys).
+  let stagedKeys = $derived(uniqueRowKeys(filteredStaged.map((f) => f.path)));
+  let unstagedKeys = $derived(uniqueRowKeys(filteredUnstaged.map((f) => f.path)));
 
   function stageAll() {
     void repoStore.stageAll();
   }
   function unstageAll() {
     void repoStore.unstageAll();
-  }
-
-  /**
-   * Stepwise growth instead of the old jump-to-full-length: each click reveals
-   * one more window; once the remainder is small enough that two more clicks
-   * would finish anyway, offer the whole tail at once.
-   */
-  function showMoreLabel(total: number, shown: number): string {
-    const remaining = total - shown;
-    return remaining <= FILE_LIST_STEP * 2
-      ? `Show all ${total.toLocaleString()}`
-      : `Show ${remaining.toLocaleString()} more`;
-  }
-
-  function growLimit(limit: number, total: number): number {
-    return total - limit <= FILE_LIST_STEP * 2 ? total : limit + FILE_LIST_STEP;
   }
 
   function pathClass(conflicted: boolean): string {
@@ -559,43 +554,18 @@
 
     {#if $repoStore.currentPath}
       <div class="px-3 pb-1 shrink-0">
-        <div
-          class="gp-segmented flex w-full"
-          role="group"
-          aria-label="Sidebar view"
-          data-testid="sidebar-view-switcher"
-        >
-          <button
-            type="button"
-            class="gp-seg-btn flex-1 justify-center gap-1.5 text-meta!"
-            data-testid="sidebar-view-git"
-            data-active={sidebarView === "git" ? "true" : "false"}
-            aria-pressed={sidebarView === "git"}
-            title="Show Git branches, worktrees, and changes"
-            onclick={() => selectSidebarView("git")}
-          >
-            <GitBranch size={12} class="shrink-0" />
-            <span>Git</span>
-          </button>
-          <button
-            type="button"
-            class="gp-seg-btn flex-1 justify-center gap-1.5 text-meta!"
-            data-testid="sidebar-view-files"
-            data-active={sidebarView === "files" ? "true" : "false"}
-            aria-pressed={sidebarView === "files"}
-            title="Browse and search repository files"
-            onclick={() => selectSidebarView("files")}
-          >
-            <FolderTree size={12} class="shrink-0" />
-            <span>Explorer</span>
-          </button>
-        </div>
+        <SidebarViewSwitch view={sidebarView} onSelect={selectSidebarView} />
       </div>
     {/if}
 
+    <!-- With no repository there is no switch, so the Git column is plain
+         content rather than a tab's panel. -->
     <div
       class="flex-1 min-h-0 flex flex-col"
       class:hidden={$repoStore.currentPath !== null && sidebarView !== "git"}
+      role={$repoStore.currentPath ? "tabpanel" : undefined}
+      id={panelId("sidebar-view", "git")}
+      aria-labelledby={$repoStore.currentPath ? tabId("sidebar-view", "git") : undefined}
     >
     {#if $repoStore.currentPath}
       <!-- At-a-glance repo pulse strip -->
@@ -811,48 +781,51 @@
               {isFiltering ? `No matches for '${fileFilter}'` : "No staged changes"}
             </div>
           {:else}
-            <div class="space-y-0.5">
-              {#each visibleStaged as f, i (`${f.path}#${i}`)}
-                {@const parts = formatPathParts(f.path)}
-                <div class="px-2 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-surfaceHover group transition-colors">
-                  <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
-                  <button
-                    type="button"
-                    draggable="true"
-                    ondragstart={(e) => startSidebarFileDrag(e, f.path)}
-                    ondragend={endSidebarFileDrag}
-                    class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
-                    onclick={() => repoStore.selectFileDiff(f.path, true)}
-                    title={f.path}
-                  >
-                    {#if parts.dir}
-                      <span class="text-faint text-micro">{parts.dir}</span>
-                    {/if}
-                    <span class="text-textPrimary font-medium">{parts.name}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      void repoStore.unstageFile(f.path);
-                    }}
-                    title="Unstage file"
-                    aria-label="Unstage file"
-                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-danger shrink-0"
-                  >
-                    <Minus size={12} />
-                  </button>
-                </div>
-              {/each}
-              {#if filteredStaged.length > visibleStaged.length}
-                <button
-                  type="button"
-                  class="w-full px-2 py-1 rounded-xl border border-dashed border-edgeStrong text-micro text-textMuted hover:text-textPrimary"
-                  onclick={() => (stagedLimit = growLimit(stagedLimit, filteredStaged.length))}
-                >
-                  {showMoreLabel(filteredStaged.length, visibleStaged.length)}
-                </button>
-              {/if}
+            <div style="height: {listHeight(filteredStaged.length)}px">
+              <VirtualList
+                items={filteredStaged}
+                rowHeight={CHANGE_ROW_HEIGHT}
+                bind:scrollTop={stagedScroll}
+                key={(_, i) => stagedKeys[i]}
+                class="h-full"
+              >
+                {#snippet row(f)}
+                  {#if f}
+                    {@const parts = formatPathParts(f.path)}
+                    <div class="pb-0.5" style="height: {CHANGE_ROW_HEIGHT}px">
+                      <div class="h-full px-2 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-surfaceHover group transition-colors">
+                        <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
+                        <button
+                          type="button"
+                          draggable="true"
+                          ondragstart={(e) => startSidebarFileDrag(e, f.path)}
+                          ondragend={endSidebarFileDrag}
+                          class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
+                          onclick={() => repoStore.selectFileDiff(f.path, true)}
+                          title={f.path}
+                        >
+                          {#if parts.dir}
+                            <span class="text-faint text-micro">{parts.dir}</span>
+                          {/if}
+                          <span class="text-textPrimary font-medium">{parts.name}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onclick={(e) => {
+                            e.stopPropagation();
+                            void repoStore.unstageFile(f.path);
+                          }}
+                          title="Unstage file"
+                          aria-label="Unstage file"
+                          class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-danger shrink-0"
+                        >
+                          <Minus size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                {/snippet}
+              </VirtualList>
             </div>
           {/if}
         {/if}
@@ -896,48 +869,51 @@
               {isFiltering ? `No matches for '${fileFilter}'` : "Working tree clean"}
             </div>
           {:else}
-            <div class="space-y-0.5">
-              {#each visibleUnstaged as f (f.path + "-" + f.status_code)}
-                {@const parts = formatPathParts(f.path)}
-                <div class="px-2 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-surfaceHover group transition-colors">
-                  <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
-                  <button
-                    type="button"
-                    draggable="true"
-                    ondragstart={(e) => startSidebarFileDrag(e, f.path)}
-                    ondragend={endSidebarFileDrag}
-                    class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
-                    onclick={() => repoStore.selectFileDiff(f.path, false)}
-                    title={f.path}
-                  >
-                    {#if parts.dir}
-                      <span class="text-faint text-micro">{parts.dir}</span>
-                    {/if}
-                    <span class="text-textPrimary font-medium">{parts.name}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      void repoStore.stageFile(f.path);
-                    }}
-                    title="Stage file"
-                    aria-label="Stage file"
-                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-ok shrink-0"
-                  >
-                    <Plus size={12} />
-                  </button>
-                </div>
-              {/each}
-              {#if filteredUnstaged.length > visibleUnstaged.length}
-                <button
-                  type="button"
-                  class="w-full px-2 py-1 rounded-xl border border-dashed border-edgeStrong text-micro text-textMuted hover:text-textPrimary"
-                  onclick={() => (unstagedLimit = growLimit(unstagedLimit, filteredUnstaged.length))}
-                >
-                  {showMoreLabel(filteredUnstaged.length, visibleUnstaged.length)}
-                </button>
-              {/if}
+            <div style="height: {listHeight(filteredUnstaged.length)}px">
+              <VirtualList
+                items={filteredUnstaged}
+                rowHeight={CHANGE_ROW_HEIGHT}
+                bind:scrollTop={unstagedScroll}
+                key={(_, i) => unstagedKeys[i]}
+                class="h-full"
+              >
+                {#snippet row(f)}
+                  {#if f}
+                    {@const parts = formatPathParts(f.path)}
+                    <div class="pb-0.5" style="height: {CHANGE_ROW_HEIGHT}px">
+                      <div class="h-full px-2 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-surfaceHover group transition-colors">
+                        <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
+                        <button
+                          type="button"
+                          draggable="true"
+                          ondragstart={(e) => startSidebarFileDrag(e, f.path)}
+                          ondragend={endSidebarFileDrag}
+                          class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
+                          onclick={() => repoStore.selectFileDiff(f.path, false)}
+                          title={f.path}
+                        >
+                          {#if parts.dir}
+                            <span class="text-faint text-micro">{parts.dir}</span>
+                          {/if}
+                          <span class="text-textPrimary font-medium">{parts.name}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onclick={(e) => {
+                            e.stopPropagation();
+                            void repoStore.stageFile(f.path);
+                          }}
+                          title="Stage file"
+                          aria-label="Stage file"
+                          class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-ok shrink-0"
+                        >
+                          <Plus size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                {/snippet}
+              </VirtualList>
             </div>
           {/if}
         {/if}
@@ -949,17 +925,25 @@
     <CommitComposer />
     </div>
 
-    {#if $repoStore.currentPath && explorerMounted}
+    {#if $repoStore.currentPath}
+      <!-- The panel exists as soon as its tab does, so the tab's
+           aria-controls always resolves; only the Explorer itself waits until
+           it is first shown. -->
       <div
         class="flex-1 min-h-0 flex flex-col"
         class:hidden={sidebarView !== "files"}
+        role="tabpanel"
+        id={panelId("sidebar-view", "files")}
+        aria-labelledby={tabId("sidebar-view", "files")}
         data-testid="sidebar-explorer-container"
       >
-        <LazyView
-          load={loadSidebarExplorer}
-          name="the file explorer"
-          props={{ repoPath: $repoStore.currentPath }}
-        />
+        {#if explorerMounted}
+          <LazyView
+            load={loadSidebarExplorer}
+            name="the file explorer"
+            props={{ repoPath: $repoStore.currentPath }}
+          />
+        {/if}
       </div>
     {/if}
 {/snippet}

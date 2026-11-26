@@ -1093,8 +1093,7 @@ Error: Unable to obtain permissions for firebase-debug.log
         assert!(listed.stdout_tail.contains("ada@example.com"));
         assert!(
             !listed.stdout_tail.contains("private@example.com"),
-            "another signed-in account leaked into the record: {}",
-            listed.stdout_tail
+            "another signed-in account leaked into the record"
         );
 
         let (nobody, _) =

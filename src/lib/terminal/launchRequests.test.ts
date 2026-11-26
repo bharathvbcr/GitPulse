@@ -1,7 +1,11 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED } from "./launchRequests";
+import { claimedFileOpen, createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED } from "./launchRequests";
 import { TERMINAL_SESSION_PENDING } from "./sessionMessages";
+import { keepFileTabFor, openFileTab, setTabFile } from "./tabs";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());
@@ -181,6 +185,73 @@ it("carries a double-click's keep on a file request", async () => {
   expect(claimed).toMatchObject({ launcher: "file", filePath: "src/a.ts", fileOpenMode: "tab", fileKeep: true });
   claimed?.complete();
   await expect(pending).resolves.toBeUndefined();
+});
+
+describe("claimedFileOpen: which checkout a sidebar file request opens and keeps in", () => {
+  // The sidebar names a repository, and the panel claims it by checkout
+  // identity (`take`), so the file belongs to the panel's own checkout. The
+  // active tab may be an agent hosted in another checkout of the repository
+  // (`TerminalTab.checkout`); the file must not follow it there.
+  const panelSource = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../components/TerminalPanel.svelte"),
+    "utf8",
+  );
+  const request = (extra: Record<string, unknown>) =>
+    ({ launcher: "file", filePath: "src/a.ts", line: 3, column: null, ...extra }) as Parameters<typeof claimedFileOpen>[0];
+
+  const agentCheckout = "/repo/.claude/worktrees/agent";
+
+  it("a visible file pane in an agent's checkout is repointed into the panel's own", () => {
+    // `openFileTabFor` repoints any visible unkept file pane, whatever its
+    // checkout, through `setTabFile`, which reads an absent checkout as "keep
+    // the pane's". The plan's value must therefore be one `setTabFile` applies.
+    const opened = openFileTab({ tabs: [], activeId: null }, { filePath: "src/old.ts", checkout: agentCheckout });
+    expect(opened.id).not.toBeNull();
+    for (const fileOpenMode of ["tab", "split"]) {
+      const plan = claimedFileOpen(request({ fileOpenMode }))!;
+      const repointed = setTabFile(opened.state, opened.id!, plan.filePath, plan.line, plan.column, { checkout: plan.checkout });
+      expect(repointed.tabs[0]).toMatchObject({ filePath: "src/a.ts" });
+      expect(repointed.tabs[0].checkout).toBeUndefined();
+    }
+  });
+
+  it("a double-click keeps the panel's own pane, not the same file open in an agent's checkout", () => {
+    const own = openFileTab({ tabs: [], activeId: null }, { filePath: "src/a.ts", reuseExisting: false });
+    const both = openFileTab(own.state, { filePath: "src/a.ts", checkout: agentCheckout, reuseExisting: false });
+    const plan = claimedFileOpen(request({ fileOpenMode: "split", fileKeep: true }))!;
+    expect(plan.keep).toBe(true);
+    const kept = keepFileTabFor(both.state, plan.filePath, plan.checkout);
+    expect(kept.id).toBe(own.id);
+    expect(kept.state.tabs.map((tab) => tab.kept === true)).toEqual([true, false]);
+  });
+
+  it("the panel's claim path takes the checkout from the plan, never from the active tab", () => {
+    // The claim is a Svelte `$effect`, which vitest does not run, so the
+    // wiring is pinned in the source: the active tab was where a tab-mode open
+    // and a keep read their checkout before.
+    const claimStart = panelSource.indexOf("const claimed = terminalLaunchRequests.take(here, pathOpts);");
+    expect(claimStart).toBeGreaterThan(-1);
+    const effect = panelSource.slice(claimStart, panelSource.indexOf("const createdId = newTab(", claimStart));
+    expect(effect).toContain("claimedFileOpen(claimed)");
+    expect(effect).not.toContain("activeTab");
+    const tabOpener = panelSource.slice(
+      panelSource.indexOf("function openFileTabFor("),
+      panelSource.indexOf("function toggleExplorerSidebar()"),
+    );
+    expect(tabOpener).not.toContain("activeTab?.checkout");
+  });
+
+  it("carries the mode, the reveal position and the focus default of each mode", () => {
+    expect(claimedFileOpen(request({ fileOpenMode: "tab" }))).toMatchObject({ mode: "tab", filePath: "src/a.ts", line: 3, column: null, focus: true, keep: false });
+    expect(claimedFileOpen(request({}))).toMatchObject({ mode: "split", focus: false });
+    expect(claimedFileOpen(request({ fileOpenMode: "split", fileFocus: true }))).toMatchObject({ focus: true });
+    expect(claimedFileOpen(request({ fileOpenMode: "tab", fileFocus: false }))).toMatchObject({ focus: false });
+  });
+
+  it("is null for a request that is no file open", () => {
+    expect(claimedFileOpen({ launcher: "shell" })).toBeNull();
+    expect(claimedFileOpen({ launcher: "file" })).toBeNull();
+  });
 });
 
 it("validates fork resume options fail-closed and delivers resume and custom name on take", async () => {

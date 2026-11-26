@@ -1434,7 +1434,16 @@ pub(super) fn rank_symbol_rows(
 /// costing the caller anything.
 pub(super) fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &str) -> f32 {
     let name = row.name.to_lowercase();
-    if name == query_lower || row.qualified_name.to_lowercase() == query_lower {
+    let qualified = row.qualified_name.to_lowercase();
+    if name == query_lower
+        || qualified == query_lower
+        || (query_lower.contains("::")
+            && crate::query_match::traversal_start_matches(
+                query_lower,
+                &qualified,
+                &row.path.to_lowercase(),
+            ))
+    {
         1.0
     } else if name.starts_with(query_lower) {
         0.95

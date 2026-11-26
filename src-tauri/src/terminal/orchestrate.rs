@@ -18,10 +18,12 @@
 //!   [`crate::ledger::redact::text`] plus `gpst_` capability-token redaction.
 
 use crate::engine::git_cli::{sandbox_join_canonical, validate_repo};
+use crate::terminal::screen_feed::{Batch, Lag, ScreenFeed};
 use crate::terminal::{
     bounded_pty_size, detach_session, is_session_id, spawn_at, write_input, OutputSink, Place,
     SessionEvents, SharedSessionTelemetry, TerminalSessions,
 };
+use crate::terminal::{KillOrigin, KillOutcome};
 #[cfg(unix)]
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -29,7 +31,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Capability token environment variable injected into every GitPulse PTY.
@@ -58,6 +60,11 @@ pub const MAX_CHILDREN_PER_PARENT: usize = 8;
 pub const MAX_EXTERNAL_ORCHESTRATED_CHILDREN: usize = 16;
 const PARSER_SCROLLBACK_ROWS: usize = MAX_READ_LINES * 2;
 const MAX_ENDED_CHILDREN: usize = 32;
+/// How long a `Read`, `Send` or `Exec` waits for the screen to catch up with
+/// the output already delivered before it answers from what the screen has
+/// and says how far behind it is. The queue is bounded, so a healthy parse
+/// catches up in a few milliseconds; this is the cap when it cannot.
+const SCREEN_SYNC_BUDGET: Duration = Duration::from_secs(2);
 const HEX_TOKEN_LEN: usize = 64;
 const FULL_TOKEN_LEN: usize = SESSION_TOKEN_PREFIX.len() + HEX_TOKEN_LEN;
 
@@ -488,6 +495,16 @@ impl CommandBlockRecorder {
         }
     }
 
+    /// Forgets what the bytes dropped in a gap may have left half-read (an
+    /// escape or OSC sequence) and keeps everything else: a command in flight
+    /// keeps its phase, so its `133;D` after the gap still records the block
+    /// (with the output the gap spared) instead of being ignored as stray.
+    fn resync(&mut self) {
+        self.osc_state = OscCaptureState::Ground;
+        self.osc_buf.clear();
+        self.osc_overflow = false;
+    }
+
     fn push_osc_byte(&mut self, byte: u8) {
         if self.osc_buf.len() < 512 {
             self.osc_buf.push(byte);
@@ -561,10 +578,116 @@ struct RegistryInner {
 
 /// Thread-safe registry of session capability tokens, Option A parent->child
 /// lineage edges, and headless `vt100` screens for orchestrated child sessions.
+///
+/// Output is not parsed where it is delivered. [`Self::observe_output`] and
+/// [`Self::observe_output_from_host`] queue it on [`ScreenFeed`] and return;
+/// one `terminal-screen-parse` worker applies it to the screens, in order per
+/// session, so a flood never holds the delivery thread (or another session's
+/// reader) behind the registry lock while it is parsed. Readers call
+/// [`Self::sync_screen`] to wait, bounded, for the screen to reach the bytes
+/// already delivered, and `Read`/`Wait`/`Exec` replies carry a `screen` object
+/// saying whether it is complete.
 #[derive(Default)]
 pub struct OrchestrationRegistry {
-    inner: Mutex<RegistryInner>,
-    changed: Condvar,
+    inner: Arc<Mutex<RegistryInner>>,
+    changed: Arc<Condvar>,
+    feed: Arc<ScreenFeed>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// What a reader got from [`OrchestrationRegistry::sync_screen`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScreenSync {
+    /// The screen reflects every byte that was delivered when the wait began
+    /// (always true for a session with no screen).
+    pub caught_up: bool,
+}
+
+impl Drop for OrchestrationRegistry {
+    fn drop(&mut self) {
+        self.feed.shutdown();
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Applies one batch of a session's output to its screen, block recorder and
+/// (for a host session) telemetry scanner. Holds the registry lock for that
+/// one batch only (`BATCH_BYTES`), so a reader waits behind at most one.
+fn apply_screen_batch(inner: &Mutex<RegistryInner>, feed: &ScreenFeed, batch: &Batch) {
+    let mut guard = inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A reset since the batch was taken means a screen rebuilt from a replay
+    // already covers these bytes.
+    if !feed.is_current(batch) {
+        return;
+    }
+    if let Some(record) = guard.sessions.get_mut(&batch.session) {
+        let (rows, cols) = (record.rows, record.cols);
+        if record.parser.is_some() {
+            if batch.resync {
+                // Bytes were dropped (or a parse failed) ahead of this batch:
+                // the old screen may be inside an escape sequence they opened,
+                // so it is replaced rather than fed across the gap.
+                record.parser = Some(vt100::Parser::new(
+                    nz_u16(rows),
+                    nz_u16(cols),
+                    PARSER_SCROLLBACK_ROWS,
+                ));
+                if let Some(blocks) = record.blocks.as_mut() {
+                    blocks.resync();
+                }
+                if record.host_scanner.is_some() {
+                    record.host_scanner = Some(crate::alerts::scan::Scanner::new());
+                }
+            }
+            if let Some(parser) = record.parser.as_mut() {
+                parser.process(&batch.bytes);
+            }
+            if let Some(blocks) = record.blocks.as_mut() {
+                blocks.feed(&batch.bytes, cols);
+            }
+            record.observed_bytes = record
+                .observed_bytes
+                .saturating_add(batch.dropped_before)
+                .saturating_add(batch.bytes.len() as u64);
+            #[cfg(unix)]
+            {
+                if batch.scan {
+                    if let Some(scanner) = record.host_scanner.as_mut() {
+                        apply_scanner_telemetry(scanner, &record.telemetry, &batch.bytes);
+                    }
+                }
+            }
+        }
+    }
+    feed.applied(batch);
+}
+
+fn run_screen_worker(inner: &Mutex<RegistryInner>, changed: &Condvar, feed: &ScreenFeed) {
+    while let Some(batch) = feed.take() {
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_screen_batch(inner, feed, &batch);
+        }));
+        if let Err(panic) = applied {
+            // The batch is lost and the screen it was part of cannot be
+            // trusted: readers see it as a gap, never as a clean screen.
+            log::error!(
+                target: "terminal",
+                "a terminal screen parse panicked, the screen resyncs: {}",
+                crate::supervisor::payload_text(panic.as_ref())
+            );
+            feed.failed(&batch);
+        }
+        changed.notify_all();
+    }
 }
 
 impl OrchestrationRegistry {
@@ -572,6 +695,76 @@ impl OrchestrationRegistry {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Starts the screen worker the first time a session has a screen. A
+    /// registry that never tracks one (most unit tests) never starts a thread.
+    fn ensure_worker(&self) {
+        let mut worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if worker.is_some() {
+            return;
+        }
+        let (inner, changed, feed) = (self.inner.clone(), self.changed.clone(), self.feed.clone());
+        match crate::supervisor::spawn_service("terminal-screen-parse", move || {
+            run_screen_worker(&inner, &changed, &feed);
+        }) {
+            Ok(handle) => *worker = Some(handle),
+            Err(error) => log::error!(
+                target: "terminal",
+                "the terminal screen worker could not start, screens will report lag: {error}"
+            ),
+        }
+    }
+
+    /// Waits, for at most `budget`, until `session_id`'s screen reflects every
+    /// byte delivered when this was called. A flood that keeps arriving does
+    /// not move the target, so the wait ends. `caught_up: false` means the
+    /// budget ran out first; the caller answers from the screen it has and
+    /// reports [`Self::screen_status`].
+    pub(crate) fn sync_screen(&self, session_id: &str, budget: Duration) -> ScreenSync {
+        let Some(target) = self.feed.lag(session_id).map(|lag| lag.delivered) else {
+            return ScreenSync { caught_up: true };
+        };
+        let deadline = Instant::now() + budget;
+        let mut inner = self.lock();
+        loop {
+            // The worker advances `parsed` while holding this lock, so a check
+            // made under it cannot miss the wake-up that follows.
+            let Some(Lag { parsed, .. }) = self.feed.lag(session_id) else {
+                return ScreenSync { caught_up: true };
+            };
+            if parsed >= target {
+                return ScreenSync { caught_up: true };
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return ScreenSync { caught_up: false };
+            }
+            let slice = (deadline - now).min(Duration::from_millis(50));
+            inner = self
+                .changed
+                .wait_timeout(inner, slice)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// How complete `session_id`'s screen is right now, for a reply: `null`
+    /// when the session has no screen, otherwise whether it reflects every
+    /// byte delivered, how many it trails by, and how many bytes were dropped
+    /// (making the screen a rebuild across a gap) since it was last replayed.
+    pub(crate) fn screen_status(&self, session_id: &str) -> Value {
+        match self.feed.lag(session_id) {
+            Some(lag) => json!({
+                "complete": lag.complete(),
+                "lag_bytes": lag.lag_bytes(),
+                "gap_bytes": lag.gap_bytes,
+            }),
+            None => Value::Null,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -625,6 +818,15 @@ impl OrchestrationRegistry {
                 telemetry,
             },
         );
+        if track_screen {
+            self.feed.register(session_id);
+        } else {
+            self.feed.forget(session_id);
+        }
+        drop(inner);
+        if track_screen {
+            self.ensure_worker();
+        }
         self.changed.notify_all();
         Ok(())
     }
@@ -653,6 +855,9 @@ impl OrchestrationRegistry {
                     record.blocks = Some(CommandBlockRecorder::default());
                 }
                 record.observed_bytes = 0;
+                // Queued bytes predate the replay and are covered by it.
+                self.feed.reset(session_id);
+                self.changed.notify_all();
             }
         }
     }
@@ -666,6 +871,7 @@ impl OrchestrationRegistry {
             return;
         }
         let mut inner = self.lock();
+        let mut tracked = false;
         for snap in snapshots {
             let size = bounded_pty_size(snap.rows, snap.cols);
             let canonical_repo = std::fs::canonicalize(&snap.repo)
@@ -700,6 +906,10 @@ impl OrchestrationRegistry {
                 .unwrap_or_else(|| snap.launcher.clone());
             let is_child = snap.parent_session_id.is_some();
             let track_screen = is_child || effective_launcher == "shell";
+            if track_screen {
+                self.feed.register(&snap.session_id);
+                tracked = true;
+            }
             let telemetry = crate::terminal::new_shared_telemetry();
             *telemetry
                 .0
@@ -734,6 +944,9 @@ impl OrchestrationRegistry {
             );
         }
         drop(inner);
+        if tracked {
+            self.ensure_worker();
+        }
         self.changed.notify_all();
     }
 
@@ -746,62 +959,24 @@ impl OrchestrationRegistry {
 
     pub(crate) fn remove_aborted(&self, session_id: &str) {
         self.lock().sessions.remove(session_id);
+        self.feed.forget(session_id);
         self.changed.notify_all();
     }
 
-    /// Feeds raw PTY output bytes into an orchestrated child's `vt100` parser
-    /// and wakes any parent `Wait` callers. No-op for non-child user sessions.
+    /// Queues raw PTY output bytes for an orchestrated child's or shell's
+    /// `vt100` screen and returns at once; the screen worker applies them and
+    /// wakes any parent `Wait` caller. No-op for sessions with no screen.
     pub(crate) fn observe_output(&self, session_id: &str, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let mut inner = self.lock();
-        let Some(record) = inner.sessions.get_mut(session_id) else {
-            return;
-        };
-        let cols = record.cols;
-        if let Some(parser) = record.parser.as_mut() {
-            parser.process(bytes);
-            if let Some(blocks) = record.blocks.as_mut() {
-                blocks.feed(bytes, cols);
-            }
-            record.observed_bytes = record.observed_bytes.saturating_add(bytes.len() as u64);
-            drop(inner);
-            self.changed.notify_all();
-        }
+        self.feed.push(session_id, bytes, false);
     }
 
-    /// Feeds raw PTY output bytes arriving from `gitpulse-ptyd` (`HostClient`)
-    /// into both the child's `vt100` parser and its OSC telemetry scanner so
+    /// Queues raw PTY output bytes arriving from `gitpulse-ptyd` (`HostClient`)
+    /// for both the child's `vt100` screen and its OSC telemetry scanner so
     /// `gitpulse-ptyd` and in-process sessions expose identical `Wait`/`Read`
-    /// telemetry.
-    #[cfg(unix)]
+    /// telemetry. Returns at once, like [`Self::observe_output`].
     #[cfg(unix)]
     pub(crate) fn observe_output_from_host(&self, session_id: &str, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let telemetry_arc = {
-            let mut inner = self.lock();
-            let Some(record) = inner.sessions.get_mut(session_id) else {
-                return;
-            };
-            let cols = record.cols;
-            let Some(parser) = record.parser.as_mut() else {
-                return;
-            };
-            parser.process(bytes);
-            if let Some(blocks) = record.blocks.as_mut() {
-                blocks.feed(bytes, cols);
-            }
-            record.observed_bytes = record.observed_bytes.saturating_add(bytes.len() as u64);
-            record.host_scanner.as_mut().map(|scanner| {
-                apply_scanner_telemetry(scanner, &record.telemetry, bytes);
-                record.telemetry.clone()
-            })
-        };
-        let _ = telemetry_arc;
-        self.changed.notify_all();
+        self.feed.push(session_id, bytes, true);
     }
 
     /// Keeps an orchestrated child's `vt100` grid dimensions aligned with PTY resizes.
@@ -844,11 +1019,13 @@ impl OrchestrationRegistry {
                         rec.ended && (rec.parent_session_id.is_some() || rec.launcher == "shell")
                     }) {
                         inner.sessions.remove(&evicted);
+                        self.feed.forget(&evicted);
                     }
                 }
             }
         } else {
             inner.sessions.remove(session_id);
+            self.feed.forget(session_id);
         }
         drop(inner);
         self.changed.notify_all();
@@ -1536,6 +1713,23 @@ fn build_agent_child_args(
     )
 }
 
+/// Brings `session_id`'s screen up to what has been delivered (waiting at most
+/// `budget` for the screen worker) and, for a detached host session, refreshes
+/// it from the host's transcript. Every reader calls this before it looks.
+fn settle_screen(state: &TerminalSessions, session_id: &str, budget: Duration) -> ScreenSync {
+    let sync = state.orchestration.sync_screen(session_id, budget);
+    // A refresh applies transcript bytes on top of the screen (or rebuilds it
+    // and drops what is queued): done while bytes are still queued it would
+    // apply some twice or lose them, so a lagging screen is left to its feed.
+    #[cfg(unix)]
+    {
+        if sync.caught_up {
+            refresh_detached_host_screen(state, session_id);
+        }
+    }
+    sync
+}
+
 #[cfg(unix)]
 fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str) {
     let host = &state.host;
@@ -1608,6 +1802,9 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
                             }
                         }
                     } else if current_seen == 0 || delta > raw.len() as u64 {
+                        // The screen is rebuilt whole from the transcript, which
+                        // covers whatever was still queued for the old one.
+                        state.orchestration.feed.reset(child_session_id);
                         let mut parser = vt100::Parser::new(
                             nz_u16(dims.0),
                             nz_u16(dims.1),
@@ -1999,8 +2196,14 @@ fn wait_child_internal(
 
     let mut last_port_probe: Option<Instant> = None;
     loop {
-        #[cfg(unix)]
-        refresh_detached_host_screen(state, child_session_id);
+        let wait_slice = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50));
+        let screen = settle_screen(state, child_session_id, wait_slice);
+        // A match on what the screen has is a match. Only the exit verdict waits
+        // for the screen to catch up: an exit seen before its last output is on
+        // the screen would end a pattern wait that output is about to satisfy.
+        let behind = !screen.caught_up && Instant::now() < deadline;
 
         if required_exec_tag.is_none()
             && wait_idle
@@ -2060,6 +2263,7 @@ fn wait_child_internal(
         let exit_code = rec.exit_code.or(tel.last_exit_code);
         let herdr = herdr_state_str(&tel.herdr_status);
 
+        let exit_known = ended && !behind;
         let matched_reason = if let Some(tag) = required_exec_tag {
             if let Some(pat) = pattern {
                 let (screen, _, _, _) = render_redacted_screen(rec, MAX_READ_LINES);
@@ -2067,14 +2271,14 @@ fn wait_child_internal(
                     Some("pattern")
                 } else if rec.blocks.as_ref().is_some_and(|b| b.has_tag(tag)) {
                     Some("command_finished")
-                } else if ended {
+                } else if exit_known {
                     Some("ended")
                 } else {
                     None
                 }
             } else if rec.blocks.as_ref().is_some_and(|b| b.has_tag(tag)) {
                 Some("command_finished")
-            } else if ended {
+            } else if exit_known {
                 Some("ended")
             } else {
                 None
@@ -2083,12 +2287,12 @@ fn wait_child_internal(
             let (screen, _, _, _) = render_redacted_screen(rec, MAX_READ_LINES);
             if screen.contains(pat) {
                 Some("pattern")
-            } else if ended {
+            } else if exit_known {
                 Some("ended")
             } else {
                 None
             }
-        } else if ended {
+        } else if exit_known {
             Some("ended")
         } else if tel.last_herdr_event_seq > effective_since
             && matches!(
@@ -2146,11 +2350,11 @@ fn wait_child_internal(
             });
         }
 
-        let wait_slice = (deadline - now).min(Duration::from_millis(50));
+        let idle_slice = (deadline - now).min(Duration::from_millis(50));
         let _ = state
             .orchestration
             .changed
-            .wait_timeout(inner, wait_slice)
+            .wait_timeout(inner, idle_slice)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
@@ -2161,6 +2365,7 @@ fn close_child_internal(
     caller_key: &str,
     child_session_id: &str,
     canonical_repo: &str,
+    origin: KillOrigin,
 ) -> Result<bool, String> {
     let already_ended = {
         let inner = state.orchestration.lock();
@@ -2175,7 +2380,16 @@ fn close_child_internal(
     };
 
     if !already_ended {
-        crate::terminal::kill_session(state, child_session_id)?;
+        // The caller rides with the origin into the log and lifecycle record.
+        match crate::terminal::kill_session_as(state, child_session_id, origin, Some(caller_key))? {
+            KillOutcome::Killed => {}
+            KillOutcome::SkippedProtected => {
+                return Err(crate::terminal::lifecycle::skipped_protected_message(
+                    child_session_id,
+                    origin,
+                ));
+            }
+        }
         state.orchestration.mark_ended(child_session_id, None);
     }
 
@@ -2288,8 +2502,7 @@ pub(crate) fn execute_with_shell_reads(
             let keep = keep_open.unwrap_or(true);
 
             let (target_id, spawned_new, effective_cwd) = if let Some(cid) = child_session_id {
-                #[cfg(unix)]
-                refresh_detached_host_screen(state, &cid);
+                let _ = settle_screen(state, &cid, SCREEN_SYNC_BUDGET);
                 let inner = state.orchestration.lock();
                 let rec = authorize_child(&inner, caller.parent_key(), &cid, &canonical_repo)?;
                 if rec.ended {
@@ -2339,12 +2552,16 @@ pub(crate) fn execute_with_shell_reads(
                             caller.parent_key(),
                             &target_id,
                             &canonical_repo,
+                            KillOrigin::AgentExecCleanup,
                         );
                     }
                     return Err(err);
                 }
             };
 
+            let _ = state
+                .orchestration
+                .sync_screen(&target_id, SCREEN_SYNC_BUDGET);
             let baseline_seq = {
                 let mut inner = state.orchestration.lock();
                 let rec = inner
@@ -2381,6 +2598,9 @@ pub(crate) fn execute_with_shell_reads(
             )?;
 
             let eff_max = max_lines.unwrap_or(DEFAULT_READ_LINES);
+            let _ = state
+                .orchestration
+                .sync_screen(&target_id, SCREEN_SYNC_BUDGET);
             let (text, lines_returned, total_lines, truncated, cmd_exit_code, active_cwd, ended) = {
                 let inner = state.orchestration.lock();
                 let rec =
@@ -2429,6 +2649,7 @@ pub(crate) fn execute_with_shell_reads(
                     caller.parent_key(),
                     &target_id,
                     &canonical_repo,
+                    KillOrigin::AgentExecCleanup,
                 )?;
                 true
             } else {
@@ -2452,6 +2673,7 @@ pub(crate) fn execute_with_shell_reads(
                 "truncated": truncated,
                 "cwd": active_cwd,
                 "dev_server_url": wait.dev_server_url,
+                "screen": state.orchestration.screen_status(&target_id),
                 "gate_checked": gate_checked,
                 "gate_notice": gate_notice,
             }))
@@ -2630,6 +2852,7 @@ pub(crate) fn execute_with_shell_reads(
                 "last_exit_code": outcome.last_exit_code,
                 "herdr_status": outcome.herdr_status,
                 "dev_server_url": outcome.dev_server_url,
+                "screen": state.orchestration.screen_status(&child_session_id),
             }))
         }
 
@@ -2654,8 +2877,7 @@ pub(crate) fn execute_with_shell_reads(
                 &canonical_repo,
             )?;
 
-            #[cfg(unix)]
-            refresh_detached_host_screen(state, &child_session_id);
+            let _ = settle_screen(state, &child_session_id, SCREEN_SYNC_BUDGET);
 
             let inner = state.orchestration.lock();
             let (rec, owned) = authorize_readable_session(
@@ -2723,6 +2945,7 @@ pub(crate) fn execute_with_shell_reads(
                 "last_exit_code": tel.last_exit_code,
                 "herdr_status": herdr_state_str(&tel.herdr_status),
                 "dev_server_url": tel.dev_server_url,
+                "screen": state.orchestration.screen_status(&child_session_id),
             }))
         }
 
@@ -2746,8 +2969,18 @@ pub(crate) fn execute_with_shell_reads(
             )?;
             validate_child_input_bytes(&input)?;
 
-            #[cfg(unix)]
-            refresh_detached_host_screen(state, &child_session_id);
+            // An interrupt is for a session that may be flooding: it does not
+            // wait for that session's screen.
+            let interrupt = matches!(input.as_str(), "\x03" | "\x04");
+            let _ = settle_screen(
+                state,
+                &child_session_id,
+                if interrupt {
+                    Duration::ZERO
+                } else {
+                    SCREEN_SYNC_BUDGET
+                },
+            );
 
             let effective_cwd = {
                 let inner = state.orchestration.lock();
@@ -2831,6 +3064,7 @@ pub(crate) fn execute_with_shell_reads(
                 caller.parent_key(),
                 &child_session_id,
                 &canonical_repo,
+                KillOrigin::AgentClose,
             )?;
 
             Ok(json!({
@@ -3111,8 +3345,8 @@ pub(crate) mod tests {
         .unwrap_err();
         assert_eq!(revoked_err, CREDENTIAL_REFUSAL);
 
-        let _ = crate::terminal::kill_session(&state, &user_shell.id);
-        let _ = crate::terminal::kill_session(&state, &child_a);
+        let _ = crate::terminal::kill_session(&state, &user_shell.id, KillOrigin::Unspecified);
+        let _ = crate::terminal::kill_session(&state, &child_a, KillOrigin::Unspecified);
     }
 
     #[test]
@@ -3239,7 +3473,7 @@ pub(crate) mod tests {
         );
         assert!(traversal.is_err(), "{traversal:?}");
 
-        let _ = crate::terminal::kill_session(&state, &child);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
     }
 
     #[cfg(unix)]
@@ -3341,7 +3575,7 @@ pub(crate) mod tests {
             "GITPULSE_SESSION_TOKEN leaked in screen read: {text}"
         );
 
-        let _ = crate::terminal::kill_session(&state, &child);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
     }
 
     #[test]
@@ -3379,6 +3613,17 @@ pub(crate) mod tests {
         state
             .orchestration
             .observe_output(child, payload.as_bytes());
+        // Output is parsed off the delivery path: wait for the screen before
+        // looking at it directly (a `Read` does this itself).
+        assert!(
+            state
+                .orchestration
+                .sync_screen(
+                    child,
+                    crate::test_support::coverage_relaxed(Duration::from_secs(20))
+                )
+                .caught_up
+        );
 
         let inner = state.orchestration.lock();
         let rec = inner.sessions.get(child).unwrap();
@@ -3506,7 +3751,7 @@ pub(crate) mod tests {
             "stale Turn-1 herdr_status woke Turn-2 Wait prematurely: {early_wait}"
         );
 
-        let _ = crate::terminal::kill_session(&state, &child);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
     }
 
     #[cfg(unix)]
@@ -3650,7 +3895,7 @@ pub(crate) mod tests {
         .unwrap_err();
         assert!(
             ninth_err.contains("already has 8 active child sessions (limit 8)"),
-            "unexpected error: {ninth_err}"
+            "the ninth child was not refused for the 8-session limit"
         );
 
         // Option A: Parent B cannot close Parent A's child, and Parent A cannot close user_shell or itself.
@@ -3733,11 +3978,185 @@ pub(crate) mod tests {
             .unwrap()
             .to_string();
 
-        let _ = crate::terminal::kill_session(&state, &user_shell.id);
-        let _ = crate::terminal::kill_session(&state, &replacement_id);
+        let _ = crate::terminal::kill_session(&state, &user_shell.id, KillOrigin::Unspecified);
+        let _ = crate::terminal::kill_session(&state, &replacement_id, KillOrigin::Unspecified);
         for cid in children_a.iter().skip(1) {
-            let _ = crate::terminal::kill_session(&state, cid);
+            let _ = crate::terminal::kill_session(&state, cid, KillOrigin::Unspecified);
         }
+    }
+
+    /// Before: only the UI's spawn command wrote a ledger row, so an agent
+    /// started by another agent or over MCP could never be offered for reopen.
+    #[cfg(unix)]
+    #[test]
+    fn an_orchestrated_agent_child_is_recorded_with_its_parent_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let parent = "term-90011-1";
+        state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let ledger = state.session_ledger();
+        let parent_row = ledger.record_spawn(crate::terminal::session_ledger::NewSessionRow {
+            terminal_id: parent.into(),
+            launcher: "claude".into(),
+            native_id: None,
+            repo_path: repo.clone(),
+            start_dir: None,
+            cwd: repo.clone(),
+            mode: None,
+            reopen_row_id: None,
+            parent_row_id: None,
+        });
+        // A stand-in named like the agent CLI, so the launcher is `claude`
+        // without starting the real one.
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("claude");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = crate::terminal::spawn_at(
+            &state,
+            Place::Repo {
+                repo_path: repo.clone(),
+                start_dir: None,
+            },
+            24,
+            80,
+            Some(fake.to_string_lossy().into_owned()),
+            None,
+            None,
+            discard_sink(),
+            Arc::new(RecordingEvents),
+            None,
+            Some(ChildSpawnMeta {
+                parent_session_id: parent.into(),
+                launcher: "claude".into(),
+                title: None,
+            }),
+        )
+        .expect("agent child");
+        assert!(ledger.row_id_for_terminal(&child.id).is_some());
+        ledger.mark_app_quit();
+        let offers = ledger.view().offers;
+        let offer = offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some(child.id.as_str()))
+            .expect("the child is offered for reopen");
+        assert_eq!(offer.launcher, "claude");
+        assert_eq!(offer.parent_row_id.as_deref(), Some(parent_row.as_str()));
+        let _ = crate::terminal::kill_session(&state, &child.id, KillOrigin::Unspecified);
+    }
+
+    /// An MCP/CLI `Spawn` goes through `execute`; its shell child is recorded
+    /// too, and a shell is never resumable.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_shell_child_is_recorded_and_never_resumable() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let parent = "term-90012-1";
+        let token = state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let spawned = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token),
+                external_caller_id: None,
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: None,
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .expect("spawn child");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        let ledger = state.session_ledger();
+        assert!(ledger.row_id_for_terminal(&child).is_some());
+        ledger.mark_app_quit();
+        let offers = ledger.view().offers;
+        let offer = offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some(child.as_str()))
+            .expect("listed");
+        assert!(!offer.resumable);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
+    /// Before: an agent's close (`gitpulse_terminal_close`, `term close`) always
+    /// ended the child, whatever the user had asked to keep.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_close_skips_a_protected_child_and_says_why() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let parent = "term-90007-1";
+        let token = state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let spawned = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: Some("kept".into()),
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .expect("spawn child");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        // The spawn owner recorded the child; nothing here does.
+        let ledger = state.session_ledger();
+        assert!(ledger.set_protected(&child, true));
+        let close = || {
+            execute(
+                &state,
+                &ui,
+                OrchestrateCall::Close {
+                    repo_path: repo.clone(),
+                    caller_session_id: Some(parent.into()),
+                    caller_token: Some(token.clone()),
+                    external_caller_id: None,
+                    child_session_id: child.clone(),
+                },
+            )
+        };
+        let refusal = close().unwrap_err();
+        // The message says what is missing; the refusal names the repository
+        // path and the session, which stay out of the test log.
+        assert!(
+            refusal.contains("is protected") && refusal.contains(&child),
+            "the refusal does not say the child session is protected"
+        );
+        assert!(
+            ui.closed.lock().unwrap().is_empty(),
+            "no child_closed event"
+        );
+        assert!(crate::terminal::list_sessions(&state)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == child && !s.ending));
+        assert!(ledger.set_protected(&child, false));
+        assert_eq!(close().expect("close once unprotected")["ok"], true);
     }
 
     #[test]
@@ -4156,6 +4575,248 @@ pub(crate) mod tests {
             LINEAGE_REFUSAL
         );
 
-        let _ = crate::terminal::kill_session(&state, &user_shell.id);
+        let _ = crate::terminal::kill_session(&state, &user_shell.id, KillOrigin::Unspecified);
+    }
+
+    /// A tracked shell child of a synthetic parent, in `state`.
+    fn tracked_child(state: &TerminalSessions, repo: &Path, child: &str) {
+        let parent = format!("{child}-parent");
+        let _ = state.orchestration.register_test_parent(&parent, repo);
+        let token = mint_session_token().unwrap();
+        state
+            .orchestration
+            .register_session(
+                child,
+                &token,
+                repo,
+                repo,
+                "shell",
+                28,
+                120,
+                crate::terminal::new_shared_telemetry(),
+                Some(ChildSpawnMeta {
+                    parent_session_id: parent,
+                    launcher: "shell".into(),
+                    title: None,
+                }),
+            )
+            .unwrap();
+    }
+
+    /// Delivery hands output to the screen worker and returns: it does not wait
+    /// for the registry lock a reader holds, nor for the parse. With the lock
+    /// held the worker cannot apply anything, so a flood far past the bound is
+    /// a gap the screen reports, queued bytes stay within the bound, and the
+    /// reply status says the screen is behind and incomplete.
+    #[test]
+    fn delivery_never_waits_on_the_screen_and_a_flood_past_the_bound_is_a_reported_gap() {
+        use crate::terminal::screen_feed::{BATCH_BYTES, SESSION_BACKLOG_BYTES};
+        let state = Arc::new(TerminalSessions::default());
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let child = "term-200-b";
+        tracked_child(&state, &repo, child);
+
+        let mut flood = vec![b'f'; 64 * 1024];
+        let last = flood.len() - 16;
+        flood[last..].copy_from_slice(b"\r\nTAIL_MARKER\r\n!");
+        let pushes = 256; // 16 MiB against a 1 MiB bound
+        let held = state.orchestration.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pusher = {
+            let state = state.clone();
+            crate::supervisor::spawn_once("screen-flood-test", "screen flood test", move || {
+                for _ in 0..pushes {
+                    state.orchestration.observe_output(child, &flood);
+                }
+                let _ = tx.send(());
+            })
+            .unwrap()
+        };
+        assert!(
+            rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                20
+            )))
+            .is_ok(),
+            "delivery waited on the registry lock a reader held"
+        );
+        pusher.join().unwrap();
+
+        let lag = state.orchestration.feed.lag(child).unwrap();
+        assert_eq!(lag.delivered, (pushes * 64 * 1024) as u64);
+        // At most one taken batch plus the bound is ever held back from the gap.
+        assert!(
+            lag.gap_bytes + (SESSION_BACKLOG_BYTES + BATCH_BYTES) as u64 >= lag.delivered,
+            "memory is bounded, the rest is counted as a gap: {lag:?}"
+        );
+        assert!(lag.gap_bytes > 0);
+        let status = state.orchestration.screen_status(child);
+        assert_eq!(status["complete"], false, "{status}");
+        assert!(status["lag_bytes"].as_u64().unwrap() > 0, "{status}");
+        assert!(status["gap_bytes"].as_u64().unwrap() > 0, "{status}");
+
+        drop(held);
+        assert!(
+            state
+                .orchestration
+                .sync_screen(
+                    child,
+                    crate::test_support::coverage_relaxed(Duration::from_secs(20))
+                )
+                .caught_up,
+            "the screen catches up once the reader lets go"
+        );
+        let status = state.orchestration.screen_status(child);
+        assert_eq!(status["lag_bytes"], 0, "{status}");
+        assert_eq!(
+            status["complete"], false,
+            "a screen rebuilt across a gap never reads as complete: {status}"
+        );
+        let inner = state.orchestration.lock();
+        let (text, ..) = render_redacted_screen(inner.sessions.get(child).unwrap(), 50);
+        assert!(
+            text.contains("TAIL_MARKER"),
+            "the newest output survives: {text}"
+        );
+    }
+
+    /// Output reaches the screen in the order it was delivered however it was
+    /// split into pushes, a reader that waits sees all of it after a flood, and
+    /// an exit right behind the last byte does not lose it.
+    #[test]
+    fn a_reader_sees_every_row_in_order_after_a_flood_and_an_immediate_exit() {
+        let state = TerminalSessions::default();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let child = "term-201-b";
+        tracked_child(&state, &repo, child);
+
+        // 40_000 rows of 12 bytes is under the bound, so nothing can be dropped
+        // however far behind the worker is.
+        let rows = 40_000usize;
+        let stream: String = (1..=rows).map(|n| format!("ROW{n:07}\r\n")).collect();
+        let bytes = stream.as_bytes();
+        let (mut at, mut size) = (0usize, 1usize);
+        while at < bytes.len() {
+            let end = (at + size).min(bytes.len());
+            state.orchestration.observe_output(child, &bytes[at..end]);
+            at = end;
+            size = size % 4_099 + 7; // splits rows and escape-free lines anywhere
+        }
+        state.orchestration.mark_ended(child, Some(0));
+
+        assert!(
+            state
+                .orchestration
+                .sync_screen(
+                    child,
+                    crate::test_support::coverage_relaxed(Duration::from_secs(20))
+                )
+                .caught_up
+        );
+        let status = state.orchestration.screen_status(child);
+        assert_eq!(
+            status,
+            json!({"complete": true, "lag_bytes": 0, "gap_bytes": 0})
+        );
+        let inner = state.orchestration.lock();
+        let rec = inner
+            .sessions
+            .get(child)
+            .expect("an ended shell child is retained");
+        let (text, lines, ..) = render_redacted_screen(rec, MAX_READ_LINES);
+        assert_eq!(lines, MAX_READ_LINES);
+        let seen: Vec<usize> = text
+            .lines()
+            .map(|l| l.strip_prefix("ROW").unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(
+            *seen.last().unwrap(),
+            rows,
+            "the final row is on the screen"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[1] == w[0] + 1),
+            "rows are consecutive, so in order and none lost"
+        );
+    }
+
+    /// A command in flight when a gap drops bytes still records its block: the
+    /// resync forgets half-read escapes, not the command the recorder is in.
+    #[test]
+    fn a_command_block_that_straddles_a_gap_is_still_recorded() {
+        let state = Arc::new(TerminalSessions::default());
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let child = "term-203-b";
+        tracked_child(&state, &repo, child);
+        let patient = crate::test_support::coverage_relaxed(Duration::from_secs(20));
+        state
+            .orchestration
+            .observe_output(child, b"\x1b]133;B\x07slow cmd\r\n\x1b]133;C\x07");
+        assert!(state.orchestration.sync_screen(child, patient).caught_up);
+
+        // The command's output overflows the bound while the screen is held.
+        let mut flood = vec![b'o'; 64 * 1024];
+        flood.extend_from_slice(b"\n");
+        let held = state.orchestration.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pusher = {
+            let state = state.clone();
+            crate::supervisor::spawn_once("screen-gap-test", "screen gap test", move || {
+                for _ in 0..48 {
+                    state.orchestration.observe_output(child, &flood);
+                }
+                state
+                    .orchestration
+                    .observe_output(child, b"\x1b]133;D;0;gpexec_gap\x07");
+                let _ = tx.send(());
+            })
+            .unwrap()
+        };
+        assert!(rx.recv_timeout(patient).is_ok());
+        pusher.join().unwrap();
+        drop(held);
+
+        assert!(state.orchestration.sync_screen(child, patient).caught_up);
+        assert!(state.orchestration.feed.lag(child).unwrap().gap_bytes > 0);
+        let inner = state.orchestration.lock();
+        let blocks = inner.sessions.get(child).unwrap().blocks.as_ref().unwrap();
+        assert!(
+            blocks.has_tag("gpexec_gap"),
+            "the block that straddled the gap was lost"
+        );
+    }
+
+    /// Dropping the registry stops its screen worker instead of leaking it, and
+    /// forgetting a session leaves no queue behind.
+    #[test]
+    fn dropping_the_registry_stops_the_screen_worker_and_a_forgotten_session_has_no_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let state = TerminalSessions::default();
+        tracked_child(&state, &repo, "term-202-b");
+        state
+            .orchestration
+            .observe_output("term-202-b", b"hello\r\n");
+        state.orchestration.remove_aborted("term-202-b");
+        assert!(state.orchestration.feed.lag("term-202-b").is_none());
+        assert_eq!(state.orchestration.screen_status("term-202-b"), Value::Null);
+        let worker_started = state.orchestration.worker.lock().unwrap().is_some();
+        assert!(worker_started, "a tracked session starts the worker");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::supervisor::spawn_once("screen-drop-test", "screen drop test", move || {
+            drop(state);
+            let _ = tx.send(());
+        })
+        .unwrap();
+        assert!(
+            rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                20
+            )))
+            .is_ok(),
+            "dropping the registry did not stop its worker"
+        );
     }
 }

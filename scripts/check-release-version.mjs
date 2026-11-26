@@ -154,6 +154,60 @@ export function parseTag(tag) {
 }
 
 /**
+ * The Tauri bundle targets a beta release must carry in `bundle.targets`.
+ *
+ * `tauri-codegen` requires a valid SemVer string in `version` (which only
+ * permits `-` for pre-releases), while `tauri-bundler`'s RPM packager passes
+ * `config.version` straight through with no version override and rejects `-`
+ * in RPM `Version:`. Skipping `rpm` keeps `-beta.N` building `.deb` and
+ * `.AppImage` on Linux; stable `X.Y.Z` restores `"all"`.
+ */
+export const BETA_BUNDLE_TARGETS = Object.freeze(["app", "dmg", "deb", "appimage", "nsis", "msi"]);
+
+/**
+ * The bundle target rules the app version and `bundle.targets` must meet
+ * together. Checked on every run so a beta cannot build with `"rpm"` or `"all"`,
+ * and a stable release cannot accidentally ship without `.rpm`.
+ *
+ * @param {string} version the agreed app version
+ * @param {string} tauriConfPath
+ * @returns {string[]} violations
+ */
+export function checkBundleTargets(version, tauriConfPath) {
+  const parsed = parseReleaseVersion(version);
+  if (!parsed) return [];
+  let targets;
+  let hasTargets = false;
+  try {
+    const conf = /** @type {{ bundle?: { targets?: unknown } }} */ (readJson(tauriConfPath));
+    hasTargets = conf.bundle !== undefined && Object.prototype.hasOwnProperty.call(conf.bundle, "targets");
+    targets = conf.bundle?.targets;
+  } catch {
+    return [];
+  }
+  if (parsed.beta !== null) {
+    const expected = [...BETA_BUNDLE_TARGETS].sort();
+    const valid =
+      Array.isArray(targets)
+      && targets.every((t) => typeof t === "string")
+      && new Set(targets).size === targets.length
+      && JSON.stringify([...targets].sort()) === JSON.stringify(expected);
+    if (!valid) {
+      return [
+        `beta ${version} needs bundle.targets = ${JSON.stringify([...BETA_BUNDLE_TARGETS])} in src-tauri/tauri.conf.json (found ${JSON.stringify(hasTargets ? targets : null)}): RPM rejects "-" in -beta.N versions`,
+      ];
+    }
+    return [];
+  }
+  if (hasTargets && targets !== "all") {
+    return [
+      `stable ${version} must set bundle.targets = "all" in src-tauri/tauri.conf.json (found ${JSON.stringify(targets)})`,
+    ];
+  }
+  return [];
+}
+
+/**
  * The MSI rules the app version and `bundle.windows.wix.version` must meet
  * together. Checked on every run, not only for tags: a stale override would
  * otherwise surface as a failed Windows leg ninety minutes into a release.
@@ -421,6 +475,7 @@ export function runVersionCheck({ sources, tag }) {
 
   if (distinct.length === 1 && typeof distinct[0] === "string") {
     violations.push(...checkMsiVersion(distinct[0], sources.tauriConfPath));
+    violations.push(...checkBundleTargets(distinct[0], sources.tauriConfPath));
   }
 
   /** @type {string | null} */

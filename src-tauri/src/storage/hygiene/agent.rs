@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub(super) const SCOPE_SESSION: &str = "agent-session-scratch";
+pub(crate) const SCOPE_SESSION: &str = "agent-session-scratch";
 pub(super) const SCOPE_REPOSITORY: &str = "agent-repo-scratch";
 pub(super) const SCOPE_CLAUDE: &str = "agent-claude-target";
 
@@ -102,7 +102,7 @@ pub struct LeakedTemp {
 
 /// What a scan found.
 #[derive(Debug, Default)]
-pub(super) struct Scan {
+pub(crate) struct Scan {
     pub candidates: Vec<CleanerCandidate>,
     pub kept: Vec<KeptItem>,
     pub issues: Vec<String>,
@@ -114,6 +114,9 @@ pub(super) struct Scan {
     /// a directory could not be listed). They are kept, but never as an answer:
     /// the run counts them as unexamined, which brings the next run forward.
     pub unexamined: u32,
+    /// Newest entry modification timestamp (Unix seconds) recorded for each
+    /// candidate's `path` during `judge`.
+    pub newest_secs: std::collections::HashMap<String, u64>,
 }
 
 /// Prefix of the kept reason for a folder whose check did not run. The UI keys
@@ -124,7 +127,7 @@ pub(crate) const COULD_NOT_CHECK: &str = "could not be checked:";
 /// folder that was examined and failed a rule, and one a check could not be
 /// run for. Only the second asks for another look soon.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Refusal {
+pub(crate) enum Refusal {
     /// Examined, and a rule keeps it.
     Kept(String),
     /// A check could not run, so the folder is kept without having been judged.
@@ -145,7 +148,7 @@ pub(super) enum Refusal {
 }
 
 impl Refusal {
-    pub(super) fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             Self::Kept(why) | Self::SessionUnmatched(why) | Self::Denied(why) => why.clone(),
             Self::PartlyRemoved { why, bytes } => {
@@ -219,6 +222,26 @@ impl Scan {
             self.complete = false;
         }
         self.keep(path, scope, refusal.message());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_candidate(
+        &mut self,
+        scope: &str,
+        scope_root: &Path,
+        target: &Path,
+        verdict: Verdict,
+        evidence: Vec<String>,
+        measure: bool,
+        deadline: Instant,
+    ) {
+        if let Ok(secs) = u64::try_from(verdict.snapshot.newest / 1_000_000_000) {
+            self.newest_secs
+                .insert(target.to_string_lossy().into_owned(), secs);
+        }
+        self.candidates.push(candidate_from(
+            scope, scope_root, target, verdict, evidence, measure, deadline,
+        ));
     }
 
     /// The entries of an open directory. An entry that could not be read is a
@@ -799,8 +822,14 @@ fn judge(
         )
         .into());
     }
-    tree::require_age(&snapshot, ctx.retention_days, at(ctx.now))
-        .map_err(|e| format!("too recent: {e}"))?;
+    if ctx.retention_days > 0 {
+        tree::require_age(&snapshot, ctx.retention_days, at(ctx.now))
+            .map_err(|e| format!("too recent: {e}"))?;
+    } else if snapshot.newest > u128::from(ctx.now.saturating_add(60)) * 1_000_000_000 {
+        return Err(
+            "too recent: newest entry is dated in the future, so its age cannot be trusted".into(),
+        );
+    }
     let newest_days = ctx
         .now
         .saturating_sub(u64::try_from(snapshot.newest / 1_000_000_000).unwrap_or(0))
@@ -1218,7 +1247,7 @@ fn plain_session_id(name: &str) -> bool {
 
 /// Scratchpad build folders of sessions that are provably finished, under
 /// `<tmp_root>/claude-<uid>/<project>/<session>/scratchpad`.
-pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measure: bool) -> Scan {
+pub(crate) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measure: bool) -> Scan {
     let mut scan = Scan {
         complete: true,
         ..Scan::default()
@@ -1286,7 +1315,7 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
                         let evidence = vec![format!(
                             "made by agent session {id} (project {project_name}); its scratchpad is the only thing here that is touched"
                         )];
-                        scan.candidates.push(candidate_from(
+                        scan.push_candidate(
                             SCOPE_SESSION,
                             &scope_root,
                             &target,
@@ -1294,7 +1323,7 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
                             evidence,
                             measure,
                             ctx.deadline,
-                        ));
+                        );
                     }
                     Err(refusal) => {
                         if matches!(refusal, Refusal::SessionUnmatched(_)) {
@@ -1324,7 +1353,7 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
 
 /// Scratch build directories inside a repository: children of
 /// `.gitpulse/scratch` and `tmp`. Ignored by git, with nothing tracked inside.
-pub(super) fn scan_repository(repo: &Path, ctx: &Context<'_>, measure: bool) -> Scan {
+pub(crate) fn scan_repository(repo: &Path, ctx: &Context<'_>, measure: bool) -> Scan {
     let mut scan = Scan {
         complete: true,
         ..Scan::default()
@@ -1338,7 +1367,7 @@ pub(super) fn scan_repository(repo: &Path, ctx: &Context<'_>, measure: bool) -> 
                 break;
             }
             match judge_repository(repo, &target, ctx) {
-                Ok(verdict) => scan.candidates.push(candidate_from(
+                Ok(verdict) => scan.push_candidate(
                     SCOPE_REPOSITORY,
                     repo,
                     &target,
@@ -1346,7 +1375,7 @@ pub(super) fn scan_repository(repo: &Path, ctx: &Context<'_>, measure: bool) -> 
                     vec!["scratch build directory inside the repository; no session records who made it".into()],
                     measure,
                     ctx.deadline,
-                )),
+                ),
                 Err(refusal) => scan.refuse(&target, SCOPE_REPOSITORY, &refusal),
             }
         }
@@ -1361,7 +1390,7 @@ pub(super) fn scan_repository(repo: &Path, ctx: &Context<'_>, measure: bool) -> 
 /// markers, `.claude` as its parent), never through `local_provider`: the
 /// preserved-name list refuses `.claude`, rightly, for its config and skills.
 /// Nothing else under `.claude` is read past its listing or ever removed.
-pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, measure: bool) -> Scan {
+pub(crate) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, measure: bool) -> Scan {
     let mut scan = Scan {
         complete: true,
         ..Scan::default()
@@ -1422,7 +1451,7 @@ pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, meas
                     if let Some(seeded) = seeded_copy_note(checkout, &verdict) {
                         evidence.push(seeded);
                     }
-                    scan.candidates.push(candidate_from(
+                    scan.push_candidate(
                         SCOPE_CLAUDE,
                         checkout,
                         &target,
@@ -1430,7 +1459,7 @@ pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, meas
                         evidence,
                         measure,
                         ctx.deadline,
-                    ));
+                    );
                 }
                 Err(refusal) => scan.refuse(&target, SCOPE_CLAUDE, &refusal),
             }
@@ -1590,7 +1619,7 @@ pub(crate) fn remove(
 
 /// [`remove`] keeping the difference between a candidate a rule keeps and one
 /// a check could not be run for, which the cleaner records as unexamined.
-pub(super) fn remove_judged(
+pub(crate) fn remove_judged(
     candidate: &CleanerCandidate,
     ctx: &Context<'_>,
     budget: u64,

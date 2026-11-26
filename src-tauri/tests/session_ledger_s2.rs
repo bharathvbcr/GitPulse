@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use gitpulse_lib::alerts::bridge::{parse_report_stamped, Reason};
 use gitpulse_lib::terminal::session_ledger::{
-    NewSessionRow, SessionEndState, SessionLedger, MAX_LEDGER_ROWS,
+    ExitFacts, NewSessionRow, SessionEndState, SessionLedger, MAX_LEDGER_ROWS,
 };
 use gitpulse_lib::workbench::conversation::{check_session_resumability, has_transcript_locator};
 use gitpulse_lib::workbench::terminal_command::{
@@ -54,6 +54,7 @@ fn spawn_spec(
         cwd: cwd.to_string_lossy().into_owned(),
         mode: mode.map(str::to_owned),
         reopen_row_id: None,
+        parent_row_id: None,
     }
 }
 
@@ -138,7 +139,7 @@ fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
 
     // Late SIGHUP exit callbacks must NEVER overwrite AppQuit.
     for tid in ["t1", "t2", "t3", "t-shell"] {
-        assert!(!ledger.record_exit(tid, true, None, Some("Hangup: 1")));
+        assert!(!ledger.record_exit(tid, ExitFacts::reaped(true, None, Some("Hangup: 1"))));
     }
     drop(ledger);
 
@@ -191,18 +192,18 @@ fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
         .expect("non-empty argv");
         assert!(
             argv.windows(2).any(|w| w == ["--resume", expected_sid]),
-            "expected [--resume, {expected_sid}] in {argv:?}"
+            "expected --resume pair in reopen argv"
         );
         if let Some(perm_val) = expected_flag {
             assert!(
                 argv.windows(2)
                     .any(|w| w == ["--permission-mode", perm_val]),
-                "expected [--permission-mode, {perm_val}] in {argv:?}"
+                "expected --permission-mode {perm_val} in reopen argv"
             );
         } else {
             assert!(
                 !argv.iter().any(|a| a == "--permission-mode"),
-                "did not expect --permission-mode in {argv:?}"
+                "did not expect --permission-mode in reopen argv"
             );
         }
     }
@@ -252,7 +253,7 @@ fn s2_03_gone_cwd_clean_exit_bounds_and_corrupt_row() {
     ));
 
     // Clean /exit and explicit user Close never appear in Reopen offers.
-    assert!(ledger.record_exit("t-clean", false, Some(0), None));
+    assert!(ledger.record_exit("t-clean", ExitFacts::reaped(false, Some(0), None)));
     assert!(ledger.mark_user_closed("t-closed"));
 
     // Quit marks t-gone AppQuit, then remove its cwd before Reopen check.
@@ -296,7 +297,7 @@ fn s2_03_gone_cwd_clean_exit_bounds_and_corrupt_row() {
     for idx in 0..(MAX_LEDGER_ROWS + 12) {
         let tid = format!("t-bound-{idx}");
         ledger.record_spawn(spawn_spec(&tid, "claude", None, &repo, &repo, None));
-        ledger.record_exit(&tid, false, Some(0), None);
+        ledger.record_exit(&tid, ExitFacts::reaped(false, Some(0), None));
     }
     let persisted_lines = fs::read_to_string(&ledger_path)
         .unwrap()

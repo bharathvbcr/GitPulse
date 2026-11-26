@@ -42,9 +42,19 @@ use std::path::{Path, PathBuf};
 use common::fixture::{git, trust_repo};
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::engine::git_cli::{git_text, git_with_stdin};
+use gitpulse_lib::engine::git_reader::GitReader;
 use gitpulse_lib::graph::{history_rev_args, RefScope};
 use gitpulse_lib::storage::commit_graph::{inspect, CommitGraphState};
 
+/// The cold-window arms (AC1 of the history-graph card): a 100,000-commit
+/// window read the shipped way (one walk) and the old way (one `--skip` walk
+/// per chunk), with and without a commit-graph file.
+const WINDOW_COMMITS: usize = 100_000;
+/// The rows of one chunk of the old paging (and of the reader's chunk size).
+const WINDOW_CHUNK: usize = 5_000;
+/// Distinct branches at the tip for the window arms: each warmup and sample
+/// reads one no earlier sample read, so the reader's ref cache is cold.
+const WINDOW_BRANCHES: usize = 48;
 const SIZES: [(&str, usize); 2] = [("5k", 5_000), ("50k", 50_000)];
 const FILES: usize = 200;
 const DIRS: usize = 20;
@@ -278,6 +288,156 @@ fn run(repo: &Path, argv: &[String]) -> String {
         .unwrap_or_else(|e| panic!("git {argv:?} failed in {}: {}", repo.display(), e.message()))
 }
 
+/// The old paging: one `git log -n5001 --skip=k*5000` per chunk, the argv the
+/// chunk loop used (the shape is the production one: `history_log_args`), read
+/// alone, no parse. Returns the commit ids it saw, in order, with each chunk's
+/// overlap row dropped.
+fn old_paged_ids(repo: &Path, revision: &str, rows: usize) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::with_capacity(rows);
+    let mut start = 0;
+    while start + 1 < rows {
+        let argv: Vec<String> = vec![
+            "log".into(),
+            format!("-n{}", WINDOW_CHUNK + 1),
+            format!("--skip={start}"),
+            "--topo-order".into(),
+            HISTORY_FORMAT.into(),
+            revision.into(),
+        ];
+        let text = run(repo, &argv);
+        // Row `k` of this chunk is row `start + k` of the window; the chunk's
+        // last row is the next chunk's first, so it is taken once.
+        for (k, record) in text
+            .split('\0')
+            .map(|r| r.trim_matches('\n'))
+            .filter(|r| !r.is_empty())
+            .enumerate()
+        {
+            if start + k == ids.len() {
+                ids.push(record.split('\u{1}').next().unwrap_or("").to_string());
+            }
+        }
+        start += WINDOW_CHUNK;
+    }
+    ids.truncate(rows);
+    ids
+}
+
+/// Cold 100k-row window, shipped single walk against the old `--skip` paging,
+/// on a clone with no commit-graph file and one with. Parity is asserted
+/// (the two reads return the same ids) before any case is built.
+fn window_cases<'a>(root: &Path, reads: usize, report: &mut Report) -> Vec<Case<'a>> {
+    assert!(
+        reads + 2 < WINDOW_BRANCHES / 2,
+        "{reads} reads need {reads} cold branches per arm, the fixture has {} per arm after the parity reads",
+        WINDOW_BRANCHES / 2 - 2
+    );
+    let rows = WINDOW_COMMITS + 1;
+    let started = std::time::Instant::now();
+    let dir = root.join("window");
+    std::fs::create_dir_all(&dir).expect("window root");
+    let source = build_window_source(&dir);
+    let built = started.elapsed();
+    let mut cases: Vec<Case> = Vec::new();
+    let mut parity: Option<Vec<String>> = None;
+    for mode in [Mode::Off, Mode::Graph] {
+        let repo = clone_in_mode(&dir, &source, "window", mode);
+        for n in 0..WINDOW_BRANCHES {
+            git(&repo, &["branch", &format!("cold{n}"), "main"]);
+        }
+        let path = repo.to_str().expect("utf-8").to_string();
+        let ids = old_paged_ids(&repo, "cold0", rows);
+        let shipped: Vec<String> = GitReader::read_commit_history_paged(
+            &path,
+            0,
+            rows,
+            Some("cold1"),
+            None,
+            RefScope::Named,
+        )
+        .expect("shipped window")
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+        assert_eq!(ids.len(), rows, "the old paging read {} rows", ids.len());
+        assert_eq!(ids, shipped, "the two reads of the window disagree");
+        match &parity {
+            None => parity = Some(ids),
+            Some(first) => assert_eq!(first, &ids, "the window differs between graph states"),
+        }
+        let old_repo = repo.clone();
+        let next = std::sync::atomic::AtomicUsize::new(2);
+        cases.push(Case::new(
+            format!(
+                "window 100k {} old: 20 git log --skip walks (read only)",
+                mode.label()
+            ),
+            move || {
+                let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let revision = format!("cold{}", n % (WINDOW_BRANCHES / 2) * 2);
+                let ids = old_paged_ids(&old_repo, &revision, rows);
+                std::hint::black_box(&ids);
+                Sample::default().counter("rows", ids.len() as u64)
+            },
+        ));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        cases.push(Case::new(
+            format!(
+                "window 100k {} shipped: one cold walk (read and parse)",
+                mode.label()
+            ),
+            move || {
+                let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let revision = format!("cold{}", n % (WINDOW_BRANCHES / 2) * 2 + 1);
+                let commits = GitReader::read_commit_history_paged(
+                    &path,
+                    0,
+                    rows,
+                    Some(&revision),
+                    None,
+                    RefScope::Named,
+                )
+                .expect("shipped window");
+                std::hint::black_box(&commits);
+                Sample::default().counter("rows", commits.len() as u64)
+            },
+        ));
+    }
+    report.note(format!(
+        "window arms (synthetic): {} linear commits on main written with fast-import \
+         (fixture built in {built:.1?}), a cold {rows}-row window of a branch no earlier sample \
+         read; clones graph-off (no commit-graph file) and graph-on, asserted by the detector; \
+         old arm = the {} `git log -n{} --skip` walks of the old chunk loop, read alone (git \
+         time only, no parse, which understates the old read); shipped arm = \
+         read_commit_history_paged, one walk, parsed. The ids of both reads are asserted equal \
+         before any sample; every row is warm in the page cache",
+        WINDOW_COMMITS + 1,
+        WINDOW_COMMITS / WINDOW_CHUNK,
+        WINDOW_CHUNK + 1,
+    ));
+    cases
+}
+
+/// `WINDOW_COMMITS + 1` linear commits on `main`, nothing else.
+fn build_window_source(root: &Path) -> PathBuf {
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).expect("create source");
+    git(&src, &["init", "-q", "--bare", "-b", "main"]);
+    git(&src, &["config", "gc.auto", "0"]);
+    trust_repo(&src);
+    // The graph's 100,000-row cap plus its has_more probe row.
+    let total = WINDOW_COMMITS + 1;
+    let mut next = 0;
+    while next < total {
+        let end = (next + IMPORT_CHUNK).min(total);
+        let batch: Vec<Commit> = (next..end).map(|i| main_commit(i, total)).collect();
+        let from = (next > 0).then_some("refs/heads/main^0");
+        import(&src, &stream("refs/heads/main", from, &batch));
+        next = end;
+    }
+    src
+}
+
 fn main() {
     gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("commit_graph_history");
@@ -325,6 +485,12 @@ fn main() {
             }
         }
     }
+    let window_rounds = std::env::var("GITPULSE_BENCH_WINDOW_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| report.opts.samples(7));
+    let window_warmup = report.opts.warmup(1);
+    let window_cases = window_cases(temp.path(), window_rounds + window_warmup, &mut report);
     report.note(
         "fixture: bare repositories built with git fast-import. 5k and 50k linear commits on main \
          (one of 200 small files each), 50 commits on rare/target.txt, 20 branches three commits \
@@ -348,5 +514,7 @@ fn main() {
         .collect();
     let measured = interleave(cases, report.opts.samples(9), report.opts.warmup(1));
     report.extend(measured);
+    let window = interleave(window_cases, window_rounds, window_warmup);
+    report.extend(window);
     report.finish();
 }

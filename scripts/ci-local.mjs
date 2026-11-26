@@ -119,6 +119,7 @@ export const GATES = [
     name: "Vendored crates unedited",
     program: "bun",
     args: ["run", "check:vendor-edits"],
+    covers: ["bun run check:vendor-edits"],
     why: "upstream drift is reported, not failed: it is a refresh signal, and failing on it would make every upstream commit break this gate",
   },
   {
@@ -126,8 +127,8 @@ export const GATES = [
     name: "Vendored schema vs installed devmap",
     program: "bun",
     args: ["run", "check:vendor-schema"],
-    covers: ["bun run check:vendor-schema -- --allow-missing-cli"],
-    why: "release.yml runs this with --allow-missing-cli; a developer machine has the CLI, so it is checked strictly here",
+    covers: ["bun run check:vendor-schema", "bun run check:vendor-schema -- --allow-missing-cli"],
+    why: "ci.yml, coverage.yml, test-parallel.yml, and release.yml run strict check:vendor-schema after building pinned devmap (release.yml also checks --allow-missing-cli before installing devmap)",
   },
   {
     id: "workflow-lint",
@@ -260,11 +261,13 @@ export const GATES = [
       "lcov.info",
     ],
     covers: [
+      `cargo nextest run --manifest-path ${CARGO_MANIFEST} --locked --profile ci --no-fail-fast --partition hash:\${{ matrix.shard }}/3`,
+      `cargo nextest run --manifest-path ${CARGO_MANIFEST} --locked --profile ci --no-fail-fast --partition hash:\${{ matrix.shard }}/4`,
       `cargo test --manifest-path ${CARGO_MANIFEST} --locked --no-fail-fast -- --nocapture --test-threads=1`,
     ],
     produces: ["lcov.info"],
     scratch: [{ kind: "cargo-llvm-cov", manifest: CARGO_MANIFEST }],
-    why: "CI's Linux and Windows legs run these under cargo test, one test at a time inside each binary's process, and its macOS legs run them as three serial nextest shards; here every test is its own process, four at a time. Instrumented on an 18-core Mac (2026-11-04, runs interleaved nextest, cargo test, nextest): 908 s and 813 s against 4,300 s, line coverage 90.5% both ways. What this cannot see, CI's cargo test still does: a test that fails only beside another in the same process, and the doctests",
+    why: "ci.yml runs the suite across all three OSes as serial nextest shards (3 on Linux/macOS, 4 on Windows), while release.yml preflight, coverage.yml, and test-parallel.yml run in-process cargo test / cargo llvm-cov; here every test is its own process, four at a time. Instrumented on an 18-core Mac (2026-11-04, runs interleaved nextest, cargo test, nextest): 908 s and 813 s against 4,300 s, line coverage 90.5% both ways. What this cannot see, in-process CI suites still do: a test that fails only beside another in the same process, and the doctests",
   },
   {
     id: "worktree-fmt",
@@ -900,6 +903,75 @@ function releaseLock(lock) {
 }
 
 /**
+ * Structural path-identity checks that depend only on where `candidate.dir`
+ * sits relative to the filesystem root, repository, home directory, and cargo's
+ * regular target/build directories (never on markers created during the gate).
+ * Checked before `fingerprintOf` and `acquireLock` so a forbidden directory
+ * (such as `/`, `$HOME`, `$TMPDIR`, or the repository root) is never scanned or
+ * locked beside.
+ *
+ * @param {{ dir: string, named: boolean }} candidate
+ * @param {string} root
+ * @param {ScratchContext} context
+ * @param {CargoDirectories} cargo
+ * @returns {{ ok: true, real: string, outside: boolean, leafIsCoverage: boolean }
+ *         | { ok: false, parentMissing: boolean, reason: string }}
+ */
+function vetPath(candidate, root, context, cargo) {
+  const { dir, named } = candidate;
+  const realParent = realpathOrNull(path.dirname(dir));
+  if (realParent === null) return { ok: false, parentMissing: true, reason: "its parent directory does not exist" };
+  const real = path.join(realParent, path.basename(dir));
+  const realRoot = realpathOrNull(root) ?? root;
+  const home = realpathOrNull(context.home ?? homedir()) ?? context.home ?? homedir();
+  if (real === path.parse(real).root) return { ok: false, parentMissing: false, reason: "it is the filesystem root" };
+  if (real === realRoot || isInside(realRoot, real)) {
+    return { ok: false, parentMissing: false, reason: "it is, or contains, the repository" };
+  }
+  if (real === home || isInside(home, real)) {
+    return { ok: false, parentMissing: false, reason: "it is, or contains, the home directory" };
+  }
+  for (const regular of [cargo.targetDirectory, cargo.buildDirectory]) {
+    const realRegular = realpathOrNull(regular) ?? regular;
+    if (real === realRegular || isInside(realRegular, real)) {
+      return { ok: false, parentMissing: false, reason: "it is, or contains, cargo's regular target directory" };
+    }
+  }
+  const outside = !isInside(real, realRoot);
+  const leafIsCoverage = path.basename(real) === COVERAGE_BUILD_NAME;
+  if (outside) {
+    // Outside the repository only a path the environment names for this build is ours to delete.
+    const targetEnv = envValue(context.env, "CARGO_TARGET_DIR");
+    let viaCargoTargetDir = false;
+    if (!named && targetEnv !== undefined) {
+      if (hasParentComponent(targetEnv)) {
+        return {
+          ok: false,
+          parentMissing: false,
+          reason: `CARGO_TARGET_DIR=${JSON.stringify(targetEnv)} has a ".." component, so where it points cannot be identified`,
+        };
+      }
+      viaCargoTargetDir = realpathOrNull(path.resolve(root, targetEnv)) === realParent;
+    }
+    if (!named && !viaCargoTargetDir) {
+      return {
+        ok: false,
+        parentMissing: false,
+        reason: "it is outside the repository and is not named by CARGO_TARGET_DIR or CARGO_LLVM_COV_TARGET_DIR",
+      };
+    }
+    if (!leafIsCoverage) {
+      return {
+        ok: false,
+        parentMissing: false,
+        reason: `outside the repository only a directory named ${COVERAGE_BUILD_NAME} is deleted, whatever names it`,
+      };
+    }
+  }
+  return { ok: true, real, outside, leafIsCoverage };
+}
+
+/**
  * Whether `dir` may be deleted as a coverage build, by where it is and what it
  * is called, or the reason it may not. Checked on the real path of its parent,
  * so a symlink on the way cannot redirect the delete.
@@ -911,45 +983,11 @@ function releaseLock(lock) {
  * @returns {{ ok: true, real: string, outside: boolean } | { ok: false, reason: string }}
  */
 function vet(candidate, root, context, cargo) {
-  const { dir, named } = candidate;
-  const realParent = realpathOrNull(path.dirname(dir));
-  if (realParent === null) return { ok: false, reason: "its parent directory does not exist" };
-  const real = path.join(realParent, path.basename(dir));
-  const realRoot = realpathOrNull(root) ?? root;
-  const home = realpathOrNull(context.home ?? homedir()) ?? context.home ?? homedir();
-  if (real === path.parse(real).root) return { ok: false, reason: "it is the filesystem root" };
-  if (real === realRoot || isInside(realRoot, real)) {
-    return { ok: false, reason: "it is, or contains, the repository" };
-  }
-  if (real === home || isInside(home, real)) return { ok: false, reason: "it is, or contains, the home directory" };
-  for (const regular of [cargo.targetDirectory, cargo.buildDirectory]) {
-    const realRegular = realpathOrNull(regular) ?? regular;
-    if (real === realRegular || isInside(realRegular, real)) {
-      return { ok: false, reason: "it is, or contains, cargo's regular target directory" };
-    }
-  }
-  const outside = !isInside(real, realRoot);
-  const leafIsCoverage = path.basename(real) === COVERAGE_BUILD_NAME;
+  const pathVerdict = vetPath(candidate, root, context, cargo);
+  if (!pathVerdict.ok) return { ok: false, reason: pathVerdict.reason };
+  const { real, outside, leafIsCoverage } = pathVerdict;
   const marked = CARGO_TARGET_MARKERS.some((marker) => lstatOrNull(path.join(real, marker)) !== null);
   if (outside) {
-    // Outside the repository only a path the environment names for this build is ours to delete.
-    const targetEnv = envValue(context.env, "CARGO_TARGET_DIR");
-    let viaCargoTargetDir = false;
-    if (!named && targetEnv !== undefined) {
-      if (hasParentComponent(targetEnv)) {
-        return { ok: false, reason: `CARGO_TARGET_DIR=${JSON.stringify(targetEnv)} has a ".." component, so where it points cannot be identified` };
-      }
-      viaCargoTargetDir = realpathOrNull(path.resolve(root, targetEnv)) === realParent;
-    }
-    if (!named && !viaCargoTargetDir) {
-      return {
-        ok: false,
-        reason: "it is outside the repository and is not named by CARGO_TARGET_DIR or CARGO_LLVM_COV_TARGET_DIR",
-      };
-    }
-    if (!leafIsCoverage) {
-      return { ok: false, reason: `outside the repository only a directory named ${COVERAGE_BUILD_NAME} is deleted, whatever names it` };
-    }
     if (!marked) {
       return { ok: false, reason: `it holds none of ${CARGO_TARGET_MARKERS.join(", ")}, so it is not recognisable as a cargo build directory` };
     }
@@ -988,11 +1026,21 @@ export function snapshotScratch(scratch, root, context) {
   if (scratch.kind !== "cargo-llvm-cov") return failed("refused", `unknown scratch kind ${JSON.stringify(scratch.kind)}`);
   try {
     const cargo = context.cargoMetadata(scratch.manifest);
-    const candidates = coverageBuildCandidates(root, context, cargo).map((candidate) => ({
-      ...candidate,
-      before: fingerprintOf(candidate.dir),
-      lock: acquireLock(candidate.dir, context),
-    }));
+    const candidates = coverageBuildCandidates(root, context, cargo).map((candidate) => {
+      const pre = vetPath(candidate, root, context, cargo);
+      if (!pre.ok && !pre.parentMissing) {
+        return {
+          ...candidate,
+          before: null,
+          lock: { file: null, token: null, otherPid: null, note: null, error: null },
+        };
+      }
+      return {
+        ...candidate,
+        before: fingerprintOf(candidate.dir),
+        lock: acquireLock(candidate.dir, context),
+      };
+    });
     return { scratch, cargo, candidates, failure: null };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

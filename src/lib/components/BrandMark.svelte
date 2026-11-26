@@ -13,31 +13,33 @@
    * `shell` is GitPulse's own: a prompt whose cursor is the heartbeat from the
    * app's logo, for a plain shell tab, kept to the same one-path contract.
    *
-   * `manvi` is Manvi's published mark, not a one-path redraw: a Red700 tile
-   * with a pixel M knocked out in Red050, on the 7x7 module grid that Manvi's
-   * `manvi/ui/logo/logo.go` defines and `svg.go` renders into
-   * `assets/manvi-mark.svg` (the same file its README and website show). It
-   * is drawn in its own two colors, like an app icon, so it ignores the
-   * caller's tint and reads the same on light and dark surfaces.
+   * `manvi` is Manvi's published Fold M mark: a dark wine rounded plate
+   * (`#24131b` to `#0c090c`) with a crimson radial glow and crisp folded-ribbon
+   * M (shaded `#b02636`/`#7a1626` silhouette with `#f0959e`/`#e0616f`/`#d92d3f`
+   * lit rising legs) on the 320x320 grid that Manvi's `manvi/ui/logo/svg.go`
+   * emits into `assets/manvi-mark.svg`. It draws in its own colors, like an
+   * app icon, so it ignores the caller's tint and reads identically on light
+   * and dark surfaces.
    */
   export type BrandMarkKind = "claude" | "codex" | "grok" | "agy" | "shell" | "manvi";
 
-  /** Manvi's brand ramp: Red700 fills the tile, Red050 is the M (manvi/ui/brand/brand.go). */
-  const MANVI_TILE = "#7a1626";
-  const MANVI_GLYPH = "#fdf2f3";
-  /** The M: Manvi's logo grid in 12-unit modules, as svg.go emits it, one subpath per run. */
-  const MANVI_M =
-    "M12 12h12v12h-12z" +
-    "M60 12h12v12h-12z" +
-    "M12 24h24v12h-24z" +
-    "M48 24h24v12h-24z" +
-    "M12 36h12v12h-12z" +
-    "M36 36h12v12h-12z" +
-    "M60 36h12v12h-12z" +
-    "M12 48h12v12h-12z" +
-    "M60 48h12v12h-12z" +
-    "M12 60h12v12h-12z" +
-    "M60 60h12v12h-12z";
+  /** Manvi Fold M geometry on the 320x320 grid (manvi/ui/logo/svg.go, assets/manvi-mark.svg). */
+  const MANVI_FOLD_OUTLINE =
+    "M58 223L100 97L136 97L160 169L184 97L220 97L262 223L226 223L202 151L178 223L142 223L118 151L94 223Z";
+  const MANVI_FOLD_LIT =
+    "M58 223L94 223L136 97L100 97ZM142 223L178 223L220 97L184 97Z";
+  /** Manvi's brand palette (manvi/ui/brand/brand.go). */
+  const MANVI_PALETTE = {
+    plateTop: "#24131b",
+    plateBottom: "#0c090c",
+    glow: "#d92d3f",
+    litTop: "#f0959e",
+    litMid: "#e0616f",
+    litBottom: "#d92d3f",
+    shadeTop: "#b02636",
+    shadeBottom: "#7a1626",
+    rim: "#ffffff",
+  } as const;
 
   interface MarkPath {
     d: string;
@@ -79,23 +81,46 @@
   }
   let { mark, size = 12, class: className = "" }: Props = $props();
 
+  const uid = $props.id();
   const path = $derived(mark === "manvi" ? null : MARKS[mark]);
 </script>
 
 {#if path === null}
-  <!-- Manvi's tile: square modules stay crisp at 12-16px; only the tile's
-       rounded corner is anti-aliased. -->
+  <!-- Manvi's Fold M mark: unique per-instance gradient IDs avoid broken fills
+       when another tab or menu holding a second instance unmounts. -->
   <svg
     class={className}
     width={size}
     height={size}
-    viewBox="0 0 84 84"
+    viewBox="0 0 320 320"
     aria-hidden="true"
     focusable="false"
     data-brand-mark="manvi"
   >
-    <rect width="84" height="84" rx="12" fill={MANVI_TILE} />
-    <path d={MANVI_M} fill={MANVI_GLYPH} shape-rendering="crispEdges" />
+    <defs>
+      <linearGradient id={`${uid}-manvi-plate`} x1="0" y1="0" x2="320" y2="320" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color={MANVI_PALETTE.plateTop} />
+        <stop offset="1" stop-color={MANVI_PALETTE.plateBottom} />
+      </linearGradient>
+      <radialGradient id={`${uid}-manvi-glow`} cx="160" cy="160" r="150" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color={MANVI_PALETTE.glow} stop-opacity="0.3" />
+        <stop offset="1" stop-color={MANVI_PALETTE.glow} stop-opacity="0" />
+      </radialGradient>
+      <linearGradient id={`${uid}-manvi-lit`} x1="160" y1="90" x2="160" y2="230" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color={MANVI_PALETTE.litTop} />
+        <stop offset="0.45" stop-color={MANVI_PALETTE.litMid} />
+        <stop offset="1" stop-color={MANVI_PALETTE.litBottom} />
+      </linearGradient>
+      <linearGradient id={`${uid}-manvi-shade`} x1="160" y1="90" x2="160" y2="230" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color={MANVI_PALETTE.shadeTop} />
+        <stop offset="1" stop-color={MANVI_PALETTE.shadeBottom} />
+      </linearGradient>
+    </defs>
+    <rect width="320" height="320" rx="100" fill={`url(#${uid}-manvi-plate)`} />
+    <rect width="320" height="320" rx="100" fill={`url(#${uid}-manvi-glow)`} />
+    <rect x="3" y="3" width="314" height="314" rx="97" fill="none" stroke={MANVI_PALETTE.rim} stroke-opacity="0.1" stroke-width="6" />
+    <path d={MANVI_FOLD_OUTLINE} fill={`url(#${uid}-manvi-shade)`} />
+    <path d={MANVI_FOLD_LIT} fill={`url(#${uid}-manvi-lit)`} />
   </svg>
 {:else}
 <svg

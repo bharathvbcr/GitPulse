@@ -72,9 +72,11 @@ fn open(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // Share nothing: a second open fails while the first is held, which
-        // is the whole lock.
-        options.share_mode(0);
+        // Share reading only (FILE_SHARE_READ): a second open for writing,
+        // which is how the lock is taken, fails while the first is held, and
+        // that is the whole lock. Sharing nothing would also refuse the plain
+        // read of the owner record, so the app could not name the daemon.
+        options.share_mode(1);
     }
     options.open(path)
 }

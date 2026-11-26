@@ -250,10 +250,13 @@ fn an_existing_registration_with_another_command_is_left_alone() {
 fn codex_registration_is_read_from_json() {
     let fx = fixture();
     let mcp = fx.bundle.join("gitpulse-mcp");
-    let json = format!(
-        r#"{{"name":"gitpulse","transport":{{"type":"stdio","command":"{}","args":[]}}}}"#,
-        mcp.display()
-    );
+    // Built as JSON, not formatted into text: a Windows path carries backslashes
+    // that a bare `{}` would leave as invalid escapes.
+    let json = serde_json::json!({
+        "name": "gitpulse",
+        "transport": {"type": "stdio", "command": mcp.to_string_lossy(), "args": []},
+    })
+    .to_string();
     let runner = FakeRunner::new(vec![("/fake/bin/codex", true, json.as_str())]);
     let only_codex = |n: &str| (n == "codex").then(|| "/fake/bin/codex".to_string());
     let plan = build_plan(&env(&fx, &runner, &only_codex));
@@ -404,9 +407,29 @@ fn link_details_say_what_depends_on_path() {
     assert!(action(&before, "link:gitpulse-hook")
         .detail
         .contains("must be on your shell's PATH"));
-    let after = apply(&e).plan;
-    let done = action(&after, "link:gitpulse-hook");
+    let outcome = apply(&e);
+    let done = action(&outcome.plan, "link:gitpulse-hook");
+    // Links are only created where a link needs no privilege; elsewhere the
+    // action stays to do and says why, and the plan keeps naming the PATH note.
+    #[cfg(unix)]
     assert_eq!(done.state, ConnectActionState::Done);
+    #[cfg(not(unix))]
+    {
+        assert_eq!(done.state, ConnectActionState::Todo);
+        let refusal = outcome
+            .results
+            .iter()
+            .find(|r| r.id == "link:gitpulse-hook")
+            .expect("the hook link was attempted");
+        assert!(!refusal.ok);
+        assert!(
+            refusal
+                .message
+                .contains("links are not created on this platform"),
+            "{}",
+            refusal.message
+        );
+    }
     assert!(
         done.detail.contains("must be on your shell's PATH"),
         "{}",
@@ -617,8 +640,11 @@ fn json_answers_are_read_through_a_wrapper_notice_and_trailing_hook_noise() {
 
     let mcp = fx.bundle.join("gitpulse-mcp");
     let json = format!(
-        "warning: something\n{{\"name\":\"gitpulse\",\"transport\":{{\"type\":\"stdio\",\"command\":\"{}\"}}}}\ntrailing\n",
-        mcp.display()
+        "warning: something\n{}\ntrailing\n",
+        serde_json::json!({
+            "name": "gitpulse",
+            "transport": {"type": "stdio", "command": mcp.to_string_lossy()},
+        })
     );
     let runner = FakeRunner::new(vec![("/fake/bin/codex", true, json.as_str())]);
     let only_codex = |n: &str| (n == "codex").then(|| "/fake/bin/codex".to_string());

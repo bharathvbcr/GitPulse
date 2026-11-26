@@ -522,7 +522,7 @@ fn stable_seed(id: &str) -> u64 {
 /// `GITPULSE_LEAK_RECALL_SALT`: a different, still deterministic corpus, for
 /// measuring how much the numbers move with the sampler's choices. 0 (unset)
 /// is the published corpus.
-fn salt() -> Result<u64, String> {
+fn corpus_variant() -> Result<u64, String> {
     match std::env::var("GITPULSE_LEAK_RECALL_SALT") {
         Err(std::env::VarError::NotPresent) => Ok(0),
         Ok(v) => v
@@ -533,13 +533,17 @@ fn salt() -> Result<u64, String> {
 }
 
 /// Sample a rule's candidates, or say why it has none.
-fn sample_rule(index: usize, rule: &Rule, salt: u64) -> Result<(Vec<Candidate>, bool), NoPlant> {
+fn sample_rule(
+    index: usize,
+    rule: &Rule,
+    corpus_variant: u64,
+) -> Result<(Vec<Candidate>, bool), NoPlant> {
     let pattern = plant_sampler::parse(&rule.pattern).map_err(NoPlant::Unsupported)?;
     // A pattern the regex crate rejects is still sampled; Kingfisher decides.
     let check = regex::Regex::new(&rule.pattern).ok();
     let validated = check.is_some();
     let mut out: Vec<Candidate> = Vec::new();
-    let base = stable_seed(&rule.id) ^ salt.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    let base = stable_seed(&rule.id) ^ corpus_variant.wrapping_mul(0xD6E8_FEB8_6659_FD93);
     for (length, wanted) in [
         (Length::Min, MIN_CANDIDATES),
         (Length::Realistic, REALISTIC_CANDIDATES),
@@ -1038,7 +1042,7 @@ struct Measurement {
     betterleaks_ids: BTreeSet<String>,
     shapes: BTreeSet<String>,
     plants: Vec<String>,
-    salt: u64,
+    corpus_variant: u64,
 }
 
 fn measure() -> Result<Measurement, String> {
@@ -1068,9 +1072,9 @@ fn measure() -> Result<Measurement, String> {
     let mut validated = vec![false; rules.len()];
     let mut sampled = vec![0usize; rules.len()];
     let mut candidates: Vec<Candidate> = Vec::new();
-    let salt = salt()?;
+    let corpus_variant = corpus_variant()?;
     for (i, rule) in rules.iter().enumerate() {
-        match sample_rule(i, rule, salt) {
+        match sample_rule(i, rule, corpus_variant) {
             Ok((c, checked)) => {
                 validated[i] = checked;
                 sampled[i] = c.len();
@@ -1155,7 +1159,7 @@ fn measure() -> Result<Measurement, String> {
         let mut pairing = Pairing::default();
         for h in helpers {
             let sample = helper_samples.entry(h).or_insert_with(|| {
-                sample_rule(h, &hidden_rules[h], salt)
+                sample_rule(h, &hidden_rules[h], corpus_variant)
                     .ok()
                     .and_then(|(c, _)| c.into_iter().next())
                     .map(|c| c.secret)
@@ -1291,7 +1295,7 @@ fn measure() -> Result<Measurement, String> {
         betterleaks_ids,
         shapes: dc_redact_shape_names(),
         plants: candidates.iter().map(Candidate::text).collect(),
-        salt,
+        corpus_variant,
     })
 }
 
@@ -1524,7 +1528,7 @@ fn render(m: &Measurement) -> String {
         "- Plants: up to {MIN_CANDIDATES} minimum-length and {REALISTIC_CANDIDATES} realistic-length candidates per rule, \
          seeded by the rule id (salt {}); {total_candidates} candidates. A rule's plant is the first candidate Kingfisher reports \
          as that rule, minimum-length first, so **Kingfisher is 100% by construction**.",
-        m.salt
+        m.corpus_variant
     );
     let _ = writeln!(
         r,

@@ -14,6 +14,9 @@
     ignoreCase: boolean;
     revision: string;
     report: RememberedReport | null;
+    executedPattern: string;
+    executedFixedStrings: boolean;
+    executedIgnoreCase: boolean;
   }
   const searchMemo = createRepoPanelCache<SearchMemo>();
 </script>
@@ -39,6 +42,12 @@
   import { describeSearchReport, groupByFile } from "../search/contentSearch";
   import { requestReveal } from "../files/revealRequests";
   import { setEditorLens } from "../files/explorerLens";
+  import {
+    buildMatcher,
+    matchesInLine,
+    sliceTokensWithMatches,
+    type LineMatch,
+  } from "../text/lineSearch";
   import type { ContentMatch, ContentSearchOptions, ContentSearchReport } from "../search/types";
   import EmptyState from "./EmptyState.svelte";
 
@@ -73,12 +82,37 @@
   let revision = $state("");
   // Replaced wholesale by each answer, never edited in place.
   let report = $state.raw<ContentSearchReport | null>(null);
+  let executedPattern = $state("");
+  let executedFixedStrings = $state(true);
+  let executedIgnoreCase = $state(true);
   let error = $state<string | null>(null);
   let running = $state(false);
   let inflight: AsyncGuard | null = null;
   let token: string | null = null;
 
   const groups = $derived(report ? groupByFile(report.matches) : []);
+  const resultMatcher = $derived(
+    executedPattern
+      ? buildMatcher(executedPattern, {
+          regex: !executedFixedStrings,
+          caseSensitive: !executedIgnoreCase,
+        })
+      : null,
+  );
+
+  function highlightResultLine(text: string): { text: string; match: "none" | "match" | "active" }[] | null {
+    const matcher = resultMatcher;
+    if (!matcher || !text) return null;
+    const found: LineMatch[] = [];
+    matchesInLine(text, matcher, 0, found, 32);
+    if (found.length === 0) return null;
+    return sliceTokensWithMatches(
+      text,
+      [{ text }],
+      found.map((m) => ({ start: m.colStart, end: m.colStart + m.length, active: false })),
+      (t) => ({ text: t }),
+    );
+  }
 
   function stop() {
     inflight?.cancel();
@@ -97,19 +131,27 @@
     token = mine;
     running = true;
     error = null;
+    const submittedPattern = pattern;
+    const submittedFixed = fixedStrings;
+    const submittedIgnoreCase = ignoreCase;
     const options: ContentSearchOptions = {
-      fixed_strings: fixedStrings,
-      ignore_case: ignoreCase,
+      fixed_strings: submittedFixed,
+      ignore_case: submittedIgnoreCase,
       revision: revision.trim() || null,
     };
     try {
       const next = await invoke<ContentSearchReport>("cmd_search_content", {
         repoPath: repo,
-        pattern,
+        pattern: submittedPattern,
         options,
         cancelToken: mine,
       });
-      if (guard.isLive()) report = next;
+      if (guard.isLive()) {
+        report = next;
+        executedPattern = submittedPattern;
+        executedFixedStrings = submittedFixed;
+        executedIgnoreCase = submittedIgnoreCase;
+      }
     } catch (err) {
       if (guard.isLive()) {
         error = formatError(err);
@@ -167,12 +209,24 @@
       ignoreCase = memo?.ignoreCase ?? true;
       revision = memo?.revision ?? "";
       report = memo?.report ?? null;
+      executedPattern = memo?.executedPattern ?? "";
+      executedFixedStrings = memo?.executedFixedStrings ?? true;
+      executedIgnoreCase = memo?.executedIgnoreCase ?? true;
     });
   });
 
   $effect(() => {
     const repo = effectiveRepoPath;
-    const memo: SearchMemo = { pattern, fixedStrings, ignoreCase, revision, report };
+    const memo: SearchMemo = {
+      pattern,
+      fixedStrings,
+      ignoreCase,
+      revision,
+      report,
+      executedPattern,
+      executedFixedStrings,
+      executedIgnoreCase,
+    };
     if (repo) untrack(() => searchMemo.set(repo, memo));
   });
 
@@ -237,9 +291,10 @@
             {group.path} <span class="text-textMuted">({group.matches.length})</span>
           </button>
           {#each group.matches as match (`${match.line}:${match.column}`)}
+            {@const lineSpans = highlightResultLine(match.text)}
             <button type="button" data-search-match class="w-full text-left flex gap-2 px-2 py-0.5 rounded hover:bg-surfaceHover font-mono text-meta" onclick={() => open(match.path, match)}>
               <span class="w-9 shrink-0 text-right text-faint tabular-nums">{match.line}</span>
-              <span class="whitespace-pre truncate text-textPrimary">{match.text}{match.text_clipped ? " …" : ""}</span>
+              <span class="whitespace-pre truncate text-textPrimary">{#if lineSpans}{#each lineSpans as span}<span class={span.match === 'match' ? 'rounded-sm bg-warn/30' : ''}>{span.text}</span>{/each}{:else}{match.text}{/if}{match.text_clipped ? " …" : ""}</span>
             </button>
           {/each}
         </section>

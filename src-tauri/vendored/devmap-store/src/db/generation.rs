@@ -2563,7 +2563,7 @@ generation {latest}; run `devmap status` to re-verify",
              JOIN paths p ON p.path = g.path
              JOIN generation_files f ON f.file_id = p.id AND f.generation_id = g.generation_id
              WHERE {filter}
-             ORDER BY g.path ASC"
+             ORDER BY CASE WHEN instr(g.reason, '; charged:') > 0 THEN 0 ELSE 1 END, g.path ASC"
         ))?;
         let mut rows = stmt.query(params![generation, label, containing])?;
         let mut kept = Vec::new();

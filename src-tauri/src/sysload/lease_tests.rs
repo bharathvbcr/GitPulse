@@ -163,15 +163,19 @@ fn a_session_is_named_by_its_terminal_then_its_run_then_its_agent_then_its_paren
 
 #[test]
 fn the_lease_folder_leads_the_agent_path_once() {
-    use std::ffi::OsStr;
     let bin = Path::new("/c/lease-bin");
     let joined = |p: &std::ffi::OsString| {
         std::env::split_paths(p)
             .map(|e| e.display().to_string())
             .collect::<Vec<_>>()
     };
+    // The inherited PATH in this platform's own separator (`:` or `;`).
+    let path = |entries: &[&str]| std::env::join_paths(entries).unwrap();
     assert_eq!(
-        joined(&path_with_bin_first(bin, Some(OsStr::new("/usr/bin:/bin")))),
+        joined(&path_with_bin_first(
+            bin,
+            Some(path(&["/usr/bin", "/bin"]).as_os_str())
+        )),
         ["/c/lease-bin", "/usr/bin", "/bin"]
     );
     // Already there, but not first (a login shell put the shim ahead of it):
@@ -179,7 +183,7 @@ fn the_lease_folder_leads_the_agent_path_once() {
     assert_eq!(
         joined(&path_with_bin_first(
             bin,
-            Some(OsStr::new("/home/x/.claude-bin:/c/lease-bin:/bin"))
+            Some(path(&["/home/x/.claude-bin", "/c/lease-bin", "/bin"]).as_os_str())
         )),
         ["/c/lease-bin", "/home/x/.claude-bin", "/bin"]
     );
@@ -598,12 +602,48 @@ fn a_hook_that_cannot_be_asked_makes_and_takes_away_no_link() {
     // A hook that never answers --version, as a spawn deferred under load or
     // a wedged binary looks to the probe: unknown, which is not a verdict.
     let silent = temp.path().join("gitpulse-hook");
-    std::fs::write(&silent, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    // It writes its pid first (an `exec` keeps it), so the test can see that
+    // the probe does not leave the silent hook running behind it.
+    let silent_pid = temp.path().join("silent.pid");
+    std::fs::write(
+        &silent,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            silent_pid.display()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         hook_serves_lease(&silent).is_err(),
         "unknown is never a pass"
     );
+    let pid: i32 = std::fs::read_to_string(&silent_pid)
+        .expect("the silent hook ran far enough to write its pid")
+        .trim()
+        .parse()
+        .unwrap();
+    let still_running = |pid: i32| {
+        use crate::procguard::LockedSpawn;
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output_locked()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        !stat.is_empty() && !stat.starts_with('Z')
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    while still_running(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let left = still_running(pid);
+    if left {
+        // SAFETY: a pid this test recorded from the process it started.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(!left, "the probe left the silent hook ({pid}) running");
     let first = ensure_links(&config, &silent).unwrap_err();
     assert_eq!(
         std::fs::read_link(&cargo).unwrap(),

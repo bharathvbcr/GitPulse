@@ -73,6 +73,23 @@ SUBCOMMANDS:
       --exec <cmd>       Guard and run a post-create command (60s timeout)
       --agent <id>       Register the lane in <git-common-dir>/gitpulse/lanes/claims.json
 
+      A copied DevMap store is refreshed inline before create returns. The answer
+      carries devmap_refresh {kind: built|fresh|deferred|cooled_down|busy|failed,
+      reason}; devmap_seeded is true only for built or fresh. Any other kind
+      (index possibly stale) makes the answer ok:false, names it on stderr and
+      exits 3 (done but incomplete, the status gitpulse-mcp uses for an
+      incomplete answer); the worktree still exists and its path is in the
+      answer. Exit codes: 0 success, 1 failure, 2 usage error, 3 created but
+      the index is not current. Exit 1 means nothing was created, except when
+      the --exec guard or command fails: that runs after the worktree exists,
+      so read the state back (`status`) before retrying the create.
+      On a large repository the inline build can run up to 900 s (devmap's
+      build deadline), longer than gitpulse-mcp's default 600 s write timeout:
+      called through `gitpulse-mcp call --write`, the create can then end with
+      exit 4 (timed out, the ceiling of --timeout-ms is 600000) while the
+      worktree may already exist: run this CLI directly for large repositories,
+      and read the state back (`status`) before retrying a create.
+
     switch               Locate an existing branch worktree (or create with --create)
       --repo <path>      Repository checkout path (required)
       --branch <name>    Branch name (required)
@@ -971,6 +988,23 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
     })
 }
 
+/// Runs `cmd`. A command that makes a worktree is the user's own action, so it
+/// is admitted as one: this process starts in the background class (its other
+/// commands are optional reads that the shared git spawn budget may shed), but
+/// a `create` that exits 1 because its `git worktree add` was deferred, or 3
+/// because the inline index refresh after it was, fails the one thing that was
+/// asked for. The rest keep the process default.
+fn execute_admitted(cmd: Subcommand) -> Result<Value, String> {
+    if matches!(
+        cmd,
+        Subcommand::Create { .. } | Subcommand::Switch { .. } | Subcommand::Isolate { .. }
+    ) {
+        gitpulse_lib::engine::process::run_as_user_action(|| execute_subcommand(cmd))
+    } else {
+        execute_subcommand(cmd)
+    }
+}
+
 fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
     match cmd {
         Subcommand::Create {
@@ -997,6 +1031,8 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             gitpulse_lib::harness::guard_command(&repo, &argv_refs)?;
             let effective_mode = CliDevmapMode::resolve(zero_copy, devmap_mode);
 
+            // Only the inline refresh of a copied store reports an outcome.
+            let mut devmap_refresh: Option<Value> = None;
             let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) = if !sparse
                 .is_empty()
             {
@@ -1032,7 +1068,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 if let Ok(family) = resolve_worktree_family(&repo, &path) {
                     let selection = CacheSelection::default();
                     let (_, dev_res) = std::thread::scope(|scope| {
-                        let c = scope.spawn(|| {
+                        let c = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
                             if share_cache {
                                 let _ = clone_ignored_caches(
                                     &family.anchor,
@@ -1040,10 +1076,10 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                                     &selection,
                                 );
                             }
-                        });
-                        let d = scope.spawn(|| {
+                        }));
+                        let d = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
                             provision_worktree_devmap_zero_copy(&family.anchor, &family.worktree)
-                        });
+                        }));
                         let _ = c.join();
                         ((), d.join().ok().and_then(Result::ok))
                     });
@@ -1071,15 +1107,13 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 )
                 .map_err(CommandError::into_message)?;
                 let seeded = matches!(created.devmap, DevmapOutcome::Provisioned { .. });
-                if seeded && effective_mode == CliDevmapMode::Copy {
+                let refresh = (seeded && effective_mode == CliDevmapMode::Copy)
                     // This process exits when the command returns, and a
                     // background build would die with it.
-                    gitpulse_lib::devmap::live::refresh_seeded_worktree(
-                        &created.path,
-                        gitpulse_lib::devmap::live::SeededRefresh::Inline,
-                    );
-                }
-                (created.path, seeded, false, None)
+                    .then(|| refresh_seeded_inline(&created.path));
+                let current = refresh.as_ref().is_none_or(|r| r.current);
+                devmap_refresh = refresh.map(|r| r.report);
+                (created.path, seeded && current, false, None)
             };
 
             let lane_claim = if let Some(ref agent_id) = agent {
@@ -1135,17 +1169,18 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 cmd_out = Some(combined);
             }
 
-            Ok(json!({
+            Ok(with_refresh_verdict(json!({
                 "ok": true,
                 "branch": branch,
                 "worktree_path": worktree_path,
                 "cache_shared": share_cache,
                 "devmap_seeded": devmap_seeded,
+                "devmap_refresh": devmap_refresh,
                 "zero_copy_devmap": zero_copy_devmap,
                 "sparse_cone": sparse_cone,
                 "lane_claim": lane_claim,
                 "command_output": cmd_out,
-            }))
+            })))
         }
         Subcommand::Switch {
             repo,
@@ -1195,20 +1230,18 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     effective_mode.to_engine_mode(),
                 )
                 .map_err(CommandError::into_message)?;
-                let devmap_seeded = matches!(created.devmap, DevmapOutcome::Provisioned { .. });
-                if devmap_seeded && effective_mode == CliDevmapMode::Copy {
-                    gitpulse_lib::devmap::live::refresh_seeded_worktree(
-                        &created.path,
-                        gitpulse_lib::devmap::live::SeededRefresh::Inline,
-                    );
-                }
-                return Ok(json!({
+                let provisioned = matches!(created.devmap, DevmapOutcome::Provisioned { .. });
+                let refresh = (provisioned && effective_mode == CliDevmapMode::Copy)
+                    .then(|| refresh_seeded_inline(&created.path));
+                let devmap_seeded = provisioned && refresh.as_ref().is_none_or(|r| r.current);
+                return Ok(with_refresh_verdict(json!({
                     "ok": true,
                     "branch": branch,
                     "worktree_path": created.path,
                     "created": true,
                     "devmap_seeded": devmap_seeded,
-                }));
+                    "devmap_refresh": refresh.map(|r| r.report),
+                })));
             }
             Err(format!("worktree for branch {branch:?} does not exist"))
         }
@@ -1232,14 +1265,20 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             let anchor = &family.anchor;
             let target = &family.worktree;
             let (cache_res, devmap_res) = std::thread::scope(|scope| {
-                let c = scope.spawn(|| clone_ignored_caches(anchor, target, &selection));
-                let d = scope.spawn(|| match effective_mode {
-                    CliDevmapMode::Stacked => {
-                        provision_worktree_devmap_zero_copy(anchor, target).map(Some)
+                // New threads start in the process default (background); both
+                // are part of the command the user asked for.
+                let c = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
+                    clone_ignored_caches(anchor, target, &selection)
+                }));
+                let d = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
+                    match effective_mode {
+                        CliDevmapMode::Stacked => {
+                            provision_worktree_devmap_zero_copy(anchor, target).map(Some)
+                        }
+                        CliDevmapMode::Copy => provision_worktree_devmap(anchor, target).map(Some),
+                        CliDevmapMode::None => Ok(None),
                     }
-                    CliDevmapMode::Copy => provision_worktree_devmap(anchor, target).map(Some),
-                    CliDevmapMode::None => Ok(None),
-                });
+                }));
                 let cr = c
                     .join()
                     .unwrap_or_else(|_| Err(CommandError::plain("cache clone worker panicked")));
@@ -1279,12 +1318,9 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 }
                 Err(e) => (false, format!("failed: {}", e.message())),
             };
-            if devmap_seeded && effective_mode == CliDevmapMode::Copy {
-                gitpulse_lib::devmap::live::refresh_seeded_worktree(
-                    &target.to_string_lossy(),
-                    gitpulse_lib::devmap::live::SeededRefresh::Inline,
-                );
-            }
+            let refresh = (devmap_seeded && effective_mode == CliDevmapMode::Copy)
+                .then(|| refresh_seeded_inline(&target.to_string_lossy()));
+            let devmap_seeded = devmap_seeded && refresh.as_ref().is_none_or(|r| r.current);
             let overlay_dirty = if effective_mode == CliDevmapMode::None {
                 0
             } else {
@@ -1294,15 +1330,16 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     .map(|r| r.modified_files + r.tombstoned_files)
                     .unwrap_or(0)
             };
-            Ok(json!({
+            Ok(with_refresh_verdict(json!({
                 "ok": true,
                 "worktree_path": worktree,
                 "caches_cloned": caches_cloned,
                 "cache_error": report.error(),
                 "devmap_seeded": devmap_seeded,
+                "devmap_refresh": refresh.map(|r| r.report),
                 "devmap_mode": devmap_mode_label,
                 "overlay_dirty_files": overlay_dirty,
-            }))
+            })))
         }
         Subcommand::CompileOverlay { worktree } => {
             gitpulse_lib::repository_trust::require(Path::new(&worktree))
@@ -1904,6 +1941,57 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
     }
 }
 
+/// What `refresh_seeded_worktree` amounted to, for a command's answer.
+struct SeededRefreshReport {
+    /// `{kind, reason, decision, cooldown_remaining_ms, index_current}`.
+    report: Value,
+    /// Whether the index is known to match the tree (built or already fresh).
+    current: bool,
+}
+
+/// Brings a just-seeded worktree's store to its tree, inline (this process
+/// exits when its command returns, so a background build would die with it),
+/// and keeps the outcome instead of dropping it.
+fn refresh_seeded_inline(path: &str) -> SeededRefreshReport {
+    let outcome = gitpulse_lib::devmap::live::refresh_seeded_worktree(
+        path,
+        gitpulse_lib::devmap::live::SeededRefresh::Inline,
+    );
+    let kind = outcome.kind();
+    SeededRefreshReport {
+        report: json!({
+            "kind": kind.as_str(),
+            "index_current": kind.index_is_current(),
+            "decision": outcome.decision,
+            "reason": outcome.reason,
+            "cooldown_remaining_ms": outcome.cooldown_remaining_ms,
+        }),
+        current: kind.index_is_current(),
+    }
+}
+
+/// A refresh that left the index possibly stale makes the answer `ok: false`
+/// (exit 3, see `main`), while the created worktree's fields stay in it: the
+/// worktree exists, so a caller can still find it and retry the refresh.
+fn with_refresh_verdict(mut answer: Value) -> Value {
+    let stale = answer["devmap_refresh"]["index_current"] == json!(false);
+    if stale {
+        let kind = answer["devmap_refresh"]["kind"]
+            .as_str()
+            .unwrap_or("failed")
+            .to_owned();
+        let reason = answer["devmap_refresh"]["reason"]
+            .as_str()
+            .map(|r| format!(": {r}"))
+            .unwrap_or_default();
+        answer["ok"] = json!(false);
+        answer["error"] = json!(format!(
+            "devmap refresh {kind}{reason}; the worktree exists but its index may be stale"
+        ));
+    }
+    answer
+}
+
 fn emit_value(json_mode: bool, value: &Value) -> io::Result<()> {
     let mut out = io::stdout().lock();
     let encoded = if json_mode {
@@ -1929,6 +2017,10 @@ fn emit_error(json_mode: bool, error: &str) {
         let _ = err.flush();
     }
 }
+
+/// Exit status of a create that made the worktree but left its DevMap index not
+/// current; the same number gitpulse-mcp gives an answer that says it is incomplete.
+const EXIT_INCOMPLETE: i32 = 3;
 
 fn main() {
     gitpulse_lib::engine::process::run_process_as_background();
@@ -1975,10 +2067,28 @@ fn main() {
         log::warn!(target: "setup", "{}", signals.describe());
     }
 
-    let exit_code = match execute_subcommand(cmd) {
+    let exit_code = match execute_admitted(cmd) {
         Ok(val) => {
-            if emit_value(json_mode, &val).is_ok() {
+            let emitted = emit_value(json_mode, &val).is_ok();
+            // An answer that carries `ok: false` is not a success: name it on
+            // stderr. A worktree that was made but whose index is not current
+            // is "done but incomplete" (exit 3, as in gitpulse-mcp); any other
+            // `ok: false` is a failure (exit 1).
+            let succeeded = val["ok"] != json!(false);
+            let incomplete = !succeeded && val["devmap_refresh"]["index_current"] == json!(false);
+            if !succeeded {
+                if let Some(error) = val["error"].as_str() {
+                    let mut err = io::stderr().lock();
+                    let _ = writeln!(err, "gitpulse-worktree: {error}");
+                    let _ = err.flush();
+                }
+            }
+            if !emitted {
+                1
+            } else if succeeded {
                 0
+            } else if incomplete {
+                EXIT_INCOMPLETE
             } else {
                 1
             }

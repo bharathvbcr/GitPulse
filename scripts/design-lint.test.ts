@@ -22,6 +22,9 @@ import {
   type Violation,
 } from "./design-lint.mjs";
 
+/** The strict gate over the whole tree (see "passes the strict gate on this tree"). */
+const STRICT_TREE_SCAN_MS = wallClockBudget(15_000);
+
 const FIXTURES = fileURLToPath(new URL("./fixtures/design-lint/", import.meta.url));
 
 function fixture(name: string): string {
@@ -933,6 +936,9 @@ describe("the committed gate config", () => {
     ]);
   });
 
+  // Lints every file in the tree: 1.8-3.3 s on the CI runners, 5.3 s once under
+  // coverage instrumentation, which vitest's flat 5 s default called a failure.
+  // The budget is the scan's, scaled under coverage like every wall-clock limit.
   it("passes the strict gate on this tree", () => {
     const logs: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
@@ -942,7 +948,7 @@ describe("the committed gate config", () => {
       spy.mockRestore();
     }
     expect(logs.join("\n")).toContain("allowed (");
-  }, WHOLE_TREE_LINT_MS);
+  }, STRICT_TREE_SCAN_MS);
 });
 
 describe("the committed baseline", () => {

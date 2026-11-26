@@ -2,18 +2,53 @@
 //!
 //! Substring `contains` on symbol *or* file path made `impact "e"` saturate the
 //! graph and report Available. Matching is exact: a qualified `file::symbol`,
-//! a path, or a symbol name (including `Type.method`).
+//! `module::symbol`, `Type::method`, a path, or a symbol name (including
+//! `Type.method`).
 
 pub fn traversal_start_matches(query: &str, symbol: &str, file: &str) -> bool {
-    match classify(query) {
+    let trimmed = query.trim();
+    match classify(trimmed) {
         StartQuery::Nothing => false,
-        StartQuery::Qualified {
-            file: wanted_file,
-            symbol: wanted_symbol,
-        } => path_matches(file, wanted_file) && symbol_matches(symbol, wanted_symbol),
+        StartQuery::Qualified { .. } => {
+            qualified_file_or_module_matches(trimmed, symbol, file)
+                || scoped_symbol_matches(symbol, trimmed)
+        }
         StartQuery::Path(path) => path_matches(file, path),
         StartQuery::Symbol(name) => symbol_matches(symbol, name),
     }
+}
+
+/// True when a `::`-qualified query matches `(symbol, file)` by matching a
+/// `::`-delimited prefix against `file` (exact/suffix file path or module path)
+/// and the remaining suffix against `symbol`.
+pub(crate) fn qualified_file_or_module_matches(query: &str, symbol: &str, file: &str) -> bool {
+    if has_empty_qualified_segment(query) {
+        return false;
+    }
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b':' && bytes[i + 1] == b':' {
+            let prefix = &query[..i];
+            let suffix = &query[i + 2..];
+            if !prefix.is_empty()
+                && !suffix.is_empty()
+                && (path_matches(file, prefix) || module_path_matches(file, prefix))
+                && symbol_matches(symbol, suffix)
+            {
+                return true;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Rejects leading `::`, trailing `::`, or empty interior segments (`a::::b`).
+fn has_empty_qualified_segment(query: &str) -> bool {
+    query.split("::").any(str::is_empty)
 }
 
 /// What a traversal-start query is asking about.
@@ -26,7 +61,9 @@ pub fn traversal_start_matches(query: &str, symbol: &str, file: &str) -> bool {
 /// both the scan and the index go through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartQuery<'a> {
-    /// `path::symbol` — both halves must match.
+    /// `path::symbol`, `module::symbol`, or `Type::method` — split at the last
+    /// `::` so `symbol` is always the leaf name that every matching symbol must
+    /// satisfy.
     Qualified { file: &'a str, symbol: &'a str },
     /// A file path.
     Path(&'a str),
@@ -56,7 +93,7 @@ fn split_qualified(query: &str) -> Option<(&str, &str)> {
         .filter(|(file, symbol)| !file.is_empty() && !symbol.is_empty())
 }
 
-fn looks_like_path(query: &str) -> bool {
+pub(crate) fn looks_like_path(query: &str) -> bool {
     query.contains('/')
         || query.contains('\\')
         || (query.contains('.') && has_source_extension(query))
@@ -84,6 +121,166 @@ pub(crate) fn has_source_extension(query: &str) -> bool {
             | "vue"
             | "svelte"
     )
+}
+
+fn is_module_source_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "go" | "py"
+            | "rs"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "mts"
+            | "cts"
+            | "c"
+            | "h"
+            | "cc"
+            | "cpp"
+            | "hpp"
+            | "cxx"
+            | "cs"
+            | "java"
+            | "kt"
+            | "kts"
+            | "swift"
+            | "rb"
+            | "php"
+            | "vue"
+            | "svelte"
+            | "astro"
+            | "scala"
+            | "dart"
+            | "lua"
+            | "sh"
+            | "bash"
+            | "sql"
+            | "ex"
+            | "exs"
+            | "zig"
+            | "m"
+            | "mm"
+    )
+}
+
+/// Whether `file` belongs to the module path `query` (e.g. `webcontent` or
+/// `sysload::webcontent` for `src-tauri/src/sysload/webcontent.rs`, or
+/// `sysload` for `src-tauri/src/sysload/mod.rs`).
+///
+/// Zero heap allocations: scans segments right-to-left over UTF-8 slices.
+pub fn module_path_matches(file: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let Some((stem_path, ext)) = strip_module_extension(file) else {
+        return false;
+    };
+    if module_segments_match_suffix(stem_path, query) {
+        return true;
+    }
+    // Directory modules: `pkg/mod.rs`, `pkg/index.ts`, `pkg/__init__.py`.
+    if let Some(dir_path) = directory_module_parent(stem_path, ext) {
+        return module_segments_match_suffix(dir_path, query);
+    }
+    false
+}
+
+fn strip_module_extension(file: &str) -> Option<(&str, &str)> {
+    let (stem, ext) = file.rsplit_once('.')?;
+    if stem.is_empty() || ext.contains(['/', '\\']) || !is_module_source_extension(ext) {
+        return None;
+    }
+    Some((stem, ext))
+}
+
+fn directory_module_parent<'a>(stem_path: &'a str, ext: &str) -> Option<&'a str> {
+    let (parent, base) = match stem_path.rfind(['/', '\\']) {
+        Some(sep) => (&stem_path[..sep], &stem_path[sep + 1..]),
+        None => ("", stem_path),
+    };
+    if parent.is_empty() {
+        return None;
+    }
+    let is_dir_module = (ext == "rs" && base == "mod")
+        || (matches!(
+            ext,
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts"
+        ) && base == "index")
+        || (ext == "py" && base == "__init__");
+    is_dir_module.then_some(parent)
+}
+
+fn module_segments_match_suffix(candidate_path: &str, query: &str) -> bool {
+    let mut q_rest = query;
+    let mut p_rest = candidate_path;
+    let mut matched_any = false;
+    while let Some(q_seg) = next_module_query_segment_back(&mut q_rest) {
+        let Ok(q_seg) = q_seg else {
+            return false;
+        };
+        let Some(p_seg) = next_path_segment_back(&mut p_rest) else {
+            return false;
+        };
+        if p_seg != q_seg {
+            return false;
+        }
+        matched_any = true;
+    }
+    matched_any
+}
+
+fn next_module_query_segment_back<'a>(rest: &mut &'a str) -> Option<Result<&'a str, ()>> {
+    if rest.is_empty() {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b == b'/' || b == b'\\' {
+            let seg = &rest[i..];
+            if seg.is_empty() || i == 1 {
+                return Some(Err(()));
+            }
+            *rest = &rest[..i - 1];
+            return Some(Ok(seg));
+        }
+        if b == b':' && i >= 2 && bytes[i - 2] == b':' {
+            let seg = &rest[i..];
+            if seg.is_empty() || i == 2 {
+                return Some(Err(()));
+            }
+            *rest = &rest[..i - 2];
+            return Some(Ok(seg));
+        }
+        i -= 1;
+    }
+    let seg = *rest;
+    *rest = "";
+    Some(Ok(seg))
+}
+
+fn next_path_segment_back<'a>(rest: &mut &'a str) -> Option<&'a str> {
+    if rest.is_empty() {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b == b'/' || b == b'\\' {
+            let seg = &rest[i..];
+            *rest = &rest[..i - 1];
+            return Some(seg);
+        }
+        i -= 1;
+    }
+    let seg = *rest;
+    *rest = "";
+    Some(seg)
 }
 
 /// `file` names `query`, exactly or as a segment-aligned suffix, with `\\` and
@@ -184,7 +381,96 @@ pub fn symbol_matches(symbol: &str, query: &str) -> bool {
             return true;
         }
     }
-    false
+    scoped_symbol_tail_matches(tail, query, is_file_node)
+}
+
+/// Matches a `::`-scoped symbol query (`Ring::dump`, `Outer::Inner::method`)
+/// against the symbol's tail (`Ring.dump`, `Outer.Inner.method`), never
+/// bypassing the file check by comparing against the full `file::symbol` ID.
+pub(crate) fn scoped_symbol_matches(symbol: &str, query: &str) -> bool {
+    let is_file_node = !symbol.contains("::");
+    let tail = symbol.rsplit("::").next().unwrap_or(symbol);
+    if is_file_node && looks_like_path(tail) {
+        return false;
+    }
+    scoped_symbol_tail_matches(tail, query, is_file_node)
+}
+
+fn scoped_symbol_tail_matches(tail: &str, query: &str, is_file_node: bool) -> bool {
+    if query.is_empty()
+        || (!query.contains("::") && !query.contains('.'))
+        || query.contains(['/', '\\'])
+    {
+        return false;
+    }
+    let mut q_rest = query;
+    let mut t_rest = tail;
+    let mut segments = 0usize;
+    while let Some(q_seg) = next_symbol_scope_segment_back(&mut q_rest) {
+        let Ok(q_seg) = q_seg else {
+            return false;
+        };
+        if segments == 0 && is_file_node && has_source_extension(q_seg) {
+            return false;
+        }
+        let Some(t_seg) = next_dot_segment_back(&mut t_rest) else {
+            return false;
+        };
+        if t_seg != q_seg {
+            return false;
+        }
+        segments += 1;
+    }
+    segments >= 2
+}
+
+fn next_symbol_scope_segment_back<'a>(rest: &mut &'a str) -> Option<Result<&'a str, ()>> {
+    if rest.is_empty() {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b == b'.' {
+            let seg = &rest[i..];
+            if seg.is_empty() || i == 1 {
+                return Some(Err(()));
+            }
+            *rest = &rest[..i - 1];
+            return Some(Ok(seg));
+        }
+        if b == b':' && i >= 2 && bytes[i - 2] == b':' {
+            let seg = &rest[i..];
+            if seg.is_empty() || i == 2 {
+                return Some(Err(()));
+            }
+            *rest = &rest[..i - 2];
+            return Some(Ok(seg));
+        }
+        i -= 1;
+    }
+    let seg = *rest;
+    *rest = "";
+    Some(Ok(seg))
+}
+
+fn next_dot_segment_back<'a>(rest: &mut &'a str) -> Option<&'a str> {
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.rfind('.') {
+        Some(dot) => {
+            let seg = &rest[dot + 1..];
+            *rest = &rest[..dot];
+            Some(seg)
+        }
+        None => {
+            let seg = *rest;
+            *rest = "";
+            Some(seg)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -375,5 +661,140 @@ mod tests {
             "client.go::paperclipClient.headers",
             "client.go"
         ));
+    }
+
+    #[test]
+    fn module_path_matches_stems_and_directory_modules() {
+        let file = "src-tauri/src/sysload/webcontent.rs";
+        assert!(module_path_matches(file, "webcontent"));
+        assert!(module_path_matches(file, "sysload::webcontent"));
+        assert!(module_path_matches(file, "src::sysload::webcontent"));
+        assert!(module_path_matches(
+            file,
+            "src-tauri::src::sysload::webcontent"
+        ));
+        // Windows separator parity.
+        assert!(module_path_matches(
+            r"src-tauri\src\sysload\webcontent.rs",
+            "sysload::webcontent"
+        ));
+        // Partial stems, parent dirs of non-index files, wrong chains, and empties are rejected.
+        assert!(!module_path_matches(file, "content"));
+        assert!(!module_path_matches(file, "sysload"));
+        assert!(!module_path_matches(file, "other::webcontent"));
+        assert!(!module_path_matches(file, ""));
+        assert!(!module_path_matches(file, "::webcontent"));
+        assert!(!module_path_matches(file, "webcontent::"));
+        assert!(!module_path_matches(file, "sysload::::webcontent"));
+
+        // Directory module files (`mod.rs`, `index.*`, `__init__.py`) match their enclosing directory.
+        assert!(module_path_matches("src/sysload/mod.rs", "sysload"));
+        assert!(module_path_matches("src/sysload/mod.rs", "src::sysload"));
+        assert!(module_path_matches("src/sysload/mod.rs", "sysload::mod"));
+        assert!(module_path_matches("src/ui/panel/index.tsx", "panel"));
+        assert!(module_path_matches("src/ui/panel/index.tsx", "ui::panel"));
+        assert!(module_path_matches("pkg/auth/__init__.py", "auth"));
+        assert!(module_path_matches("pkg/auth/__init__.py", "pkg::auth"));
+        // Root-level index/mod files have no parent directory module.
+        assert!(!module_path_matches("mod.rs", ""));
+        assert!(module_path_matches("mod.rs", "mod"));
+    }
+
+    #[test]
+    fn scoped_symbol_matches_double_colon_member_tails() {
+        assert!(scoped_symbol_matches(
+            "src-tauri/src/sysload/webcontent.rs::Ring.dump",
+            "Ring::dump"
+        ));
+        assert!(scoped_symbol_matches("a.rs::Outer.Inner.run", "Inner::run"));
+        assert!(scoped_symbol_matches(
+            "a.rs::Outer.Inner.run",
+            "Outer::Inner::run"
+        ));
+        // Boundary and structural rejections.
+        assert!(!scoped_symbol_matches(
+            "src-tauri/src/sysload/webcontent.rs::Ring.dump",
+            "ing::dump"
+        ));
+        assert!(!scoped_symbol_matches(
+            "src-tauri/src/sysload/webcontent.rs::Ring.dump",
+            "Other::dump"
+        ));
+        assert!(!scoped_symbol_matches(
+            "src-tauri/src/sysload/webcontent.rs::Ring.dump",
+            "Ring::other"
+        ));
+        assert!(!scoped_symbol_matches("a.rs::Ring.dump", "Ring::"));
+        assert!(!scoped_symbol_matches("a.rs::Ring.dump", "::dump"));
+        assert!(!scoped_symbol_matches("a.rs::Ring.dump", "Ring::::dump"));
+        // File nodes (no `::`) are never scoped symbols.
+        assert!(!scoped_symbol_matches("pkg/Ring.dump", "Ring::dump"));
+    }
+
+    #[test]
+    fn traversal_start_matches_all_qualified_module_and_type_shapes() {
+        let file = "src-tauri/src/sysload/webcontent.rs";
+        let fn_node = "src-tauri/src/sysload/webcontent.rs::snapshot";
+        let method_node = "src-tauri/src/sysload/webcontent.rs::Ring.dump";
+
+        for query in [
+            "webcontent::snapshot",
+            "sysload::webcontent::snapshot",
+            "webcontent.rs::snapshot",
+            "src-tauri/src/sysload/webcontent.rs::snapshot",
+        ] {
+            assert!(
+                traversal_start_matches(query, fn_node, file),
+                "expected {query:?} to match {fn_node:?}"
+            );
+        }
+
+        for query in [
+            "Ring::dump",
+            "webcontent::Ring::dump",
+            "sysload::webcontent::Ring::dump",
+            "webcontent.rs::Ring::dump",
+            "src-tauri/src/sysload/webcontent.rs::Ring::dump",
+            "webcontent::Ring.dump",
+        ] {
+            assert!(
+                traversal_start_matches(query, method_node, file),
+                "expected {query:?} to match {method_node:?}"
+            );
+        }
+
+        assert!(traversal_start_matches(
+            "sysload::init",
+            "src/sysload/mod.rs::init",
+            "src/sysload/mod.rs"
+        ));
+        assert!(traversal_start_matches(
+            "panel::render",
+            "src/ui/panel/index.ts::render",
+            "src/ui/panel/index.ts"
+        ));
+        assert!(traversal_start_matches(
+            "auth::login",
+            "pkg/auth/__init__.py::login",
+            "pkg/auth/__init__.py"
+        ));
+
+        for bad in [
+            "other::snapshot",
+            "Other::dump",
+            "other.rs::Ring::dump",
+            "::snapshot",
+            "webcontent::",
+            "webcontent::::snapshot",
+        ] {
+            assert!(
+                !traversal_start_matches(bad, fn_node, file),
+                "expected {bad:?} not to match {fn_node:?}"
+            );
+            assert!(
+                !traversal_start_matches(bad, method_node, file),
+                "expected {bad:?} not to match {method_node:?}"
+            );
+        }
     }
 }

@@ -6,7 +6,12 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", test))]
-const LABEL: &str = "com.gitpulse.hygiene";
+const LABEL: &str = "dev.vbcr.gitpulse.hygiene";
+/// The label before the VBCR Dev rename. An agent still registered under it
+/// would start the cleaner beside the new one, so it is retired when the new
+/// agent is written, and on every disable.
+#[cfg(any(target_os = "macos", test))]
+const LEGACY_LABEL: &str = "com.gitpulse.hygiene";
 #[cfg(any(target_os = "macos", test))]
 const OWNER: &str = "<!-- GitPulse repository hygiene v1 -->";
 
@@ -42,10 +47,16 @@ fn plist(executable: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;");
-    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{OWNER}\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array><string>{escaped}</string><string>--cleaner-due</string></array>\n<key>StartInterval</key><integer>60</integer>\n<key>RunAtLoad</key><true/>\n<key>ProcessType</key><string>Background</string>\n</dict></plist>\n")
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{OWNER}\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array><string>{escaped}</string><string>--cleaner-due</string></array>\n<key>StartInterval</key><integer>60</integer>\n<key>RunAtLoad</key><true/>\n<key>ProcessType</key><string>Background</string>\n</dict></plist>\n"
+    )
 }
 #[cfg(any(target_os = "macos", test))]
 fn owned(path: &Path) -> Result<bool, CommandError> {
+    owned_as(path, LABEL)
+}
+#[cfg(any(target_os = "macos", test))]
+fn owned_as(path: &Path, label: &str) -> Result<bool, CommandError> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.to_string().into()),
@@ -63,7 +74,7 @@ fn owned(path: &Path) -> Result<bool, CommandError> {
                 .map_err(|e| e.to_string())?;
             if text.len() > 16384
                 || !text.contains(OWNER)
-                || !text.contains(&format!("<string>{LABEL}</string>"))
+                || !text.contains(&format!("<string>{label}</string>"))
             {
                 return Err("Existing LaunchAgent is not owned by GitPulse; preserved it".into());
             }
@@ -73,6 +84,10 @@ fn owned(path: &Path) -> Result<bool, CommandError> {
 }
 #[cfg(target_os = "macos")]
 fn location() -> Result<PathBuf, CommandError> {
+    location_of(LABEL)
+}
+#[cfg(target_os = "macos")]
+fn location_of(label: &str) -> Result<PathBuf, CommandError> {
     let home = std::env::var_os("HOME").ok_or("Home directory unavailable")?;
     let home = PathBuf::from(home);
     if !home.is_absolute() {
@@ -81,7 +96,54 @@ fn location() -> Result<PathBuf, CommandError> {
     super::tree::no_symlinks(&home)?;
     Ok(home
         .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist")))
+        .join(format!("{label}.plist")))
+}
+/// Stops and removes the agent registered under [`LEGACY_LABEL`], if GitPulse
+/// wrote it. Returns whether there was one. Same rules as [`configure_at`]:
+/// a file that is not GitPulse's is preserved.
+#[cfg(any(target_os = "macos", test))]
+fn retire_legacy_at(
+    path: &Path,
+    domain: &str,
+    mut launch: impl FnMut(&[&str]) -> Result<bool, CommandError>,
+) -> Result<bool, CommandError> {
+    // A file at the old name that GitPulse did not write (or cannot be read)
+    // is not ours to stop or remove, and is no reason to fail the new agent.
+    if !owned_as(path, LEGACY_LABEL).unwrap_or(false) {
+        return Ok(false);
+    }
+    let target = format!("{domain}/{LEGACY_LABEL}");
+    if launch(&["print", &target])? && !launch(&["bootout", &target])? {
+        return Err("The pre-rename LaunchAgent could not be stopped".into());
+    }
+    if !owned_as(path, LEGACY_LABEL)? {
+        return Err("The pre-rename LaunchAgent changed during removal".into());
+    }
+    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+#[cfg(target_os = "macos")]
+fn launchctl(args: &[&str]) -> Result<bool, CommandError> {
+    let output = crate::engine::process::capture_command(
+        "/bin/launchctl",
+        args,
+        None,
+        std::time::Duration::from_secs(5),
+        &[],
+    )?;
+    if output.success {
+        return Ok(true);
+    }
+    // launchctl identifies an absent service explicitly. Other failures
+    // (permissions, invalid GUI domain, timeout) remain errors.
+    if args.first() == Some(&"print") && output.stderr_text().contains("Could not find service") {
+        return Ok(false);
+    }
+    Err(format!(
+        "launchctl failed: {}",
+        output.stderr_text().chars().take(1024).collect::<String>()
+    )
+    .into())
 }
 /// Re-registers the cleaner when its LaunchAgent starts something other than
 /// the running app (moved, translocated, replaced), and says why when it does
@@ -91,6 +153,16 @@ fn location() -> Result<PathBuf, CommandError> {
 pub fn refresh_if_stale() -> Result<crate::desktop::launch_agent::Registration, CommandError> {
     use crate::desktop::launch_agent::{inspect, is_translocated, Registration};
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    // An agent from before the rename means the user turned closed-app
+    // cleaning on: write the new one first, then retire the old, so a failure
+    // leaves the cleaner running (once or, briefly, twice) and never off.
+    if owned_as(&location_of(LEGACY_LABEL)?, LEGACY_LABEL).unwrap_or(false) {
+        if is_translocated(&current) {
+            return Err("the pre-rename cleaner LaunchAgent is still registered, but this copy runs from a translocated path; move GitPulse to Applications and reopen it".into());
+        }
+        configure(true)?;
+        return Ok(Registration::Current);
+    }
     let path = location()?;
     if !owned(&path)? {
         return Ok(Registration::Absent);
@@ -132,30 +204,12 @@ pub fn configure(enable: bool) -> Result<(), CommandError> {
         };
         // SAFETY: geteuid has no pointers or side effects.
         let domain = format!("gui/{}", unsafe { libc::geteuid() });
-        configure_at(&path, document.as_deref(), &domain, |args| {
-            let output = crate::engine::process::capture_command(
-                "/bin/launchctl",
-                args,
-                None,
-                std::time::Duration::from_secs(5),
-                &[],
-            )?;
-            if output.success {
-                return Ok(true);
-            }
-            // launchctl identifies an absent service explicitly. Other failures
-            // (permissions, invalid GUI domain, timeout) remain errors.
-            if args.first() == Some(&"print")
-                && output.stderr_text().contains("Could not find service")
-            {
-                return Ok(false);
-            }
-            Err(format!(
-                "launchctl failed: {}",
-                output.stderr_text().chars().take(1024).collect::<String>()
-            )
-            .into())
-        })
+        configure_at(&path, document.as_deref(), &domain, launchctl)?;
+        // Enabling or disabling both end with no agent under the old label:
+        // two agents would run the cleaner twice, and a disabled cleaner must
+        // not survive as the old one.
+        retire_legacy_at(&location_of(LEGACY_LABEL)?, &domain, launchctl)?;
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -288,6 +342,84 @@ mod tests {
         assert_eq!(calls, ["print", "bootout"]);
         assert!(!path.exists());
         configure_at(&path, None, "gui/1", |_| panic!("already absent")).unwrap();
+    }
+    /// A plist GitPulse wrote under the pre-rename label.
+    fn legacy_plist(executable: &str) -> String {
+        plist(executable).replace(LABEL, LEGACY_LABEL)
+    }
+    #[test]
+    fn the_label_is_in_the_vbcr_namespace_and_the_old_one_is_still_known() {
+        assert_eq!(LABEL, "dev.vbcr.gitpulse.hygiene");
+        assert_eq!(LEGACY_LABEL, "com.gitpulse.hygiene");
+        assert!(plist("app").contains(&format!("<string>{LABEL}</string>")));
+    }
+    #[test]
+    fn a_loaded_pre_rename_agent_is_stopped_and_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let path = root.join("old.plist");
+        std::fs::write(&path, legacy_plist("app")).unwrap();
+        let mut calls = vec![];
+        let retired = retire_legacy_at(&path, "gui/1", |args| {
+            calls.push(args.join(" "));
+            Ok(true)
+        })
+        .unwrap();
+        assert!(retired);
+        assert_eq!(
+            calls,
+            [
+                format!("print gui/1/{LEGACY_LABEL}"),
+                format!("bootout gui/1/{LEGACY_LABEL}")
+            ]
+        );
+        assert!(!path.exists());
+        // Idempotent: nothing left to retire, and launchctl is not asked.
+        assert!(!retire_legacy_at(&path, "gui/1", |_| panic!("already gone")).unwrap());
+    }
+    #[test]
+    fn an_unloaded_pre_rename_agent_is_just_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let path = root.join("old.plist");
+        std::fs::write(&path, legacy_plist("app")).unwrap();
+        let mut calls = vec![];
+        assert!(retire_legacy_at(&path, "gui/1", |args| {
+            calls.push(args[0].to_string());
+            Ok(false)
+        })
+        .unwrap());
+        assert_eq!(calls, ["print"]);
+        assert!(!path.exists());
+    }
+    #[test]
+    fn a_pre_rename_agent_that_cannot_be_stopped_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let path = root.join("old.plist");
+        std::fs::write(&path, legacy_plist("app")).unwrap();
+        // `launchctl bootout` failing surfaces as an error, as in `configure`.
+        assert!(retire_legacy_at(&path, "gui/1", |args| {
+            if args[0] == "bootout" {
+                Err("launchctl failed".into())
+            } else {
+                Ok(true)
+            }
+        })
+        .is_err());
+        assert!(path.exists(), "a running agent must keep its plist");
+    }
+    #[test]
+    fn a_file_at_the_old_name_that_is_not_gitpulses_is_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let path = root.join("old.plist");
+        std::fs::write(&path, "foreign").unwrap();
+        assert!(!retire_legacy_at(&path, "gui/1", |_| panic!("foreign job")).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foreign");
+        // The new agent's own label is not the old one's.
+        std::fs::write(&path, plist("app")).unwrap();
+        assert!(!retire_legacy_at(&path, "gui/1", |_| panic!("not the old label")).unwrap());
     }
     #[test]
     fn debug_executables_and_foreign_loaded_labels_cannot_be_scheduled() {

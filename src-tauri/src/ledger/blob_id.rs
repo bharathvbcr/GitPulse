@@ -15,7 +15,9 @@
 //! SHA-1 crate, so it is written out; the tests pin it to the published vectors
 //! and to a real `git hash-object --stdin` in both object formats.
 
+use crate::storage::repo_tuning::index_file::repo_hash_len;
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 /// The two names one string has: its blob id in a SHA-1 repository and in a
 /// SHA-256 repository. They differ in length (40 and 64 hex digits), so one
@@ -37,6 +39,62 @@ impl BlobIds {
             sha256: hex(&Sha256::digest(&framed)),
         }
     }
+}
+
+/// The blob id `git hash-object --stdin` would print for `content` in the
+/// repository checked out at `repo`, or `None` when this process cannot tell
+/// which object format that repository uses.
+///
+/// The object format is read, not guessed: `extensions.objectFormat` from the
+/// config of the repository's common directory, the one place Git itself reads
+/// it (a linked worktree reaches it through its `commondir` file; no key means
+/// SHA-1). The reader is [`repo_hash_len`], shared with the repository-tuning
+/// scan. Anything short of a definite answer is `None`: no `.git`, a
+/// `gitdir:` or `commondir` pointer that is unreadable, empty or points at
+/// nothing, an unreadable config or an unknown format value. The caller then
+/// asks Git, so a doubt falls toward the authority and never toward a key of
+/// the wrong length.
+pub(super) fn blob_id_in_repo(repo: &Path, content: &[u8]) -> Option<String> {
+    let common = common_dir_of(repo)?;
+    let ids = BlobIds::of(content);
+    match repo_hash_len(&common)? {
+        20 => Some(ids.sha1),
+        32 => Some(ids.sha256),
+        _ => None,
+    }
+}
+
+/// The common directory of the checkout at `repo`: its `.git` directory, or
+/// for a linked worktree (whose `.git` is a `gitdir:` file) the directory its
+/// `commondir` file names.
+fn common_dir_of(repo: &Path) -> Option<PathBuf> {
+    let dot_git = repo.join(".git");
+    let git_dir = if std::fs::symlink_metadata(&dot_git).ok()?.is_dir() {
+        dot_git
+    } else {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        if target.is_empty() {
+            return None;
+        }
+        repo.join(target)
+    };
+    if !git_dir.is_dir() {
+        return None;
+    }
+    let pointer = git_dir.join("commondir");
+    let common = match std::fs::read_to_string(&pointer) {
+        Ok(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            git_dir.join(text)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir,
+        Err(_) => return None,
+    };
+    common.is_dir().then_some(common)
 }
 
 fn hex(bytes: &[u8]) -> String {

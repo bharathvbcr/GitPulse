@@ -213,6 +213,13 @@ impl TranscriptSource for ClaudeSource {
     }
 
     fn roots(&self) -> SourceRoots {
+        #[cfg(test)]
+        if let Some(path) = super::test_transcript_root::get() {
+            return SourceRoots::one(Some(SourceRoot {
+                path,
+                explicit: true,
+            }));
+        }
         if let Some(path) = std::env::var_os("GITPULSE_TRANSCRIPT_ROOT").filter(|p| !p.is_empty()) {
             return SourceRoots::one(Some(SourceRoot {
                 path: PathBuf::from(path),

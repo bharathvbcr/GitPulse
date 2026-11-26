@@ -570,4 +570,37 @@ describe("TerminalSession bypass prompt and status announcements", () => {
     expect(source).toContain("out:popoverExit");
     expect(source).toContain("takeInitialCommand()");
   });
+
+  it("offers HTML preview and code+preview actions when right-clicking an HTML link, bare HTML cell token, or selected HTML path", () => {
+    expect(source).toContain("isCellInTerminalRange(hoveredLinkRange, pointerCell.row1, pointerCell.col1)");
+    expect(source).toContain("resolveTerminalHtmlCandidate(hoveredAtPointer, workPath, activeCwdSubdir)");
+    expect(source).toContain("resolveTerminalHtmlCandidate(pointerToken, workPath, activeCwdSubdir)");
+    expect(source).toContain("resolveTerminalHtmlCandidate(selected, workPath, activeCwdSubdir)");
+    expect(source).toContain("extractTerminalTokenAtCell(linkBuffer(current), cell.row1, cell.col1)");
+    expect(source).toContain('data-testid="terminal-ctx-html-preview"');
+    expect(source).toContain('data-testid="terminal-ctx-html-split"');
+    expect(source).toContain('data-testid="terminal-ctx-html-code"');
+    // Snapshot the Svelte 5 `{@const}` target before `closeContextMenu` clears `$state`
+    expect(source).toContain("const target = htmlTarget;");
+    expect(source).toContain('openContextHtml(target, "preview"); }, { focusTerminal: false }');
+    expect(source).toContain('openContextHtml(target, "split"); }, { focusTerminal: false }');
+    expect(source).toContain('openContextHtml(target, "code"); }, { focusTerminal: false }');
+    expect(source).toContain("requestHtmlViewMode(workPath, target.path, mode, Date.now(), target.fallbackPath)");
+  });
+
+  it("gives .svg paths Preview hover verb parity and right-click Preview, Code & Preview, and SVG Code actions", () => {
+    expect(source).toContain('(isHtmlFile(action.path) || isSvgFile(action.path)) && action.line === null ? "Preview" : "Open"');
+    expect(source).toContain("resolveTerminalSvgCandidate(hoveredAtPointer, workPath, activeCwdSubdir)");
+    expect(source).toContain("resolveTerminalSvgCandidate(pointerToken, workPath, activeCwdSubdir)");
+    expect(source).toContain("resolveTerminalSvgCandidate(selected, workPath, activeCwdSubdir)");
+    expect(source).toContain('data-testid="terminal-ctx-svg-preview"');
+    expect(source).toContain('data-testid="terminal-ctx-svg-split"');
+    expect(source).toContain('data-testid="terminal-ctx-svg-code"');
+    // Snapshot the Svelte 5 `{@const}` target before `closeContextMenu` clears `$state`
+    expect(source).toContain("const target = svgTarget;");
+    expect(source).toContain('openContextSvg(target, "preview"); }, { focusTerminal: false }');
+    expect(source).toContain('openContextSvg(target, "split"); }, { focusTerminal: false }');
+    expect(source).toContain('openContextSvg(target, "code"); }, { focusTerminal: false }');
+    expect(source).toContain("requestSvgViewMode(workPath, target.path, mode, Date.now(), target.fallbackPath)");
+  });
 });

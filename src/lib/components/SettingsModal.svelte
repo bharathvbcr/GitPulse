@@ -77,6 +77,7 @@
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
   import ManviConnection from "./ManviConnection.svelte";
   import LocalModelServers from "./LocalModelServers.svelte";
+  import ManviStewardSettings from "./ManviStewardSettings.svelte";
   import { harnessStore } from "../stores/harnessStore";
   import {
     MANVI_FOCUS_TARGETS,
@@ -92,9 +93,11 @@
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
   import HostLoadSetting from "./HostLoadSetting.svelte";
+  import IdleMemorySetting from "./IdleMemorySetting.svelte";
   import HostLoadInputSetting from "./HostLoadInputSetting.svelte";
   import HostLoadDiskGuardSetting from "./HostLoadDiskGuardSetting.svelte";
   import WatchScopeSetting from "./WatchScopeSetting.svelte";
+  import { EDITOR_CHOICES } from "../desktop/editorChoice";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -1046,7 +1049,7 @@
                   </div>
                   </section>
 
-                  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["tab-width"])}>
+                  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["tab-width", "preferred-editor"])}>
                     <h3 class="gp-label">Code display</h3>
                   <div data-setting="tab-width" hidden={!shown("tab-width")}>
                     <div class="text-textPrimary text-meta font-medium mb-2">Tab width</div>
@@ -1061,6 +1064,20 @@
                       Columns a literal tab advances to, in the diff, the file viewer,
                       blame and the conflict editor. Display only — GitPulse never
                       rewrites the bytes in the file.
+                    </p>
+                  </div>
+                  <div data-setting="preferred-editor" hidden={!shown("preferred-editor")}>
+                    <div class="text-textPrimary text-meta font-medium mb-2">External editor</div>
+                    <SettingSegment
+                      ariaLabel="External editor"
+                      options={EDITOR_CHOICES}
+                      value={$interfaceStore.preferredEditor}
+                      onselect={(editor) => interfaceStore.setPreferredEditor(editor)}
+                    />
+                    <p class="text-textMuted text-micro mt-1.5">
+                      Where Open in editor sends a file, at the selected line when there is
+                      one. Auto takes the first installed of VS Code, Antigravity IDE, Cursor and Zed; a
+                      named editor that is not installed is an error, never a substitute.
                     </p>
                   </div>
                   </section>
@@ -1165,6 +1182,9 @@
                 <div data-setting="local-model-servers" hidden={!shown("local-model-servers")}>
                   <LocalModelServers />
                 </div>
+                <div data-setting="manvi-steward" hidden={!shown("manvi-steward")}>
+                  <ManviStewardSettings active={isOpen && activeSection === "agents"} repoPath={$repoStore.currentPath} />
+                </div>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["apple-intelligence"])}>
                   <h3 class="gp-label">Apple Intelligence</h3>
                   <div data-setting="apple-intelligence" hidden={!shown("apple-intelligence")}>
@@ -1205,6 +1225,11 @@
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["host-load"])}>
                   <div data-setting="host-load" hidden={!shown("host-load")}>
                     <HostLoadSetting active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["idle-memory"])}>
+                  <div data-setting="idle-memory" hidden={!shown("idle-memory")}>
+                    <IdleMemorySetting active={isOpen && activeSection === "agents"} />
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-4" hidden={!any(HOST_LOAD_INPUT_ROWS)}>

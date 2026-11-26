@@ -1,5 +1,11 @@
+<script lang="ts" module>
+  export type ImageDiffCanvas = "light" | "dark" | "grid";
+</script>
+
 <script lang="ts">
-  import { Image, TriangleAlert } from "@lucide/svelte";
+  import { Grid3x3, Image, Moon, Sun, TriangleAlert } from "@lucide/svelte";
+  import { themeStore } from "../stores/themeStore";
+  import { isSvgFile } from "../files/svgPreview";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
 
@@ -22,6 +28,8 @@
     error = null,
     oldError = null,
     newError = null,
+    canvas = undefined,
+    onCanvasChange,
     onRetry,
   }: {
     filePath?: string;
@@ -31,6 +39,8 @@
     error?: string | null;
     oldError?: string | null;
     newError?: string | null;
+    canvas?: ImageDiffCanvas;
+    onCanvasChange?: (next: ImageDiffCanvas) => void;
     onRetry?: () => void;
   } = $props();
 
@@ -40,36 +50,94 @@
   let mode: "2up" | "swipe" | "onion" = $state("swipe");
   let swipePosition = $state(50);
   let opacity = $state(50);
+  let localCanvas = $state<ImageDiffCanvas | null>(null);
+
+  const activeCanvas = $derived<ImageDiffCanvas>(
+    canvas ?? localCanvas ?? ($themeStore === "dark" ? "dark" : "light"),
+  );
+  const stageSurfaceAttr = $derived(
+    activeCanvas === "grid" ? ($themeStore === "dark" ? "dark-grid" : "grid") : activeCanvas,
+  );
+  const isSvgDiff = $derived(
+    isSvgFile(filePath) ||
+      Boolean(oldSrc?.startsWith("data:image/svg+xml")) ||
+      Boolean(newSrc?.startsWith("data:image/svg+xml")),
+  );
+
+  function selectCanvas(next: ImageDiffCanvas) {
+    localCanvas = next;
+    onCanvasChange?.(next);
+  }
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans select-none overflow-hidden">
-  <div class="gp-header justify-between">
+  <div class="gp-header justify-between gap-2">
     <div class="flex items-center gap-2 min-w-0">
       <Image size={15} class="text-accent shrink-0" />
       <span class="font-medium text-textPrimary truncate">{filePath}</span>
     </div>
-    <div class="gp-segmented" role="group" aria-label="Image comparison mode">
-      <button
-        type="button"
-        onclick={() => (mode = "2up")}
-        aria-pressed={mode === "2up"}
-        data-active={mode === "2up" ? "true" : "false"}
-        class="gp-seg-btn"
-      >2-up</button>
-      <button
-        type="button"
-        onclick={() => (mode = "swipe")}
-        aria-pressed={mode === "swipe"}
-        data-active={mode === "swipe" ? "true" : "false"}
-        class="gp-seg-btn"
-      >Swipe</button>
-      <button
-        type="button"
-        onclick={() => (mode = "onion")}
-        aria-pressed={mode === "onion"}
-        data-active={mode === "onion" ? "true" : "false"}
-        class="gp-seg-btn"
-      >Onion skin</button>
+    <div class="flex items-center gap-2 shrink-0">
+      <div class="flex items-center rounded-full border border-edge bg-surface p-0.5 gap-0.5" role="group" aria-label="Image canvas surface">
+        <button
+          type="button"
+          onclick={() => selectCanvas("light")}
+          aria-pressed={activeCanvas === "light"}
+          aria-label="Light image canvas"
+          title="Light canvas"
+          data-testid="image-diff-canvas-light"
+          class="gp-icon-btn {activeCanvas === 'light' ? 'text-accent bg-accent/15' : ''}"
+          data-size="sm"
+        >
+          <Sun size={11} />
+        </button>
+        <button
+          type="button"
+          onclick={() => selectCanvas("dark")}
+          aria-pressed={activeCanvas === "dark"}
+          aria-label="Dark image canvas"
+          title="Dark canvas"
+          data-testid="image-diff-canvas-dark"
+          class="gp-icon-btn {activeCanvas === 'dark' ? 'text-accent bg-accent/15' : ''}"
+          data-size="sm"
+        >
+          <Moon size={11} />
+        </button>
+        <button
+          type="button"
+          onclick={() => selectCanvas("grid")}
+          aria-pressed={activeCanvas === "grid"}
+          aria-label="Transparency grid canvas"
+          title="Transparency grid canvas"
+          data-testid="image-diff-canvas-grid"
+          class="gp-icon-btn {activeCanvas === 'grid' ? 'text-accent bg-accent/15' : ''}"
+          data-size="sm"
+        >
+          <Grid3x3 size={11} />
+        </button>
+      </div>
+      <div class="gp-segmented" role="group" aria-label="Image comparison mode">
+        <button
+          type="button"
+          onclick={() => (mode = "2up")}
+          aria-pressed={mode === "2up"}
+          data-active={mode === "2up" ? "true" : "false"}
+          class="gp-seg-btn"
+        >2-up</button>
+        <button
+          type="button"
+          onclick={() => (mode = "swipe")}
+          aria-pressed={mode === "swipe"}
+          data-active={mode === "swipe" ? "true" : "false"}
+          class="gp-seg-btn"
+        >Swipe</button>
+        <button
+          type="button"
+          onclick={() => (mode = "onion")}
+          aria-pressed={mode === "onion"}
+          data-active={mode === "onion" ? "true" : "false"}
+          class="gp-seg-btn"
+        >Onion skin</button>
+      </div>
     </div>
   </div>
 
@@ -82,13 +150,13 @@
         <Skeleton variant="rect" width="20rem" height="20rem" />
         <span>Loading images…</span>
       </div>
-    {:else if status === "failed"}
+    {:else if status === "failed" || (!oldSrc && !newSrc && (newError || oldError))}
       <!-- Couldn't determine, not "nothing exists": the unknown tone. -->
       <div class="gp-notice max-w-sm" data-tone="unknown" role="status">
         <TriangleAlert size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
         <div class="min-w-0 flex-1">
           <p class="font-semibold">Couldn't read this image.</p>
-          <p class="mt-0.5 text-textMuted">{error ?? "The image couldn't be read."}</p>
+          <p class="mt-0.5 text-textMuted">{error ?? newError ?? oldError ?? "The image couldn't be read."}</p>
         </div>
         {#if onRetry}
           <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={onRetry}>Try again</button>
@@ -100,9 +168,16 @@
       <div class="flex gap-8 items-center">
         <div class="flex flex-col items-center gap-2">
           <span class="text-textMuted text-meta">Before (old)</span>
-          <div class="w-64 h-64 bg-surface border border-edge rounded-2xl shadow-card flex items-center justify-center overflow-hidden">
+          <div
+            class="w-64 h-64 image-diff-stage border border-edge rounded-2xl shadow-card flex items-center justify-center overflow-hidden"
+            data-image-canvas={stageSurfaceAttr}
+          >
             {#if oldSrc}
-              <img src={oldSrc} alt={`Before version of ${filePath}`} class="max-w-full max-h-full object-contain" />
+              <img
+                src={oldSrc}
+                alt={`Before version of ${filePath}`}
+                class={isSvgDiff ? "w-full h-full object-contain p-3" : "max-w-full max-h-full object-contain"}
+              />
             {:else}
               <span class="text-textMuted text-xs">{OLD_ABSENT}</span>
             {/if}
@@ -111,9 +186,16 @@
         </div>
         <div class="flex flex-col items-center gap-2">
           <span class="text-textMuted text-meta">After (new)</span>
-          <div class="w-64 h-64 bg-surface border border-accent rounded-2xl shadow-card flex items-center justify-center overflow-hidden">
+          <div
+            class="w-64 h-64 image-diff-stage border border-accent rounded-2xl shadow-card flex items-center justify-center overflow-hidden"
+            data-image-canvas={stageSurfaceAttr}
+          >
             {#if newSrc}
-              <img src={newSrc} alt={`After version of ${filePath}`} class="max-w-full max-h-full object-contain" />
+              <img
+                src={newSrc}
+                alt={`After version of ${filePath}`}
+                class={isSvgDiff ? "w-full h-full object-contain p-3" : "max-w-full max-h-full object-contain"}
+              />
             {:else}
               <span class="text-textMuted text-xs">{NEW_ABSENT}</span>
             {/if}
@@ -123,7 +205,10 @@
       </div>
     {:else if mode === "swipe"}
       <div class="flex flex-col items-center gap-4 w-md">
-        <div class="w-80 h-80 bg-surface border border-edge rounded-2xl shadow-card relative overflow-hidden">
+        <div
+          class="w-80 h-80 image-diff-stage border border-edge rounded-2xl shadow-card relative overflow-hidden"
+          data-image-canvas={stageSurfaceAttr}
+        >
           {#if newSrc}
             <img src={newSrc} alt={`After version of ${filePath}`} class="absolute inset-0 w-full h-full object-contain" />
           {/if}
@@ -146,7 +231,10 @@
       </div>
     {:else}
       <div class="flex flex-col items-center gap-4 w-md">
-        <div class="w-80 h-80 bg-surface border border-edge rounded-2xl shadow-card relative overflow-hidden">
+        <div
+          class="w-80 h-80 image-diff-stage border border-edge rounded-2xl shadow-card relative overflow-hidden"
+          data-image-canvas={stageSurfaceAttr}
+        >
           {#if oldSrc}
             <img src={oldSrc} alt={`Before version of ${filePath}`} class="absolute inset-0 w-full h-full object-contain" />
           {/if}
@@ -188,3 +276,44 @@
     </div>
   {/if}
 {/snippet}
+
+<style>
+  .image-diff-stage[data-image-canvas="light"] {
+    color-scheme: light;
+    background-color: Canvas;
+  }
+  .image-diff-stage[data-image-canvas="dark"] {
+    color-scheme: dark;
+    background-color: Canvas;
+  }
+  .image-diff-stage[data-image-canvas="grid"] {
+    color-scheme: light;
+    background-color: Canvas;
+    background-image:
+      linear-gradient(45deg, color-mix(in srgb, CanvasText 9%, transparent) 25%, transparent 25%),
+      linear-gradient(-45deg, color-mix(in srgb, CanvasText 9%, transparent) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, color-mix(in srgb, CanvasText 9%, transparent) 75%),
+      linear-gradient(-45deg, transparent 75%, color-mix(in srgb, CanvasText 9%, transparent) 75%);
+    background-size: 16px 16px;
+    background-position:
+      0 0,
+      0 8px,
+      8px -8px,
+      -8px 0;
+  }
+  .image-diff-stage[data-image-canvas="dark-grid"] {
+    color-scheme: dark;
+    background-color: Canvas;
+    background-image:
+      linear-gradient(45deg, color-mix(in srgb, CanvasText 12%, transparent) 25%, transparent 25%),
+      linear-gradient(-45deg, color-mix(in srgb, CanvasText 12%, transparent) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, color-mix(in srgb, CanvasText 12%, transparent) 75%),
+      linear-gradient(-45deg, transparent 75%, color-mix(in srgb, CanvasText 12%, transparent) 75%);
+    background-size: 16px 16px;
+    background-position:
+      0 0,
+      0 8px,
+      8px -8px,
+      -8px 0;
+  }
+</style>

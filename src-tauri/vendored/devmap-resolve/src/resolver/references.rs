@@ -341,6 +341,79 @@ impl Resolver {
                 },
             ));
         }
+        // JS/TS: a member of a module-scope const object (spread, alias,
+        // forwarding, inline) or a factory-returned object referenced as a
+        // value (e.g. `onclick={interfaceStore.resetZoom}`), matching call
+        // ladder rung 2a''.
+        if family == LangFamily::JsTs {
+            let first = receiver.split('.').next().unwrap_or(receiver);
+            let first_binding = ext.local_binding_at(reference.span.start_byte, first);
+            let exact_binding = if first == receiver {
+                binding.or(first_binding)
+            } else {
+                binding.filter(|b| b.name == receiver)
+            };
+            let shadowed = first_binding.is_some()
+                || exact_binding.is_some()
+                || reference
+                    .enclosing_symbol
+                    .as_deref()
+                    .is_some_and(|scope| self.scope_declares_local(&ext.file_path, scope, first));
+            let chained_call = Self::is_chained_factory_receiver(ext, &reference.span, receiver);
+            let answer = if !shadowed {
+                let use_at = reference
+                    .enclosing_symbol
+                    .is_none()
+                    .then_some(reference.span.start_byte);
+                match self.object_member_target(&ext.file_path, receiver, name, use_at) {
+                    jsobjects::ObjectMember::Absent => self.factory_member_target(
+                        &ext.file_path,
+                        reference.enclosing_symbol.as_deref(),
+                        receiver,
+                        None,
+                        chained_call,
+                        name,
+                    ),
+                    decided => decided,
+                }
+            } else if exact_binding.is_some() {
+                self.factory_member_target(
+                    &ext.file_path,
+                    reference.enclosing_symbol.as_deref(),
+                    receiver,
+                    exact_binding,
+                    false,
+                    name,
+                )
+            } else {
+                jsobjects::ObjectMember::Absent
+            };
+            match answer {
+                jsobjects::ObjectMember::Bound(target_file, target_symbol) => {
+                    let resolution = if target_file == ext.file_path {
+                        Resolution::SameFile {
+                            target_symbol: target_symbol.clone(),
+                            target_file: target_file.clone(),
+                        }
+                    } else {
+                        Resolution::ImportScoped {
+                            target_symbol: target_symbol.clone(),
+                            target_file: target_file.clone(),
+                            imported_from: receiver.to_string(),
+                        }
+                    };
+                    return Some(self.reference_edge(
+                        ext,
+                        &target_file,
+                        &target_symbol,
+                        reference,
+                        resolution,
+                    ));
+                }
+                jsobjects::ObjectMember::Abstain => return None,
+                jsobjects::ObjectMember::Absent => {}
+            }
+        }
         if ext
             .local_binding_at(reference.span.start_byte, receiver)
             .is_some()

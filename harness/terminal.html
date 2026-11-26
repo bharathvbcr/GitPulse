@@ -58,6 +58,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
       // differs between Chromium and WebKit is explained in the verdict's
       // diagnostics rather than by a silently missing row.
       const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [], skipped: [] };
+      let legacySessions = [];
       /** Every `cmd_terminal_resize`: which session was told which grid, in order. */
       const resizeLog = [];
       const showReport = () => document.querySelector("#result").textContent = JSON.stringify(report);
@@ -119,6 +120,8 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             acks.push({ sessionId: args.sessionId, bytes: args.bytes });
             return null;
           case "cmd_terminal_set_title":
+            // A flag-only call (no title) is the protection toggle; the host answers true once it stored it.
+            if (args.protected !== undefined) { (report.protection ??= []).push({ sessionId: args.sessionId, protected: args.protected, titleSent: "title" in args }); return true; }
             return null;
           case "cmd_terminal_session_ledger":
             return { offers: [], reopenable_count: 0, unreadable_count: 0 };
@@ -138,7 +141,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             resizeLog.push({ id: args.sessionId, rows: args.rows, cols: args.cols });
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
-          case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
+          case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; (report.killOrigins ??= []).push({ sessionId: args.sessionId, origin: args.origin ?? null }); showReport(); return null;
           // A tab unmounted without Close: the host keeps the process.
           case "cmd_terminal_detach": {
             const kept = sessions.has(args.sessionId);
@@ -156,6 +159,16 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             const now = Math.floor(Date.now() / 1000);
             return JSON.stringify({ ok: true, item: { kind: "external_terminal", id: "fixture-run", revision: 2, updated_at: 1, task_id: "fixture-task", source_revision: 1, task_title: "Fix the flaky test", repository_id: "repo", provider: "claude", permission_mode: "ask", state: "running", cwd: "/fixture/GitPulse", created_at: now, expires_at: now + 300, session_id: "fixture-task-session", exit_code: null, reason: "", outcome_uncertain: false } });
           }
+          // Sessions an earlier GitPulse version's host still runs: listed, stoppable, readable; never attachable.
+          case "cmd_terminal_legacy_hosts":
+            return legacySessions.length === 0 ? [] : [{ protocol: 4, socket: "/fixture/ptyd-4.sock", status: { state: "listed", info: { protocol: 4, build: "0.9.0", pid: 4242, sessions: legacySessions.length }, sessions: legacySessions } }];
+          case "cmd_terminal_legacy_kill":
+            (report.legacyKills ??= []).push({ protocol: args.protocol, sessionId: args.sessionId });
+            legacySessions = legacySessions.filter((row) => row.id !== args.sessionId);
+            return null;
+          case "cmd_terminal_legacy_transcript":
+            (report.legacyReads ??= []).push({ protocol: args.protocol, sessionId: args.sessionId, redact: args.redact });
+            return { state: "found", data_b64: btoa("legacy output marker\n"), bytes: 21, retained: 21, truncated: false, rotated: false, clipped: false, gap_markers: 0, unrecorded_bytes: 0, redacted: true, live: true, settled: true, recording_error: null, run_id: null };
           case "cmd_terminal_sessions":
             // The host's own sessions as it lists them, plus one a reload left.
             return [
@@ -210,7 +223,10 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           // Repository logos: GitPulse ships an icon, Other has none, so the
           // session list draws one logo and one set of initials.
           case "cmd_list_repo_files": return args?.repoPath === "/fixture/GitPulse" ? ["src-tauri/icons/128x128.png", "src/lib.ts", "src/main.ts"] : ["src/main.ts"];
-          case "cmd_get_file_blob": if (String(args?.filePath).endsWith(".png")) return { path: args.filePath, is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 }; return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
+          case "cmd_get_file_blob":
+            if (String(args?.filePath).endsWith(".png")) return { path: args.filePath, is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 };
+            if (String(args?.filePath).endsWith(".svg")) return { path: args.filePath, is_binary: false, is_image: true, mime: "image/svg+xml", text: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="12" fill="currentColor"/></svg>', base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture-svg" };
+            return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
       }, { shouldMockEvents: true });
@@ -483,6 +499,89 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           check("the viewer reports the revealed line as selected",
             () => visible("[data-code-host]")[0].textContent.includes("Ln 240"));
           repoStore.selectFilePath(null); await wait();
+
+          // ---- SVG link hover parity & viewport right-click context menu (including proximity precedence over HTML selection)
+          {
+            for (const id of sessions.keys()) {
+              await output(id, "\r\nSVG assets: public/gitpulse-mark.svg badge.svg docs/demo.html\r\n");
+            }
+            await wait(300);
+            await hover("public/gitpulse-mark.svg", 4);
+            check("hovering a .svg path in terminal shows Preview hover verb",
+              () => footer().includes("Preview public/gitpulse-mark.svg beside terminal"));
+
+            // Select docs/demo.html via mouse drag, then right-click directly on bare badge.svg:
+            // pointer proximity MUST target badge.svg rather than the selected HTML path.
+            const htmlStart = pointAt("docs/demo.html", 0);
+            const htmlEnd = pointAt("docs/demo.html", "docs/demo.html".length - 1);
+            await mouse("mousedown", htmlStart, { button: 0, buttons: 1 });
+            await mouse("mousemove", htmlEnd, { button: 0, buttons: 1 });
+            await mouse("mouseup", htmlEnd, { button: 0, buttons: 0 });
+            await wait(120);
+
+            const badgePt = pointAt("badge.svg", 2);
+            const termScreen = visible(".xterm-screen")[0];
+            termScreen.dispatchEvent(new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              button: 2,
+              clientX: badgePt.clientX,
+              clientY: badgePt.clientY,
+            }));
+            await wait(150);
+            const svgCtxMenu = visible('[data-testid="terminal-viewport-context-menu"]')[0];
+            const hasSvgItems = Boolean(
+              svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-preview"]') &&
+              svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-split"]') &&
+              svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-code"]') &&
+              !svgCtxMenu?.querySelector('[data-testid="terminal-ctx-html-preview"]') &&
+              svgCtxMenu.textContent.includes("badge.svg")
+            );
+            check("right-clicking bare badge.svg offers SVG Preview/Split/Code actions even while an HTML path is selected",
+              () => hasSvgItems);
+
+            svgCtxMenu?.querySelector('[data-testid="terminal-ctx-svg-split"]')?.click();
+            {
+              const deadline = performance.now() + 3000;
+              while (performance.now() < deadline) {
+                const img = filePane()?.querySelector('[data-testid="svg-preview-img"]');
+                if (
+                  filePane()?.querySelector('[data-testid="svg-preview-viewer"]') &&
+                  filePane()?.querySelector("[data-svg-split-code]") &&
+                  img?.complete &&
+                  img.naturalWidth > 0
+                ) break;
+                await wait(50);
+              }
+            }
+            const svgImg = filePane()?.querySelector('[data-testid="svg-preview-img"]');
+            // Probe an unstyled detached Image so WebKitGTK 2.50.4's SVGImageForContainer
+            // layout sizing does not mask the decoded SVG's true intrinsic 32x32 size.
+            const svgIntrinsic = svgImg?.getAttribute("src")
+              ? await new Promise((resolve) => {
+                  const probe = new Image();
+                  probe.onload = () => resolve({ w: probe.naturalWidth, h: probe.naturalHeight });
+                  probe.onerror = () => resolve({ w: 0, h: 0 });
+                  probe.src = svgImg.getAttribute("src");
+                })
+              : { w: 0, h: 0 };
+            const svgSplitOpened = Boolean(
+              filePane()?.querySelector('[data-testid="svg-preview-viewer"]') &&
+              filePane()?.querySelector("[data-svg-split-code]") &&
+              svgImg?.complete &&
+              svgImg.naturalWidth > 0 &&
+              svgIntrinsic.w === 32 &&
+              svgIntrinsic.h === 32
+            );
+            check("clicking Open Code & Preview from terminal SVG context menu opens TerminalFilePane in SVG Split mode",
+              () => svgSplitOpened);
+
+            if (filePane()) {
+              const svgPaneTab = document.getElementById(`terminal-tab-${filePane().dataset.terminalFilePane}`);
+              svgPaneTab?.parentElement?.querySelector('button[aria-label^="Close "]')?.click();
+              await wait(400);
+            }
+          }
 
           check("linkification writes nothing to the shell", () => report.writes === writesBefore);
 
@@ -1287,6 +1386,42 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           const tabCount = visible('[role="tab"]').length;
           await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
           check("close chord kills only its session", () => visible('[role="tab"]').length === tabCount - 1 && report.killed === 1);
+          check("a single tab's close sends the tab_close origin", () => report.killOrigins.length === 1 && report.killOrigins[0].origin === "tab_close");
+          {
+            // Protection: a protected tab is skipped (named, never killed) by a batch close, and the
+            // same batch with the flag removed closes it with the batch_close origin.
+            const tabCards = () => visible('[role="tab"]').map((el) => el.closest("[data-terminal-tab]"));
+            const openTabMenu = async (card) => {
+              const box = card.getBoundingClientRect();
+              card.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: box.left + 8, clientY: box.bottom - 2 }));
+              return waitFor(() => visible('[data-testid="terminal-tab-context-menu"]')[0]);
+            };
+            const cards = tabCards();
+            const lastCard = cards.at(-1), anchorCard = cards.at(-2);
+            const lastId = lastCard.querySelector('[role="tab"]').id.replace("terminal-tab-", "");
+            const tabsBeforeProtect = cards.length;
+            const killsBeforeProtect = report.killed;
+            let menu = await openTabMenu(lastCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-protect"]')?.click();
+            await waitFor(() => lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]'));
+            check("Protect from Batch Close sends the flag alone, without touching the title", () =>
+              report.protection?.length === 1 && report.protection[0].protected === true && report.protection[0].titleSent === false);
+            check("a protected tab shows its lock", () => Boolean(lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]')));
+            menu = await openTabMenu(anchorCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-close-right"]')?.click();
+            const notice = await waitFor(() => visible('[data-testid="terminal-protection-notice"]')[0]);
+            await wait(200);
+            check("a batch close leaves a protected tab running and names it", () =>
+              report.killed === killsBeforeProtect && visible('[role="tab"]').length === tabsBeforeProtect && Boolean(notice) && notice.textContent.includes("protected from batch close"));
+            menu = await openTabMenu(lastCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-protect"]')?.click();
+            await waitFor(() => !lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]'));
+            menu = await openTabMenu(anchorCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-close-right"]')?.click();
+            await waitFor(() => visible('[role="tab"]').length === tabsBeforeProtect - 1);
+            check("with the protection removed the same batch closes it, as batch_close", () =>
+              report.killed === killsBeforeProtect + 1 && report.killOrigins.at(-1).origin === "batch_close" && report.killOrigins.at(-1).sessionId !== undefined && lastId !== "");
+          }
           // A shell tab opened beside another starts where that shell is.
           contextDir = "src/lib";
           const spawnsBeforeHere = report.spawned;
@@ -1416,6 +1551,28 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             while (performance.now() < listedDeadline && !kept()) await wait(20);
             check("the kept session is listed under Sessions, where it can be shown or stopped", kept);
             contextBusy = false;
+            {
+              // An earlier version's host still runs a session: shown apart, stopped and read through its own commands.
+              legacySessions = [{ id: "term-9-z", program: "/bin/zsh", cwd: "/fixture/Old", repo: "/fixture/Old", launcher: null, run_id: null, title: "old build", parent_session_id: null, detached: true, ending: false, quiet_ms: 5 }];
+              const killsBeforeLegacy = report.killOrigins.length;
+              await dockMenu("terminal-session-count"); await wait(80);
+              await dockMenu("terminal-session-count");
+              const legacyRegion = await waitFor(() => visible('[data-testid="legacy-sessions"]')[0]);
+              check("a session in the previous version's host is listed apart, as not shown here", () =>
+                Boolean(legacyRegion) && legacyRegion.textContent.includes("previous GitPulse version's terminal host") && legacyRegion.textContent.includes("old build"));
+              legacyRegion.querySelector('[data-testid="legacy-session-output"]')?.click();
+              await waitFor(() => visible('[data-testid="legacy-session-output-view"]')[0]);
+              check("Show output reads it through the legacy command, masked, and shows the text", () =>
+                report.legacyReads?.[0]?.protocol === 4 && report.legacyReads[0].redact === true && visible('[data-testid="legacy-session-output-view"]')[0].textContent.includes("legacy output marker"));
+              legacyRegion.querySelector('[data-testid="legacy-session-stop"]')?.click();
+              const stopAsked = await waitFor(() => get(promptState));
+              check("Stop asks first, naming the previous host", () => stopAsked?.options.message.includes("previous GitPulse version's terminal host"));
+              completePrompt(true);
+              await waitFor(() => visible('[data-testid="legacy-sessions"]').length === 0);
+              check("Stop goes through the legacy kill with its protocol, and never through cmd_terminal_kill", () =>
+                report.legacyKills?.length === 1 && report.legacyKills[0].protocol === 4 && report.legacyKills[0].sessionId === "term-9-z" && report.killOrigins.length === killsBeforeLegacy);
+              check("a stopped legacy session leaves the list", () => visible('[data-testid="legacy-sessions"]').length === 0);
+            }
           }
           check("no runtime errors", () => report.errors.length === 0);
         } catch (error) {
@@ -1469,6 +1626,45 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           await wait(150);
           check("a paste carrying a bracket terminator asks, and declining sends nothing",
             () => Boolean(injectAsk?.options.message.includes("ends a paste early")) && written.join("") === "");
+          // Text sent to an agent from outside the panel (the Code page's ⌘L): the panel
+          // claims the request and types it into the live session, unsubmitted, or says why not.
+          {
+            const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+            const repo = "/fixture/GitPulse";
+            written = [];
+            const sent = await terminalLaunchRequests.requestReference(repo, "@src/main.ts#L1-L2 ", repo).then(() => null, (error) => error.message);
+            await wait(150);
+            check(`a reference request is claimed and typed into the live shell, unsubmitted (${sent ?? "ok"})`, () => sent === null && written.join("") === "@src/main.ts#L1-L2 ");
+            written = [];
+            const refused = await terminalLaunchRequests.requestReference(repo, "File: a.ts, lines 1-2\n```\nx\ny\n```", repo).then(() => null, (error) => error.message);
+            await wait(100);
+            check("a block of lines is refused, with the reason, by a shell that is not in bracketed-paste mode, and nothing is typed", () => /bracketed-paste/.test(refused ?? "") && written.join("") === "");
+            // The same block once the shell has asked for bracketed paste: one paste, never typed line by line.
+            const block = "File: a.ts, lines 1-2\n```\nx\ny\n```";
+            await output(lastWriteId, "\u001b[?2004h");
+            await wait(100);
+            written = [];
+            const delivered = await terminalLaunchRequests.requestReference(repo, block, repo).then(() => null, (error) => error.message);
+            await wait(150);
+            check(`with bracketed paste on, the block arrives as one bracketed paste (${delivered ?? "ok"})`, () =>
+              delivered === null && written.join("") === `\u001b[200~${block.replaceAll("\n", "\r")}\u001b[201~`);
+            await output(lastWriteId, "\u001b[?2004l");
+            await wait(100);
+            // The context tray: chip with count and bytes, Insert all types the references, Clear empties it.
+            const { addToTray, trayFor } = await import("../src/lib/terminal/contextTray");
+            addToTray(repo, { checkout: repo, path: "a.ts", startLine: 1, endLine: 3 });
+            addToTray(repo, { checkout: repo, path: "b.ts", startLine: 7, endLine: 7 });
+            const chip = () => document.querySelector('[data-testid="terminal-context-tray"]');
+            for (let waited = 0; !chip() && waited < 3000; waited += 50) await wait(50);
+            check("the terminal header shows the tray's count and byte size", () => Boolean(chip()) && chip().textContent.includes("2 references") && chip().textContent.includes("21 B"));
+            written = [];
+            chip().querySelector('[data-testid="terminal-context-tray-insert"]').click();
+            await wait(150);
+            check("Insert all types the references into the live session, unsubmitted, and keeps the tray", () => written.join("") === "@a.ts#L1-L3 @b.ts#L7 " && trayFor(repo).length === 2);
+            chip().querySelector('[data-testid="terminal-context-tray-clear"]').click();
+            await wait(100);
+            check("Clear empties the tray and removes the chip", () => trayFor(repo).length === 0 && !chip());
+          }
           // Synthetic Backspace plus the insertText WebKit emits after it.
           // The guard must write one DEL and must not forward the line.
           written = [];
@@ -2573,12 +2769,13 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           const explorerAside = await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]')[0]);
           check("G1: toggling File Explorer sidebar docks beside a 2-pane split without forcing a 3rd split pane", () => {
             const panes = visible('[role="tabpanel"]');
-            const tabTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-tab"]');
+            // The open target is the app-wide setting, "auto" by default.
+            const autoTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-auto"]');
             const splitTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-split"]');
             return (
               Boolean(explorerAside) &&
               panes.length === 2 &&
-              tabTarget?.getAttribute("aria-pressed") === "true" &&
+              autoTarget?.getAttribute("aria-pressed") === "true" &&
               Boolean(splitTarget)
             );
           });
@@ -2883,8 +3080,65 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
                 throw new Error(`G5: false Background job shown on generic card: ${genericCard.textContent}`);
               }
               check("G5: TerminalPill hover dropdown renders agent icon, repo logo, repo/worktree, title, and omits false Background job / generic startup titles", () => true);
-              window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
-              await waitFor(() => visible('[data-testid="terminal-pill-menu"]').length === 0);
+
+              // G5b: TerminalPill hover search stays open on pointerleave while focused, filters/highlights agents across checkouts, offers quick-start pills, and Enter / Shift+Enter quick-launch terminals
+              const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests.ts");
+              const quickPills = pillMenu?.querySelectorAll('[data-testid="terminal-pill-quick-launcher"]') ?? [];
+              if (quickPills.length < 6) {
+                throw new Error(`G5b: expected quick-start launcher pills, got ${quickPills.length}`);
+              }
+              const pillSearch = pillMenu?.querySelector('[data-testid="terminal-pill-search"]');
+              if (!(pillSearch instanceof HTMLInputElement)) {
+                throw new Error("G5b: missing terminal-pill-search input");
+              }
+              pillSearch.focus();
+              pillMenu?.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true }));
+              await wait(300);
+              if (visible('[data-testid="terminal-pill-menu"]').length === 0) {
+                throw new Error("G5b: hover menu closed on pointerleave while search input was focused");
+              }
+              const setPillSearch = (next) => {
+                pillSearch.value = next;
+                pillSearch.dispatchEvent(new Event("input", { bubbles: true }));
+              };
+              setPillSearch("sidebar");
+              await waitFor(() => pillMenu?.querySelectorAll('[data-testid="terminal-pill-session"]').length === 1);
+              const matchedCard = pillMenu?.querySelector('[data-testid="terminal-pill-session"]');
+              if (!matchedCard?.textContent?.includes("Improve sidebar navigation")) {
+                throw new Error("G5b: sidebar search did not narrow to matching agent session");
+              }
+              if (!matchedCard?.querySelector("mark")?.textContent?.toLowerCase().includes("sidebar")) {
+                throw new Error(`G5b: expected highlighted <mark> for sidebar match, got ${matchedCard?.innerHTML}`);
+              }
+              setPillSearch("zzzz-no-such-agent");
+              await waitFor(() => pillMenu?.querySelector('[data-testid="terminal-pill-empty"]'));
+              pillSearch.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+              await waitFor(() => pillSearch.value === "" && visible('[data-testid="terminal-pill-menu"]').length > 0);
+              // Shift+Enter launches a new Claude session directly even while matching Claude sessions are listed above it.
+              setPillSearch("claude");
+              await waitFor(() =>
+                (pillMenu?.querySelectorAll('[data-testid="terminal-pill-session"]').length ?? 0) >= 2 &&
+                pillMenu?.querySelector('[data-testid="terminal-pill-launch"]')?.textContent?.includes("New Claude session")
+              );
+              let capturedLaunch = null;
+              const unsubLaunch = terminalLaunchRequests.subscribe((req) => {
+                if (!req) return;
+                const claimed = terminalLaunchRequests.take(req.repoPath);
+                if (claimed) {
+                  capturedLaunch = { repoPath: claimed.repoPath, launcher: claimed.launcher };
+                  claimed.complete();
+                }
+              });
+              try {
+                pillSearch.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", shiftKey: true, bubbles: true, cancelable: true }));
+                await waitFor(() => capturedLaunch !== null && visible('[data-testid="terminal-pill-menu"]').length === 0);
+              } finally {
+                unsubLaunch();
+              }
+              if (capturedLaunch?.launcher !== "claude") {
+                throw new Error(`G5b: expected claude launch on Shift+Enter, got ${JSON.stringify(capturedLaunch)}`);
+              }
+              check("G5b: TerminalPill hover search pins on focus, highlights filtered agents, offers quick-start pills, clears on Esc, and launches via Shift+Enter", () => true);
             } finally {
               await unmountComp(mountedPill);
               claudeHandle.release();
@@ -2908,6 +3162,9 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             sidebarHost.style.cssText = "position:fixed;top:0;left:0;height:520px;z-index:9998;display:flex;";
             document.body.appendChild(sidebarHost);
             const mountedSidebar = mountComp(Sidebar, { target: sidebarHost });
+            // The sidebar's Git | Explorer switch is a tablist with panels of
+            // its own; these checks count the terminal's panes.
+            const terminalPanels = () => visible('[role="tabpanel"]').filter((el) => !sidebarHost.contains(el));
             try {
               const gitViewBtn = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]'));
               const filesViewBtn = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-files"]'));
@@ -2924,7 +3181,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
               mainTsItem?.click();
               mainTsItem?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
               await waitFor(() => visible('[data-terminal-tab] [role="tab"]').some((el) => el.textContent?.includes("main.ts")));
-              const openedStandaloneTab = visible('[role="tabpanel"]').length === 1;
+              const openedStandaloneTab = terminalPanels().length === 1;
               const noDoubleClickErrorToast = getStore(toastStore).filter((t) => t.type === "error").length === errorToastsBefore;
 
               // Open TerminalFilePane's internal ExplorerRail on the non-empty main.ts tab, then dock outer sidebar via SidebarExplorerPane
@@ -2956,11 +3213,11 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
               const sawRailButtons = Boolean(railGitBtn && railFilesBtn);
               const clearedOuterExplorerDockedOnCollapse = getStore(sidebarExplorerDocked) === false;
               railGitBtn?.click();
-              await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-pressed") === "true");
-              const restoredGitView = sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-pressed") === "true";
+              await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-selected") === "true");
+              const restoredGitView = sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-selected") === "true";
 
               if (!syncedOuterExplorerDocked) throw new Error("G8: sidebarExplorerDocked was not true while Sidebar Explorer was open");
-              if (!openedStandaloneTab) throw new Error(`G8: expected 1 standalone tabpanel, got ${visible('[role="tabpanel"]').length}`);
+              if (!openedStandaloneTab) throw new Error(`G8: expected 1 standalone tabpanel, got ${terminalPanels().length}`);
               if (!noDoubleClickErrorToast) throw new Error("G8: double-clicking a file in SidebarExplorerPane triggered an error toast");
               if (!sawInnerExplorerBeforeDock) throw new Error("G8: inner file explorer card did not open before docking");
               if (!autoCollapsedDuplicateTree) throw new Error("G8: duplicate inner file tree did not auto-collapse on dock");
@@ -2980,7 +3237,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
               mainTsTabWrap?.querySelector('button[aria-label^="Close "]')?.click();
               await wait(40);
               visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
-              await waitFor(() => visible('[role="tabpanel"]').length === 2);
+              await waitFor(() => terminalPanels().length === 2);
 
               // G8b: a double-click keeps a file's terminal tab. The next single
               // click on another file opens beside it, and the one after reuses
@@ -3033,7 +3290,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
               visible('[data-testid="terminal-explorer-sidebar-toggle"]')[0]?.click();
               await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 0);
               visible("[data-terminal-tab] [role=\"tab\"]").find((el) => el.textContent?.includes("lib.ts"))?.click();
-              await waitFor(() => visible('[role="tabpanel"]').length === 1);
+              await waitFor(() => terminalPanels().length === 1);
               const innerToggle = await waitFor(() => visible('[role="tabpanel"] [data-testid="terminal-file-pane-explorer-toggle"]')[0]);
               if (visible("[data-terminal-file-explorer-card]").length === 0) innerToggle?.click();
               const innerCard = await waitFor(() => visible("[data-terminal-file-explorer-card]")[0]);
@@ -3045,12 +3302,42 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
               const innerTabsSeen = tabNames().join(" | ");
               for (const name of ["main.ts", "lib.ts", "128x128.png"]) if (hasTab(name)) await closeFileTab(name);
               visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
-              await waitFor(() => visible('[role="tabpanel"]').length === 2);
+              await waitFor(() => terminalPanels().length === 2);
               check(`G8b: double-click keeps a terminal file tab; the next click opens beside it, the one after reuses that preview (sidebar: ${sidebarTabsSeen}; docked: ${dockTabsSeen})`, () =>
                 sidebarKeptBeside && sidebarPreviewReused && dockKeptBeside,
               );
               check(`G8c: a click in a kept pane's own explorer opens beside it instead of replacing the kept file (${innerTabsSeen})`, () =>
                 innerKeptBeside,
+              );
+
+              // G8d: under Auto, a sidebar click goes where the user last worked.
+              // A real pointerdown (a programmatic .click() fires none) inside the
+              // dock makes the terminal that surface, so the file opens as a split;
+              // one inside the page (a stand-in view bar) sends the next to Code.
+              const { repoStore: autoRepoStore } = await import("../src/lib/stores/repoStore.ts");
+              const tabBeforeAuto = getStore(autoRepoStore).activeTab;
+              sidebarNavStore.setView("files");
+              const autoPane = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-explorer-pane"]'));
+              autoPane?.querySelector('[data-testid="sidebar-explorer-target-auto"]')?.click();
+              const autoPressed = Boolean(await waitFor(() => autoPane?.querySelector('[data-testid="sidebar-explorer-target-auto"][aria-pressed="true"]')));
+              const dockSurface = document.querySelector("[data-terminal-dock] .xterm-rows") ?? document.querySelector("[data-terminal-dock]");
+              dockSurface?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+              const panelsBeforeAuto = terminalPanels().length;
+              (await waitFor(() => treeItem(autoPane, "main.ts")))?.click();
+              await waitFor(() => terminalPanels().length === panelsBeforeAuto + 1);
+              const autoSplit = terminalPanels().length === panelsBeforeAuto + 1 && getStore(autoRepoStore).activeTab === tabBeforeAuto;
+              const standInPage = document.createElement("div");
+              standInPage.setAttribute("data-viewbar", "");
+              document.body.appendChild(standInPage);
+              standInPage.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+              treeItem(autoPane, "lib.ts")?.click();
+              await waitFor(() => getStore(autoRepoStore).activeTab === "code");
+              const autoCode = terminalPanels().length === panelsBeforeAuto + 1;
+              standInPage.remove();
+              autoRepoStore.setActiveTab(tabBeforeAuto);
+              await closeFileTab("main.ts");
+              check(`G8d: Auto opens a terminal split after the dock was last used, and the Code page after the page was (pressed ${autoPressed}, split ${autoSplit}, code ${autoCode}, panels ${panelsBeforeAuto}->${terminalPanels().length})`, () =>
+                autoPressed && autoSplit && autoCode,
               );
             } finally {
               await unmountComp(mountedSidebar);

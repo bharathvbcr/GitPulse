@@ -38,11 +38,87 @@ esac
 
 input=$(cat) || { say "could not read the hook input"; exit 1; }
 
-# The string value of JSON key $1, only when it holds no escaped character.
-# A value that needs unescaping is not guessed at: the caller refuses it.
+# The top-level string value of JSON key $1, only when it holds no escaped
+# character. Nested objects/arrays are skipped so nested keys cannot shadow
+# top-level fields. A value that needs unescaping is not guessed at: the
+# caller refuses it.
 field() {
-  printf '%s' "$input" | tr '\n' ' ' |
-    sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"\\\\]*\)\".*/\1/p"
+  printf '%s' "$input" | awk -v key="$1" '
+    { s = (NR == 1 ? $0 : s " " $0) }
+    END {
+      n = length(s)
+      depth = 0
+      in_str = 0
+      esc = 0
+      has_esc = 0
+      str_start = 0
+      expect_val_for = 0
+      just_closed_str = 0
+      last_str = ""
+      last_has_esc = 0
+
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (in_str) {
+          if (esc) {
+            esc = 0
+          } else if (c == "\\") {
+            esc = 1
+            has_esc = 1
+          } else if (c == "\"") {
+            in_str = 0
+            val = substr(s, str_start, i - str_start)
+            if (expect_val_for) {
+              if (!has_esc) {
+                print val
+              }
+              exit 0
+            }
+            if (depth == 1) {
+              just_closed_str = 1
+              last_str = val
+              last_has_esc = has_esc
+            }
+          }
+          continue
+        }
+
+        if (c == " " || c == "\t" || c == "\r" || c == "\n") {
+          continue
+        }
+
+        if (just_closed_str) {
+          just_closed_str = 0
+          if (c == ":" && !last_has_esc && last_str == key) {
+            expect_val_for = 1
+            continue
+          }
+        }
+
+        if (expect_val_for) {
+          if (c == "\"") {
+            in_str = 1
+            esc = 0
+            has_esc = 0
+            str_start = i + 1
+            continue
+          }
+          expect_val_for = 0
+        }
+
+        if (c == "\"") {
+          in_str = 1
+          esc = 0
+          has_esc = 0
+          str_start = i + 1
+        } else if (c == "{" || c == "[") {
+          depth++
+        } else if (c == "}" || c == "]") {
+          if (depth > 0) depth--
+        }
+      }
+    }
+  '
 }
 
 # Whether $bin is runnable and lists $event among the subcommands it serves.

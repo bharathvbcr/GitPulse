@@ -93,9 +93,12 @@ mod kotlinloss;
 #[cfg(feature = "parse")]
 mod kotlinsemi;
 // The same-length letter rewrite that lets a bare `&` or `>` of a Svelte
-// template's text parse.
+// template's text parse, and Svelte 5 `{@attach}` attributes.
 #[cfg(feature = "parse")]
 mod sveltetext;
+// Same-length grammar-quirk repairs for TypeScript/TSX, Rust, and Shell.
+#[cfg(feature = "parse")]
+mod parse_repair;
 // Python-only facts (dynamic dispatch). Walks a parse tree; its one caller is
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]

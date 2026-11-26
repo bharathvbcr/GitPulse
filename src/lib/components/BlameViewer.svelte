@@ -39,6 +39,22 @@
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
+  import FindField from "./FindField.svelte";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
+  import { debounce } from "../async/debounce";
+  import { SEARCH_DEBOUNCE_MS } from "../files/searchLimits";
+  import {
+    EMPTY_SEARCH,
+    findMatches,
+    firstMatchFrom,
+    matchLabel,
+    sliceTokensWithMatches,
+    stepMatch,
+    type LineMatchRange,
+  } from "../text/lineSearch";
+  import { goToLineTarget } from "../files/revealRequests";
+  import { extractSelectionSeed } from "../files/fileSearchTarget";
   import { describeFailure } from "../ui/copy/describeFailure";
 
   /** Tallest timeline column, in px. The strip is chrome, not a chart pane. */
@@ -339,6 +355,151 @@
 
   const ROW = $derived(rowHeight("blame", $densityStore));
 
+  let blameRootEl: HTMLDivElement | undefined = $state();
+  let blameSearchOpen = $state(false);
+  let blameSearchMode = $state<"find" | "line">("find");
+  let blameSearchQuery = $state("");
+  let blameDebouncedQuery = $state("");
+  let blameCaseSensitive = $state(false);
+  let blameRegex = $state(false);
+  let blameMatchIdx = $state(0);
+  let highlightedLineNo = $state<number | null>(null);
+  let blameFindFieldRef: ReturnType<typeof FindField> | undefined = $state();
+  let blameSearchInputEl: HTMLInputElement | undefined = $state();
+
+  $effect(() => {
+    void filePath;
+    void atRevision;
+    highlightedLineNo = null;
+  });
+
+  const applyBlameSearch = debounce((q: string) => (blameDebouncedQuery = q), SEARCH_DEBOUNCE_MS);
+  $effect(() => {
+    const next = blameSearchQuery;
+    if (next === "") {
+      applyBlameSearch.cancel();
+      blameDebouncedQuery = "";
+      return;
+    }
+    applyBlameSearch(next);
+  });
+
+  $effect(() => () => applyBlameSearch.cancel());
+
+  const blameSearchResult = $derived(
+    blameSearchOpen && blameDebouncedQuery.trim()
+      ? findMatches(
+          { length: visibleLines.length, at: (i: number) => visibleLines[i]?.content ?? "" },
+          blameDebouncedQuery,
+          { caseSensitive: blameCaseSensitive, regex: blameRegex },
+        )
+      : EMPTY_SEARCH,
+  );
+  const blameMatches = $derived(blameSearchResult.matches);
+
+  function scrollToBlameRow(rowIndex: number) {
+    listScroll = Math.max(0, rowIndex * ROW - 80);
+  }
+
+  function stepBlameMatch(delta: 1 | -1) {
+    const next = stepMatch(blameMatchIdx, blameMatches.length, delta);
+    if (next < 0) return;
+    blameMatchIdx = next;
+    const match = blameMatches[next];
+    if (match) scrollToBlameRow(match.lineIndex);
+  }
+
+  let lastBlameSearchSig = "";
+  $effect(() => {
+    const sig = `${filePath}\u0000${activeLabel ?? ""}\u0000${visibleLines.length}\u0000${blameDebouncedQuery}\u0000${blameCaseSensitive}\u0000${blameRegex}\u0000${blameMatches.length}`;
+    if (sig === lastBlameSearchSig) return;
+    lastBlameSearchSig = sig;
+    if (blameMatches.length === 0) {
+      untrack(() => {
+        blameMatchIdx = 0;
+      });
+      return;
+    }
+    const topRow = Math.max(
+      0,
+      Math.floor(untrack(() => listScroll) / Math.max(1, untrack(() => ROW))),
+    );
+    const anchor = firstMatchFrom(blameMatches, topRow);
+    const nextIdx = anchor < 0 ? 0 : anchor;
+    untrack(() => {
+      blameMatchIdx = nextIdx;
+      const match = blameMatches[nextIdx];
+      if (blameDebouncedQuery.trim().length > 0 && match) {
+        scrollToBlameRow(match.lineIndex);
+      }
+    });
+  });
+
+  const blameMatchesByRow = $derived.by(() => {
+    const map = new Map<number, LineMatchRange[]>();
+    if (!blameSearchOpen || !blameDebouncedQuery.trim()) return map;
+    for (let i = 0; i < blameMatches.length; i += 1) {
+      const m = blameMatches[i];
+      const range: LineMatchRange = {
+        start: m.colStart,
+        end: m.colStart + m.length,
+        active: i === blameMatchIdx,
+      };
+      const bucket = map.get(m.lineIndex);
+      if (bucket) bucket.push(range);
+      else map.set(m.lineIndex, [range]);
+    }
+    return map;
+  });
+
+  function handleBlameGoToLine(value: unknown) {
+    const target = goToLineTarget(value, blameLines.length);
+    if (target === null) return;
+    highlightedLineNo = target;
+    const inFiltered = selection === null || visibleLines.some((line) => line.line_no === target);
+    if (!inFiltered) {
+      selection = null;
+    }
+    const list = inFiltered ? visibleLines : blameLines;
+    const rowIndex = list.findIndex((line) => line.line_no === target);
+    const index = rowIndex >= 0 ? rowIndex : Math.min(target - 1, Math.max(0, list.length - 1));
+    scrollToBlameRow(index);
+  }
+
+  function handleBlameKeydown(e: KeyboardEvent) {
+    if (e.defaultPrevented) return;
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      e.stopPropagation();
+      void blameFindFieldRef?.openFind(extractSelectionSeed(null, blameRootEl));
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "g") {
+      e.preventDefault();
+      e.stopPropagation();
+      void blameFindFieldRef?.openLine();
+      return;
+    }
+    if (e.key === "F3" && !e.metaKey && !e.ctrlKey && !e.altKey && blameSearchOpen && blameMatches.length > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      stepBlameMatch(e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (e.key === "Escape" && blameSearchOpen) {
+      e.preventDefault();
+      e.stopPropagation();
+      blameFindFieldRef?.close();
+    }
+  }
+
+  $effect(() => {
+    const el = blameRootEl;
+    if (!el) return;
+    el.addEventListener("keydown", handleBlameKeydown);
+    return () => el.removeEventListener("keydown", handleBlameKeydown);
+  });
+
   /**
    * The rail maps the list ACTUALLY drawn, not the whole file: under a filter
    * the two are different lists, and a map of the other one points every mark
@@ -395,11 +556,11 @@
   }
 </script>
 
-<div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
+<div bind:this={blameRootEl} class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
-  <div class="px-4 py-2 flex items-center justify-between gap-3 font-sans shrink-0">
-    <div class="flex items-center gap-3 min-w-0">
-      <FileCode size={16} class="text-accent" />
+  <div class="px-4 py-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 font-sans shrink-0">
+    <div class="flex flex-1 items-center gap-3 min-w-0 basis-56">
+      <FileCode size={16} class="text-accent shrink-0" />
       <!-- The file, named rather than typed. Blame is Explorer's other lens
            on the open file and reads the selection its tabs set, so a second
            path box here would be a second way to say the same thing — and the
@@ -454,12 +615,36 @@
       {/if}
     </div>
 
-    <!-- min-w-0, not shrink-0: the summary is the longest string in this row,
-         and a rigid one would push the path it sits beside down to nothing on
-         a narrow pane. Both sides give, and both truncate. -->
-    <div class="flex items-center gap-3 text-meta text-textMuted min-w-0">
+    <!-- min-w-0 + flex-wrap: the summary and find controls wrap beneath the
+         path on a narrow pane rather than squeezing the subject of the pane
+         down to nothing. -->
+    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta text-textMuted min-w-0 max-w-full">
+      {#if filePath}
+        <div class="flex min-w-0 shrink items-center gap-1">
+          <FindField
+            bind:this={blameFindFieldRef}
+            bind:open={blameSearchOpen}
+            bind:mode={blameSearchMode}
+            bind:query={blameSearchQuery}
+            bind:caseSensitive={blameCaseSensitive}
+            bind:regex={blameRegex}
+            bind:input={blameSearchInputEl}
+            registerControl
+            label="Find in blame"
+            placeholder="Find in blame…"
+            shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
+            goToShortcut={shortcutTextLabel("⌘G", $hostPlatform.os)}
+            lineCount={blameLines.length}
+            status={matchLabel(blameSearchResult, blameMatchIdx)}
+            invalid={blameSearchResult.invalid}
+            hasMatches={blameMatches.length > 0}
+            onstep={stepBlameMatch}
+            ongotoline={handleBlameGoToLine}
+          />
+        </div>
+      {/if}
       {#if blameLines.length > 0}
-        <span class="tabular-nums truncate" title="Across the whole file, not just the selected period">
+        <span class="tabular-nums truncate max-w-full" title="Across the whole file, not just the selected period">
           {summary}
         </span>
       {/if}
@@ -468,7 +653,7 @@
           class="flex items-center gap-1 text-warn"
           title="Coverage data couldn't be loaded; hit badges are unavailable."
         >
-          <span class="w-2 h-2 rounded-full bg-warn"></span> Coverage unavailable
+          <span class="w-2 h-2 rounded-full bg-warn shrink-0"></span> Coverage unavailable
         </span>
       {/if}
     </div>
@@ -662,6 +847,11 @@
                    grouping never costs a reader the way back to the commit. -->
               {@const grouped = index > 0 && visibleLines[index - 1]?.commit_id === line.commit_id}
               {@const inHoveredCommit = !uncommitted && hoverCommit === line.commit_id}
+              {@const isTargetLine = highlightedLineNo === line.line_no}
+              {@const rowMatches = blameMatchesByRow.get(index) ?? []}
+              {@const contentSpans = rowMatches.length > 0
+                ? sliceTokensWithMatches(line.content, [{ text: line.content }], rowMatches, (text) => ({ text }))
+                : null}
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <!-- Justified: the pointer handlers activate nothing. They tint
                    the rest of the hovered commit's lines, which a reader who
@@ -678,10 +868,11 @@
                 data-blame-line={line.line_no}
                 data-blame-grouped={grouped ? "true" : undefined}
                 data-blame-block={inHoveredCommit ? "true" : undefined}
+                data-blame-target-line={isTargetLine ? "true" : undefined}
                 class="flex items-center w-full rounded-r-md pl-0.5 pr-1"
                 style:height={`${ROW}px`}
-                style:box-shadow={inHoveredCommit ? "inset 2px 0 0 rgb(var(--c-accent) / 0.7)" : undefined}
-                style:background-color={blameRowTint(line, timeline.nowMs)}
+                style:box-shadow={isTargetLine ? "inset 2px 0 0 rgb(var(--c-accent))" : inHoveredCommit ? "inset 2px 0 0 rgb(var(--c-accent) / 0.7)" : undefined}
+                style:background-color={isTargetLine ? "rgb(var(--c-accent) / 0.14)" : blameRowTint(line, timeline.nowMs)}
                 onmouseenter={() => (hoverCommit = line.commit_id)}
                 onmouseleave={() => (hoverCommit = null)}
               >
@@ -720,7 +911,7 @@
                 >{grouped ? "" : $timestampFormat.text(line.timestamp)}</span>
                 <span class="w-8 px-2 text-right text-faint text-micro select-none shrink-0">{line.line_no}</span>
                 <span class={hitBadgeClass(coverageHits.get(line.line_no))}>{coverageHits.get(line.line_no) ?? "·"}</span>
-                <span class="gp-diff-text px-3 whitespace-pre text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
+                <span class="gp-diff-text px-3 whitespace-pre text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{#if contentSpans}{#each contentSpans as span}<span class={span.match === 'active' ? 'rounded-sm bg-warn text-onWarn' : span.match === 'match' ? 'rounded-sm bg-warn/30' : ''}>{span.text}</span>{/each}{:else}{line.content}{/if}</span>
               </div>
             {/if}
           {/snippet}

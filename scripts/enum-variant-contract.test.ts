@@ -38,6 +38,14 @@ const NO_TS_MIRROR = new Map<string, string>([
     "TranscriptRead",
     "internally tagged enum, not a unit enum; `parseSavedTranscript` in src/lib/terminal/savedTranscript.ts refuses any `state` but the five it knows, pinned by savedTranscript.test.ts and the proto round-trip test",
   ],
+  [
+    "LegacyStatus",
+    "internally tagged enum, not a unit enum; `parseLegacyHosts` in src/lib/terminal/legacySessions.ts reads `state` and turns every state but `listed` into an unlisted host with its reason, pinned by legacySessions.test.ts",
+  ],
+  [
+    "LegacyError",
+    "reaches the frontend only as its Display message in a command's error string; nothing branches on the variant",
+  ],
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
   [
     "SkipReason",
@@ -123,6 +131,10 @@ const NO_TS_MIRROR = new Map<string, string>([
   [
     "CampaignViolation",
     "campaign audit findings (engine/campaign_formal.rs): reported to agents over MCP (`gitpulse_campaign_audit`) and by the gitpulse-worktree CLI; no Tauri command returns them and the frontend has no consumer",
+  ],
+  [
+    "LiveRefreshKind",
+    "devmap live-refresh outcome (devmap/live.rs): reaches agents as `devmap_refresh.kind` in the gitpulse-worktree CLI's JSON answer; no Tauri command returns it and the frontend has no consumer",
   ],
   // Argument-only enums found when this check began reading `Deserialize`
   // enums. Each is a known gap, named rather than fixed here.

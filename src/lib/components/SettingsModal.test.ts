@@ -11,6 +11,7 @@ import { TAB_WIDTHS } from "../ui/codeDisplay";
 import { VIEW_TABS } from "../repos/persist";
 import { viewNavItemFor } from "../views/viewNav";
 import { resetHostPlatformForTests } from "../stores/platformStore";
+import { MANVI_FOCUS_LIST } from "../ui/manviFocus";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "SettingsModal.svelte"),
@@ -455,10 +456,13 @@ describe("SettingsModal category rail keyboard support", () => {
     // the rail was a tablist in name only: eight separate tab stops, none of
     // which answered an arrow key.
     expect(body.match(/tabindex="0"/g) ?? []).toHaveLength(1);
+    const settingsManviAnchors = MANVI_FOCUS_LIST.filter(
+      (target) => target.destination.kind === "settings",
+    ).length;
     expect(body.match(/tabindex="-1"/g) ?? []).toHaveLength(
-      // Every unselected tab, the dialog container itself, and the two Manvi
+      // Every unselected tab, the dialog container itself, and the Settings Manvi
       // card anchors (programmatic focus targets for deep links, not tab stops).
-      SETTINGS_SECTIONS.length - 1 + 1 + 2,
+      SETTINGS_SECTIONS.length - 1 + 1 + settingsManviAnchors,
     );
   });
 
@@ -579,15 +583,25 @@ describe("SettingsModal diff and code panel", () => {
 });
 
 describe("SettingsModal Manvi cards in Agents", () => {
-  it("renders the three cards under their catalog headings inside the agents panel", () => {
+  it("renders the Manvi cards under their catalog headings inside the agents panel", () => {
     const agents = panel(open(), "agents");
-    for (const heading of ["Manvi policy", "Capability boundary", "Local model servers"]) {
+    for (const heading of [
+      "Manvi policy",
+      "Capability boundary",
+      "Local model servers",
+      "Manvi system steward",
+    ]) {
       expect(agents, heading).toContain(heading);
     }
     expect(agents).toContain('data-setting="manvi-policy"');
     expect(agents).toContain('data-setting="local-model-servers"');
+    expect(agents).toContain('data-setting="manvi-steward"');
     expect(agents).toContain('id="manvi-section-harness"');
     expect(agents).toContain('id="manvi-section-model"');
+    expect(agents).toContain('id="manvi-section-steward"');
+    const plateIds = [...agents.matchAll(/id="([^"]*-manvi-plate)"/g)].map((m) => m[1]);
+    expect(plateIds.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(plateIds).size).toBe(plateIds.length);
   });
 
   it("renders the External CLIs panel once, never again inside a Manvi card", () => {
@@ -600,14 +614,17 @@ describe("SettingsModal Manvi cards in Agents", () => {
   });
 
   it("finds the cards by the words a reader would type", () => {
-    for (const query of ["manvi", "policy", "model servers", "capability"]) {
+    for (const query of ["manvi", "policy", "model servers", "capability", "steward"]) {
       const result = matchSettings(query);
-      const hits = result.settings.filter((id) => ["manvi-policy", "local-model-servers"].includes(id));
+      const hits = result.settings.filter((id) =>
+        ["manvi-policy", "local-model-servers", "manvi-steward"].includes(id),
+      );
       expect(hits.length, query).toBeGreaterThan(0);
     }
     expect(matchSettings("model servers").settings).toContain("local-model-servers");
     expect(matchSettings("capability").settings).toContain("manvi-policy");
     expect(matchSettings("policy").settings).toContain("manvi-policy");
+    expect(matchSettings("steward").settings).toContain("manvi-steward");
   });
 });
 

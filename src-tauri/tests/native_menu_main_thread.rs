@@ -351,7 +351,7 @@ fn main() {
 
 fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
     use std::sync::{Arc, Mutex};
-    use tauri::Listener;
+    use tauri::{Listener, Manager};
     let ids = [
         "stage-all",
         "unstage-all",
@@ -379,11 +379,27 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
             active: true,
             ..Default::default()
         });
+    state
+        .agent_requests
+        .push(gitpulse_lib::desktop::state::MenuAgentRequest {
+            id: "term:colon-1".into(),
+            source: "terminal".into(),
+            provider: "claude".into(),
+            agent_label: "Claude".into(),
+            repo_label: "repo".into(),
+            repo_path: Some("/r/with:colon/repo".into()),
+            urgency: "blocking".into(),
+            reason: "Needs your permission".into(),
+            detail: None,
+            at_ms: None,
+        });
     state.enabled.extend(ids.iter().map(|id| id.to_string()));
     set_menu_state(app.handle(), state.clone()).unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&events);
-    let listener = app.listen(gitpulse_lib::desktop::MENU_EVENT, move |event| {
+    // Any target: menu events are broadcast while there is no "main", and
+    // sent to "main" once revealing has built it.
+    let listener = app.listen_any(gitpulse_lib::desktop::MENU_EVENT, move |event| {
         observed
             .lock()
             .unwrap()
@@ -402,14 +418,44 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
         .collect();
     gitpulse_lib::desktop::handle_menu_event(app.handle(), "activate-repo:/r/with:colon/repo");
     expected.push(serde_json::json!({"id":"activate-repo", "path":"/r/with:colon/repo", "repo_path":"/r/with:colon/repo"}));
+    // A status-menu action other than the in-menu ones reveals "main". This
+    // app has no main window yet, so revealing builds one, and the event
+    // waits in the hibernation queue until that page says it is ready, as
+    // the real page does on mount (`cmd_main_ready`).
+    gitpulse_lib::desktop::handle_menu_event(app.handle(), "tray:focus-agent:term:colon-1");
+    let desktop = app.state::<DesktopState>();
+    let hibernation = &desktop.hibernation;
+    assert!(
+        app.get_webview_window("main").is_some(),
+        "revealing built the main window"
+    );
+    assert_eq!(
+        hibernation.pending_len(),
+        1,
+        "the event waits for the page that was just built"
+    );
+    gitpulse_lib::desktop::hibernate::main_ready(app.handle());
+    assert_eq!(
+        hibernation.pending_len(),
+        0,
+        "the ready page drained the queue"
+    );
+    expected.push(serde_json::json!({"id":"focus-agent", "path":"term:colon-1", "repo_path":"/r/with:colon/repo"}));
     assert_eq!(*events.lock().unwrap(), expected);
     state.enabled.retain(|id| id != "stage-all");
+    state.agent_requests.clear();
     set_menu_state(app.handle(), state).unwrap();
     gitpulse_lib::desktop::handle_menu_event(app.handle(), "stage-all");
+    gitpulse_lib::desktop::handle_menu_event(app.handle(), "tray:focus-agent:term:colon-1");
     assert_eq!(
         *events.lock().unwrap(),
         expected,
         "disabled actions must not emit"
+    );
+    assert_eq!(
+        hibernation.pending_len(),
+        0,
+        "nor wait to emit once the page is ready"
     );
     app.unlisten(listener);
     set_menu_state(app.handle(), MenuState::default()).unwrap();
@@ -455,6 +501,90 @@ fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
             "tray:quit"
         ]
     );
+
+    let waiting_agents = MenuState {
+        agents_waiting: 2,
+        agents_running: 1,
+        agent_requests: vec![
+            gitpulse_lib::desktop::state::MenuAgentRequest {
+                id: "req-1".into(),
+                source: "terminal".into(),
+                provider: "claude".into(),
+                agent_label: "Claude & Co".into(),
+                repo_label: "GitPulse".into(),
+                repo_path: Some("/r/gp".into()),
+                urgency: "blocking".into(),
+                reason: "Approve & run".into(),
+                detail: None,
+                at_ms: None,
+            },
+            gitpulse_lib::desktop::state::MenuAgentRequest {
+                id: "req-2".into(),
+                source: "managed".into(),
+                provider: "agy".into(),
+                agent_label: "Antigravity".into(),
+                repo_label: "Manvi".into(),
+                repo_path: Some("/r/manvi".into()),
+                urgency: "error".into(),
+                reason: "Stopped on an error".into(),
+                detail: None,
+                at_ms: None,
+            },
+        ],
+        ..Default::default()
+    };
+    waiting_agents.validate().unwrap();
+    let built = gitpulse_lib::desktop::build_tray_menu(app.handle(), &waiting_agents).unwrap();
+    let items = built.items().unwrap();
+    let waiting_ids: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            item.as_menuitem()
+                .map(|entry| entry.id().as_ref().to_string())
+        })
+        .collect();
+    assert_eq!(
+        waiting_ids,
+        [
+            "tray:show",
+            "tray:focus-agent:req-1",
+            "tray:focus-agent:req-2",
+            "tray:agents",
+            "tray:settings",
+            "tray:quit"
+        ]
+    );
+    let first_req_text = items
+        .iter()
+        .find_map(|item| {
+            item.as_menuitem()
+                .filter(|entry| entry.id().as_ref() == "tray:focus-agent:req-1")
+                .and_then(|entry| entry.text().ok())
+        })
+        .unwrap();
+    let expected_escaped = if cfg!(target_os = "macos") {
+        "Claude & Co · GitPulse — Approve & run"
+    } else {
+        "Claude && Co · GitPulse — Approve && run"
+    };
+    assert_eq!(first_req_text, expected_escaped);
+
+    let agents_disabled = MenuState {
+        agents_running: 1,
+        enabled: Vec::new(),
+        ..Default::default()
+    };
+    let no_double_sep =
+        gitpulse_lib::desktop::build_tray_menu(app.handle(), &agents_disabled).unwrap();
+    let no_double_items = no_double_sep.items().unwrap();
+    assert_eq!(no_double_items.len(), 3);
+    for (item, id) in no_double_items
+        .iter()
+        .zip(["tray:show", "tray:settings", "tray:quit"])
+    {
+        assert_eq!(item.id().as_ref(), id);
+    }
+
     println!(
         "ok   status popover retains an independent native Open, Settings and Quit escape path"
     );

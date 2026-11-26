@@ -354,17 +354,16 @@ fn source_is_writable(path: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
-    if !meta.is_file() || meta.permissions().readonly() {
-        return false;
-    }
+    let writable = meta.is_file() && !meta.permissions().readonly();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o200 == 0 {
-            return false;
-        }
+        writable && meta.permissions().mode() & 0o200 != 0
     }
-    true
+    #[cfg(not(unix))]
+    {
+        writable
+    }
 }
 
 fn try_heal_or_pin_wal_and_clone(source: &Path, staged: &Path) -> Result<SeedMethod> {
@@ -757,6 +756,173 @@ pub fn rebind_staged(staged: &Path, root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Verify a staged SQLite database (e.g. unpacked from a remote cache archive)
+/// using SQLite defensive mode, `trusted_schema = OFF`, `cell_size_check = ON`,
+/// and `PRAGMA quick_check(1)` before it is ever rebound or swapped into place.
+pub fn verify_staged_integrity(staged: &Path) -> Result<()> {
+    let conn = Connection::open_with_flags(
+        staged,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "cannot open staged store {} for integrity check",
+            staged.display()
+        )
+    })?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .context("failed to enable SQLITE_DBCONFIG_DEFENSIVE on staged store")?;
+    conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;")
+        .context("failed to configure defensive pragmas on staged store")?;
+    let outcome: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .context("PRAGMA quick_check(1) failed on staged store")?;
+    if !outcome.eq_ignore_ascii_case("ok") {
+        bail!("staged store failed SQLite integrity check (PRAGMA quick_check): {outcome}");
+    }
+    conn.close().map_err(|(_, error)| error)?;
+    Ok(())
+}
+
+/// Scrub indexed string literals, docstrings, signatures, diagnostics, and
+/// raw extraction caches from a private staged snapshot before exporting a
+/// plaintext cache archive (C9).
+///
+/// Runs `PRAGMA secure_delete = ON`, deletes `payload_literals`,
+/// `generation_literals`, `extraction_cache`, and `extraction_cache_v4`, strips
+/// `literals` / `source_code` / `diagnostics` / symbol `docstring` & `signature`
+/// from every `file_payloads.extraction_json` document, and then executes
+/// `VACUUM INTO` a brand-new SQLite file so ZERO residual bytes survive in
+/// freed B-tree pages.
+pub fn strip_staged_literals(staged: &Path) -> Result<()> {
+    let vacuumed = sidecar(staged, ".vacuumed");
+    let _ = std::fs::remove_file(&vacuumed);
+    {
+        let mut conn = Connection::open(staged).with_context(|| {
+            format!(
+                "cannot open staged store {} to strip literals",
+                staged.display()
+            )
+        })?;
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA secure_delete = ON;")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in [
+            "payload_literals",
+            "generation_literals",
+            "extraction_cache",
+            "extraction_cache_v4",
+        ] {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            if exists > 0 {
+                tx.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+        }
+
+        let has_file_payloads: i64 = tx.query_row(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = 'file_payloads'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_file_payloads > 0 {
+            let mut updates: Vec<(i64, Vec<u8>, Vec<u8>)> = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT payload_id, parse_outcome_json, engine_json, extraction_json FROM file_payloads",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let payload_id: i64 = row.get(0)?;
+                    let parse_outcome_json: String = row.get(1)?;
+                    let engine_json: String = row.get(2)?;
+                    let json_cow = crate::payload_codec::decode_value(
+                        row.get_ref(3)?,
+                        "file_payloads.extraction_json",
+                    )?;
+                    let mut doc: serde_json::Value =
+                        serde_json::from_str(json_cow.as_ref()).with_context(|| {
+                            format!("failed to parse file_payloads row {payload_id} during literal scrub")
+                        })?;
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.remove("source_code");
+                        if let Some(lits) = obj.get_mut("literals") {
+                            *lits = serde_json::Value::Array(Vec::new());
+                        }
+                        if let Some(diags) = obj.get_mut("diagnostics") {
+                            *diags = serde_json::Value::Array(Vec::new());
+                        }
+                        if let Some(syms) = obj.get_mut("symbols").and_then(|v| v.as_array_mut()) {
+                            for sym in syms {
+                                if let Some(sobj) = sym.as_object_mut() {
+                                    sobj.remove("docstring");
+                                    sobj.remove("signature");
+                                }
+                            }
+                        }
+                        // Strip string-literal references emitted by entry_names.rs (`kind == "EntryName"`).
+                        if let Some(refs) = obj.get_mut("references").and_then(|v| v.as_array_mut())
+                        {
+                            refs.retain(|r| {
+                                r.get("kind").and_then(|k| k.as_str()) != Some("EntryName")
+                            });
+                        }
+                        // Strip literal prefixes from dynamic dispatch annotations.
+                        if let Some(dd) = obj
+                            .get_mut("dynamic_dispatch")
+                            .and_then(|v| v.as_array_mut())
+                        {
+                            for entry in dd {
+                                if let Some(dobj) = entry.as_object_mut() {
+                                    dobj.remove("name_prefix");
+                                }
+                            }
+                        }
+                    }
+                    let scrubbed_json = serde_json::to_string(&doc)?;
+                    let digest = crate::db::payload_digest(
+                        &parse_outcome_json,
+                        &engine_json,
+                        &scrubbed_json,
+                    )
+                    .to_vec();
+                    let compressed = crate::payload_codec::compress_document(&scrubbed_json)?;
+                    updates.push((payload_id, compressed, digest));
+                }
+            }
+            let mut upd = tx.prepare(
+                "UPDATE file_payloads SET extraction_json = ?1, payload_digest = ?2 WHERE payload_id = ?3",
+            )?;
+            for (payload_id, compressed, digest) in updates {
+                upd.execute(rusqlite::params![compressed, digest, payload_id])?;
+            }
+        }
+        tx.commit()?;
+
+        let target = vacuumed
+            .to_str()
+            .context("vacuumed staged store path is not valid UTF-8")?;
+        conn.execute("VACUUM INTO ?1", [target])
+            .with_context(|| format!("VACUUM INTO {target} failed after literal scrubbing"))?;
+        conn.close().map_err(|(_, error)| error)?;
+    }
+
+    for suffix in SQLITE_SIDECARS {
+        let _ = std::fs::remove_file(sidecar(staged, suffix));
+    }
+    let _ = std::fs::remove_file(staged);
+    std::fs::rename(&vacuumed, staged).with_context(|| {
+        format!(
+            "failed to replace staged store {} with vacuumed copy",
+            staged.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Convert a staged database into a sidecar-free, read-only (`chmod 0444`)
 /// immutable base snapshot suitable for `?immutable=1` (`OQ1`).
 pub fn prepare_immutable_snapshot(staged: &Path) -> Result<()> {
@@ -809,6 +975,9 @@ pub fn set_file_writable(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         let mut perms = std::fs::metadata(path)?.permissions();
+        // The lint warns that this makes a Unix file world-writable. This arm is
+        // compiled off Unix only, where the readonly flag is the whole mode.
+        #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         std::fs::set_permissions(path, perms)
             .with_context(|| format!("cannot clear readonly {}", path.display()))?;
@@ -1255,6 +1424,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(target_os = "macos")]
     fn sealed_snapshot_with_head(path: &Path, head: &str) {
         {
             let store = Store::open(path).unwrap();

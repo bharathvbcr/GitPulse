@@ -129,6 +129,534 @@ fn integration_tests_resolve_state_under_the_per_process_root() {
     );
 }
 
+/// Environment names production reads that are neither removed by the hermetic
+/// constructor nor GitPulse/Manvi/lappi/portless-prefixed (those are removed by
+/// prefix). One entry per name, with the reason it may be inherited. A new name
+/// that is not here fails `every_environment_name_read_under_src_is_scrubbed_or_allowed`:
+/// either the constructor removes it (`SCRUBBED` in `src/test_support/env.rs`)
+/// or it is listed here with a reason.
+const ALLOWED_ENV_NAMES: &[(&str, &str)] = &[
+    (
+        "HOME",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "USERPROFILE",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "APPDATA",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "LOCALAPPDATA",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "XDG_CONFIG_HOME",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "XDG_CACHE_HOME",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "XDG_STATE_HOME",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "CLAUDE_CONFIG_DIR",
+        "rewritten to the per-process root by the constructor",
+    ),
+    (
+        "GIT_CONFIG_GLOBAL",
+        "rewritten to the pinned config by the constructor",
+    ),
+    ("GIT_CONFIG_NOSYSTEM", "set to 1 by the constructor"),
+    (
+        "CARGO_HOME",
+        "kept on purpose: the rustup shims tests spawn find their toolchain there",
+    ),
+    (
+        "PATH",
+        "kept on purpose: tests spawn git, cargo and the fixture tools through it",
+    ),
+    (
+        "CI",
+        "read-only runner marker, selects strictness; carries no state location",
+    ),
+    (
+        "CARGO_LLVM_COV",
+        "set by cargo-llvm-cov for a coverage run; read-only marker",
+    ),
+    (
+        "LLVM_PROFILE_FILE",
+        "set by cargo-llvm-cov; names the profile output, written not read for state",
+    ),
+    (
+        "CARGO_SLOT_HELD",
+        "set by the machine-wide cargo slot gate; read-only marker",
+    ),
+    (
+        "CARGO_CREV_ROOT_DIR_OVERRIDE",
+        "dependency-review tool override, opt-in test driver",
+    ),
+    ("RAYON_NUM_THREADS", "thread-count tuning only"),
+    (
+        "DEVELOPER_DIR",
+        "Xcode toolchain selection for spawned native builds, not GitPulse state",
+    ),
+    (
+        "GNUPGHOME",
+        "git signing fixture input; reviewed as a test driver, not rewritten",
+    ),
+    (
+        "CLAUDECODE",
+        "agent-host marker read for context detection; not scrubbed, no state location",
+    ),
+    (
+        "CLAUDE_CODE_ENTRYPOINT",
+        "agent-host marker read for context detection; not scrubbed, no state location",
+    ),
+    (
+        "CLAUDE_ENV_FILE",
+        "agent-host file the hook appends exports to; not scrubbed, test-bound where read",
+    ),
+    (
+        "ANTIGRAVITY_EDITOR_APP_ROOT",
+        "editor install location probe, read-only",
+    ),
+    (
+        "PLUGIN_ROOT",
+        "plugin-host marker read by a fixture, read-only",
+    ),
+    (
+        "GRAFT_NOTIFY_SOCKET",
+        "external notifier socket name read by an adapter test, opt-in",
+    ),
+    (
+        "QD_CALLER_RECORDS_BIN",
+        "path of an external tool's binary, opt-in test driver",
+    ),
+    (
+        "MAC_HEAVY_LABEL",
+        "launchd label of the heavy-job lane, read-only",
+    ),
+    (
+        "PROCGUARD_SELF_AIM",
+        "test-only fault-injection switch set by the test that reads it",
+    ),
+    (
+        "LEDGER_WIRE_DUMP",
+        "opt-in test driver: where a wire dump is written",
+    ),
+    ("GP_MEASURE_REPO", "opt-in measurement input"),
+    ("PROFILE_REPO", "opt-in measurement input"),
+    (
+        "MAVI_LIVE_CLAUDE",
+        "opt-in test driver: an ignored test runs the real Claude CLI only when set to 1",
+    ),
+    (
+        "MAVI_LIVE_RESUME_DIR",
+        "opt-in test driver: checkout of a real conversation an ignored test resumes",
+    ),
+    (
+        "MAVI_LIVE_RESUME_ID",
+        "opt-in test driver: id of a real conversation an ignored test resumes",
+    ),
+    (
+        "MAVI_TRANSCRIPT",
+        "opt-in test driver: transcript an ignored test converts into a fixture",
+    ),
+    (
+        "MAVI_HISTORY_OUT",
+        "opt-in test driver: where an ignored test writes the converted fixture",
+    ),
+    (
+        "ADV_CODEX_FILES",
+        "adversarial-suite parameter, set by the parent test for its child",
+    ),
+    (
+        "ADV_OPEN_DB",
+        "adversarial-suite parameter, set by the parent test for its child",
+    ),
+    ("ADV_OUT", "adversarial-suite parameter, opt-in output path"),
+    ("ADV_ROWS", "adversarial-suite parameter, opt-in size"),
+    (
+        "ADV_W3C_CHILD_SOCKET",
+        "adversarial-suite parameter, set by the parent test for its child",
+    ),
+    (
+        "ADV_W4B_PROBE",
+        "adversarial-suite parameter, set by the parent test for its child",
+    ),
+    (
+        "ADV_W4B_PROBE_GIT",
+        "adversarial-suite parameter, set by the parent test for its child",
+    ),
+];
+
+/// Every `const NAME: &str = "literal"` under `src`, by name. A name may be
+/// defined in several modules, so each maps to every literal it takes; a read of
+/// `NAME` is then checked against all of them.
+fn string_consts(text: &str, out: &mut BTreeMap<String, BTreeSet<String>>) {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("const ") {
+        let start = from + at + "const ".len();
+        from = start;
+        let name: String = text[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let after = start + name.len();
+        let Some(eq) = text[after..].find('=') else {
+            continue;
+        };
+        let ty = text[after..after + eq].replace(' ', "");
+        if !(ty == ":&str" || ty == ":&'staticstr") {
+            continue;
+        }
+        let mut lit = after + eq + 1;
+        while lit < bytes.len() && bytes[lit].is_ascii_whitespace() {
+            lit += 1;
+        }
+        if bytes.get(lit) != Some(&b'"') {
+            continue;
+        }
+        if let Some(end) = text[lit + 1..].find('"') {
+            out.entry(name)
+                .or_default()
+                .insert(text[lit + 1..lit + 1 + end].to_string());
+        }
+    }
+}
+
+/// What the scan saw: names read through a literal or a resolvable const, the
+/// reads whose argument is a runtime value (invisible by construction), and the
+/// literals that are not environment-name shaped.
+struct EnvReads {
+    names: BTreeMap<String, BTreeSet<String>>,
+    dynamic: Vec<String>,
+    not_names: usize,
+}
+
+fn scan_env_reads(roots: &[PathBuf]) -> EnvReads {
+    let mut files = Vec::new();
+    for root in roots {
+        rust_files(root, &mut files);
+    }
+    let mut sources = Vec::new();
+    let mut consts = BTreeMap::new();
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        string_consts(&text, &mut consts);
+        sources.push((path, text));
+    }
+    let mut reads = EnvReads {
+        names: BTreeMap::new(),
+        dynamic: Vec::new(),
+        not_names: 0,
+    };
+    for (path, text) in &sources {
+        let rel = path
+            .strip_prefix(manifest(""))
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        for needle in ["env::var(", "env::var_os("] {
+            let mut from = 0;
+            while let Some(at) = text[from..].find(needle) {
+                let arg_at = from + at + needle.len();
+                from = arg_at;
+                // Skip a read that sits on a commented line.
+                let line_start = text[..arg_at].rfind('\n').map_or(0, |n| n + 1);
+                if text[line_start..arg_at].trim_start().starts_with("//") {
+                    continue;
+                }
+                let arg = text[arg_at..]
+                    .trim_start()
+                    .trim_start_matches('&')
+                    .trim_start();
+                let literals: Vec<String> = if let Some(rest) = arg.strip_prefix('"') {
+                    rest.find('"')
+                        .map(|end| rest[..end].to_string())
+                        .into_iter()
+                        .collect()
+                } else {
+                    let ident: String = arg
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':'))
+                        .collect();
+                    let last = ident.rsplit("::").next().unwrap_or("");
+                    match consts.get(last) {
+                        Some(values) if !last.is_empty() => values.iter().cloned().collect(),
+                        _ => {
+                            let line = text[..arg_at].matches('\n').count() + 1;
+                            reads.dynamic.push(format!("{rel}:{line}: {needle}{ident}"));
+                            continue;
+                        }
+                    }
+                };
+                for name in literals {
+                    let shaped = name
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_uppercase())
+                        && name
+                            .chars()
+                            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
+                    if shaped {
+                        reads.names.entry(name).or_default().insert(rel.clone());
+                    } else {
+                        reads.not_names += 1;
+                    }
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// The environment is only hermetic for the names the constructor knows about,
+/// so a name production starts reading tomorrow must be decided on the day it is
+/// added: removed by the constructor (a `GITPULSE_`, `MANVI_`, `LAPPI_` or
+/// `PORTLESS_` name is removed by prefix) or listed in `ALLOWED_ENV_NAMES` with a
+/// reason. Reads through a variable (`env::var(name)`) cannot be named by a
+/// source scan; they are printed so a reviewer can see the blind spot, not
+/// counted as clean.
+#[test]
+fn every_environment_name_read_under_src_is_scrubbed_or_allowed() {
+    let reads = scan_env_reads(&[manifest("src")]);
+    assert!(
+        reads.names.len() > 40,
+        "the scan found only {} names; it has stopped reading the source",
+        reads.names.len()
+    );
+    let allowed: BTreeMap<&str, &str> = ALLOWED_ENV_NAMES.iter().copied().collect();
+    assert_eq!(
+        allowed.len(),
+        ALLOWED_ENV_NAMES.len(),
+        "ALLOWED_ENV_NAMES lists a name twice"
+    );
+    let unclassified: Vec<String> = reads
+        .names
+        .iter()
+        .filter(|(name, _)| {
+            !common::env::hermetic::is_scrubbed(name)
+                && !common::env::hermetic::is_kept_test_knob(name)
+                && !allowed.contains_key(name.as_str())
+        })
+        .map(|(name, files)| format!("{name} (read in {files:?})"))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "environment names read under src/ that the hermetic constructor neither removes \
+         nor keeps on purpose. Add the name to `SCRUBBED` in src/test_support/env.rs, or to \
+         ALLOWED_ENV_NAMES here with a reason:\n{}\n(blind spot: {} reads take a runtime value \
+         and cannot be named: {:?})",
+        unclassified.join("\n"),
+        reads.dynamic.len(),
+        reads.dynamic
+    );
+    let stale: Vec<&str> = allowed
+        .keys()
+        .copied()
+        .filter(|name| !reads.names.contains_key(*name) || common::env::hermetic::is_scrubbed(name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "ALLOWED_ENV_NAMES entries nothing reads, or that the constructor now removes: {stale:?}"
+    );
+}
+
+/// Scoped names the suites set for a child process they spawn. The child is the
+/// same test binary and inherits `GITPULSE_TEST_HERMETIC_ROOT`, so its
+/// constructor returns before it scrubs anything: the value the parent set
+/// arrives intact. Nothing a developer exports reaches these, so they are not
+/// kept; each is listed with the test that sets it.
+const SET_FOR_A_CHILD: &[(&str, &str)] = &[
+    (
+        "GITPULSE_E2E_GRANT_REPO",
+        "cli_e2e and build_cache_integration pass the fixture repository to their grant helper",
+    ),
+    (
+        "GITPULSE_E2E_MAIN",
+        "repository_trust passes the main checkout to its isolated subprocess",
+    ),
+    (
+        "GITPULSE_E2E_WORKTREE",
+        "repository_trust passes the linked worktree to its isolated subprocess",
+    ),
+    (
+        "GITPULSE_E2E_READY",
+        "repository_trust passes the readiness file to its isolated subprocess",
+    ),
+    (
+        "GITPULSE_PROBE_FULL_STDERR",
+        "logging_process selects the stderr-pipe mode of its child",
+    ),
+    (
+        "GITPULSE_PROBE_STATUS_FILE",
+        "logging_process names the status file of each child",
+    ),
+    (
+        "GITPULSE_LOGGING_PROBE",
+        "logging_process selects the mode of its child",
+    ),
+    (
+        "GITPULSE_FAKE_AGENT_ROLE",
+        "mcp_sessions selects the role of the fake agent it spawns",
+    ),
+    (
+        "GITPULSE_LOG_DIR",
+        "mcp_sessions and logging_process give each child the log directory it writes to",
+    ),
+    (
+        "GITPULSE_SIGNAL_TEARDOWN_DIR",
+        "signal_teardown passes the scratch directory to the child it signals",
+    ),
+    (
+        "GITPULSE_FSEVENT_FAULT",
+        "native_watcher_faults selects the injected fault of its child",
+    ),
+];
+
+/// The integration crates, benches and the workspace crates' own tests read
+/// scoped names too, and the source scan above does not see them. A name read
+/// there that the constructor removes is a switch a developer can export and the
+/// test never sees: it must be kept on purpose (`KEPT_PREFIXES`) or be a value the
+/// suite sets for a child (`SET_FOR_A_CHILD`).
+#[test]
+fn every_scoped_name_a_test_reads_survives_the_constructor_or_is_set_for_a_child() {
+    let mut roots = vec![manifest("tests"), manifest("benches")];
+    for krate in std::fs::read_dir(manifest("../crates")).unwrap() {
+        let krate = krate.unwrap().path();
+        roots.extend(
+            ["tests", "benches"]
+                .map(|dir| krate.join(dir))
+                .into_iter()
+                .filter(|dir| dir.is_dir()),
+        );
+    }
+    let reads = scan_env_reads(&roots);
+    let scoped: BTreeMap<&String, &BTreeSet<String>> = reads
+        .names
+        .iter()
+        .filter(|(name, _)| common::env::hermetic::is_scrubbed(name))
+        .collect();
+    assert!(
+        reads.names.len() > 20,
+        "the scan found only {} names under tests, benches and crates; it has stopped reading them",
+        reads.names.len()
+    );
+    let child: BTreeMap<&str, &str> = SET_FOR_A_CHILD.iter().copied().collect();
+    assert_eq!(
+        child.len(),
+        SET_FOR_A_CHILD.len(),
+        "SET_FOR_A_CHILD lists a name twice"
+    );
+    let swallowed: Vec<String> = scoped
+        .iter()
+        .filter(|(name, _)| !child.contains_key(name.as_str()))
+        .map(|(name, files)| format!("{name} (read in {files:?})"))
+        .collect();
+    assert!(
+        swallowed.is_empty(),
+        "tests read these names, but the hermetic constructor removes them from the test \
+         process, so a value a developer exports never arrives. If a developer sets it, \
+         add it to `KEPT_PREFIXES` in src/test_support/env.rs with the reason; if the \
+         suite sets it for a child process, add it to SET_FOR_A_CHILD here:\n{}\n(blind \
+         spot: {} reads take a runtime value and cannot be named: {:?})",
+        swallowed.join("\n"),
+        reads.dynamic.len(),
+        reads.dynamic
+    );
+    let stale: Vec<&str> = child
+        .keys()
+        .copied()
+        .filter(|name| !scoped.contains_key(&name.to_string()))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "SET_FOR_A_CHILD entries no test reads, or the constructor no longer removes: {stale:?}"
+    );
+}
+
+/// A name being on the kept list is a claim about a process the constructor ran
+/// in. Run it: a fresh copy of this binary, with the hermetic markers removed so
+/// its constructor really runs, is started with the opt-in drivers and a
+/// terminal's session variables exported, and reports what is left. The drivers
+/// survive and the session variables do not.
+#[test]
+fn an_exported_opt_in_driver_reaches_the_test_process_and_a_session_variable_does_not() {
+    use gitpulse_lib::procguard::LockedSpawn;
+    let kept = [
+        "GITPULSE_MANVI_BIN",
+        "GITPULSE_DEVMAP_BIN",
+        "GITPULSE_HOST_LOAD_ONCE",
+    ];
+    let gone = [
+        "GITPULSE_SESSION_ID",
+        "GITPULSE_RUSTC_BIN",
+        "MANVI_STATE_DIR",
+        "LAPPI_SOCKET",
+    ];
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "scrub_probe_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_remove("GITPULSE_TEST_HERMETIC_ROOT")
+        .env_remove("GITPULSE_TEST_HERMETIC_OWNER")
+        .env("GITPULSE_TEST_SCRUB_PROBE_KEPT", kept.join(","))
+        .env("GITPULSE_TEST_SCRUB_PROBE_GONE", gone.join(","));
+    for name in kept.into_iter().chain(gone) {
+        command.env(name, "/exported/by/a/developer");
+    }
+    let output = command.output_locked().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("scrub probe: ok"),
+        "the child did not see the drivers kept and the session variables removed:\n{text}"
+    );
+}
+
+/// The child half of the test above. Ignored so it only runs when spawned.
+#[test]
+#[ignore = "child of an_exported_opt_in_driver_reaches_the_test_process_and_a_session_variable_does_not"]
+fn scrub_probe_child() {
+    let names = |key: &str| {
+        std::env::var(key)
+            .expect("probe list")
+            .split(',')
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    for name in names("GITPULSE_TEST_SCRUB_PROBE_KEPT") {
+        assert_eq!(
+            std::env::var(&name).as_deref(),
+            Ok("/exported/by/a/developer"),
+            "{name} was exported and did not survive the constructor"
+        );
+    }
+    for name in names("GITPULSE_TEST_SCRUB_PROBE_GONE") {
+        assert!(
+            std::env::var_os(&name).is_none(),
+            "{name} survived the constructor"
+        );
+    }
+    println!("scrub probe: ok");
+}
+
 /// Lines (1-based, with their text) where an elapsed time is compared against a
 /// `Duration::from_*` that is not wrapped in `coverage_relaxed`.
 ///

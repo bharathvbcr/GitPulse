@@ -2,9 +2,9 @@
   /**
    * A viewer mounted as a page's own pane, with the view bar's search field
    * above it. In the app, History provides "history:diff" around its Diff
-   * section and Code provides "code:explorer" around its file; the field
-   * lives in row 2. This stands the two in one column so a harness can drive
-   * the field against a real viewer.
+   * section, while Code > Explorer leaves row 2 as the repository palette and
+   * keeps `FindField` inline on the file viewer. This stands the two in one
+   * column so a harness can drive both behaviors against a real viewer.
    */
   import type { Component } from "svelte";
   import PageSearch from "../src/lib/components/PageSearch.svelte";

@@ -67,8 +67,52 @@ describe("Stack merged into Overview", () => {
   it("renders the collapsed card as a disclosure, not a pane", () => {
     // The toggle must carry aria-expanded and the lazy pane must be gated on
     // the same state, or the card is a button that does nothing.
-    expect(workSource).toContain("aria-expanded={showStackDetail}");
+    const snippetStart = workSource.indexOf("{#snippet detailToggle(");
+    const snippetEnd = workSource.indexOf("{/snippet}", snippetStart);
+    expect(snippetStart).toBeGreaterThan(-1);
+    const snippetBody = workSource.slice(snippetStart, snippetEnd);
+    expect(snippetBody).toContain("aria-expanded={open}");
+    expect(snippetBody).toContain("onclick={toggle}");
+    expect(workSource).toContain(
+      "{@render detailToggle(showStackDetail, () => (showStackDetail = !showStackDetail), \"Branch chains and stacked diffs\")}",
+    );
     expect(workSource).toContain("{#if showStackDetail}");
+    expect(
+      workSource.indexOf("{@render detailToggle(showStackDetail,"),
+    ).toBeLessThan(workSource.indexOf("{#if showStackDetail}"));
+  });
+
+  it("mounts <LazyView load={loadStack}> strictly inside the {#if showStackDetail} block", () => {
+    const toggleCall =
+      '{@render detailToggle(showStackDetail, () => (showStackDetail = !showStackDetail), "Branch chains and stacked diffs")}';
+    const ifOpen = "{#if showStackDetail}";
+    const toggleIdx = workSource.indexOf(toggleCall);
+    const ifIdx = workSource.indexOf(ifOpen);
+    expect(toggleIdx).toBeGreaterThan(-1);
+    expect(ifIdx).toBeGreaterThan(toggleIdx);
+
+    // Match the closing {/if} of `{#if showStackDetail}` with Svelte block nesting.
+    let depth = 0;
+    let blockEnd = -1;
+    const tagRe = /\{#(if|each|await|key|snippet)\b|\{\/(if|each|await|key|snippet)\}/g;
+    tagRe.lastIndex = ifIdx;
+    let match: RegExpExecArray | null;
+    while ((match = tagRe.exec(workSource)) !== null) {
+      if (match[1]) depth += 1;
+      else depth -= 1;
+      if (depth === 0) {
+        blockEnd = match.index;
+        break;
+      }
+    }
+    expect(blockEnd).toBeGreaterThan(ifIdx);
+
+    const guardedBlock = workSource.slice(ifIdx, blockEnd);
+    const lazyTag = "<LazyView load={loadStack}";
+    expect(guardedBlock).toContain(lazyTag);
+
+    const outside = workSource.slice(0, ifIdx) + workSource.slice(blockEnd);
+    expect(outside).not.toContain(lazyTag);
   });
 
   it("renders Overview without a repository (SSR smoke)", () => {

@@ -95,6 +95,8 @@
     initialThreads?: AgentInboxThread[];
     initialLanes?: AgentLaneClaim[];
     initialSelectedKeys?: string[];
+    focusThreadKey?: string | null;
+    focusSeq?: number;
     onopenTask?: (taskId: string) => Promise<void>;
     onkickoff?: (directive: MobileKickoffDirective, thread: AgentInboxThread) => Promise<void> | void;
     embedded?: boolean;
@@ -105,6 +107,8 @@
     initialThreads,
     initialLanes,
     initialSelectedKeys,
+    focusThreadKey = null,
+    focusSeq = 0,
     onopenTask,
     onkickoff,
     embedded = false,
@@ -130,15 +134,57 @@
   });
 
   let lastLoadedRepoPath: string | undefined = undefined;
+  let refreshEpoch = 0;
+  let inFlightRefreshRepo: string | null = null;
+
+  function notifyInboxChanged() {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("gitpulse:inbox-changed"));
+    }
+  }
+
   $effect(() => {
     const activeRepo = repoPath;
-    if (!initialThreads && activeRepo && activeRepo !== lastLoadedRepoPath) {
+    if (!initialThreads && activeRepo !== lastLoadedRepoPath) {
       lastLoadedRepoPath = activeRepo;
-      void refreshInbox();
+      refreshEpoch += 1;
+      inFlightRefreshRepo = null;
+      threads = [];
+      lanes = [];
+      selectedKeys = new Set();
+      error = "";
+      notice = "";
+      selectedThreadKey = untrack(() => focusThreadKey) || null;
+      selectedDecision = null;
+      completedSteps = {};
+      textAnswer = "";
+      reviewNotes = "";
+      isWithdrawing = false;
+      withdrawReason = "";
+      replyText = "";
+      busy = false;
+      if (activeRepo) {
+        void refreshInbox();
+      }
     }
   });
 
-  let selectedThreadKey = $state<string | null>(null);
+  let selectedThreadKey = $state<string | null>(
+    untrack(() => focusThreadKey || null)
+  );
+  let lastAppliedFocusSeq = -1;
+  $effect(() => {
+    const target = focusThreadKey;
+    const seq = focusSeq;
+    if (!target || seq === lastAppliedFocusSeq) return;
+    lastAppliedFocusSeq = seq;
+    statusFilter = "all";
+    searchQuery = "";
+    selectThread(target);
+    if (!initialThreads && repoPath && repoPath === lastLoadedRepoPath && inFlightRefreshRepo !== repoPath) {
+      void refreshInbox();
+    }
+  });
   let selectedKeys = $state<Set<string>>(
     untrack(() => new Set(initialSelectedKeys ?? []))
   );
@@ -193,7 +239,7 @@
   );
 
   onMount(() => {
-    if (threads.length === 0 && repoPath) {
+    if (!initialThreads && threads.length === 0 && repoPath && repoPath !== lastLoadedRepoPath) {
       lastLoadedRepoPath = repoPath;
       void refreshInbox();
     }
@@ -206,13 +252,19 @@
   }
 
   export async function refreshInbox(): Promise<void> {
-    if (!repoPath) return;
+    const requestedRepo = repoPath;
+    if (!requestedRepo) return;
+    const epoch = ++refreshEpoch;
+    inFlightRefreshRepo = requestedRepo;
     busy = true;
     error = "";
     try {
       const res = await invoke<InboxSnapshot>("cmd_inbox_read", {
-        repoPath,
+        repoPath: requestedRepo,
       });
+      if (epoch !== refreshEpoch || requestedRepo !== repoPath) {
+        return;
+      }
 
       if (res?.threads) {
         threads = res.threads;
@@ -221,9 +273,15 @@
         lanes = res.lanes;
       }
     } catch (err: unknown) {
+      if (epoch !== refreshEpoch || requestedRepo !== repoPath) {
+        return;
+      }
       error = failure("load", "inbox threads", err);
     } finally {
-      busy = false;
+      if (epoch === refreshEpoch) {
+        inFlightRefreshRepo = null;
+        busy = false;
+      }
     }
   }
 
@@ -297,20 +355,23 @@
   }
 
   async function sendAnswer(body: string) {
-    if (!selectedThread) return;
+    const targetThread = selectedThread;
+    if (!targetThread) return;
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
     busy = true;
     error = "";
     notice = "";
     try {
-      const targetKey = selectedThread.thread_key;
-      const targetAgent = selectedThread.from_agent;
+      const targetKey = targetThread.thread_key;
+      const targetAgent = targetThread.from_agent;
       let persistedMsg: BusMessage | null = null;
 
-      if (repoPath) {
+      if (targetRepo) {
         const receipt = await invoke<InboxMessageReceipt>(
           "cmd_worktree_send_message",
           {
-            repoPath,
+            repoPath: targetRepo,
             fromAgent: "developer",
             toAgent: targetAgent,
             threadKey: targetKey,
@@ -321,9 +382,14 @@
         persistedMsg = receipt?.message ?? null;
       }
 
+      notifyInboxChanged();
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
+
       const now = Date.now();
       const newMsg: BusMessage = persistedMsg ?? {
-        seq: (selectedThread.latest_msg?.seq ?? 0) + 1,
+        seq: (targetThread.latest_msg?.seq ?? 0) + 1,
         from_agent: "developer",
         to_agent: targetAgent,
         kind: "reply",
@@ -333,17 +399,21 @@
         thread_key: targetKey,
       };
 
-      selectedThread.status = "answered";
-      selectedThread.updated_at_ms = newMsg.created_at_ms;
-      selectedThread.latest_msg = newMsg;
-      selectedThread.messages = [...selectedThread.messages, newMsg];
+      targetThread.status = "answered";
+      targetThread.updated_at_ms = newMsg.created_at_ms;
+      targetThread.latest_msg = newMsg;
+      targetThread.messages = [...targetThread.messages, newMsg];
       threads = [...threads];
 
       notice = "Response sent to agent";
     } catch (err: unknown) {
-      error = failure("send", "the response", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("send", "the response", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 
@@ -375,19 +445,22 @@
   }
 
   async function handleWithdraw() {
-    if (!selectedThread) return;
+    const targetThread = selectedThread;
+    if (!targetThread) return;
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
     busy = true;
     error = "";
     try {
-      const targetKey = selectedThread.thread_key;
+      const targetKey = targetThread.thread_key;
       const reason = withdrawReason.trim() || "Withdrawn by developer";
       let persistedMsg: BusMessage | null = null;
 
-      if (repoPath) {
+      if (targetRepo) {
         const receipt = await invoke<InboxMessageReceipt>(
           "cmd_inbox_withdraw",
           {
-            repoPath,
+            repoPath: targetRepo,
             fromAgent: "developer",
             threadKey: targetKey,
             reason,
@@ -396,11 +469,16 @@
         persistedMsg = receipt?.message ?? null;
       }
 
+      notifyInboxChanged();
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
+
       const now = Date.now();
       const withdrawMsg: BusMessage = persistedMsg ?? {
-        seq: (selectedThread.latest_msg?.seq ?? 0) + 1,
+        seq: (targetThread.latest_msg?.seq ?? 0) + 1,
         from_agent: "developer",
-        to_agent: selectedThread.from_agent,
+        to_agent: targetThread.from_agent,
         kind: "withdraw",
         body: `Ask withdrawn: ${reason}`,
         branch: null,
@@ -408,19 +486,23 @@
         thread_key: targetKey,
       };
 
-      selectedThread.status = "withdrawn";
-      selectedThread.updated_at_ms = withdrawMsg.created_at_ms;
-      selectedThread.latest_msg = withdrawMsg;
-      selectedThread.messages = [...selectedThread.messages, withdrawMsg];
+      targetThread.status = "withdrawn";
+      targetThread.updated_at_ms = withdrawMsg.created_at_ms;
+      targetThread.latest_msg = withdrawMsg;
+      targetThread.messages = [...targetThread.messages, withdrawMsg];
       threads = [...threads];
 
       isWithdrawing = false;
       withdrawReason = "";
       notice = "Ask withdrawn";
     } catch (err: unknown) {
-      error = failure("withdraw", "the ask", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("withdraw", "the ask", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 
@@ -430,6 +512,8 @@
       error = "Ask title or question is required";
       return;
     }
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
     busy = true;
     error = "";
     notice = "";
@@ -475,9 +559,10 @@
       const body = JSON.stringify(payload);
       const toAgent = newAskToAgent.trim() || null;
 
-      if (repoPath) {
+      let expectedEpoch = startEpoch;
+      if (targetRepo) {
         await invoke<InboxMessageReceipt>("cmd_inbox_post", {
-          repoPath,
+          repoPath: targetRepo,
           fromAgent: "developer",
           toAgent: toAgent ?? undefined,
           threadKey,
@@ -486,6 +571,11 @@
           body,
           branch: newAskBranch.trim() || undefined,
         });
+        notifyInboxChanged();
+        if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+          return;
+        }
+        expectedEpoch = refreshEpoch + 1;
         await refreshInbox();
       } else {
         const now = Date.now();
@@ -513,8 +603,12 @@
           },
           ...threads,
         ];
+        notifyInboxChanged();
       }
 
+      if (targetRepo !== repoPath || refreshEpoch !== expectedEpoch) {
+        return;
+      }
       selectedThreadKey = threadKey;
       activeDrawer = "none";
       newAskTitle = "";
@@ -524,9 +618,13 @@
       newAskSummary = "";
       notice = "Structured ask posted to coordination bus";
     } catch (err: unknown) {
-      error = failure("post", "the structured ask", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("post", "the structured ask", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 
@@ -536,23 +634,33 @@
       error = "Task title and at least one subtask line are required";
       return;
     }
-    if (!repoPath) {
+    const targetRepo = repoPath;
+    if (!targetRepo) {
       error = "Select a repository before filing decomposed tasks";
       return;
     }
+    const startEpoch = refreshEpoch;
     busy = true;
     error = "";
     notice = "";
     try {
       const res = await invoke<InboxDecomposeReceipt>("cmd_inbox_decompose_task", {
-        repoPath,
+        repoPath: targetRepo,
         title,
         description: breakdownDescription.trim() || undefined,
         subtasks: previewPlan.subtasks.map((s) => s.title),
         assignAgent: breakdownAssignee.trim() || undefined,
         branch: breakdownBranch.trim() || undefined,
       });
+      notifyInboxChanged();
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
+      const expectedPostRefreshEpoch = refreshEpoch + 1;
       await refreshInbox();
+      if (targetRepo !== repoPath || refreshEpoch !== expectedPostRefreshEpoch) {
+        return;
+      }
       if (res?.thread_key) {
         selectedThreadKey = res.thread_key;
       }
@@ -562,9 +670,13 @@
       breakdownSubtasksText = "";
       notice = `Filed parent task with ${previewPlan.subtasks.length} subtasks and posted agent handoff`;
     } catch (err: unknown) {
-      error = failure("break down", "the task", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("break down", "the task", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 
@@ -598,15 +710,23 @@
 
   async function handleBatchWithdraw() {
     if (selectedKeys.size === 0 || busy) return;
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
     busy = true;
     error = "";
     notice = "";
     try {
       const res = await batchWithdrawOpenThreads({
-        repoPath,
+        repoPath: targetRepo,
         threads,
         selectedKeys,
       });
+      if (res.withdrawnKeys.length > 0) {
+        notifyInboxChanged();
+      }
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
       threads = res.updatedThreads;
       selectedKeys = new Set();
       if (res.errors.length > 0) {
@@ -615,24 +735,36 @@
         notice = `Withdrew ${res.withdrawnKeys.length} open ${res.withdrawnKeys.length === 1 ? "ask" : "asks"}${res.skippedCount > 0 ? ` (${res.skippedCount} already settled skipped)` : ""}`;
       }
     } catch (err: unknown) {
-      error = failure("withdraw", "the selected asks", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("withdraw", "the selected asks", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 
   async function handleBatchResolve() {
     if (selectedKeys.size === 0 || !batchNote.trim() || busy) return;
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
     busy = true;
     error = "";
     notice = "";
     try {
       const res = await batchResolveThreadsWithNote({
-        repoPath,
+        repoPath: targetRepo,
         threads,
         selectedKeys,
         note: batchNote,
       });
+      if (res.resolvedKeys.length > 0) {
+        notifyInboxChanged();
+      }
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
       threads = res.updatedThreads;
       selectedKeys = new Set();
       batchNote = "";
@@ -642,41 +774,62 @@
         notice = `Posted resolution note across ${res.resolvedKeys.length} ${res.resolvedKeys.length === 1 ? "thread" : "threads"}`;
       }
     } catch (err: unknown) {
-      error = failure("resolve", "the selected threads", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("resolve", "the selected threads", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 
   async function handleKickOffAgent() {
-    if (!selectedThread || busy) return;
+    const targetThread = selectedThread;
+    if (!targetThread || busy) return;
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
+    const provider = kickoffProvider;
+    const mode = kickoffMode;
     busy = true;
     error = "";
     notice = "";
     try {
       const res = await kickOffAgentFromInboxThread({
-        thread: selectedThread,
+        thread: targetThread,
         ask: currentAsk,
-        provider: kickoffProvider,
-        mode: kickoffMode,
-        repoPath,
+        provider,
+        mode,
+        repoPath: targetRepo,
       });
-      if (repoPath) {
+      notifyInboxChanged();
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
+      if (targetRepo) {
+        const expectedPostRefreshEpoch = refreshEpoch + 1;
         await refreshInbox();
+        if (targetRepo !== repoPath || refreshEpoch !== expectedPostRefreshEpoch) {
+          return;
+        }
       } else if (res.handoffMessage) {
-        selectedThread.latest_msg = res.handoffMessage;
-        selectedThread.messages = [...selectedThread.messages, res.handoffMessage];
-        selectedThread.updated_at_ms = res.handoffMessage.created_at_ms;
+        targetThread.latest_msg = res.handoffMessage;
+        targetThread.messages = [...targetThread.messages, res.handoffMessage];
+        targetThread.updated_at_ms = res.handoffMessage.created_at_ms;
         threads = [...threads];
       }
       notice =
         res.launchedVia === "task_run"
-          ? `Kicked off ${kickoffProvider} (${kickoffMode === "managed" ? "warm managed" : "worktree terminal"}) session`
-          : `Opened interactive ${kickoffProvider} terminal with thread handoff`;
+          ? `Kicked off ${provider} (${mode === "managed" ? "warm managed" : "worktree terminal"}) session`
+          : `Opened interactive ${provider} terminal with thread handoff`;
     } catch (err: unknown) {
-      error = failure("kick off", "the agent session", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("kick off", "the agent session", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 
@@ -703,13 +856,33 @@
   });
 
   async function handleLaunchMobileKickoff(directive: MobileKickoffDirective) {
-    if (!selectedThread || busy) return;
+    const targetThread = selectedThread;
+    if (!targetThread || busy) return;
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
     kickoffProvider = directive.provider;
     kickoffMode = directive.mode;
     if (onkickoff) {
-      await onkickoff(directive, selectedThread);
+      busy = true;
+      error = "";
+      notice = "";
+      try {
+        await onkickoff(directive, targetThread);
+      } catch (err: unknown) {
+        if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+          error = failure("kick off", "the agent session", err);
+        }
+        return;
+      } finally {
+        if (startEpoch === refreshEpoch) {
+          busy = false;
+        }
+      }
     }
-    if (repoPath) {
+    if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+      return;
+    }
+    if (targetRepo) {
       await handleKickOffAgent();
     } else {
       notice = `Prepared ${directive.provider} (${directive.mode}) session from Graft Mobile`;
@@ -718,35 +891,52 @@
 
   async function handleApplyMobileBreakdown(breakdown: MobileTaskBreakdown) {
     if (!selectedThread || busy) return;
-    if (breakdown.taskId && onopenTask) {
-      await onopenTask(breakdown.taskId);
-    }
-    if (!repoPath) {
-      breakdownTitle = breakdown.title;
-      breakdownSubtasksText = breakdown.steps.join("\n");
-      breakdownAssignee = breakdown.assignAgent ?? "";
-      breakdownBranch = breakdown.branch ?? "";
-      activeDrawer = "decompose";
-      notice = `Loaded ${breakdown.steps.length} subtasks from Graft Mobile`;
-      return;
-    }
+    const targetRepo = repoPath;
+    const startEpoch = refreshEpoch;
     busy = true;
     error = "";
     notice = "";
     try {
+      if (breakdown.taskId && onopenTask) {
+        await onopenTask(breakdown.taskId);
+      }
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
+      if (!targetRepo) {
+        breakdownTitle = breakdown.title;
+        breakdownSubtasksText = breakdown.steps.join("\n");
+        breakdownAssignee = breakdown.assignAgent ?? "";
+        breakdownBranch = breakdown.branch ?? "";
+        activeDrawer = "decompose";
+        notice = `Loaded ${breakdown.steps.length} subtasks from Graft Mobile`;
+        return;
+      }
       await invoke<InboxDecomposeReceipt>("cmd_inbox_decompose_task", {
-        repoPath,
+        repoPath: targetRepo,
         title: breakdown.title,
         subtasks: breakdown.steps,
         assignAgent: breakdown.assignAgent,
         branch: breakdown.branch,
       });
+      notifyInboxChanged();
+      if (targetRepo !== repoPath || startEpoch !== refreshEpoch) {
+        return;
+      }
+      const expectedPostRefreshEpoch = refreshEpoch + 1;
       await refreshInbox();
+      if (targetRepo !== repoPath || refreshEpoch !== expectedPostRefreshEpoch) {
+        return;
+      }
       notice = `Applied ${breakdown.steps.length} subtasks from Graft Mobile`;
     } catch (err: unknown) {
-      error = failure("apply", "the subtasks from Graft Mobile", err);
+      if (targetRepo === repoPath && startEpoch === refreshEpoch) {
+        error = failure("apply", "the subtasks from Graft Mobile", err);
+      }
     } finally {
-      busy = false;
+      if (startEpoch === refreshEpoch) {
+        busy = false;
+      }
     }
   }
 </script>

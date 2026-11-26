@@ -47,6 +47,7 @@ use self::hits::{
     scope_report_from_narrowing, skeleton_symbol_tokens, LITERAL_PAGE_CAP,
 };
 pub use self::hits::{EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH};
+#[cfg(all(test, feature = "parse"))]
 use self::trace::shortest_path;
 pub(crate) use self::trace::PathSearch;
 use self::traversal::{
@@ -635,12 +636,21 @@ impl<'a> StoreQueryEngine<'a> {
             .chain(inbound_starts.iter())
             .cloned()
             .collect();
-        if matches!(
+        let pure_scoped_symbol = matches!(
             crate::query_match::classify(target),
-            crate::query_match::StartQuery::Symbol(_)
-        ) {
+            crate::query_match::StartQuery::Qualified { .. }
+        ) && !named.iter().any(|(sym, file)| {
+            crate::query_match::qualified_file_or_module_matches(target, sym, file)
+        });
+        if pure_scoped_symbol
+            || matches!(
+                crate::query_match::classify(target),
+                crate::query_match::StartQuery::Symbol(_)
+            )
+        {
             // One side may hold a namesake the other does not: a callee-only
-            // `run` and a called-only `run` are two symbols.
+            // `run` and a called-only `run` are two symbols. The same rule
+            // applies to a pure `Type::method` that matched no file/module.
             traversal::refuse_ambiguous(target, &named.iter().cloned().collect::<Vec<_>>())?;
         }
         if named.is_empty() {
@@ -1156,20 +1166,6 @@ impl<'a> StoreQueryEngine<'a> {
             let (from, to) = req.query;
             let from = from.trim();
             let to = to.trim();
-            // "No indexed path" is a claim about the graph only where both
-            // endpoints' calls were looked for (P2.7a). Bare-name endpoints name no
-            // file and are not checked here; a qualified or path endpoint is.
-            let coverage_gap = devmap_analyze::combine_reasons(
-                analysis_coverage_gap(index.analysis()),
-                self.call_blind_starts(query_file(from).into_iter().chain(query_file(to)))?
-                    .reason(),
-            );
-            let unavailable = |reason: String| {
-                let mut response =
-                    unavailable_response(ResolutionAvailability::Unavailable { reason });
-                response.walk_incomplete = coverage_gap.clone();
-                response
-            };
             if from.is_empty() || to.is_empty() {
                 return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                     reason: "scoped trace endpoints must not be empty".to_string(),
@@ -1190,14 +1186,60 @@ impl<'a> StoreQueryEngine<'a> {
                 }));
             }
             let edges = self.resolved_edges(&index, req.min_confidence)?;
-            let path = match shortest_path(
+            let (search, mut walked) = trace::shortest_path_walked(
                 &edges,
                 from,
                 to,
                 req.max_depth.min(MAX_TRAVERSAL_DEPTH),
                 5_000,
                 &self.cancel,
-            )? {
+            )?;
+            // If `from` had no resolved outbound edges, still check unbound calls
+            // inside `from` itself so a leaf whose only calls went unbound says so.
+            let mut radius_side = RadiusSide::Callees;
+            if walked.is_empty() {
+                let inbound = indexed_traversal_starts(&index, from, true, 0.0, &self.cancel)?;
+                walked.extend(inbound);
+                if walked.is_empty() {
+                    match crate::query_match::classify(from) {
+                        crate::query_match::StartQuery::Qualified { file, .. } => {
+                            walked.insert((from.to_string(), file.to_string()));
+                        }
+                        crate::query_match::StartQuery::Path(path) => {
+                            radius_side = RadiusSide::FileCallees;
+                            walked.insert((path.to_string(), path.to_string()));
+                        }
+                        crate::query_match::StartQuery::Symbol(_)
+                        | crate::query_match::StartQuery::Nothing => {}
+                    }
+                }
+            }
+            // Corpus parse-coverage half + per-walk attribution gap (only unbound
+            // calls inside nodes this trace actually walked, matching `impact`,
+            // `trace`, `affected`, and `neighbors`) + call-blind endpoint check.
+            let attribution = self.radius_attribution_gap(
+                index.generation(),
+                index.analysis(),
+                &walked,
+                radius_side,
+            )?;
+            let call_blind = self.call_blind_starts(
+                query_file(from)
+                    .into_iter()
+                    .chain(query_file(to))
+                    .chain(walked.iter().map(|(_, file)| file.as_str())),
+            )?;
+            let coverage_gap = devmap_analyze::combine_reasons(
+                devmap_analyze::combine_reasons(analysis_status_gap(index.analysis()), attribution),
+                call_blind.reason(),
+            );
+            let unavailable = |reason: String| {
+                let mut response =
+                    unavailable_response(ResolutionAvailability::Unavailable { reason });
+                response.walk_incomplete = coverage_gap.clone();
+                response
+            };
+            let path = match search {
                 PathSearch::Found(path) => path,
                 // The only outcome that is a claim about the graph.
                 PathSearch::NoPath => {
@@ -1475,7 +1517,11 @@ impl<'a> StoreQueryEngine<'a> {
             let (name, families) = match crate::query_match::classify(target.trim()) {
                 crate::query_match::StartQuery::Qualified { file, symbol } => (
                     bare_callee_name(symbol),
-                    BTreeSet::from([family_of_path(file)]),
+                    if crate::query_match::looks_like_path(file) {
+                        BTreeSet::from([family_of_path(file)])
+                    } else {
+                        BTreeSet::new()
+                    },
                 ),
                 crate::query_match::StartQuery::Symbol(name) => {
                     (bare_callee_name(name), BTreeSet::new())
@@ -1617,37 +1663,6 @@ impl<'a> StoreQueryEngine<'a> {
         };
         let start: Vec<String> = starts.iter().map(|(symbol, _)| symbol.clone()).collect();
         if start.is_empty() {
-            // A symbol whose every call went unbound has no outbound edge, so
-            // it is no start for a walk toward callees — and its unbound calls
-            // are exactly what this answer cannot show. Ask about the target
-            // itself. (Toward callers, `attach_unresolved_namesakes` asks.)
-            let coverage_gap = if reverse {
-                coverage_gap
-            } else {
-                let named = match crate::query_match::classify(target) {
-                    crate::query_match::StartQuery::Qualified { file, .. } => {
-                        Some((RadiusSide::Callees, (target.to_string(), file.to_string())))
-                    }
-                    crate::query_match::StartQuery::Path(path) => Some((
-                        RadiusSide::FileCallees,
-                        (path.to_string(), path.to_string()),
-                    )),
-                    crate::query_match::StartQuery::Symbol(_)
-                    | crate::query_match::StartQuery::Nothing => None,
-                };
-                match named {
-                    Some((side, key)) => devmap_analyze::combine_reasons(
-                        coverage_gap,
-                        self.radius_attribution_gap(
-                            index.generation(),
-                            index.analysis(),
-                            &BTreeSet::from([key]),
-                            side,
-                        )?,
-                    ),
-                    None => coverage_gap,
-                }
-            };
             // An indexed symbol with no edge on this side is a leaf, not a
             // miss. `neighbors seed_for_repeat` answered its callees
             // `Unavailable: no indexed traversal start` for a function the
@@ -1670,6 +1685,44 @@ impl<'a> StoreQueryEngine<'a> {
                 indexed_traversal_starts(index, target, !reverse, 0.0, &self.cancel)?
             } else {
                 Vec::new()
+            };
+            // A symbol whose every call went unbound has no outbound edge, so
+            // it is no start for a walk toward callees — and its unbound calls
+            // are exactly what this answer cannot show. Ask about the resolved
+            // symbol(s) when known, falling back to the query text. (Toward
+            // callers, `attach_unresolved_namesakes` asks.)
+            let coverage_gap = if reverse {
+                coverage_gap
+            } else {
+                let named: Option<(RadiusSide, BTreeSet<(String, String)>)> =
+                    if !indexed_in.is_empty() {
+                        Some((RadiusSide::Callees, indexed_in.iter().cloned().collect()))
+                    } else {
+                        match crate::query_match::classify(target) {
+                            crate::query_match::StartQuery::Qualified { file, .. } => Some((
+                                RadiusSide::Callees,
+                                BTreeSet::from([(target.to_string(), file.to_string())]),
+                            )),
+                            crate::query_match::StartQuery::Path(path) => Some((
+                                RadiusSide::FileCallees,
+                                BTreeSet::from([(path.to_string(), path.to_string())]),
+                            )),
+                            crate::query_match::StartQuery::Symbol(_)
+                            | crate::query_match::StartQuery::Nothing => None,
+                        }
+                    };
+                match named {
+                    Some((side, keys)) => devmap_analyze::combine_reasons(
+                        coverage_gap,
+                        self.radius_attribution_gap(
+                            index.generation(),
+                            index.analysis(),
+                            &keys,
+                            side,
+                        )?,
+                    ),
+                    None => coverage_gap,
+                }
             };
             let files: BTreeSet<&str> = indexed_in.iter().map(|(_, file)| file.as_str()).collect();
             // The files `call_blind` already read, when the target named its

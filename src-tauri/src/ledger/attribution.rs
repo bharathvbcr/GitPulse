@@ -584,6 +584,9 @@ fn place(row: Row, anchor: &str, seen: &mut HashMap<String, String>) -> Placed {
 /// absolute. It never asks the filesystem, so a symlink, a directory since
 /// removed, or a repository since nested or un-nested changes nothing.
 pub(super) fn lexical(path: &str) -> Option<PathBuf> {
+    if let Some(windows) = windows_lexical(path) {
+        return Some(windows);
+    }
     if !path.starts_with('/') {
         return None;
     }
@@ -603,6 +606,80 @@ pub(super) fn lexical(path: &str) -> Option<PathBuf> {
     }
     out.extend(parts);
     Some(out)
+}
+
+/// [`lexical`] for a path spelled as an absolute Windows path: a drive letter
+/// and a separator (`C:\repo`, `c:/repo`), a `\\server\share` UNC path, or the
+/// extended-length forms of those (`\\?\C:\repo`, `\\?\UNC\server\share`).
+/// `None` for anything else, a POSIX path with a backslash in a name included.
+///
+/// Every spelling of one location comes back as one text, so the equality the
+/// attribution rules depend on holds across them: `\` and `/` separate, case
+/// does not matter, `.` and `..` fold, and `..` never leaves its drive or share.
+/// Drives come back as `c:/dir/sub` and UNC paths as `\\server\share\dir`,
+/// which this function reads back to themselves (a platform's `Path::join` may
+/// append a component with its own separator).
+///
+/// Before this, any such path was `None`, so on Windows every commit-making
+/// command read [`Target::Unknown`] and no commit was ever linked to the
+/// session that ran it.
+fn windows_lexical(path: &str) -> Option<PathBuf> {
+    let (verbatim, body) = match path.strip_prefix(r"\\?\") {
+        Some(rest) => (true, rest),
+        None => (false, path),
+    };
+    let unc_spelled = verbatim
+        && body
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("UNC\\"));
+    let (body, unc) = if unc_spelled {
+        (&body[4..], true)
+    } else {
+        (body, !verbatim && path.starts_with(r"\\"))
+    };
+    let unc_body = if unc && !unc_spelled && !verbatim {
+        &body[2..]
+    } else {
+        body
+    };
+    let normalized = unc_body.replace('\\', "/").to_lowercase();
+    let bytes = normalized.as_bytes();
+    let (head, rest) = if unc {
+        let mut parts = normalized.trim_start_matches('/').splitn(3, '/');
+        let (server, share) = (parts.next()?, parts.next()?);
+        if server.is_empty() || share.is_empty() {
+            return None;
+        }
+        (format!(r"\\{server}\{share}"), parts.next().unwrap_or(""))
+    } else if bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'/'
+    {
+        (normalized[..2].to_string(), &normalized[2..])
+    } else {
+        return None;
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let separator = if unc { '\\' } else { '/' };
+    let mut out = head;
+    for part in parts {
+        out.push(separator);
+        out.push_str(part);
+    }
+    if !unc && out.len() == 2 {
+        out.push('/');
+    }
+    Some(PathBuf::from(out))
 }
 
 /// A command row that is, or may be, a commit-making run in its own worktree.
@@ -1547,7 +1624,7 @@ fn enter(base: Option<&Path>, word: &Word) -> Option<PathBuf> {
     {
         return None;
     }
-    let joined = if path.is_absolute() {
+    let joined = if path.is_absolute() || windows_lexical(&word.text).is_some() {
         path.to_path_buf()
     } else {
         base?.join(path)

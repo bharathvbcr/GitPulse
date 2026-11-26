@@ -20,6 +20,7 @@ pub mod engine;
 pub mod escape;
 pub mod evidence;
 pub mod export;
+pub mod federate;
 pub mod freshness;
 pub mod guides;
 pub mod host;
@@ -76,6 +77,12 @@ pub use engine::{
 };
 pub use escape::{html_escape, render_symbol_label};
 pub use evidence::{EvidenceFile, EvidencePack, EvidenceRole, EvidenceUnit};
+pub use federate::{
+    federate_impact, federate_impact_with_opts, federate_status, federate_status_with_opts,
+    FederateOptions, FederatedDefinition, FederatedDegradedRepo, FederatedHitKind,
+    FederatedImpactHit, FederatedImpactReport, FederatedRepoSpec, FederatedRepoStatus,
+    FederatedStatusReport, FederatedWorkspaceManifest, DEFAULT_FEDERATE_LIMIT, MAX_FEDERATE_LIMIT,
+};
 pub use lean_tcb::{
     analyze_lean_tcb, audit_lean_tcb_tree, audit_lean_tcb_tree_with_mode, LeanKernelMode,
     LeanTcbDeclaration, LeanTcbFileAudit, LeanTcbFileDeclaration, LeanTcbFileHole, LeanTcbHole,

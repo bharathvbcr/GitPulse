@@ -123,6 +123,9 @@ pub(super) struct Gathered {
     pub read_free: fn(&Path) -> Free,
     /// What the lease wrapper does for a build in this session.
     pub lease: LeaseSource,
+    /// Active Manvi system steward critical slowdown lease, when in force for
+    /// this repository and not exempt (`MAC_HEAVY_LABEL`).
+    pub steward_throttle: Option<crate::harness::steward::ActiveThrottleRecord>,
 }
 
 /// Where the facts about the build lease come from.
@@ -367,10 +370,33 @@ pub(super) fn brief_line(report: &SensorReport, snapshot: Option<&Snapshot>) -> 
     bounded(line)
 }
 
+fn is_heavy_lane_exempt() -> bool {
+    std::env::var_os("MAC_HEAVY_LABEL").is_some_and(|label| !label.is_empty())
+}
+
+/// Active Manvi steward critical slowdown record for `cwd`, unless this call
+/// runs inside the heavy lane (`MAC_HEAVY_LABEL`). On a normal host where
+/// `<config>/steward/active.json` does not exist, this is a single `NotFound`
+/// `symlink_metadata` check and opens nothing.
+pub(super) fn live_steward_throttle(
+    cwd: &str,
+) -> Option<crate::harness::steward::ActiveThrottleRecord> {
+    if is_heavy_lane_exempt() {
+        return None;
+    }
+    crate::harness::steward::active_throttle_for_cwd(cwd)
+}
+
 /// What the real world says. Called only for a command that is in the table.
 pub(super) fn gather_live(cwd: &str) -> Gathered {
     let mode = crate::tool_config::host_load_hook_mode();
-    let live = |availability, exempt, disk| Gathered {
+    let exempt = is_heavy_lane_exempt();
+    let steward_throttle = if exempt {
+        None
+    } else {
+        crate::harness::steward::active_throttle_for_cwd(cwd)
+    };
+    let live = |availability, exempt, disk, steward_throttle| Gathered {
         mode,
         exempt,
         availability,
@@ -379,15 +405,16 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
         disk,
         read_free: real_free,
         lease: LeaseSource::Live,
+        steward_throttle,
     };
-    if mode == HostLoadHookMode::Off {
+    if mode == HostLoadHookMode::Off && steward_throttle.is_none() {
         return live(
             Availability::Unavailable(String::new()),
-            false,
+            exempt,
             DiskFacts::from_settings(None),
+            None,
         );
     }
-    let exempt = std::env::var_os("MAC_HEAVY_LABEL").is_some_and(|label| !label.is_empty());
     live(
         availability_live(),
         exempt,
@@ -396,6 +423,7 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
             std::env::current_dir().ok(),
             real_free,
         )),
+        steward_throttle,
     )
 }
 
@@ -523,49 +551,170 @@ pub(super) fn availability_of(report: &SensorReport, snapshot: Option<&Snapshot>
     }
 }
 
+/// Cooperative pacing delay applied during active Manvi steward critical
+/// slowdown, bounded to `1_200 ms` and reserving at least `6s` of
+/// [`super::TOTAL_BUDGET`] (`8s`) so downstream `command_gate_with` keeps its
+/// full `5s` budget.
+///
+/// `started` is the hook process's deadline anchor. Without one (the app
+/// judging an orchestrated child's input line) nothing bounds the pause and
+/// a sleep per line would stall the caller, so nothing is paced.
+pub(super) fn pace_duration_for(
+    requested_ms: u64,
+    started: Option<std::time::Instant>,
+) -> Duration {
+    let Some(started) = started else {
+        return Duration::ZERO;
+    };
+    let target = Duration::from_millis(requested_ms.clamp(0, 1_200));
+    let reserve_for_gate = Duration::from_secs(6);
+    let left = super::TOTAL_BUDGET
+        .saturating_sub(started.elapsed())
+        .saturating_sub(reserve_for_gate);
+    target.min(left)
+}
+
+fn steward_pace_advice(
+    throttle: &crate::harness::steward::ActiveThrottleRecord,
+    paced: Duration,
+) -> HookOutput {
+    let waited = if paced.is_zero() {
+        String::new()
+    } else {
+        format!(" GitPulse paced this command by {}ms.", paced.as_millis())
+    };
+    advice(&format!(
+        "Manvi system steward critical slowdown is active ({} load: {}).{waited} \
+         Pause heavy builds, cap concurrency, and avoid rapid command loops until critical host pressure clears.",
+        throttle.tier, throttle.reason
+    ))
+}
+
 /// The load stage of `command-gate`. Silent for everything that is not in the
 /// table, and for `off`; otherwise the refusal or the advice described above.
 ///
 /// `gather` runs only once the command is known to be in the table, so every
 /// other call pays for the table lookup and nothing else.
+#[cfg(test)]
 pub(super) fn judge(input: &HookInput, gather: impl FnOnce() -> Gathered) -> HookOutput {
+    judge_with_steward_and_pacer(
+        input,
+        gather,
+        || None,
+        Some(std::time::Instant::now()),
+        |_| {},
+    )
+}
+
+/// [`judge`] plus the live Manvi steward critical slowdown lease for commands
+/// outside `heavy_commands` (such as custom scripts or command loops).
+pub(super) fn judge_with_steward(
+    input: &HookInput,
+    gather: impl FnOnce() -> Gathered,
+    unclassified_steward: impl FnOnce() -> Option<crate::harness::steward::ActiveThrottleRecord>,
+) -> HookOutput {
+    judge_with_steward_and_pacer(
+        input,
+        gather,
+        unclassified_steward,
+        super::STARTED.get().copied(),
+        |d| {
+            if !d.is_zero() {
+                std::thread::sleep(d);
+            }
+        },
+    )
+}
+
+pub(super) fn judge_with_steward_and_pacer(
+    input: &HookInput,
+    gather: impl FnOnce() -> Gathered,
+    unclassified_steward: impl FnOnce() -> Option<crate::harness::steward::ActiveThrottleRecord>,
+    started: Option<std::time::Instant>,
+    pace: impl FnOnce(Duration),
+) -> HookOutput {
     if input.command.is_empty() {
         return HookOutput::silent();
     }
     let classified = classify(&input.command);
     if classified.is_empty() {
-        return HookOutput::silent();
+        let Some(throttle) = unclassified_steward() else {
+            return HookOutput::silent();
+        };
+        let delay = pace_duration_for(throttle.pace_ms, started);
+        pace(delay);
+        return steward_pace_advice(&throttle, delay);
     }
     let gathered = gather();
-    judge_classified(input, &classified, &gathered)
+    judge_classified(input, &classified, &gathered, started, pace)
 }
 
-fn judge_classified(input: &HookInput, classified: &Classified, g: &Gathered) -> HookOutput {
-    if g.mode == HostLoadHookMode::Off || g.exempt {
+fn judge_classified(
+    input: &HookInput,
+    classified: &Classified,
+    g: &Gathered,
+    started: Option<std::time::Instant>,
+    pace: impl FnOnce(Duration),
+) -> HookOutput {
+    if g.exempt {
+        return HookOutput::silent();
+    }
+    let steward = g.steward_throttle.as_ref();
+    if g.mode == HostLoadHookMode::Off && steward.is_none() {
         return HookOutput::silent();
     }
     let Some(heavy) = classified.heavy.as_ref() else {
-        if classified.unreadable {
+        let base = if g.mode == HostLoadHookMode::Off {
+            HookOutput::silent()
+        } else if classified.unreadable {
             let why = "it could not read the command line (an unterminated quote, or longer than it reads)";
-            return match first_notice(g, input, why) {
+            match first_notice(g, input, why) {
                 Notice::Repeat => HookOutput::silent(),
                 notice => advice(&format!(
                     "GitPulse did NOT load-check this command: {why}.{}",
                     notice.suffix()
                 )),
-            };
-        }
-        return advise_rows(classified, &g.availability);
+            }
+        } else {
+            advise_rows(classified, &g.availability)
+        };
+        return match steward {
+            Some(throttle) => {
+                let delay = pace_duration_for(throttle.pace_ms, started);
+                pace(delay);
+                fold(base, steward_pace_advice(throttle, delay))
+            }
+            None => base,
+        };
     };
-    let disk = disk_check(input, classified, heavy, g);
+    let mut enforced;
+    let effective_g = if steward.is_some() && g.mode != HostLoadHookMode::Enforce {
+        enforced = g.clone();
+        enforced.mode = HostLoadHookMode::Enforce;
+        &enforced
+    } else {
+        g
+    };
+    let disk = disk_check(input, classified, heavy, effective_g);
     if let DiskCall::Refuse(output) = disk {
         return output;
     }
-    let verdict_answer = verdict_answer(input, classified, heavy, g);
-    match disk {
+    let verdict_answer = verdict_answer(input, classified, heavy, effective_g);
+    let answer = match disk {
         DiskCall::Say(text) => fold(verdict_answer, advice(&text)),
         _ => verdict_answer,
+    };
+    if let Some(throttle) = steward {
+        if !refuses(&answer) {
+            let is_disk = matches!(throttle.binding.as_str(), "low_disk" | "disk_filling");
+            let why = format!(
+                "Manvi system steward critical slowdown is active ({} load: {})",
+                throttle.tier, throttle.reason
+            );
+            return fold(answer, deny(input, heavy, &why, is_disk, effective_g));
+        }
     }
+    answer
 }
 
 /// What the disk checks make of a heavy command.
@@ -766,12 +915,19 @@ fn deny(input: &HookInput, heavy: &Hit, why: &str, disk: bool, g: &Gathered) -> 
         ));
     }
     let repeats = deny_count(g, input);
+    // Under a steward slowdown the gate is enforced whatever its own setting,
+    // so the switch that lifts the refusal is the steward's, not the gate's.
+    let user_switch = if g.steward_throttle.is_some() {
+        "switch off \"Slow agents when host load is critical\" in GitPulse Settings > Agents > Manvi system steward"
+    } else {
+        "set the command gate to Advise or Off in GitPulse Settings > Agents > Host load"
+    };
     let (reason, notice) = match repeats {
         Some(n) if n >= LOOP_AT => (
             format!(
                 "STOP: you are looping. GitPulse has refused this same heavy command ({}) {n} times in the last {} minutes because {why}. \
                  Do not run it again, and do not run any other build or test command, until {}. \
-                 Tell the user {} and ask them to {} or change the command gate in GitPulse Settings > Agents > Host load. \
+                 Tell the user {} and ask them to {} or {user_switch}. \
                  This grants nothing.",
                 heavy.label,
                 LOOP_WINDOW.as_secs() / 60,
@@ -788,7 +944,7 @@ fn deny(input: &HookInput, heavy: &Hit, why: &str, disk: bool, g: &Gathered) -> 
             format!(
                 "GitPulse refused this heavy command ({}) because {why}. \
                  What to do: {}. Do not retry in a loop, and do not work around this by running the same work through another build tool, a wrapper script or a subshell{}. \
-                 If the work cannot wait, tell the user: they can set the command gate to Advise or Off in GitPulse Settings > Agents > Host load.",
+                 If the work cannot wait, tell the user: they can {user_switch}.",
                 heavy.label,
                 if disk {
                     "free disk space first (remove build output such as cargo target directories, or run cargo llvm-cov clean), then run it again; waiting alone will not free any"

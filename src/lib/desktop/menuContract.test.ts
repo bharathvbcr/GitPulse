@@ -717,6 +717,65 @@ describe("an unsendable payload is repaired rather than dropped", () => {
       d.activePath = null;
     }],
     ["a fetch time outside i64", (d) => { d.status.fetchedAt = Number.MAX_VALUE; }],
+    ["too many agent requests", (d) => {
+      d.agentRequests = Array.from({ length: MENU_LIMITS.agentRequests + 1 }, (_, i) => ({
+        id: `term:${i}`,
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "Claude",
+        repoLabel: "a",
+        repoPath: "/r/a",
+        urgency: "blocking",
+        reason: "Needs your permission",
+        detail: null,
+        atMs: 1,
+      }));
+    }],
+    ["an agent request with an invalid urgency", (d) => {
+      d.agentRequests = [{
+        id: "term:1",
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "Claude",
+        repoLabel: "a",
+        repoPath: "/r/a",
+        urgency: "action_needed" as never,
+        reason: "Needs your permission",
+        detail: null,
+        atMs: 1,
+      }];
+    }],
+    ["an agent request with an oversized detail", (d) => {
+      d.agentRequests = [{
+        id: "term:1",
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "Claude",
+        repoLabel: "a",
+        repoPath: "/r/a",
+        urgency: "error",
+        reason: "Stopped on an error",
+        detail: "d".repeat(MENU_LIMITS.text + 1),
+        atMs: 1,
+      }];
+    }],
+    ["an agent request timestamp outside i64", (d) => {
+      d.agentRequests = [{
+        id: "term:1",
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "Claude",
+        repoLabel: "a",
+        repoPath: "/r/a",
+        urgency: "blocking",
+        reason: "Needs your permission",
+        detail: null,
+        atMs: Number.MAX_VALUE,
+      }];
+    }],
+    ["a hidden agent request count when list is not full", (d) => { d.agentRequestsHidden = 2; }],
+    ["an oversized running agent count", (d) => { d.agentsRunning = MENU_LIMITS.agentsWaiting + 1; }],
+    ["an oversized informational agent count", (d) => { d.agentsInformational = MENU_LIMITS.agentsWaiting + 1; }],
   ];
 
   for (const [name, breach] of breakages) {

@@ -296,10 +296,17 @@ struct Approval {
 }
 
 fn approval_store() -> Result<PathBuf, CommandError> {
-    crate::tool_config::default_config_dir()
-        .map(|dir| dir.join(APPROVAL_DIR))
-        .ok_or_else(|| "Cannot resolve GitPulse hook approval storage".to_string())
-        .map_err(CommandError::from)
+    #[cfg(test)]
+    {
+        Ok(crate::test_support::hermetic_config_dir().join(APPROVAL_DIR))
+    }
+    #[cfg(not(test))]
+    {
+        crate::tool_config::default_config_dir()
+            .map(|dir| dir.join(APPROVAL_DIR))
+            .ok_or_else(|| "Cannot resolve GitPulse hook approval storage".to_string())
+            .map_err(CommandError::from)
+    }
 }
 
 /// The repository the approval is keyed to, and the record's file name in

@@ -1688,6 +1688,442 @@ fn signal_term(_pid: i32, _start_us: u64) -> Result<(), String> {
     Err("terminating a process is not supported on this platform".into())
 }
 
+/// One live process inside an agent session tree eligible for background
+/// scheduler/I/O throttling while the host is at critical pressure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentThrottleCandidate {
+    pub pid: i32,
+    pub start_us: u64,
+    pub name: String,
+    pub session_pid: i32,
+    pub session_kind: AgentKind,
+    pub session_cwd: Option<String>,
+    pub is_session_root: bool,
+    /// Working directories of this process's ancestors, nearest first, up to
+    /// and including the session root (`/` and unreadable ones left out). A
+    /// build script or a dependency's `rustc` runs in the package's own
+    /// directory under the Cargo registry, outside every repository; the
+    /// `cargo` that started it is where the work belongs.
+    pub lineage_cwds: Vec<String>,
+    /// Process ids of this process's ancestors, nearest first, up to and
+    /// including the session root (at most `MAX_ANCESTOR_PIDS`). The steward
+    /// uses them to tell a child that inherited background priority from a
+    /// process it throttled apart from one someone else backgrounded.
+    pub ancestor_pids: Vec<i32>,
+}
+
+/// Most ancestor working directories one candidate carries.
+const MAX_LINEAGE_CWDS: usize = 8;
+
+/// Most ancestor process ids one candidate carries.
+const MAX_ANCESTOR_PIDS: usize = 8;
+
+/// Returns live current-user worker processes belonging to active agent session
+/// trees (`Claude`, `Codex`, `Antigravity`, `DevCouncil`), excluding GitPulse
+/// itself, `memguard`, `Manvi` workers, helper binaries (`devmap`, `ptyd`,
+/// `gitpulse-*`), and session root processes (interactive CLI TUIs and IDE
+/// hosts, whose responsiveness and `fork()` priority inheritance must stay clean).
+pub(crate) fn agent_throttle_candidates() -> Result<Vec<AgentThrottleCandidate>, String> {
+    if !os::SUPPORTED {
+        return Err("process scanning is not supported on this platform".into());
+    }
+    let mut scanner = Scanner::os();
+    scanner.collect_throttle_candidates(i32::try_from(std::process::id()).unwrap_or(-1))
+}
+
+impl Scanner {
+    pub(crate) fn collect_throttle_candidates(
+        &mut self,
+        me_pid: i32,
+    ) -> Result<Vec<AgentThrottleCandidate>, String> {
+        self.source.read(&mut self.facts)?;
+        let me_uid = self.source.me_uid();
+        self.index.clear();
+        for (i, f) in self.facts.iter().enumerate() {
+            self.index.insert(f.pid, i);
+        }
+        let sessions_at = self.assign_sessions(me_uid);
+        let mut session_cwds: Vec<Option<String>> = Vec::with_capacity(sessions_at.len());
+        for &si in &sessions_at {
+            let pid = self.facts[si].pid;
+            session_cwds.push(
+                self.source
+                    .cwd(pid)
+                    .map(|p| p.to_string_lossy().into_owned()),
+            );
+        }
+        let mut out = Vec::new();
+        let mut ancestor_cwds: HashMap<i32, Option<String>> = HashMap::new();
+        for (i, f) in self.facts.iter().enumerate() {
+            let Some(s_idx) = self.session_of[i].map(|n| n as usize) else {
+                continue;
+            };
+            let Some(&root_i) = sessions_at.get(s_idx) else {
+                continue;
+            };
+            let root = &self.facts[root_i];
+            let Some(session_kind) = root.ident.kind else {
+                continue;
+            };
+            // Never throttle GitPulse's own Manvi worker trees.
+            if session_kind == AgentKind::Manvi {
+                continue;
+            }
+            if f.pid <= 1 || f.start_us == 0 || f.pid == me_pid || f.uid != me_uid {
+                continue;
+            }
+            if f.ident.memguard {
+                continue;
+            }
+            // Never throttle the session root itself (interactive CLI TUI or IDE
+            // host): keeping the root at normal priority preserves Ctrl+C / hook
+            // responsiveness and prevents XNU fork() inheritance of PRIO_DARWIN_BG
+            // onto newly spawned long-lived child helpers.
+            if f.pid == root.pid {
+                continue;
+            }
+            // An IDE-hosted root is the whole editor: beside its agent server
+            // it parents the integrated-terminal shells and everything the
+            // person types there. Only the agent server's own descendants are
+            // the agent's work.
+            if root.ident.ide_hosted
+                && !is_ide_agent_server(root)
+                && !self.descends_from_agent_server(i, root_i)
+            {
+                continue;
+            }
+            let lower_name = f.ident.name.to_ascii_lowercase();
+            if matches!(
+                lower_name.as_str(),
+                "gitpulse"
+                    | "gitpulsed"
+                    | "gitpulse-mcp"
+                    | "gitpulse-hook"
+                    | "manvi"
+                    | "ptyd"
+                    | "devmap"
+            ) {
+                continue;
+            }
+            let own_cwd = self
+                .source
+                .cwd(f.pid)
+                .filter(|p| p != std::path::Path::new("/"))
+                .map(|p| p.to_string_lossy().into_owned());
+            let effective_cwd = own_cwd.or_else(|| session_cwds.get(s_idx).cloned().flatten());
+            let lineage_cwds = self.lineage_cwds(i, root_i, &mut ancestor_cwds);
+            let ancestor_pids = self.ancestor_pids(i, root_i);
+            out.push(AgentThrottleCandidate {
+                pid: f.pid,
+                start_us: f.start_us,
+                name: f.ident.name.clone(),
+                session_pid: root.pid,
+                session_kind,
+                session_cwd: effective_cwd,
+                is_session_root: false,
+                lineage_cwds,
+                ancestor_pids,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Working directories of `i`'s ancestors, nearest first, through the
+    /// session root `root_i`, each read once per scan through `cache`.
+    fn lineage_cwds(
+        &self,
+        i: usize,
+        root_i: usize,
+        cache: &mut HashMap<i32, Option<String>>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut at = self.parent_of(i);
+        for _ in 0..MAX_DEPTH {
+            let Some(p) = at else { break };
+            let pid = self.facts[p].pid;
+            let cwd = cache
+                .entry(pid)
+                .or_insert_with(|| {
+                    self.source
+                        .cwd(pid)
+                        .filter(|c| c != Path::new("/"))
+                        .map(|c| c.to_string_lossy().into_owned())
+                })
+                .clone();
+            if let Some(cwd) = cwd {
+                if out.last() != Some(&cwd) {
+                    out.push(cwd);
+                    if out.len() >= MAX_LINEAGE_CWDS {
+                        break;
+                    }
+                }
+            }
+            if p == root_i {
+                break;
+            }
+            at = self.parent_of(p);
+        }
+        out
+    }
+
+    /// Process ids of `i`'s ancestors, nearest first, through the session
+    /// root `root_i`, bounded by `MAX_ANCESTOR_PIDS`.
+    fn ancestor_pids(&self, i: usize, root_i: usize) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut at = self.parent_of(i);
+        for _ in 0..MAX_DEPTH.min(MAX_ANCESTOR_PIDS) {
+            let Some(p) = at else { break };
+            out.push(self.facts[p].pid);
+            if p == root_i {
+                break;
+            }
+            at = self.parent_of(p);
+        }
+        out
+    }
+
+    /// Whether an IDE's agent server lies strictly between process `i` and
+    /// its session root `root_i`.
+    fn descends_from_agent_server(&self, i: usize, root_i: usize) -> bool {
+        let mut at = self.parent_of(i);
+        for _ in 0..MAX_DEPTH {
+            let Some(p) = at else { return false };
+            if p == root_i {
+                return false;
+            }
+            if is_ide_agent_server(&self.facts[p]) {
+                return true;
+            }
+            at = self.parent_of(p);
+        }
+        false
+    }
+}
+
+/// Antigravity's `language_server`: the process inside the IDE that runs the
+/// agent, as opposed to the editor windows, helpers and terminal host.
+fn is_ide_agent_server(f: &ProcFacts) -> bool {
+    f.ident.kind == Some(AgentKind::Antigravity) && f.ident.name == "language_server"
+}
+
+#[cfg(target_os = "macos")]
+const PRIO_DARWIN_PROCESS_WHICH: libc::c_int = 4;
+#[cfg(target_os = "macos")]
+const PRIO_DARWIN_BG_FLAG: libc::c_int = 0x1000;
+/// Darwin XNU `MAXPRI_THROTTLE`: task priority assigned when a process is
+/// placed in `PRIO_DARWIN_BG` (`BASEPRI_DEFAULT` is `31`).
+#[cfg(target_os = "macos")]
+const DARWIN_MAXPRI_THROTTLE: i32 = 4;
+
+/// Reads XNU `proc_taskinfo::pti_priority` for `pid` on macOS, since
+/// `getpriority(PRIO_DARWIN_PROCESS, pid)` only queries the calling task (`who == 0`)
+/// whereas `setpriority(PRIO_DARWIN_PROCESS, pid, ...)` updates any same-UID `pid`.
+#[cfg(target_os = "macos")]
+pub(crate) fn darwin_task_priority(pid: i32) -> Result<i32, String> {
+    let size = std::mem::size_of::<libc::proc_taskinfo>();
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    // SAFETY: `info` matches `proc_taskinfo` layout and is read only after the
+    // kernel reports writing all `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if usize::try_from(written).ok() != Some(size) {
+        return Err(format!(
+            "proc_pidinfo(PROC_PIDTASKINFO) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fully initialized by `proc_pidinfo`.
+    Ok(unsafe { info.assume_init() }.pti_priority)
+}
+
+/// The nice value a slowed Linux process is given.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_SLOW_NICE: i32 = 10;
+
+/// Whether a Linux process at nice `current` may be slowed. Raising nice is
+/// always allowed, but lowering it again needs the target's `RLIMIT_NICE` to
+/// cover the old value (`20 - nice <= limit`) or a privileged caller, and the
+/// usual limit is 0. A process that could not be put back is not slowed.
+#[cfg(any(target_os = "linux", test))]
+fn linux_may_slow(current: i32, rlimit_nice: u64, privileged: bool) -> Result<bool, String> {
+    if current >= LINUX_SLOW_NICE {
+        return Ok(false);
+    }
+    let needed = u64::try_from(20 - current).unwrap_or(u64::MAX);
+    if privileged || needed <= rlimit_nice {
+        return Ok(true);
+    }
+    Err(format!(
+        "Linux would not let GitPulse put its priority back (its RLIMIT_NICE is {rlimit_nice}, nice {current} needs {needed}), so it was left at normal priority"
+    ))
+}
+
+/// The nice value to restore a slowed Linux process to: the one it had before,
+/// when this process slowed it. After a restart that record is gone, and 0, the
+/// default, is used. A process whose nice someone else changed since is left.
+#[cfg(any(target_os = "linux", test))]
+fn linux_restore_nice(recorded: Option<i32>, current: i32) -> Option<i32> {
+    (current == LINUX_SLOW_NICE).then(|| recorded.unwrap_or(0))
+}
+
+/// Nice values of the Linux processes this process slowed, by `(pid,
+/// start_us)`, so each is restored to what it had. Bounded: past the cap no
+/// further process is slowed rather than one that cannot be put back exactly.
+#[cfg(target_os = "linux")]
+static LINUX_SLOWED_FROM: std::sync::Mutex<std::collections::BTreeMap<(i32, u64), i32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(target_os = "linux")]
+const MAX_LINUX_SLOWED: usize = 4096;
+
+/// Places (`enable = true`) or restores (`enable = false`) a live current-user
+/// process in OS background scheduler / I/O throttle after re-verifying both
+/// `pid` and `start_us` against the live process table.
+///
+/// Returns `Ok(true)` when the process's scheduling state was changed by this
+/// call, `Ok(false)` when it was already in the target state, or `Err` when
+/// refused or unsupported.
+pub(crate) fn set_background_throttle(
+    pid: i32,
+    start_us: u64,
+    enable: bool,
+) -> Result<bool, String> {
+    if pid <= 1 || start_us == 0 || i32::try_from(std::process::id()).ok() == Some(pid) {
+        return Err("refused to change priority of reserved or current process".into());
+    }
+    let Some(facts) = probe_one(pid) else {
+        return Err("process is no longer running".into());
+    };
+    if facts.start_us != start_us {
+        return Err("pid was recycled by a newer process".into());
+    }
+    #[cfg(unix)]
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    #[cfg(not(unix))]
+    let me = u32::MAX;
+    if facts.uid != me {
+        return Err("process belongs to another user".into());
+    }
+    if facts.ident.memguard {
+        return Err("GitPulse never modifies memguard scheduling".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let pri = darwin_task_priority(pid)?;
+        let already_throttled = pri <= DARWIN_MAXPRI_THROTTLE;
+        let target = pid as libc::id_t;
+        // SAFETY: `setpriority` takes plain integer identifiers with no pointers.
+        unsafe {
+            if enable {
+                if already_throttled {
+                    return Ok(false);
+                }
+                if libc::setpriority(PRIO_DARWIN_PROCESS_WHICH, target, PRIO_DARWIN_BG_FLAG) != 0 {
+                    return Err(format!(
+                        "setpriority(PRIO_DARWIN_BG) failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(true)
+            } else {
+                if !already_throttled {
+                    return Ok(false);
+                }
+                if libc::setpriority(PRIO_DARWIN_PROCESS_WHICH, target, 0) != 0 {
+                    return Err(format!(
+                        "setpriority(restore) failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let target = pid as libc::id_t;
+        // SAFETY: `__errno_location` is thread-local; `getpriority` takes plain integers.
+        let current = unsafe {
+            *libc::__errno_location() = 0;
+            let current = libc::getpriority(libc::PRIO_PROCESS, target);
+            let err = *libc::__errno_location();
+            if current == -1 && err != 0 {
+                return Err(format!(
+                    "getpriority failed: {}",
+                    std::io::Error::from_raw_os_error(err)
+                ));
+            }
+            current
+        };
+        let set_nice = |nice: i32| -> Result<(), String> {
+            // SAFETY: `setpriority` takes plain integers.
+            if unsafe { libc::setpriority(libc::PRIO_PROCESS, target, nice) } != 0 {
+                return Err(format!(
+                    "setpriority(nice {nice}) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        };
+        if enable {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: reads `pid`'s limit into a local; a null new limit sets nothing.
+            if unsafe { libc::prlimit(pid, libc::RLIMIT_NICE, std::ptr::null(), &mut limit) } != 0 {
+                return Err(format!(
+                    "could not read its RLIMIT_NICE: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: `geteuid` has no preconditions.
+            let privileged = unsafe { libc::geteuid() } == 0;
+            if !linux_may_slow(current, limit.rlim_cur, privileged)? {
+                return Ok(false);
+            }
+            let mut slowed = crate::supervisor::lock_or_recover(&LINUX_SLOWED_FROM);
+            if slowed.len() >= MAX_LINUX_SLOWED {
+                // Processes that exited while slowed need no restore.
+                slowed.retain(|&(p, s), _| probe_one(p).is_some_and(|f| f.start_us == s));
+            }
+            if slowed.len() >= MAX_LINUX_SLOWED && !slowed.contains_key(&(pid, start_us)) {
+                return Err(
+                    "GitPulse already holds as many slowed processes as it can put back".into(),
+                );
+            }
+            set_nice(LINUX_SLOW_NICE)?;
+            slowed.insert((pid, start_us), current);
+            Ok(true)
+        } else {
+            let mut slowed = crate::supervisor::lock_or_recover(&LINUX_SLOWED_FROM);
+            let recorded = slowed.get(&(pid, start_us)).copied();
+            let Some(to) = linux_restore_nice(recorded, current) else {
+                slowed.remove(&(pid, start_us));
+                return Ok(false);
+            };
+            set_nice(to)?;
+            slowed.remove(&(pid, start_us));
+            Ok(true)
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = enable;
+        Err("process background throttling is not supported on this platform".into())
+    }
+}
+
 /// Whether this platform has a process scan at all.
 pub(crate) const SCAN_SUPPORTED: bool = os::SUPPORTED;
 
@@ -2286,6 +2722,18 @@ pub(crate) fn all_pids() -> Result<Vec<i32>, String> {
     let mut pids = Vec::new();
     os::list_pids(&mut pids)?;
     Ok(pids)
+}
+
+/// A process's executable path, when the OS will say. macOS only.
+#[cfg(target_os = "macos")]
+pub(crate) fn exec_path_of(pid: i32) -> Option<String> {
+    os::pidpath(pid)
+}
+
+/// A process's phys footprint (bytes) and CPU time (ns). macOS only.
+#[cfg(target_os = "macos")]
+pub(crate) fn footprint_cpu_of(pid: i32) -> Option<(u64, u64)> {
+    os::footprint_cpu(pid)
 }
 
 /// A process's working directory, when the OS will say.
@@ -3206,7 +3654,17 @@ mod os {
         }
     }
 
-    fn pidpath(pid: i32) -> Option<String> {
+    /// Phys footprint (bytes) and CPU time (ns) of `pid` from
+    /// `proc_pid_rusage`; `None` when the process is gone or unreadable.
+    pub(crate) fn footprint_cpu(pid: i32) -> Option<(u64, u64)> {
+        let usage = usage(pid, timebase());
+        match (usage.footprint, usage.cpu_ns) {
+            (Reading::Value(footprint), Reading::Value(cpu_ns)) => Some((footprint, cpu_ns)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pidpath(pid: i32) -> Option<String> {
         let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
         // SAFETY: `buf` is PROC_PIDPATHINFO_MAXSIZE bytes, which is what the
         // call writes into.
@@ -3268,6 +3726,22 @@ mod os {
     }
 }
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
+fn parse_proc_cwd_link(path: PathBuf) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    if path.exists() {
+        return Some(path);
+    }
+    let clean = path
+        .to_str()
+        .and_then(|raw| raw.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .unwrap_or(path);
+    clean.is_absolute().then_some(clean)
+}
+
 #[cfg(target_os = "linux")]
 mod os {
     use super::{Identity, LaunchKey, ProcFacts, ProcSource, MAX_SCANNED_PROCESSES};
@@ -3324,8 +3798,9 @@ mod os {
 
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
         let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-        // A deleted directory reads back as "/old/path (deleted)".
-        path.is_absolute().then_some(path).filter(|p| p.is_dir())
+        // A deleted directory reads back as "/old/path (deleted)", which is still
+        // proof of this process's working directory rather than an unreadable process.
+        super::parse_proc_cwd_link(path)
     }
 
     pub(crate) fn fd_path(pid: i32, fd: i32) -> Reading<String> {
@@ -7114,5 +7589,220 @@ pub(crate) mod tests {
         ] {
             assert!(!is_dynamic_loader(other), "{other}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linux_proc_cwd_with_a_deleted_suffix_keeps_its_path_unless_literally_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("gone-worktree");
+        let marked = PathBuf::from(format!("{} (deleted)", gone.display()));
+        assert_eq!(super::parse_proc_cwd_link(marked), Some(gone));
+
+        let literal_deleted = dir.path().join("real (deleted)");
+        std::fs::create_dir(&literal_deleted).expect("create dir with deleted suffix");
+        assert_eq!(
+            super::parse_proc_cwd_link(literal_deleted.clone()),
+            Some(literal_deleted)
+        );
+
+        assert_eq!(
+            super::parse_proc_cwd_link(PathBuf::from("relative (deleted)")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cwd_returns_the_path_even_after_the_directory_is_deleted() {
+        use crate::procguard::LockedSpawn;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = dir.path().join("vanished");
+        std::fs::create_dir(&work).expect("create vanished dir");
+        let pidfile = dir.path().join("child.pid");
+        let (exe, args) = fixture_command();
+        let mut child = std::process::Command::new(&exe)
+            .args(&args)
+            .env(
+                FIXTURE_ENV,
+                format!("sleep=30,pidfile={}", pidfile.display()),
+            )
+            .current_dir(&work)
+            .stdout(std::process::Stdio::null())
+            .spawn_locked()
+            .expect("spawn child in vanished dir");
+        let pid = fixture_pid(&pidfile);
+        std::fs::remove_dir(&work).expect("remove child cwd while alive");
+        let resolved = super::os::cwd(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(resolved, Some(work));
+    }
+
+    #[test]
+    fn collect_throttle_candidates_skips_session_roots_and_helpers_and_resolves_worker_cwd() {
+        let facts = Arc::new(Mutex::new(antigravity_facts(vec![
+            p(100, 1, "/usr/local/bin/claude"),
+            p(101, 100, "/Users/dev/.cargo/bin/cargo"),
+            p(102, 100, "/Users/dev/.local/bin/devmap"),
+            p(103, 100, "/Users/dev/.local/bin/gitpulse-mcp"),
+            p(
+                200,
+                1,
+                "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            ),
+            p(202, 200, AG_LANGUAGE_SERVER),
+            p(201, 202, "/Users/dev/.rustup/toolchains/stable/bin/rustc"),
+        ])));
+        let mut scanner = Scanner::new(Box::new(Fixture {
+            facts,
+            cwds: HashMap::from([
+                (100, PathBuf::from("/Users/dev/repo-a")),
+                (200, PathBuf::from("/")),
+                (201, PathBuf::from("/Users/dev/opted-out-repo")),
+            ]),
+            fds: HashMap::new(),
+            fail: None,
+        }));
+        let out = scanner.collect_throttle_candidates(999).expect("scan");
+        let pids: Vec<i32> = out.iter().map(|c| c.pid).collect();
+        assert_eq!(
+            pids,
+            vec![101, 201],
+            "interactive session roots (100, 200) and helper binaries (102, 103) must be excluded"
+        );
+        assert_eq!(out[0].session_cwd.as_deref(), Some("/Users/dev/repo-a"));
+        assert_eq!(
+            out[1].session_cwd.as_deref(),
+            Some("/Users/dev/opted-out-repo"),
+            "worker cwd must override IDE root cwd == /"
+        );
+    }
+
+    #[test]
+    fn a_worker_outside_every_repository_carries_its_ancestors_working_directories() {
+        let facts = Arc::new(Mutex::new(facts_of(vec![
+            p(100, 1, "/usr/local/bin/claude"),
+            p(101, 100, "/Users/dev/.cargo/bin/cargo"),
+            p(
+                102,
+                101,
+                "/Users/dev/repo/target/debug/build/serde-1/build-script-build",
+            ),
+            p(103, 102, "/usr/bin/cc"),
+        ])));
+        let registry = "/Users/dev/.cargo/registry/src/index/serde-1.0.0";
+        let mut scanner = Scanner::new(Box::new(Fixture {
+            facts,
+            cwds: HashMap::from([
+                (100, PathBuf::from("/Users/dev/repo")),
+                (101, PathBuf::from("/Users/dev/repo")),
+                (102, PathBuf::from(registry)),
+                (103, PathBuf::from(registry)),
+            ]),
+            fds: HashMap::new(),
+            fail: None,
+        }));
+        let out = scanner.collect_throttle_candidates(999).expect("scan");
+        let lineage = |pid: i32| {
+            out.iter()
+                .find(|c| c.pid == pid)
+                .map(|c| c.lineage_cwds.clone())
+                .unwrap_or_else(|| panic!("{pid} not a candidate: {out:?}"))
+        };
+        assert_eq!(lineage(102), vec!["/Users/dev/repo".to_string()]);
+        assert_eq!(
+            lineage(103),
+            vec![registry.to_string(), "/Users/dev/repo".to_string()],
+            "nearest first, each directory once"
+        );
+    }
+
+    #[test]
+    fn linux_slows_only_what_it_can_put_back_and_restores_the_value_it_found() {
+        // The usual limit (0) cannot cover any return trip: not slowed, and said why.
+        let refused = linux_may_slow(0, 0, false).unwrap_err();
+        assert!(refused.contains("RLIMIT_NICE is 0"), "{refused}");
+        // A limit that covers the old value (20 - 5 = 15), or a privileged caller.
+        assert_eq!(linux_may_slow(5, 15, false), Ok(true));
+        assert!(linux_may_slow(5, 14, false).is_err());
+        assert_eq!(linux_may_slow(0, 0, true), Ok(true));
+        // Already at or past the slowed value: nothing to do, nothing to undo.
+        assert_eq!(linux_may_slow(LINUX_SLOW_NICE, 0, false), Ok(false));
+        assert_eq!(linux_may_slow(15, 0, false), Ok(false));
+
+        // Restored to what it had, or to the default when that record is gone.
+        assert_eq!(linux_restore_nice(Some(5), LINUX_SLOW_NICE), Some(5));
+        assert_eq!(linux_restore_nice(None, LINUX_SLOW_NICE), Some(0));
+        // Someone changed it since: theirs to keep.
+        assert_eq!(linux_restore_nice(Some(5), 12), None);
+    }
+
+    const AG_LANGUAGE_SERVER: &str =
+        "/Applications/Antigravity.app/Contents/Resources/bin/language_server";
+
+    /// [`facts_of`], with Antigravity's `language_server` given the flag that
+    /// identifies it (`facts_of` passes the executable as the only argument).
+    fn antigravity_facts(rows: Vec<P>) -> Vec<ProcFacts> {
+        let mut facts = facts_of(rows);
+        for f in &mut facts {
+            if f.ident.name == "language_server" {
+                f.ident = Arc::new(Identity::new(
+                    "language_server".into(),
+                    Some(AG_LANGUAGE_SERVER.into()),
+                    vec![
+                        AG_LANGUAGE_SERVER.into(),
+                        "--override_ide_name".into(),
+                        "antigravity".into(),
+                    ],
+                    LaunchKey::from_env(std::iter::empty::<&str>()),
+                ));
+            }
+        }
+        facts
+    }
+
+    #[test]
+    fn an_ide_s_terminal_shells_are_never_slowed_only_its_agent_s_work() {
+        let facts = Arc::new(Mutex::new(antigravity_facts(vec![
+            p(
+                200,
+                1,
+                "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            ),
+            // The agent server and a build it started.
+            p(202, 200, AG_LANGUAGE_SERVER),
+            p(
+                203,
+                202,
+                "/Users/dev/.rustup/toolchains/stable/bin/rustc",
+            ),
+            // The editor's terminal host, the person's shell, and their build.
+            p(
+                210,
+                200,
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper",
+            ),
+            p(211, 210, "/bin/zsh"),
+            p(212, 211, "/Users/dev/.cargo/bin/cargo"),
+        ])));
+        let mut scanner = Scanner::new(Box::new(Fixture {
+            facts,
+            cwds: HashMap::from([
+                (200, PathBuf::from("/")),
+                (203, PathBuf::from("/Users/dev/repo")),
+                (211, PathBuf::from("/Users/dev/repo")),
+                (212, PathBuf::from("/Users/dev/repo")),
+            ]),
+            fds: HashMap::new(),
+            fail: None,
+        }));
+        let out = scanner.collect_throttle_candidates(999).expect("scan");
+        let pids: Vec<i32> = out.iter().map(|c| c.pid).collect();
+        assert_eq!(
+            pids,
+            vec![203],
+            "only the agent server's build; not the server itself, the terminal host, the shell or what was typed in it"
+        );
     }
 }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import {
     Image as ImageIcon,
     Binary,
@@ -10,13 +11,16 @@
   import type { LineEnding } from "../../files/types";
   import { describeError } from "../../ui/copy/describeFailure";
   import { bytesFromBase64Prefix, hexDumpRows } from "../../files/hexDump";
+  import { isHtmlFile } from "../../files/htmlPreview";
+  import { isSvgFile } from "../../files/svgPreview";
   import CodeViewer from "./CodeViewer.svelte";
   import LazyMount from "../LazyMount.svelte";
   import ScrollCue from "../ScrollCue.svelte";
-  // The Markdown reader and its 21 KB parser are only reachable through a
-  // .md file, and shipped in the startup chunk regardless. Module scope: the
-  // loader identity is LazyMount's cache key.
+  // The Markdown, HTML, and SVG viewers stay deferred in separate chunks until
+  // opened. Module scope: the loader identity is LazyMount's cache key.
   const loadMarkDevViewer = () => import("./MarkDevViewer.svelte");
+  const loadHtmlPreviewViewer = () => import("./HtmlPreviewViewer.svelte");
+  const loadSvgPreviewViewer = () => import("./SvgPreviewViewer.svelte");
 
   let {
     filePath,
@@ -29,6 +33,7 @@
     onRequestDiscard,
     revealTarget = null,
     onSendSelectionToAgent,
+    agentSend,
   }: {
     filePath: string;
     blob: {
@@ -49,7 +54,8 @@
     onDraftChange?: (newContent: string, sourceContent: string) => void;
     onRequestDiscard?: () => Promise<boolean>;
     revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
-    onSendSelectionToAgent?: (reference: string) => void;
+    onSendSelectionToAgent?: (reference: string, checkout?: string) => unknown;
+    agentSend?: { repoPath: string; checkout: string };
   } = $props();
 
   const effectiveRepoPath = $derived(repoPath ?? $repoStore.currentPath);
@@ -62,19 +68,32 @@
   let imageBar: HTMLDivElement | undefined = $state();
   let binaryBar: HTMLDivElement | undefined = $state();
 
-  let isSvg = $derived(filePath.toLowerCase().endsWith(".svg"));
+  let isSvg = $derived(
+    isSvgFile(filePath) && (!blob.is_binary || (blob.is_image && Boolean(blob.base64))),
+  );
   let isMarkdown = $derived(
     filePath.toLowerCase().endsWith(".md") ||
     filePath.toLowerCase().endsWith(".markdown") ||
     filePath.toLowerCase().endsWith(".mdx")
   );
+  let isHtml = $derived(!blob.is_binary && isHtmlFile(filePath));
+
+  let lastRasterPath = untrack(() => filePath);
+  $effect(() => {
+    const next = filePath;
+    if (next === lastRasterPath) return;
+    lastRasterPath = next;
+    untrack(() => {
+      naturalWidth = null;
+      naturalHeight = null;
+      imageFit = true;
+      imageZoom = 100;
+    });
+  });
 
   let imageSrc = $derived.by(() => {
     if (blob.base64) {
       return `data:${blob.mime};base64,${blob.base64}`;
-    }
-    if (isSvg && blob.text) {
-      return `data:image/svg+xml;utf8,${encodeURIComponent(blob.text)}`;
     }
     return null;
   });
@@ -99,7 +118,25 @@
   }
 </script>
 
-{#if blob.is_image || isSvg}
+{#if isSvg}
+  <!-- Interactive SVG Previewer & Split Source Editor -->
+  <LazyMount
+    load={loadSvgPreviewViewer}
+    name="The SVG previewer"
+    props={{
+      filePath,
+      blob,
+      repoPathOverride: effectiveRepoPath,
+      draftContent,
+      dirty,
+      onSave,
+      onDraftChange,
+      onRequestDiscard,
+      revealTarget,
+      onSendSelectionToAgent,
+    }}
+  />
+{:else if blob.is_image}
   <!-- Image Viewer Surface -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-none">
     <!-- Image Top Bar Controls -->
@@ -160,19 +197,21 @@
       <ScrollCue target={imageBar} axis="x" />
     </div>
 
-    <!-- Image Canvas Area with Transparency Grid -->
-    <div class="flex-1 min-h-0 flex items-center justify-center p-8 overflow-auto bg-background/80 relative">
+    <!-- Image Canvas Area with Transparency Grid (`m-auto` keeps top-left reachable when zoomed) -->
+    <div class="flex-1 min-h-0 flex p-8 overflow-auto gp-scroll bg-background/80 relative" data-raster-stage>
       <div
-        class="rounded-xl border border-edgeStrong shadow-card p-2 bg-[radial-gradient(rgb(var(--c-border)/0.6)_1px,transparent_1px)] bg-size-[16px_16px] max-w-full max-h-full flex items-center justify-center overflow-hidden"
+        class="m-auto shrink-0 rounded-xl border border-edgeStrong shadow-card p-2 bg-[radial-gradient(rgb(var(--c-border)/0.6)_1px,transparent_1px)] bg-size-[16px_16px] flex items-center justify-center {imageFit
+          ? 'max-w-full max-h-full overflow-hidden'
+          : ''}"
       >
         {#if imageSrc}
           <img
             src={imageSrc}
             alt={filePath}
             onload={onImageLoad}
-            class="rounded-lg {imageFit
+            class="block rounded-lg {imageFit
               ? 'max-w-full max-h-[70vh] object-contain'
-              : ''}"
+              : 'max-w-none'}"
             style={!imageFit ? `width: ${((naturalWidth || 400) * imageZoom) / 100}px;` : ""}
           />
         {/if}
@@ -184,6 +223,25 @@
   <LazyMount
     load={loadMarkDevViewer}
     name="The Markdown reader"
+    props={{
+      filePath,
+      blob,
+      repoPathOverride: effectiveRepoPath,
+      draftContent,
+      dirty,
+      onSave,
+      onDraftChange,
+      onRequestDiscard,
+      revealTarget,
+      onSendSelectionToAgent,
+      agentSend,
+    }}
+  />
+{:else if isHtml}
+  <!-- Sandboxed Live HTML Viewer & Split Editor -->
+  <LazyMount
+    load={loadHtmlPreviewViewer}
+    name="The HTML previewer"
     props={{
       filePath,
       blob,
@@ -259,5 +317,6 @@
     {onRequestDiscard}
     {revealTarget}
     {onSendSelectionToAgent}
+    {agentSend}
   />
 {/if}

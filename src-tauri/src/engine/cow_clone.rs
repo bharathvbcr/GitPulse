@@ -731,6 +731,7 @@ const NOT_CLONED: &str = "this filesystem could not clone it, and a build direct
 #[cfg(test)]
 thread_local! {
     static FORCE_BYTE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EMULATE_CLONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a test has ruled out every clone primitive on this thread, so the
@@ -752,6 +753,24 @@ pub(crate) fn with_forced_byte_copy<T>(body: impl FnOnce() -> T) -> T {
     let _restore =
         std::mem::DropGuard::new(FORCE_BYTE_COPY.with(|cell| cell.replace(true)), |prev| {
             FORCE_BYTE_COPY.with(|cell| cell.set(prev));
+        });
+    body()
+}
+
+/// Runs `body` as if this filesystem could clone a file: where the per-file
+/// clone primitive (FICLONE) is refused, the file is copied and counted as
+/// cloned. For the tests of what a clone does next (a Cargo `target` clone's
+/// rewrite, its locks and budget) on a runner whose filesystem cannot clone at
+/// all: ext4, as on ubuntu-latest, where every such test otherwise ends at
+/// "could not clone it" before reaching what it is about. That a filesystem
+/// that cannot clone gets no `target` at all is tested apart, with
+/// [`with_forced_byte_copy`]. macOS clones a whole tree in one call and never
+/// reaches the per-file primitive, so there this changes nothing.
+#[cfg(test)]
+pub(crate) fn with_emulated_clone<T>(body: impl FnOnce() -> T) -> T {
+    let _restore =
+        std::mem::DropGuard::new(EMULATE_CLONE.with(|cell| cell.replace(true)), |prev| {
+            EMULATE_CLONE.with(|cell| cell.set(prev));
         });
     body()
 }
@@ -912,6 +931,19 @@ fn try_clone_file(src: &Path, dst: &Path) -> bool {
     if byte_copy_forced() {
         return false;
     }
+    if clone_primitive(src, dst) {
+        return true;
+    }
+    #[cfg(test)]
+    if EMULATE_CLONE.with(std::cell::Cell::get) {
+        return fs::copy(src, dst).is_ok();
+    }
+    false
+}
+
+/// This platform's per-file clone: `clonefile(2)` on macOS, FICLONE on Linux,
+/// none elsewhere.
+fn clone_primitive(src: &Path, dst: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
         if let (Some(src_s), Some(dst_s)) = (src.to_str(), dst.to_str()) {
@@ -1441,37 +1473,52 @@ fn rewrite_out_tree_text_files(
 }
 
 fn replace_path_prefixes(text: &str, replacements: &[(&str, &str)]) -> String {
-    let mut current = text.to_string();
-    for (from, to) in replacements {
-        if !from.is_empty() && from != to && current.contains(from) {
-            current = replace_path_prefix(&current, from, to);
-        }
+    let mut valid: Vec<(&str, &str)> = replacements
+        .iter()
+        .copied()
+        .filter(|(from, to)| !from.is_empty() && from != to)
+        .collect();
+    if valid.is_empty() {
+        return text.to_string();
     }
-    current
+    // Longest prefix first so more specific target paths win ties at identical positions.
+    valid.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let mut best: Option<(usize, &str, &str)> = None;
+        for &(from, to) in &valid {
+            if let Some(rel) = rest.find(from) {
+                if best.is_none_or(|(best_rel, _, _)| rel < best_rel) {
+                    best = Some((rel, from, to));
+                }
+            }
+        }
+        let Some((rel, from, to)) = best else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..rel]);
+        let after = &rest[rel + from.len()..];
+        let continues_component = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        out.push_str(if continues_component { from } else { to });
+        cursor += rel + from.len();
+    }
+    out
 }
 
 /// `text` with every occurrence of the path `from` that ends at a path-component
 /// boundary replaced by `to`. `/a/target2` and `/w/lane-10` are not inside
 /// `/a/target` or `/w/lane-1`, whereas `/a/target/debug`, `"/a/target"`, and
 /// `DIR=/a/target:more` are rewritten.
+#[cfg(test)]
 fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
-    if from.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(from) {
-        let after = &rest[at + from.len()..];
-        let continues_component = after
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-        out.push_str(&rest[..at]);
-        out.push_str(if continues_component { from } else { to });
-        rest = after;
-    }
-    out.push_str(rest);
-    out
+    replace_path_prefixes(text, &[(from, to)])
 }
 
 #[cfg(target_os = "macos")]
@@ -1895,10 +1942,11 @@ mod tests {
         let dst = temp.path().join("dest_cache");
 
         fs::create_dir_all(src.join("sub")).unwrap();
-        let mut file1 = File::create(src.join("file1.txt")).unwrap();
-        writeln!(file1, "Hello CoW!").unwrap();
-        let mut file2 = File::create(src.join("sub/file2.txt")).unwrap();
-        writeln!(file2, "Nested CoW!").unwrap();
+        // Written and closed, not held open: a directory listing on Windows
+        // reports a file's length as of its last close, so the walk measured a
+        // file still open here as empty and copied no bytes of it.
+        fs::write(src.join("file1.txt"), "Hello CoW!\n").unwrap();
+        fs::write(src.join("sub/file2.txt"), "Nested CoW!\n").unwrap();
 
         let result = reflink_copy_dir(&src, &dst).expect("reflink_copy_dir failed");
         assert_eq!(result.files_cloned, 2);
@@ -2261,7 +2309,9 @@ mod tests {
     ) {
         let (main, parent, worktree) = anchor_and_worktree(&["target", "node_modules"]);
         let anchor = main.path().canonicalize().unwrap();
-        let script = PathBuf::from("debug/build/ring-0f3a9c");
+        // Component by component: the tests compare this path's text with what
+        // the rewrite wrote, and on Windows a `/` in a plain path stays a `/`.
+        let script: PathBuf = "debug/build/ring-0f3a9c".split('/').collect();
         let out = anchor.join("target").join(&script).join("out");
         fs::create_dir_all(&out).unwrap();
         fs::write(out.join("libring_core.a"), "archive").unwrap();
@@ -2290,37 +2340,39 @@ mod tests {
     /// is told why; one more allowed and it is cloned as before.
     #[test]
     fn a_new_worktree_gets_no_cloned_target_once_the_clone_budget_is_reached() {
-        let (main, _parent, linked) = crate::test_support::repo_with_worktrees(3);
-        fs::create_dir_all(main.path().join(".git/info")).unwrap();
-        fs::write(main.path().join(".git/info/exclude"), "target/\n").unwrap();
-        let anchor = main.path().canonicalize().unwrap();
-        fs::create_dir_all(anchor.join("target/debug/deps")).unwrap();
-        fs::write(anchor.join("target/debug/deps/libserde-1a2b.rlib"), "rlib").unwrap();
-        for held in &linked[..2] {
-            fs::create_dir_all(held.join("target")).unwrap();
-        }
-        let fresh = &linked[2];
+        with_emulated_clone(|| {
+            let (main, _parent, linked) = crate::test_support::repo_with_worktrees(3);
+            fs::create_dir_all(main.path().join(".git/info")).unwrap();
+            fs::write(main.path().join(".git/info/exclude"), "target/\n").unwrap();
+            let anchor = main.path().canonicalize().unwrap();
+            fs::create_dir_all(anchor.join("target/debug/deps")).unwrap();
+            fs::write(anchor.join("target/debug/deps/libserde-1a2b.rlib"), "rlib").unwrap();
+            for held in &linked[..2] {
+                fs::create_dir_all(held.join("target")).unwrap();
+            }
+            let fresh = &linked[2];
 
-        let at_budget = CacheSelection {
-            max_target_clones: 2,
-            ..CacheSelection::default()
-        };
-        let report = clone_ignored_caches(&anchor, fresh, &at_budget).expect("synced");
-        assert!(!fresh.join("target").exists(), "{report:?}");
-        assert!(
-            report.failures.is_empty(),
-            "advice, not a failure: {report:?}"
-        );
-        let advice = report.clone_budget.expect("the skip is explained");
-        assert!(advice.contains("2 other worktree(s)"), "{advice}");
+            let at_budget = CacheSelection {
+                max_target_clones: 2,
+                ..CacheSelection::default()
+            };
+            let report = clone_ignored_caches(&anchor, fresh, &at_budget).expect("synced");
+            assert!(!fresh.join("target").exists(), "{report:?}");
+            assert!(
+                report.failures.is_empty(),
+                "advice, not a failure: {report:?}"
+            );
+            let advice = report.clone_budget.expect("the skip is explained");
+            assert!(advice.contains("2 other worktree(s)"), "{advice}");
 
-        let roomier = CacheSelection {
-            max_target_clones: 3,
-            ..CacheSelection::default()
-        };
-        let report = clone_ignored_caches(&anchor, fresh, &roomier).expect("synced");
-        assert!(report.clone_budget.is_none(), "{report:?}");
-        assert!(fresh.join("target/debug/deps/libserde-1a2b.rlib").is_file());
+            let roomier = CacheSelection {
+                max_target_clones: 3,
+                ..CacheSelection::default()
+            };
+            let report = clone_ignored_caches(&anchor, fresh, &roomier).expect("synced");
+            assert!(report.clone_budget.is_none(), "{report:?}");
+            assert!(fresh.join("target/debug/deps/libserde-1a2b.rlib").is_file());
+        });
     }
 
     /// A cloned `target/` reuses the anchor's compiled dependencies, but
@@ -2329,37 +2381,39 @@ mod tests {
     /// a `cargo clean` there would pull out from under the worktree.
     #[test]
     fn a_cloned_cargo_target_records_its_own_paths_not_the_anchors() {
-        let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
-        let copied =
-            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
-        assert!(
-            copied
-                .iter()
-                .any(|r| Path::new(&r.destination).file_name() == Some("target".as_ref())),
-            "{copied:?}"
-        );
-        assert!(worktree
-            .join("target/debug/deps/libserde-1a2b.rlib")
-            .is_file());
-        let anchor_target = anchor.join("target");
-        let worktree_target = worktree.join("target");
-        for name in ["output", "root-output"] {
-            let cloned = fs::read_to_string(worktree_target.join(&script).join(name)).unwrap();
-            assert_eq!(
-                cloned.matches(anchor_target.to_str().unwrap()).count(),
-                0,
-                "{name} still names the anchor: {cloned}"
-            );
+        with_emulated_clone(|| {
+            let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
+            let copied = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+                .expect("synced");
             assert!(
-                cloned.contains(worktree_target.join(&script).join("out").to_str().unwrap()),
-                "{name}: {cloned}"
+                copied
+                    .iter()
+                    .any(|r| Path::new(&r.destination).file_name() == Some("target".as_ref())),
+                "{copied:?}"
             );
-            let original = fs::read_to_string(anchor_target.join(&script).join(name)).unwrap();
-            assert!(
-                original.contains(anchor_target.to_str().unwrap()),
-                "the anchor's own was rewritten"
-            );
-        }
+            assert!(worktree
+                .join("target/debug/deps/libserde-1a2b.rlib")
+                .is_file());
+            let anchor_target = anchor.join("target");
+            let worktree_target = worktree.join("target");
+            for name in ["output", "root-output"] {
+                let cloned = fs::read_to_string(worktree_target.join(&script).join(name)).unwrap();
+                assert_eq!(
+                    cloned.matches(anchor_target.to_str().unwrap()).count(),
+                    0,
+                    "{name} still names the anchor: {cloned}"
+                );
+                assert!(
+                    cloned.contains(worktree_target.join(&script).join("out").to_str().unwrap()),
+                    "{name}: {cloned}"
+                );
+                let original = fs::read_to_string(anchor_target.join(&script).join(name)).unwrap();
+                assert!(
+                    original.contains(anchor_target.to_str().unwrap()),
+                    "the anchor's own was rewritten"
+                );
+            }
+        });
     }
 
     /// The anchor's `target/` as cargo >= 1.100 lays it out: no `deps/`; every unit has
@@ -2375,7 +2429,7 @@ mod tests {
     ) {
         let (main, parent, worktree) = anchor_and_worktree(&["target", "node_modules"]);
         let anchor = main.path().canonicalize().unwrap();
-        let unit = PathBuf::from("debug/build/ring/0f3a9c11");
+        let unit: PathBuf = "debug/build/ring/0f3a9c11".split('/').collect();
         let unit_dir = anchor.join("target").join(&unit);
         let out = unit_dir.join("out");
         fs::create_dir_all(&out).unwrap();
@@ -2411,36 +2465,40 @@ mod tests {
     /// will never rerun.
     #[test]
     fn a_cloned_cargo_1_100_target_records_its_own_paths_not_the_anchors() {
-        let (_main, _parent, anchor, worktree, unit) = anchor_with_cargo_1_100_target();
-        reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
-        let anchor_target = anchor.join("target");
-        let worktree_target = worktree.join("target");
-        assert!(worktree_target
-            .join("debug/build/serde/aa11bb22/out/libserde-aa11bb22.rlib")
-            .is_file());
-        for name in ["run/stdout", "run/root-output"] {
-            let cloned = fs::read_to_string(worktree_target.join(&unit).join(name)).unwrap();
+        with_emulated_clone(|| {
+            let (_main, _parent, anchor, worktree, unit) = anchor_with_cargo_1_100_target();
+            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+            let anchor_target = anchor.join("target");
+            let worktree_target = worktree.join("target");
+            assert!(worktree_target
+                .join("debug/build/serde/aa11bb22/out/libserde-aa11bb22.rlib")
+                .is_file());
+            for name in ["run/stdout", "run/root-output"] {
+                let cloned = fs::read_to_string(worktree_target.join(&unit).join(name)).unwrap();
+                assert_eq!(
+                    cloned.matches(anchor_target.to_str().unwrap()).count(),
+                    0,
+                    "{name} still names the anchor: {cloned}"
+                );
+                assert!(
+                    cloned.contains(worktree_target.join(&unit).join("out").to_str().unwrap()),
+                    "{name}: {cloned}"
+                );
+                let original = fs::read_to_string(anchor_target.join(&unit).join(name)).unwrap();
+                assert!(
+                    original.contains(anchor_target.to_str().unwrap()),
+                    "the anchor's own {name} was rewritten"
+                );
+            }
+            // The compiled crate's artifacts are cloned byte for byte, not rewritten.
             assert_eq!(
-                cloned.matches(anchor_target.to_str().unwrap()).count(),
-                0,
-                "{name} still names the anchor: {cloned}"
-            );
-            assert!(
-                cloned.contains(worktree_target.join(&unit).join("out").to_str().unwrap()),
-                "{name}: {cloned}"
-            );
-            let original = fs::read_to_string(anchor_target.join(&unit).join(name)).unwrap();
-            assert!(
-                original.contains(anchor_target.to_str().unwrap()),
-                "the anchor's own {name} was rewritten"
-            );
-        }
-        // The compiled crate's artifacts are cloned byte for byte, not rewritten.
-        assert_eq!(
-            fs::read(worktree_target.join("debug/build/serde/aa11bb22/out/libserde-aa11bb22.rlib"))
+                fs::read(
+                    worktree_target.join("debug/build/serde/aa11bb22/out/libserde-aa11bb22.rlib")
+                )
                 .unwrap(),
-            b"rlib"
-        );
+                b"rlib"
+            );
+        });
     }
 
     /// A cargo <= 1.99 script directory is not scanned for 1.100 units: a build script
@@ -2448,58 +2506,64 @@ mod tests {
     /// UTF-8, and that must neither be mistaken for a recorded output nor fail the clone.
     #[test]
     fn a_generated_run_directory_under_a_legacy_out_dir_is_not_a_cargo_1_100_unit() {
-        let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
-        let generated = anchor.join("target").join(&script).join("out/run");
-        fs::create_dir_all(&generated).unwrap();
-        fs::write(generated.join("stdout"), b"\xff\xfe").unwrap();
-        reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
-        assert_eq!(
-            fs::read(worktree.join("target").join(&script).join("out/run/stdout")).unwrap(),
-            b"\xff\xfe"
-        );
+        with_emulated_clone(|| {
+            let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
+            let generated = anchor.join("target").join(&script).join("out/run");
+            fs::create_dir_all(&generated).unwrap();
+            fs::write(generated.join("stdout"), b"\xff\xfe").unwrap();
+            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+            assert_eq!(
+                fs::read(worktree.join("target").join(&script).join("out/run/stdout")).unwrap(),
+                b"\xff\xfe"
+            );
+        });
     }
 
     /// An unrewritable `run/stdout` fails the clone whole, exactly as an unrewritable
     /// `output` does in the older layout.
     #[test]
     fn an_unrewritable_cargo_1_100_build_output_fails_the_target_clone_whole() {
-        let (_main, _parent, anchor, worktree, unit) = anchor_with_cargo_1_100_target();
-        fs::write(
-            anchor.join("target").join(&unit).join("run/stdout"),
-            b"cargo:x=\xff\n",
-        )
-        .unwrap();
-        let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
-            .expect_err("an output that could not be rewritten was cloned");
-        assert!(error.contains("target"), "{error}", error = error.message());
-        assert!(!worktree.join("target").exists());
-        assert!(worktree.join("node_modules/pkg/index.js").is_file());
+        with_emulated_clone(|| {
+            let (_main, _parent, anchor, worktree, unit) = anchor_with_cargo_1_100_target();
+            fs::write(
+                anchor.join("target").join(&unit).join("run/stdout"),
+                b"cargo:x=\xff\n",
+            )
+            .unwrap();
+            let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+                .expect_err("an output that could not be rewritten was cloned");
+            assert!(error.contains("target"), "{error}", error = error.message());
+            assert!(!worktree.join("target").exists());
+            assert!(worktree.join("node_modules/pkg/index.js").is_file());
+        });
     }
 
     /// cargo >= 1.100 keeps `.cargo-build-lock` and `.cargo-artifact-lock` beside
     /// `.cargo-lock`. A build holding either one is a build in progress.
     #[test]
     fn a_cargo_1_100_build_lock_marks_the_anchor_build_in_progress() {
-        for lock_name in CARGO_LOCK_FILES {
-            let (_main, _parent, anchor, worktree, _unit) = anchor_with_cargo_1_100_target();
-            let lock_path = anchor.join("target/debug").join(lock_name);
-            fs::write(&lock_path, "").unwrap();
-            let held = File::open(&lock_path).unwrap();
-            held.lock().unwrap();
-            let synced = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default());
-            held.unlock().unwrap();
-            let error = synced.expect_err("a target/ under a held lock must be skipped");
-            assert!(
-                error.contains("anchor build in progress") && error.contains(lock_name),
-                "{lock_name}: {error}",
-                error = error.message()
-            );
-            assert!(!worktree.join("target").exists(), "{lock_name}");
+        with_emulated_clone(|| {
+            for lock_name in CARGO_LOCK_FILES {
+                let (_main, _parent, anchor, worktree, _unit) = anchor_with_cargo_1_100_target();
+                let lock_path = anchor.join("target/debug").join(lock_name);
+                fs::write(&lock_path, "").unwrap();
+                let held = File::open(&lock_path).unwrap();
+                held.lock().unwrap();
+                let synced = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default());
+                held.unlock().unwrap();
+                let error = synced.expect_err("a target/ under a held lock must be skipped");
+                assert!(
+                    error.contains("anchor build in progress") && error.contains(lock_name),
+                    "{lock_name}: {error}",
+                    error = error.message()
+                );
+                assert!(!worktree.join("target").exists(), "{lock_name}");
 
-            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
-                .expect("released, the next sync clones it");
-            assert!(worktree.join("target/debug/build/ring").is_dir());
-        }
+                reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+                    .expect("released, the next sync clones it");
+                assert!(worktree.join("target/debug/build/ring").is_dir());
+            }
+        });
     }
 
     /// A build in progress in the anchor holds `target/debug/.cargo-lock`.
@@ -2507,59 +2571,63 @@ mod tests {
     /// is skipped and the reason reported, and the other caches still land.
     #[test]
     fn a_cargo_target_mid_build_is_skipped_with_the_reason_and_without_waiting() {
-        let (_main, _parent, anchor, worktree, _script) = anchor_with_cargo_target();
-        let lock_path = anchor.join("target/debug/.cargo-lock");
-        fs::write(&lock_path, "").unwrap();
-        let held = File::open(&lock_path).unwrap();
-        held.lock().unwrap();
-        let started = Instant::now();
-        let synced = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default());
-        let waited = started.elapsed();
-        held.unlock().unwrap();
-        let error = synced.expect_err("a skipped target/ must be reported");
-        assert!(error.contains("target"), "{error}", error = error.message());
-        assert!(
-            error.contains("anchor build in progress"),
-            "{error}",
-            error = error.message()
-        );
-        assert!(
-            waited < std::time::Duration::from_secs(10),
-            "waited {waited:?}"
-        );
-        assert!(!worktree.join("target").exists());
-        assert!(worktree.join("node_modules/pkg/index.js").is_file());
+        with_emulated_clone(|| {
+            let (_main, _parent, anchor, worktree, _script) = anchor_with_cargo_target();
+            let lock_path = anchor.join("target/debug/.cargo-lock");
+            fs::write(&lock_path, "").unwrap();
+            let held = File::open(&lock_path).unwrap();
+            held.lock().unwrap();
+            let started = Instant::now();
+            let synced = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default());
+            let waited = started.elapsed();
+            held.unlock().unwrap();
+            let error = synced.expect_err("a skipped target/ must be reported");
+            assert!(error.contains("target"), "{error}", error = error.message());
+            assert!(
+                error.contains("anchor build in progress"),
+                "{error}",
+                error = error.message()
+            );
+            assert!(
+                waited < std::time::Duration::from_secs(10),
+                "waited {waited:?}"
+            );
+            assert!(!worktree.join("target").exists());
+            assert!(worktree.join("node_modules/pkg/index.js").is_file());
 
-        // Released, the next sync clones it.
-        reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
-        assert!(worktree
-            .join("target/debug/deps/libserde-1a2b.rlib")
-            .is_file());
+            // Released, the next sync clones it.
+            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+            assert!(worktree
+                .join("target/debug/deps/libserde-1a2b.rlib")
+                .is_file());
+        });
     }
 
     /// A recorded build output that is not UTF-8 cannot be rewritten
     /// byte-exactly, so the target/ clone fails whole and nothing is left.
     #[test]
     fn an_unrewritable_build_output_fails_the_target_clone_whole() {
-        let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
-        fs::write(
-            anchor.join("target").join(&script).join("output"),
-            b"cargo:x=\xff\n",
-        )
-        .unwrap();
-        let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
-            .expect_err("an output that could not be rewritten was cloned");
-        assert!(error.contains("target"), "{error}", error = error.message());
-        assert!(!worktree.join("target").exists());
-        assert!(worktree.join("node_modules/pkg/index.js").is_file());
-        assert_eq!(
-            entries(&worktree)
-                .iter()
-                .filter(|name| name.contains("gitpulse-partial"))
-                .count(),
-            0,
-            "a staging tree was left"
-        );
+        with_emulated_clone(|| {
+            let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
+            fs::write(
+                anchor.join("target").join(&script).join("output"),
+                b"cargo:x=\xff\n",
+            )
+            .unwrap();
+            let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+                .expect_err("an output that could not be rewritten was cloned");
+            assert!(error.contains("target"), "{error}", error = error.message());
+            assert!(!worktree.join("target").exists());
+            assert!(worktree.join("node_modules/pkg/index.js").is_file());
+            assert_eq!(
+                entries(&worktree)
+                    .iter()
+                    .filter(|name| name.contains("gitpulse-partial"))
+                    .count(),
+                0,
+                "a staging tree was left"
+            );
+        });
     }
 
     /// Where nothing can be cloned (Windows, ext4, a cross-device FICLONE),
@@ -2636,6 +2704,30 @@ mod tests {
             replace_path_prefix("nothing here", from, to),
             "nothing here"
         );
+    }
+
+    #[test]
+    fn nested_worktree_under_anchor_root_does_not_double_rewrite_target_paths() {
+        let replacements = [
+            (
+                "/repo/src-tauri/target",
+                "/repo/.gitpulse/worktrees/wt/src-tauri/target",
+            ),
+            ("/repo", "/repo/.gitpulse/worktrees/wt"),
+        ];
+        let input = concat!(
+            "OUT=/repo/src-tauri/target/debug/build/pkg/out\n",
+            "ROOT=/repo/src-tauri\n",
+            "SIBLING=/repo2/target\n",
+            "BARE=/repo/src-tauri/target\n",
+        );
+        let expected = concat!(
+            "OUT=/repo/.gitpulse/worktrees/wt/src-tauri/target/debug/build/pkg/out\n",
+            "ROOT=/repo/.gitpulse/worktrees/wt/src-tauri\n",
+            "SIBLING=/repo2/target\n",
+            "BARE=/repo/.gitpulse/worktrees/wt/src-tauri/target\n",
+        );
+        assert_eq!(replace_path_prefixes(input, &replacements), expected);
     }
 
     /// target/ passes the same ignore check as every other cache.
@@ -3074,8 +3166,15 @@ mod tests {
         for i in 0..50 {
             fs::write(anchor.join(format!("node_modules/p/f{i}")), [b'x'; 100]).unwrap();
         }
-        let report = with_forced_byte_copy(|| {
-            clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+        // Where a volume has no block size to round files up to (Windows),
+        // the fifty files plan 5,000 bytes against 10,000 of headroom and the
+        // copy begins; only a re-check inside it stops it, and the real
+        // 64 MiB interval would never be reached by 5 KB. Ten files of this
+        // interval's worth is where the re-check falls.
+        let report = with_recheck_every(1_000, || {
+            with_forced_byte_copy(|| {
+                clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+            })
         })
         .unwrap();
         assert!(

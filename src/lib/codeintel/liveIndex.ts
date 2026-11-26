@@ -95,8 +95,21 @@ function collectDelayMs(attempt: number): number {
 /**
  * `paused`: the last automatic build ran past its deadline and the backend
  * paused automatic indexing; `reason` is the sentence the Map strip shows.
+ *
+ * `deferred`: the backend's spawn gate declined the index check under load,
+ * and the retries ran out. Nothing was examined and nothing failed, so it is
+ * not `failed`: the index on screen is the last good one, not a broken one.
+ * A focus, a watcher tick or Refresh asks again.
  */
-export type LiveIndexPhase = "idle" | "scheduled" | "running" | "ready" | "skipped" | "failed" | "paused";
+export type LiveIndexPhase =
+  | "idle"
+  | "scheduled"
+  | "running"
+  | "ready"
+  | "skipped"
+  | "failed"
+  | "paused"
+  | "deferred";
 
 export interface LiveIndexSnapshot {
   phase: LiveIndexPhase;
@@ -348,7 +361,7 @@ export function createLiveIndex(opts?: {
         forgetRetries(repoPath);
       }
       patch(repoPath, {
-        phase: retrying ? "scheduled" : "failed",
+        phase: retrying ? "scheduled" : "deferred",
         decision: outcome.decision,
         reason: retrying
           ? `Index check deferred while the app is busy; retrying in ${Math.round(delayMs / 1_000)} s.`
@@ -450,7 +463,7 @@ export function createLiveIndex(opts?: {
       const focused = scope.visible ? scope.activeKey : null;
       if (focused && focused !== lastFocused) {
         const prev = get(snapshots)[focused];
-        if (prev?.phase === "failed" && prev.decision === "skip_deferred") offered.delete(focused);
+        if (prev?.phase === "deferred") offered.delete(focused);
       }
       lastFocused = focused;
       lastActive = scope.activeKey;

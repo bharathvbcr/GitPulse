@@ -196,10 +196,12 @@ pub const SHARE_BLOCK_BYTES: usize = 4096;
 
 /// A file smaller than this is written whole: cloning it saves nothing worth
 /// the extra open and read-back.
+#[cfg(unix)]
 const MIN_PATCHED_BYTES: u64 = 64 * 1024;
 
 /// Compared and written in strides of this many blocks, so a rewrite touching
 /// scattered blocks does not hold the whole file in memory twice.
+#[cfg(unix)]
 const PATCH_STRIDE_BLOCKS: usize = 256;
 
 #[cfg(all(test, unix))]
@@ -389,6 +391,12 @@ pub struct ArtifactRecord {
     /// Old records without either form of evidence cannot authorize a skip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<u64>,
+    /// Generation id this specific output was written from, when written by a
+    /// build that tracks per-artifact currency (e.g. `devmap build --repo-map`
+    /// updating `repo_map.json` without rewriting `code_graph.json`). Older v3
+    /// stamps omit this and fall back to `inputs["generation_id"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<u64>,
 }
 
 /// A stamp written before `ctime_ns` existed has no value for it. `-1` is the
@@ -428,7 +436,23 @@ impl ArtifactRecord {
             ino: ino_of(&meta),
             ctime_ns: change_time,
             content_hash,
+            generation_id: None,
         })
+    }
+
+    fn with_generation(mut self, generation_id: Option<u64>) -> Self {
+        self.generation_id = generation_id;
+        self
+    }
+
+    fn matches_disk_record(&self, current: &Self) -> bool {
+        self.role == current.role
+            && self.path == current.path
+            && self.len == current.len
+            && self.mtime_ns == current.mtime_ns
+            && self.ino == current.ino
+            && self.ctime_ns == current.ctime_ns
+            && self.content_hash == current.content_hash
     }
 
     /// Whether the file this record names is still, byte for byte, the file it
@@ -445,7 +469,8 @@ impl ArtifactRecord {
         if self.ctime_ns < 0 && self.content_hash.is_none() {
             return false;
         }
-        ArtifactRecord::of(&self.role, Path::new(&self.path)).is_ok_and(|current| &current == self)
+        ArtifactRecord::of(&self.role, Path::new(&self.path))
+            .is_ok_and(|current| self.matches_disk_record(&current))
     }
 }
 
@@ -553,6 +578,9 @@ impl ArtifactStamp {
         generated_head: Option<String>,
         outputs: &[(&str, &Path)],
     ) -> std::io::Result<Self> {
+        let generation_id = inputs
+            .get("generation_id")
+            .and_then(serde_json::Value::as_u64);
         Ok(Self {
             version: ARTIFACT_STAMP_VERSION,
             writer: writer_identity(),
@@ -561,8 +589,44 @@ impl ArtifactStamp {
             inputs,
             outputs: outputs
                 .iter()
-                .map(|(role, path)| ArtifactRecord::of(role, path))
+                .map(|(role, path)| {
+                    Ok(ArtifactRecord::of(role, path)?.with_generation(generation_id))
+                })
                 .collect::<std::io::Result<Vec<_>>>()?,
+        })
+    }
+
+    /// Carry forward any roles from `previous` that this write deliberately did
+    /// not rewrite (e.g. `code_graph` during a `--repo-map` write), preserving
+    /// each carried role's own generation so `ArtifactCurrency` never forgets
+    /// or mislabels a lagging sibling artifact.
+    pub fn with_preserved_outputs(mut self, previous: Option<&Self>) -> Self {
+        let Some(previous) = previous else {
+            return self;
+        };
+        for record in &previous.outputs {
+            if self
+                .outputs
+                .iter()
+                .any(|existing| existing.role == record.role)
+            {
+                continue;
+            }
+            let effective_gen = previous.record_generation(record);
+            self.outputs
+                .push(record.clone().with_generation(effective_gen));
+        }
+        self
+    }
+
+    /// The generation id recorded for `record`, falling back to the stamp's
+    /// top-level `inputs["generation_id"]` for stamps written before per-output
+    /// generation tracking existed.
+    pub fn record_generation(&self, record: &ArtifactRecord) -> Option<u64> {
+        record.generation_id.or_else(|| {
+            self.inputs
+                .get("generation_id")
+                .and_then(serde_json::Value::as_u64)
         })
     }
 
@@ -590,9 +654,10 @@ impl ArtifactStamp {
     /// the current inputs would produce.
     ///
     /// Fail-closed in every direction: an unreadable sidecar, a missing output,
-    /// a stat that will not answer, a different writer, one differing input —
-    /// each is a miss, and a miss regenerates. The only way to skip is for every
-    /// question to have been asked and answered the same.
+    /// a stat that will not answer, a different writer, one differing input, or
+    /// any output recorded from an older generation — each is a miss, and a
+    /// miss regenerates. The only way to skip is for every question to have
+    /// been asked and answered the same.
     pub fn still_current(
         &self,
         inputs: &BTreeMap<String, serde_json::Value>,
@@ -607,14 +672,42 @@ impl ArtifactStamp {
         if self.outputs.len() != outputs.len() {
             return false;
         }
-        outputs
-            .iter()
-            .zip(self.outputs.iter())
-            .all(|((role, path), record)| {
-                record.role == *role
-                    && record.path == path.to_string_lossy()
+        let wanted_gen = inputs
+            .get("generation_id")
+            .and_then(serde_json::Value::as_u64);
+        outputs.iter().all(|(role, path)| {
+            self.record(role).is_some_and(|record| {
+                record.path == path.to_string_lossy()
+                    && self.record_generation(record) == wanted_gen
                     && record.still_describes_disk()
             })
+        })
+    }
+
+    /// Like [`Self::still_current`], but checks only the requested subset of
+    /// roles (e.g. `repo_map` alone during `devmap build --repo-map`) while
+    /// ignoring any preserved sibling roles (e.g. an older `code_graph`).
+    pub fn still_current_roles(
+        &self,
+        inputs: &BTreeMap<String, serde_json::Value>,
+        outputs: &[(&str, &Path)],
+    ) -> bool {
+        if self.writer != writer_identity() || &self.inputs != inputs {
+            return false;
+        }
+        if self.map_engine != CONSUMER_MAP_ENGINE || outputs.is_empty() {
+            return false;
+        }
+        let wanted_gen = inputs
+            .get("generation_id")
+            .and_then(serde_json::Value::as_u64);
+        outputs.iter().all(|(role, path)| {
+            self.record(role).is_some_and(|record| {
+                record.path == path.to_string_lossy()
+                    && self.record_generation(record) == wanted_gen
+                    && record.still_describes_disk()
+            })
+        })
     }
 }
 
@@ -634,13 +727,19 @@ impl ArtifactStamp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArtifactCurrency {
     pub current: bool,
-    /// The generation the sidecar says the artifacts were written from.
+    /// The oldest generation among the sidecar's outputs (fail-closed: if one
+    /// artifact lags behind another, this reports the lagging generation).
     pub written_from_generation: Option<u64>,
     pub store_generation: Option<u64>,
+    /// How many generations the oldest artifact trails `store_generation`
+    /// (`Some(0)` when current, `None` when either generation is unknown).
+    pub lag_generations: Option<u64>,
     /// Why `current` is false; `None` when it is true.
     pub reason: Option<String>,
     /// Per output role, whether the file still stats exactly as it was written.
     pub outputs: BTreeMap<String, bool>,
+    /// Per output role, the generation it was written from.
+    pub output_generations: BTreeMap<String, u64>,
 }
 
 impl ArtifactCurrency {
@@ -651,30 +750,78 @@ impl ArtifactCurrency {
                 current: false,
                 written_from_generation: None,
                 store_generation,
+                lag_generations: None,
                 reason: Some(
                     "no artifact stamp: the consumer artifacts were never written by \
                      this store, or were written before stamps existed"
                         .to_string(),
                 ),
                 outputs: BTreeMap::new(),
+                output_generations: BTreeMap::new(),
             };
         };
-        let written = stamp
-            .inputs
-            .get("generation_id")
-            .and_then(serde_json::Value::as_u64);
         let outputs: BTreeMap<String, bool> = stamp
             .outputs
             .iter()
             .map(|record| (record.role.clone(), record.still_describes_disk()))
             .collect();
+        let output_generations: BTreeMap<String, u64> = stamp
+            .outputs
+            .iter()
+            .filter_map(|record| Some((record.role.clone(), stamp.record_generation(record)?)))
+            .collect();
+        let top_gen = stamp
+            .inputs
+            .get("generation_id")
+            .and_then(serde_json::Value::as_u64);
+        let written = if !output_generations.is_empty() {
+            output_generations.values().copied().min()
+        } else {
+            top_gen
+        };
+        let lag_generations = match (written, store_generation) {
+            (Some(w), Some(s)) if s >= w => Some(s - w),
+            _ => None,
+        };
         let reason = match (written, store_generation) {
             (_, None) => Some("the store holds no generation to compare against".to_string()),
             (None, _) => Some("the artifact stamp records no generation".to_string()),
-            (Some(written), Some(store)) if written != store => Some(format!(
-                "the artifacts were written from generation {written} and the store is at \
-                 {store}; run `devmap build --manifest` to rewrite them"
-            )),
+            (Some(written), Some(store)) if written != store => {
+                let delta_clause = if store > written {
+                    format!(" ({} generation(s) behind)", store - written)
+                } else {
+                    String::new()
+                };
+                let lagging_roles: Vec<&str> = output_generations
+                    .iter()
+                    .filter(|(_, gen)| **gen != store)
+                    .map(|(role, _)| role.as_str())
+                    .collect();
+                let current_roles: Vec<&str> = output_generations
+                    .iter()
+                    .filter(|(role, gen)| {
+                        **gen == store && outputs.get(role.as_str()) == Some(&true)
+                    })
+                    .map(|(role, _)| role.as_str())
+                    .collect();
+                if !lagging_roles.is_empty() && !current_roles.is_empty() {
+                    Some(format!(
+                        "{} was written from generation {written} and the store is at \
+                         {store}{delta_clause}; {} is current at generation {store} and \
+                         queries use devmap.sqlite directly — run `devmap build --manifest` to \
+                         rewrite all artifacts",
+                        lagging_roles.join(", "),
+                        current_roles.join(", "),
+                    ))
+                } else {
+                    Some(format!(
+                        "the artifacts were written from generation {written} and the store is at \
+                         {store}{delta_clause}; queries use devmap.sqlite directly — run \
+                         `devmap build --repo-map` to refresh repo_map.json only or \
+                         `devmap build --manifest` to rewrite all artifacts"
+                    ))
+                }
+            }
             _ => outputs
                 .iter()
                 .find(|(_, intact)| !**intact)
@@ -684,12 +831,14 @@ impl ArtifactCurrency {
             current: reason.is_none() && !outputs.is_empty(),
             written_from_generation: written,
             store_generation,
+            lag_generations,
             reason: reason.or_else(|| {
                 outputs
                     .is_empty()
                     .then(|| "the artifact stamp lists no outputs".to_string())
             }),
             outputs,
+            output_generations,
         }
     }
 }
@@ -1367,6 +1516,98 @@ mod patch_tests {
             "code graph"
         )
         .unwrap());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn artifact_stamp_preserves_older_sibling_generations_and_reports_lag() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-stamp-mixed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let repo_map = dir.join("repo_map.json");
+        let code_graph = dir.join("code_graph.json");
+        fs::write(&repo_map, b"{\"gen\":1}").unwrap();
+        fs::write(&code_graph, b"{\"gen\":1}").unwrap();
+
+        let mut inputs_v1 = BTreeMap::new();
+        inputs_v1.insert("generation_id".to_string(), serde_json::json!(5));
+        let stamp_v1 = ArtifactStamp::of(
+            inputs_v1.clone(),
+            Some("head-1".to_string()),
+            &[("repo_map", &repo_map), ("code_graph", &code_graph)],
+        )
+        .unwrap();
+        assert!(stamp_v1.still_current(
+            &inputs_v1,
+            &[("repo_map", &repo_map), ("code_graph", &code_graph)]
+        ));
+        let currency_v1 = ArtifactCurrency::of(Some(&stamp_v1), Some(5));
+        assert!(currency_v1.current);
+        assert_eq!(currency_v1.lag_generations, Some(0));
+        assert_eq!(currency_v1.output_generations.get("repo_map"), Some(&5));
+        assert_eq!(currency_v1.output_generations.get("code_graph"), Some(&5));
+
+        // Legacy stamp JSON without per-record `generation_id` falls back to inputs["generation_id"].
+        let mut legacy = stamp_v1.clone();
+        for record in &mut legacy.outputs {
+            record.generation_id = None;
+        }
+        let legacy_currency = ArtifactCurrency::of(Some(&legacy), Some(8));
+        assert!(!legacy_currency.current);
+        assert_eq!(legacy_currency.written_from_generation, Some(5));
+        assert_eq!(legacy_currency.lag_generations, Some(3));
+        assert!(legacy_currency
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("devmap build --repo-map"));
+
+        // Refresh only repo_map at generation 10 while preserving code_graph at generation 5.
+        fs::write(&repo_map, b"{\"gen\":10}").unwrap();
+        let mut inputs_v2 = BTreeMap::new();
+        inputs_v2.insert("generation_id".to_string(), serde_json::json!(10));
+        let stamp_v2 = ArtifactStamp::of(
+            inputs_v2.clone(),
+            Some("head-2".to_string()),
+            &[("repo_map", &repo_map)],
+        )
+        .unwrap()
+        .with_preserved_outputs(Some(&stamp_v1));
+
+        // repo_map alone is current for `--repo-map`, but full `--manifest` must NOT skip.
+        assert!(stamp_v2.still_current_roles(&inputs_v2, &[("repo_map", &repo_map)]));
+        assert!(!stamp_v2.still_current(
+            &inputs_v2,
+            &[("repo_map", &repo_map), ("code_graph", &code_graph)]
+        ));
+
+        let mixed = ArtifactCurrency::of(Some(&stamp_v2), Some(10));
+        assert!(!mixed.current);
+        assert_eq!(mixed.written_from_generation, Some(5));
+        assert_eq!(mixed.store_generation, Some(10));
+        assert_eq!(mixed.lag_generations, Some(5));
+        assert_eq!(mixed.output_generations.get("repo_map"), Some(&10));
+        assert_eq!(mixed.output_generations.get("code_graph"), Some(&5));
+        let reason = mixed.reason.as_deref().unwrap();
+        assert!(reason.contains("code_graph"), "{reason}");
+        assert!(
+            reason.contains("repo_map is current at generation 10"),
+            "{reason}"
+        );
+        assert!(reason.contains("5 generation(s) behind"), "{reason}");
+
+        // Store rebuilt at lower generation: lag is None and must not claim "0 generation(s) behind".
+        let reset = ArtifactCurrency::of(Some(&stamp_v1), Some(2));
+        assert!(!reset.current);
+        assert_eq!(reset.lag_generations, None);
+        assert!(!reset.reason.as_deref().unwrap().contains("behind"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

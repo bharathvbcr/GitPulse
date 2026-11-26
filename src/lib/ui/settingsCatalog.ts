@@ -377,6 +377,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tab size indent indentation columns spaces 2 4 8",
   },
   {
+    id: "preferred-editor",
+    section: "diff",
+    label: "External editor",
+    keywords: "open in editor external ide vs code vscode antigravity cursor zed line goto launch preferred default auto",
+  },
+  {
     id: "auto-github-alerts",
     section: "analysis",
     label: "Check GitHub alerts on launch",
@@ -414,6 +420,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "agents",
     label: "Host load",
     keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability reset defaults thresholds command gate hook heavy build test cargo refuse advise enforce",
+  },
+  {
+    id: "idle-memory",
+    section: "agents",
+    label: "Idle memory efficiency",
+    keywords: "idle memory efficiency shed shedding hibernate hibernation webview gpu webgl ram footprint background balanced aggressive off ptyd wake skeleton",
   },
   {
     id: "host-load-swap",
@@ -481,6 +493,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "agents",
     label: "Local model servers",
     keywords: "local model servers ollama lm studio llama.cpp vllm endpoint scan discover pick pin select model manvi claude anthropic api key keychain loopback chat completion tools context window",
+  },
+  {
+    id: "manvi-steward",
+    section: "agents",
+    label: "Manvi system steward",
+    keywords: "manvi steward monitor system stats periodic interval cloud local message agents slow critical throttle pace clean storage cargo cache disk memory pressure global repository override",
   },
   {
     id: "external-tools",

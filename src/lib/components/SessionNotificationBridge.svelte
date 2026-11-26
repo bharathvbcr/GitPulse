@@ -12,20 +12,24 @@
    * its place. It is reported quietly rather than silently so "clicking does
    * nothing" has an explanation on screen.
    */
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { describeError } from "../ui/copy/describeFailure";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { sessionByNativeId, terminalSessions } from "../terminal/sessionRegistry";
   import { adoptDetachedSessions } from "../terminal/detachedSessions";
+  import { retryListing } from "../terminal/retryListing";
   import { repoStore } from "../stores/repoStore";
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import { bindAttention, sessionActivity } from "../terminal/sessionActivity";
   import { standingAttention } from "../stores/sessionAlertsStore";
   import { LAYERS } from "../ui/layers";
+  import Logo from "./Logo.svelte";
 
-  let missed = $state<string | null>(null);
+  let { initialMissed = null }: { initialMissed?: string | null } = $props();
+
+  let missed = $state<string | null>(untrack(() => initialMissed));
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   /**
@@ -40,6 +44,10 @@
     const record = sessionByNativeId($terminalSessions, sessionId);
     const outcome = await focusTerminalSession(record);
     if (outcome.ok) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       missed = null;
       return;
     }
@@ -54,14 +62,18 @@
   function say(message: string, ms: number) {
     missed = message;
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => (missed = null), ms);
+    timer = setTimeout(() => {
+      timer = null;
+      missed = null;
+    }, ms);
   }
 
   onMount(() => {
     if (!isTauri()) return;
     // Once per page. After a reload the host still runs what the previous
     // page started; without this they would be invisible and uncounted.
-    void adoptDetachedSessions({ familyOf: (path) => repoStore.familyOf(path) }).then(
+    // A failed listing is not an empty one: it is tried again (bounded) before the dock gives up on restoring.
+    void retryListing(() => adoptDetachedSessions({ familyOf: (path) => repoStore.familyOf(path) })).then(
       (count) => {
         if (count) say(`${count === 1 ? "A terminal session is" : `${count} terminal sessions are`} still running from before the window reloaded. Find ${count === 1 ? "it" : "them"} under Sessions in the dock.`, 10000);
       },
@@ -87,7 +99,10 @@
 </script>
 
 {#if missed}
-  <div class="session-activation gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status">{missed}</div>
+  <div class="session-activation gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status">
+    <span class="session-activation-logo" aria-hidden="true"><Logo size={16} variant="badge" /></span>
+    <span class="session-activation-text">{missed}</span>
+  </div>
 {/if}
 
 <style>
@@ -99,5 +114,18 @@
     padding: 12px;
     font-size: var(--text-xs);
     color: rgb(var(--c-text));
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .session-activation-logo {
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .session-activation-text {
+    min-width: 0;
+    flex: 1;
+    overflow-wrap: anywhere;
   }
 </style>

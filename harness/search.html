@@ -106,6 +106,8 @@
           check("and is not styled as a warning", () => !summary().className.includes("bg-warn"));
           check("matches are grouped under their file", () => text().includes("src/a.ts (2)") && text().includes("lib/b.rs (1)"));
           check("each match shows its line number", () => matches()[1].textContent.includes("9"));
+          check("each match highlights the matched text inline", () =>
+            matches()[0].querySelector("span.bg-warn\\/30")?.textContent === "needle");
           check("a clipped line says it was clipped", () => matches()[2].textContent.trim().endsWith("…"));
 
           // --- options --------------------------------------------------------

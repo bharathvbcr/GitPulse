@@ -368,9 +368,12 @@ fn the_process_count_writes_the_record_beside_the_socket_the_environment_names()
     let _env = crate::test_support::env::bind_env(&serial)
         .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
         .set(crate::alerts::bridge::SOCKET_ENV, &socket);
-    let error = run_notify(Some("session_ended"), &input(), |_, _| {
-        Err(SendError::NoReply)
-    })
+    let error = run_notify(
+        Some("session_ended"),
+        &input(),
+        |_, _| Err(SendError::NoReply),
+        INJECTED_TRANSPORT,
+    )
     .expect_err("no reply");
     assert!(!error.to_string().contains("not recorded"), "{error}");
     let lines = record_lines(&socket);

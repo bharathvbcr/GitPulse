@@ -1785,7 +1785,7 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
             let satisfies = ver
                 .as_deref()
                 .map(|v| {
-                    // go 1.26+ preferred (module directive); accept 1.22+ as soft.
+                    // go 1.27+ preferred (module directive); accept 1.22+ as soft.
                     v.contains("go1.2") || v.contains("go1.3") || v.contains("devel")
                 })
                 .unwrap_or(false);
@@ -1796,7 +1796,7 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
                 version: ver,
                 satisfies,
                 note: (!satisfies)
-                    .then(|| "Manvi go.mod directs go 1.26.6; install a matching toolchain".into()),
+                    .then(|| "Manvi go.mod directs go 1.27.4; install a matching toolchain".into()),
             });
         }
     }

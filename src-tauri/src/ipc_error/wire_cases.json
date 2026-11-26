@@ -49,5 +49,10 @@
       "skipped_total": 0,
       "failure": null
     }
+  },
+  {
+    "kind": "editor_not_found",
+    "message": "Cursor is not installed: no `cursor` command was found. Install it, or choose another editor in Settings.",
+    "detail": { "editor": "cursor" }
   }
 ]

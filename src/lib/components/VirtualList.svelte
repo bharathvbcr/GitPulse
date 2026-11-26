@@ -40,6 +40,17 @@
      * keeps split panes scrolling in lockstep.
      */
     scrollTop?: number;
+    /**
+     * Stable identity for a row. Without it rows are reused by index: scroll
+     * and a row's DOM node simply shows whatever item now sits at that slot,
+     * which is right for passive rows but wrong for rows holding focus or
+     * state tied to their item (a stage button whose file just left the list
+     * would be handed the next file, and a second Space would act on it).
+     * With it a row's node follows its key, a removed item's node (and focus)
+     * goes with it, and its neighbours keep theirs. Keys must be unique among
+     * items and are ignored when `items` is not given.
+     */
+    key?: (item: T, index: number) => string | number;
     /** Receives the row item (undefined past a shorter column) and its index. */
     row: Snippet<[item: T | undefined, index: number]>;
     class?: string;
@@ -60,6 +71,7 @@
     overscan = 8,
     contentWidth = false,
     scrollTop = $bindable(0),
+    key,
     row,
     class: className = "",
     scrollCue = false,
@@ -85,6 +97,12 @@
       rowHeight,
       viewportHeight
     )
+  );
+
+  let keyedRows = $derived(
+    key && items
+      ? items.slice(win.start, win.end).map((item, i) => ({ item, index: win.start + i }))
+      : null
   );
 
   function handleScroll(event: Event) {
@@ -120,9 +138,15 @@
         class="absolute top-0 {contentWidth ? 'left-0 w-max min-w-full' : 'inset-x-0'}"
         style="transform: translate3d(0, {win.start * rowHeight}px, 0);"
       >
-        {#each { length: win.end - win.start } as _, i}
-          {@render row(items?.[win.start + i], win.start + i)}
-        {/each}
+        {#if key && keyedRows}
+          {#each keyedRows as r (key(r.item, r.index))}
+            {@render row(r.item, r.index)}
+          {/each}
+        {:else}
+          {#each { length: win.end - win.start } as _, i}
+            {@render row(items?.[win.start + i], win.start + i)}
+          {/each}
+        {/if}
       </div>
     </div>
   {:else}

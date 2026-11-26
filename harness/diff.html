@@ -108,13 +108,20 @@ fixtures.cmd_codeintel_cancel=a=>{cancels.push(a.cancelToken);return true;};
 const blobs={};
 fixtures.cmd_get_file_blob=async a=>{blobCalls.push({path:a.filePath,commitId:a.commitId});const b=blobs[a.filePath]??{};if(b.delay)await new Promise(r=>setTimeout(r,b.delay));
  // `failNew` / `failOld` throw for that side only: the working-tree read has no commit, the old read names HEAD or a parent.
- const side=a.commitId===null?"failNew":"failOld";if(b[side])throw new Error(b[side]);
+ const isNew=a.commitId===null;
+ const side=isNew?"failNew":"failOld";if(b[side])throw new Error(b[side]);
+ const absentKey=isNew?"absentNew":"absentOld";if(b[absentKey])return null;
+ const sideText=isNew?(b.newText!==undefined?b.newText:b.text):(b.oldText!==undefined?b.oldText:b.text);
+ if(sideText!==undefined){
+  return {path:a.filePath,is_binary:b.is_binary??false,is_image:true,mime:b.mime??"image/svg+xml",text:sideText,base64:b.base64??null,invalid_utf8_bytes:0};
+ }
  return {path:a.filePath,is_binary:true,is_image:true,mime:b.mime??"image/png",base64:b.base64??"AAAA",invalid_utf8_bytes:0};};
 files=[status(FILE),status("src/other.ts")];
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
 const {mount,unmount,tick}=await import("svelte");
 const {get}=await import("svelte/store");
 const {repoStore}=await import("../src/lib/stores/repoStore.ts");
+const {themeStore}=await import("../src/lib/stores/themeStore.ts");
 const {interfaceStore}=await import("../src/lib/stores/interfaceStore.ts");
 const {toastStore}=await import("../src/lib/stores/toastStore.ts");
 const DiffViewer=(await import("../src/lib/components/DiffViewer.svelte")).default;
@@ -356,20 +363,23 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("Escape on the diff text closes find",()=>!findBox());
  outside.remove();
  // --- stepping between changes -------------------------------------------
+ const twoFrames=()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
  await open({text:longHunk(),truncated:false});
  const pane=scroller();
- // Start just below the first block, so only the second can be next.
- pane.scrollTop=300;await wait(150);
+ // Start just below the first block, so only the second can be next. Wait two
+ // animation frames so the async `scroll` event reaches VirtualList's bindable
+ // scrollTop before Next change reads it (software WebKitGTK can exceed 150 ms).
+ pane.scrollTop=300;await twoFrames();await wait(150);
  const from=pane.scrollTop;
- button("Next change").click();await wait(250);
+ button("Next change").click();await twoFrames();await wait(250);
  const atSecond=pane.scrollTop;
  check("Next change goes to the block of change 150 lines on, not to a nearer line",()=>from>0&&atSecond>from+1500);
- button("Previous change").click();await wait(250);
+ button("Previous change").click();await twoFrames();await wait(250);
  check("Previous change comes back to the first block, above where the reader was",()=>pane.scrollTop<from);
  // --- a refresh does not take the reader's place away --------------------
  await open({text:longHunk(),truncated:false});
  const placed=scroller();
- placed.scrollTop=300;await wait(150);
+ placed.scrollTop=300;await twoFrames();await wait(150);
  const placedAt=placed.scrollTop;
  lineBoxes()[0]?.click();await tick();await wait();
  const pickedBefore=text().includes("1 line selected");
@@ -553,6 +563,73 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  blobCalls.length=0;
  buttons("Try again")[0].click();await wait(500);
  check("Try again reads the same image again and draws it",()=>blobCalls.length===2&&imgSrc("After version of bad.png")==="data:image/png;base64,RklYRUQ="&&!text().includes("Couldn't read this image"));
+ // --- SVG diffs: dark-mode currentColor, canvas toggle, parse/size errors, Visual/Code toggle ---
+ const decodeSvgSrc=src=>{const p="data:image/svg+xml;base64,";if(!src?.startsWith(p))return "";return new TextDecoder().decode(Uint8Array.from(atob(src.slice(p.length)),c=>c.charCodeAt(0)));};
+ const svgOld='<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path fill="currentColor" d="M2 2h20v20z"/></svg>';
+ const svgNew='<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path fill="currentColor" d="M4 4h16v16z"/></svg>';
+ const svgPatch=["diff --git a/icons/mark.svg b/icons/mark.svg","--- a/icons/mark.svg","+++ b/icons/mark.svg","@@ -1 +1 @@",`-${svgOld}`,`+${svgNew}`,""].join("\n");
+ const savedFiles=files;
+ files=[...files,status("icons/mark.svg")];
+ themeStore.setTheme("dark");
+ blobs["icons/mark.svg"]={mime:"image/svg+xml",oldText:svgOld,newText:svgNew};
+ blobCalls.length=0;
+ await openAs("icons/mark.svg",svgPatch);
+ await until(()=>imgSrc("After version of icons/mark.svg").startsWith("data:image/svg+xml;base64,"),"svg diff drawn");
+ check("SVG diff in dark theme renders currentColor with light ink and synthesizes viewBox",()=>{
+  const xml=decodeSvgSrc(imgSrc("After version of icons/mark.svg"));
+  return xml.includes('color="#f1f5f9"')&&xml.includes('viewBox="0 0 24 24"')&&preview.querySelector('[data-image-canvas="dark"]')!==null;
+ });
+ check("SVG Visual mode hides inert text-diff controls while offering Visual | Code toggle",()=>
+  Boolean(preview.querySelector('[data-testid="diff-svg-visual"][aria-pressed="true"]'))&&
+  Boolean(preview.querySelector('[data-testid="diff-svg-code"]'))&&
+  !preview.querySelector('[aria-label="Toggle syntax coloring"]')&&
+  !preview.querySelector('[aria-label="Toggle word wrap"]'));
+ const blobReadsBeforeCanvas=blobCalls.length;
+ preview.querySelector('[data-testid="image-diff-canvas-light"]').click();await tick();await wait(80);
+ check("switching ImageDiffViewer canvas to Light updates SVG currentColor ink with zero extra IPC reads",()=>
+  blobCalls.length===blobReadsBeforeCanvas&&
+  preview.querySelector('[data-image-canvas="light"]')!==null&&
+  decodeSvgSrc(imgSrc("After version of icons/mark.svg")).includes('color="#0f172a"'));
+ preview.querySelector('[data-testid="image-diff-canvas-grid"]').click();await tick();await wait(80);
+ check("switching ImageDiffViewer canvas to Grid in dark mode uses dark-grid surface and light ink",()=>
+  blobCalls.length===blobReadsBeforeCanvas&&
+  preview.querySelector('[data-image-canvas="dark-grid"]')!==null&&
+  decodeSvgSrc(imgSrc("After version of icons/mark.svg")).includes('color="#f1f5f9"'));
+ button("2-up").click();await tick();await wait(80);
+ check("2-up mode scales small 24x24 SVG icons up cleanly to fill the comparison card",()=>
+  preview.querySelector('img[alt="After version of icons/mark.svg"]').getBoundingClientRect().width>100);
+ preview.querySelector('[data-testid="diff-svg-code"]').click();await tick();await wait(120);
+ check("switching SVG diff to Code mode exposes XML diff lines, text controls, and hunk staging",()=>
+  text().includes("M4 4h16v16z")&&
+  Boolean(preview.querySelector('[aria-label="Toggle syntax coloring"]'))&&
+  hunkButtons("Stage hunk").length===1);
+ preview.querySelector('[data-testid="diff-svg-visual"]').click();await tick();await wait(120);
+ blobs["icons/broken.svg"]={mime:"image/svg+xml",oldText:svgOld,newText:'<svg xmlns="http://www.w3.org/2000/svg"><rect></svg>'};
+ answer={text:section("icons/broken.svg",svgOld,"<svg><rect></svg>"),truncated:false};
+ await repoStore.selectFileDiff("icons/broken.svg",false);await until(()=>text().includes("couldn't be read:"),"malformed svg error");
+ check("malformed SVG on current side surfaces XML parse error instead of silently reporting plain deleted",()=>
+  imgSrc("Before version of icons/broken.svg").startsWith("data:image/svg+xml;base64,")&&
+  text().includes("couldn't be read:"));
+ blobs["icons/huge.svg"]={mime:"image/svg+xml",oldText:"x".repeat(1024*1024+32),newText:"y".repeat(1024*1024+32)};
+ answer={text:section("icons/huge.svg","old","new"),truncated:false};
+ await repoStore.selectFileDiff("icons/huge.svg",false);await until(()=>text().includes("1 MiB"),"oversized svg error");
+ check("oversized SVG exceeding 1 MiB reports the limit error instead of 'No image on either side'",()=>
+  text().includes("Couldn't read this image")&&text().includes("1 MiB")&&!text().includes("No image on either side"));
+ blobs["icons/added-broken.svg"]={mime:"image/svg+xml",absentOld:true,newText:'<svg xmlns="http://www.w3.org/2000/svg"><rect></svg>'};
+ answer={text:section("icons/added-broken.svg","","<svg><rect></svg>"),truncated:false};
+ await repoStore.selectFileDiff("icons/added-broken.svg",false);await until(()=>text().includes("Couldn't read this image"),"single-side added malformed svg error");
+ check("newly added malformed SVG with absent old side surfaces parse error instead of 'No image on either side'",()=>
+  text().includes("Couldn't read this image")&&!text().includes("No image on either side"));
+ blobs["icons/mark.svg"]={mime:"image/svg+xml",oldText:svgOld,newText:svgNew};
+ await openAs("icons/mark.svg",svgPatch);
+ await until(()=>Boolean(preview.querySelector('[data-testid="diff-svg-visual"][aria-pressed="true"]')),"svg visual active before Cmd+F");
+ window.dispatchEvent(new KeyboardEvent("keydown",{key:"f",metaKey:true,bubbles:true,cancelable:true}));
+ await until(()=>document.activeElement===preview.querySelector('input[aria-label="Find in this diff"]'),"Cmd+F switches SVG diff to Code and focuses Find");
+ check("Cmd+F from SVG Visual diff switches to Code view and focuses Find input",()=>
+  Boolean(preview.querySelector('[data-testid="diff-svg-code"][aria-pressed="true"]'))&&
+  document.activeElement===preview.querySelector('input[aria-label="Find in this diff"]'));
+ window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));await tick();await wait(60);
+ files=savedFiles;
  // --- opening at the configured defaults -----------------------------------
  interfaceStore.setDiffLayout("split");interfaceStore.setDiffWordWrap(true);interfaceStore.setDiffSyntaxHighlight(false);
  await open({text:twoHunks(),truncated:false});

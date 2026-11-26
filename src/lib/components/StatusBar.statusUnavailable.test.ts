@@ -7,22 +7,23 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "svelte/server";
+import { readable } from "svelte/store";
 import StatusBar from "./StatusBar.svelte";
 import { interfaceStore } from "../stores/interfaceStore";
 
 const poll = vi.hoisted(() => ({ since: null as number | null }));
 
-// The real store, with the one field the poll would have set.
+// The real store, with the one field the poll would have set. The bar reads it
+// through the `statusUnavailableSince` field store, so that is what is replaced.
 vi.mock("../stores/repoStore", async (importOriginal) => {
   const real = await importOriginal<typeof import("../stores/repoStore")>();
   return {
     ...real,
     repoStore: {
       ...real.repoStore,
-      subscribe: (run: (value: never) => void) =>
-        real.repoStore.subscribe((value) =>
-          run({ ...value, statusUnavailableSince: poll.since } as never),
-        ),
+      statusUnavailableSince: {
+        subscribe: (run: (value: number | null) => void) => readable(poll.since).subscribe(run),
+      },
     },
   };
 });

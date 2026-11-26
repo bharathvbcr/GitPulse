@@ -577,6 +577,93 @@ describe("createDiagnostics", () => {
     ]);
   });
 
+  it("drops persisted xterm.js: null console errors from earlier builds while keeping current-build regressions and other xterm entries", () => {
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        {
+          id: 7,
+          at: 7,
+          severity: "error",
+          source: "console",
+          message: "xterm.js: null",
+          count: 1,
+          buildId: "current-build-id",
+        },
+        {
+          id: 6,
+          at: 6,
+          severity: "error",
+          source: "console",
+          message: "xterm.js: null",
+          count: 1,
+          buildId: "5e378975-470b-452a-83a2-720b9e008294",
+        },
+        {
+          id: 5,
+          at: 5,
+          severity: "error",
+          source: "console",
+          message: "xterm.js: null",
+          count: 1,
+        },
+        {
+          id: 4,
+          at: 4,
+          severity: "error",
+          source: "console",
+          message: "xterm.js: Parsing error: bad escape",
+          count: 1,
+        },
+        {
+          id: 3,
+          at: 3,
+          severity: "warning",
+          source: "console",
+          message: "xterm.js: null",
+          count: 1,
+        },
+        {
+          id: 2,
+          at: 2,
+          severity: "error",
+          source: "uncaught-error",
+          message: "xterm.js: null",
+          count: 1,
+        },
+      ]),
+    });
+    const store = createDiagnostics({ storage, development: false, buildId: "current-build-id" });
+    expect(
+      get(store).map((entry) => ({
+        id: entry.id,
+        severity: entry.severity,
+        source: entry.source,
+        message: entry.message,
+        buildId: entry.buildId,
+      })),
+    ).toEqual([
+      { id: 7, severity: "error", source: "console", message: "xterm.js: null", buildId: "current-build-id" },
+      { id: 4, severity: "error", source: "console", message: "xterm.js: Parsing error: bad escape", buildId: undefined },
+      { id: 3, severity: "warning", source: "console", message: "xterm.js: null", buildId: undefined },
+      { id: 2, severity: "error", source: "uncaught-error", message: "xterm.js: null", buildId: undefined },
+    ]);
+    // Rewrote storage so dropped historical entries from earlier/unstamped builds do not come back,
+    // while the same-build regression stays persisted across restarts.
+    const persisted = storage.getItem(DIAGNOSTIC_STORAGE_KEY) ?? "";
+    expect(persisted).toContain('"id":7');
+    expect(persisted).not.toContain('"id":6');
+    expect(persisted).not.toContain('"id":5');
+
+    // Live calls are NOT suppressed so any regression still surfaces.
+    store.error("console", "xterm.js: null");
+    expect(get(store)[0]).toMatchObject({
+      severity: "error",
+      source: "console",
+      message: "xterm.js: null",
+      buildId: "current-build-id",
+    });
+  });
+
   it("compacts consecutive fingerprint matches already in the persisted blob", () => {
     // Live coalescing only folds the head, and only after fingerprint masking
     // exists. Overnight UI-timer warnings written before that masking stay as

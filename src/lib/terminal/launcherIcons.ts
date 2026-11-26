@@ -30,8 +30,8 @@ export const LAUNCHER_ICONS: Readonly<Record<TabKind, LauncherIconSpec>> = {
   shell: { icon: null, mark: "shell", tint: "var(--color-textMuted)" },
   // Claude's own mark in its brand color.
   claude: { icon: null, mark: "claude", tint: "#d97757" },
-  // Manvi's published tile draws in its own colours; the tint is Red400, the
-  // accent its brand ramp uses where the red has to read as text.
+  // Manvi's published Fold M mark draws in its own colours; the tint is Red400,
+  // the accent its brand ramp uses where the red has to read as text.
   manvi: { icon: null, mark: "manvi", tint: "#d92d3f" },
   // Codex's blue-violet and Antigravity's blue are from their own marks;
   // Grok's mark is monochrome, so it takes the text color.

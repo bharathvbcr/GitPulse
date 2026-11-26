@@ -915,6 +915,34 @@ pub enum Need {
     Clear,
 }
 
+/// How urgently an event asks for the user's attention.
+///
+/// Orthogonal to [`Need`] so existing wire consumers and contract tests that
+/// map `Need` stay intact while the backend and UI can separate genuinely
+/// blocking human prompts from passive reminders and completion notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    /// Blocks forward progress until the user responds (permission, elicitation, input).
+    Blocking,
+    /// Execution failed and stopped on an error.
+    Error,
+    /// Passive notification (turn finished, work completed, idle reminder).
+    Informational,
+    /// Resolves or clears a prior request (prompt submitted, tool finished, exited).
+    Clear,
+}
+
+impl Urgency {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::Error => "error",
+            Self::Informational => "informational",
+            Self::Clear => "clear",
+        }
+    }
+}
+
 /// What GitPulse does with an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -937,6 +965,7 @@ pub struct Event {
     pub phrase: &'static str,
     pub need: Need,
     pub role: Role,
+    pub urgency: Urgency,
 }
 
 /// Events an agent hook may report, and how GitPulse words each one.
@@ -965,42 +994,49 @@ pub const EVENTS: &[Event] = &[
         phrase: "needs your permission",
         need: Need::Ask,
         role: Role::Banner,
+        urgency: Urgency::Blocking,
     },
     Event {
         name: "idle_prompt",
         phrase: "is waiting for you",
         need: Need::Ask,
         role: Role::Banner,
+        urgency: Urgency::Informational,
     },
     Event {
         name: "agent_needs_input",
         phrase: "needs your input",
         need: Need::Ask,
         role: Role::Banner,
+        urgency: Urgency::Blocking,
     },
     Event {
         name: "agent_completed",
         phrase: "finished its work",
         need: Need::Finished,
         role: Role::Banner,
+        urgency: Urgency::Informational,
     },
     Event {
         name: "elicitation_dialog",
         phrase: "is asking a question",
         need: Need::Ask,
         role: Role::Banner,
+        urgency: Urgency::Blocking,
     },
     Event {
         name: "elicitation_url_dialog",
         phrase: "is asking you to open a link",
         need: Need::Ask,
         role: Role::Banner,
+        urgency: Urgency::Blocking,
     },
     Event {
         name: "error",
         phrase: "stopped on an error",
         need: Need::Error,
         role: Role::Banner,
+        urgency: Urgency::Error,
     },
     // `PermissionRequest`. Also fires when another hook is about to approve
     // the call itself, which is why it is never a banner: the `Notification`
@@ -1010,6 +1046,7 @@ pub const EVENTS: &[Event] = &[
         phrase: "needs your permission",
         need: Need::Ask,
         role: Role::State,
+        urgency: Urgency::Blocking,
     },
     // `Stop`: the turn ended. `idle_prompt` follows a minute later if nobody
     // answers, and that one may interrupt.
@@ -1018,6 +1055,7 @@ pub const EVENTS: &[Event] = &[
         phrase: "finished its turn",
         need: Need::Finished,
         role: Role::State,
+        urgency: Urgency::Informational,
     },
     // `UserPromptSubmit`: the user answered, from wherever they answered.
     Event {
@@ -1025,6 +1063,7 @@ pub const EVENTS: &[Event] = &[
         phrase: "is working again",
         need: Need::Clear,
         role: Role::Resolve,
+        urgency: Urgency::Clear,
     },
     // `PostToolUse` / `PostToolUseFailure`: a tool ran, so the call it names
     // is no longer waiting for approval.
@@ -1033,6 +1072,7 @@ pub const EVENTS: &[Event] = &[
         phrase: "is working again",
         need: Need::Clear,
         role: Role::Resolve,
+        urgency: Urgency::Clear,
     },
     // `SessionEnd`, or the PTY's process exiting: nobody can answer a
     // question from a session that is gone.
@@ -1041,6 +1081,7 @@ pub const EVENTS: &[Event] = &[
         phrase: "ended its session",
         need: Need::Clear,
         role: Role::Resolve,
+        urgency: Urgency::Clear,
     },
 ];
 
@@ -2833,6 +2874,70 @@ mod tests {
         }
         for event in EVENTS.iter().filter(|e| e.role == Role::Banner) {
             assert!(report(&format!(r#"{{"v":1,"event":"{}"}}"#, event.name)).is_ok());
+        }
+    }
+
+    #[test]
+    fn every_event_carries_its_canonical_urgency_and_need() {
+        assert_eq!(EVENTS.len(), 12);
+        for (name, expected_urgency, expected_str, expected_need) in [
+            (
+                "permission_prompt",
+                Urgency::Blocking,
+                "blocking",
+                Need::Ask,
+            ),
+            (
+                "permission_request",
+                Urgency::Blocking,
+                "blocking",
+                Need::Ask,
+            ),
+            (
+                "agent_needs_input",
+                Urgency::Blocking,
+                "blocking",
+                Need::Ask,
+            ),
+            (
+                "elicitation_dialog",
+                Urgency::Blocking,
+                "blocking",
+                Need::Ask,
+            ),
+            (
+                "elicitation_url_dialog",
+                Urgency::Blocking,
+                "blocking",
+                Need::Ask,
+            ),
+            ("error", Urgency::Error, "error", Need::Error),
+            (
+                "agent_completed",
+                Urgency::Informational,
+                "informational",
+                Need::Finished,
+            ),
+            (
+                "turn_finished",
+                Urgency::Informational,
+                "informational",
+                Need::Finished,
+            ),
+            (
+                "idle_prompt",
+                Urgency::Informational,
+                "informational",
+                Need::Ask,
+            ),
+            ("prompt_submitted", Urgency::Clear, "clear", Need::Clear),
+            ("tool_finished", Urgency::Clear, "clear", Need::Clear),
+            ("session_ended", Urgency::Clear, "clear", Need::Clear),
+        ] {
+            let ev = event(name).unwrap_or_else(|| panic!("missing event {name}"));
+            assert_eq!(ev.urgency, expected_urgency, "{name}");
+            assert_eq!(ev.urgency.as_str(), expected_str, "{name}");
+            assert_eq!(ev.need, expected_need, "{name}");
         }
     }
 

@@ -13,8 +13,21 @@
       import "../src/app.css";
 
       const errors = [];
-      addEventListener("error", event => errors.push(event.message));
-      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+      // Each error says where the run was when it fired: how many checks had
+      // been recorded, the last one's name, and the repository open then. The
+      // list is only judged at the end ("no unhandled runtime errors"), so
+      // without this an error that broke a check mid-run arrived with nothing
+      // tying it to the switch that raised it.
+      const at = { results: null, repo: () => null };
+      const where = () => {
+        const last = at.results?.at(-1);
+        const after = at.results ? `after ${at.results.length} checks${last ? `, last "${last.name}"` : ""}` : "before the checks";
+        let repo = null;
+        try { repo = at.repo(); } catch { /* the store is not loaded yet */ }
+        return ` [${after}; repository ${repo ?? "none"}]`;
+      };
+      addEventListener("error", event => errors.push(`${event.message}${where()}`));
+      addEventListener("unhandledrejection", event => errors.push(`${String(event.reason)}${where()}`));
 
       // Fixture shapes are the complete wire types, per src/lib/health/types.ts
       // and src/lib/codeintel/types.ts. A fixture short of a field is not a
@@ -26,7 +39,7 @@
       let githubMode = "alerts";
       // Knobs for healthChecks.js; all null/zero outside its scenarios.
       const ipcLog = [], aiCalls = [], runs = [];
-      const knobs = { scanDelay: 0, deps: null, dead: null, secrets: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH", hostLoad: null, hostLoadLeases: null, hostLoadIdle: null };
+      const knobs = { scanDelay: 0, deps: null, dead: null, secrets: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH", hostLoad: null, hostLoadLeases: null, hostLoadIdle: null, manviSteward: null };
       // Health's secrets section scans on open. A complete, empty scan that
       // Kingfisher's second opinion corroborated by default, so every other
       // check reads a verdict secrets does not move. Only a corroborated scan
@@ -214,6 +227,9 @@
           case "cmd_host_load_idle":
             if (knobs.hostLoadIdle) return knobs.hostLoadIdle();
             throw new Error(`Unimplemented fixture: ${cmd}`);
+          case "cmd_manvi_steward_status":
+          case "cmd_manvi_steward_run_now":
+            return knobs.manviSteward ? knobs.manviSteward(cmd, args) : null;
           case "cmd_copy_text": return null;
           case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
           case "cmd_stash_list": return { entries: [], truncated: false };
@@ -230,6 +246,7 @@
       const { createChecks, CheckFailed } = await import("./checks.ts");
       const { HEALTH_SECTIONS } = await import("../src/lib/health/sections.ts");
       const { get } = await import("svelte/store");
+      at.repo = () => get(repoStore.currentPath);
       const { diagnostics } = await import("../src/lib/diagnostics/diagnostics.ts");
       const HealthPanel = (await import("../src/lib/components/HealthPanel.svelte")).default;
 
@@ -284,6 +301,7 @@
         // beside its name, and the run writes down where it stopped instead of
         // ending in a short list of passes that reads as silence.
         const { results, check, stopped } = createChecks();
+        at.results = results;
         const finish = () => {
           const payload = { results, errors };
           document.querySelector("#result").textContent = JSON.stringify(results, null, 2);
@@ -674,7 +692,7 @@
             setMode: next => { mode = next; }, setGithub: next => { githubMode = next; },
           });
           const { runHostLoadChecks } = await import("./healthChecks.js");
-          await runHostLoadChecks({ check, root, section, has, flat, wait, until, tick, knobs });
+          await runHostLoadChecks({ check, root, section, has, flat, wait, until, tick, knobs, remount });
           check("no unhandled runtime errors", () => errors.length === 0);
           checksButton.textContent = `${results.length}/${results.length} health checks passed`;
         } catch (error) {

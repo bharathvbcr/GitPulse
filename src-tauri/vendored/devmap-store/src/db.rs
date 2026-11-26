@@ -2614,15 +2614,28 @@ fn fts_match_query(query: &str) -> Result<String> {
     // wildcards and hyphens inside a term stay data rather than becoming
     // syntax. `AND` is the only thing this function adds as syntax, and it adds
     // it *between* quoted terms where no user text can reach.
+    // Each whitespace-separated word — and each `::`-delimited segment of a
+    // qualified query (`webcontent::snapshot`, `sysload::webcontent::snapshot`,
+    // `Ring::dump`) — is its own quoted prefix term, joined by AND.
+    //
+    // A quoted FTS5 phrase requires its tokens to appear adjacently and in
+    // order inside a single column. For `"webcontent::snapshot"*`, unicode61
+    // treats `:` as a separator, so it demanded `webcontent` immediately before
+    // `snapshot`, missing `src-tauri/src/sysload/webcontent.rs::snapshot`
+    // because the `rs` extension token sits between them. Splitting on `::`
+    // turns that into `"webcontent"* AND "snapshot"*` while keeping single `:`
+    // (e.g. hostile column filters like `name:Trainer`) quoted as plain data.
     let mut terms = query
         .split_whitespace()
+        .flat_map(|word| word.split("::"))
+        .filter(|term| !term.is_empty())
         .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
         .peekable();
     if terms.peek().is_none() {
-        // Whitespace-only (or empty). No term to join, and an empty MATCH
-        // expression is a syntax error rather than an empty result — so this
-        // keeps the exact expression the single-phrase form produced, and with
-        // it whatever SQLite already did about it.
+        // Whitespace-only (or empty / bare `::`). No term to join, and an
+        // empty MATCH expression is a syntax error rather than an empty result
+        // — so this keeps the exact expression the single-phrase form produced,
+        // and with it whatever SQLite already did about it.
         return Ok(format!("\"{}\"*", query.replace('"', "\"\"")));
     }
     Ok(terms.collect::<Vec<_>>().join(" AND "))

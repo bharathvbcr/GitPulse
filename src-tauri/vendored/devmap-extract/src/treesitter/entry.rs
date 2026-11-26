@@ -620,9 +620,26 @@ pub(super) fn extract_treesitter_before_deadline(
                         ParseAttempt::Parsed(repaired.tree),
                         Vec::new(),
                         Some(format!(
-                            "svelte template text: {} bare `&`/`>` character(s) written over \
+                            "svelte template repair: {} construct(s) written over \
                              so the file parses; offsets are the file's own",
                             repaired.edits
+                        )),
+                    ),
+                    None => (ParseAttempt::Parsed(tree), Vec::new(), None),
+                }
+            }
+            ParseAttempt::Parsed(tree)
+                if matches!(lang, "typescript" | "tsx" | "rust" | "shell")
+                    && tree.root_node().has_error() =>
+            {
+                match crate::parse_repair::repair(lang, &mut parser, &tree, source, deadline) {
+                    Some(repaired) => (
+                        ParseAttempt::Parsed(repaired.tree),
+                        Vec::new(),
+                        Some(format!(
+                            "{}: {} site(s) repaired same-width so the file parses; offsets are \
+                             the file's own",
+                            repaired.kind, repaired.edits
                         )),
                     ),
                     None => (ParseAttempt::Parsed(tree), Vec::new(), None),
