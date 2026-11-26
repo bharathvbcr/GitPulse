@@ -1,6 +1,6 @@
 # Command palette
 
-The palette is a lazy-loaded entry point to GitPulse's existing stores, dialogs and
+The palette is a lazy-loaded entry point to Waylode's existing stores, dialogs and
 views. Open it with Cmd/Ctrl+K, the native menu, or the status bar. App handles the
 first keyboard/event request before the component exists; subsequent requests use
 the mounted palette. Clone and Rebase delegate to the same App functions as the

@@ -54,8 +54,8 @@ export function formatDevmapLogs(
       ].join("\n")
     : `Durable log unavailable: ${formatDiagnosticFailure(durable.reason)}`;
   return [
-    `GitPulse code map logs — ${new Date().toISOString()}`,
-    `GitPulse ${APP_VERSION} (${APP_BUILD_ID})`,
+    `Waylode code map logs — ${new Date().toISOString()}`,
+    `Waylode ${APP_VERSION} (${APP_BUILD_ID})`,
     "Map context at copy request:", contextText,
     "", boundedSection(memoryText), "", boundedSection(durableText),
   ].join("\n");

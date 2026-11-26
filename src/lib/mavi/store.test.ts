@@ -53,6 +53,15 @@ vi.mock("./client", () => ({
   },
 }));
 
+const closed = vi.hoisted(() => ({ keys: [] as string[] }));
+vi.mock("./childTabs.svelte", () => ({
+  childTabs: { forget: () => {} },
+  closeThreadChildren: vi.fn(async (key: string) => {
+    closed.keys.push(key);
+    return { closed: 0, skippedProtected: 0 };
+  }),
+}));
+
 function summary(id: string, extra: Record<string, unknown> = {}): MaviSummary {
   return {
     id,
@@ -244,6 +253,25 @@ describe("maviStore", () => {
     // Nothing to act on once forgotten.
     await store.answer(key, "r", "allow");
     await expect(store.send(key, "x")).rejects.toThrow("Resume");
+  });
+
+  it("names the owning thread to the host on create, resume and adopt, and closes its tabs only on forget", async () => {
+    closed.keys = [];
+    const store = await freshStore();
+    const key = await store.create({ target: { kind: "local", repoPath: "/repo" }, mode: "ask", firstMessage: "go" });
+    expect(host.started[0]).toMatchObject({ threadKey: key });
+    host.status!(summary("s1", { phase: "ended" }));
+    await store.resume(key);
+    expect(host.started[1]).toMatchObject({ threadKey: key });
+    const adopted = await store.adopt({ root: "/other", conversationId: "abc", mode: "ask" });
+    expect(host.started[2]).toMatchObject({ threadKey: adopted });
+    expect(adopted).not.toBe(key);
+    // Stopping or interrupting leaves the tabs: the person may still want them.
+    await store.interrupt(key);
+    await store.stop(key);
+    expect(closed.keys).toEqual([]);
+    store.forget(key);
+    expect(closed.keys).toEqual([key]);
   });
 
   it("counts attention, lists touched files and marks a thread seen only while it is on screen", async () => {

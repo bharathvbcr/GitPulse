@@ -55,40 +55,40 @@ describe("NativeNotificationBridgeView", () => {
     expect(body).not.toContain("activation-error");
   });
 
-  it("renders .receipt with the current GitPulse badge Logo and Close notification button", () => {
+  it("renders .receipt with the current Waylode badge Logo and Close notification button", () => {
     const { body } = render(NativeNotificationBridgeView, {
       props: { initialCurrent: deliveryFixture, initialNotice: noticeFixture },
     });
     expect(body).toMatch(/class="receipt\b/);
     expect(body).toContain("Coding agent exited");
     expect(body).toContain("Close notification");
-    expect(body).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
-    expect(body).toMatch(/id="gp-[a-z0-9]+-badge"/);
-    expect(body).toMatch(/<span class="receipt-logo[^"]*" aria-hidden="true">[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
+    expect(body).toContain("M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8");
+    expect(body).toMatch(/id="wl-[a-z0-9]+-badge"/);
+    expect(body).toMatch(/<span class="receipt-logo[^"]*" aria-hidden="true">[\s\S]*?<svg[^>]*aria-label="Waylode"/);
   });
 
-  it("falls back to GitPulse activity heading when notice is missing or empty", () => {
+  it("falls back to Waylode activity heading when notice is missing or empty", () => {
     const missingNotice = render(NativeNotificationBridgeView, {
       props: { initialCurrent: deliveryFixture },
     }).body;
-    expect(missingNotice).toMatch(/<strong[^>]*>GitPulse activity<\/strong>/);
+    expect(missingNotice).toMatch(/<strong[^>]*>Waylode activity<\/strong>/);
     expect(missingNotice).toContain("Resolving the saved notification");
 
     const emptyTitle = render(NativeNotificationBridgeView, {
       props: { initialCurrent: deliveryFixture, initialNotice: { ...noticeFixture, title: "" } },
     }).body;
-    expect(emptyTitle).toMatch(/<strong[^>]*>GitPulse activity<\/strong>/);
+    expect(emptyTitle).toMatch(/<strong[^>]*>Waylode activity<\/strong>/);
   });
 
-  it("renders .activation-error with the current GitPulse badge Logo and Dismiss button", () => {
+  it("renders .activation-error with the current Waylode badge Logo and Dismiss button", () => {
     const { body } = render(NativeNotificationBridgeView, {
       props: { initialError: "Notification activation failed" },
     });
     expect(body).toMatch(/class="activation-error gp-card shadow-float\b/);
     expect(body).toContain("Notification activation failed");
     expect(body).toContain("Dismiss");
-    expect(body).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
-    expect(body).toMatch(/id="gp-[a-z0-9]+-badge"/);
-    expect(body).toMatch(/<span class="receipt-logo[^"]*" aria-hidden="true">[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
+    expect(body).toContain("M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8");
+    expect(body).toMatch(/id="wl-[a-z0-9]+-badge"/);
+    expect(body).toMatch(/<span class="receipt-logo[^"]*" aria-hidden="true">[\s\S]*?<svg[^>]*aria-label="Waylode"/);
   });
 });

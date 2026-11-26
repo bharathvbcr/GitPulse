@@ -11,18 +11,18 @@
 //! asks git and compares. Every rule encoded twice — once in a Rust prefix
 //! test, once in a git option — is a rule that can drift.
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
 
 use std::collections::{BTreeSet, HashSet};
 use std::process::Command;
 
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::graph::{
+use tempfile::TempDir;
+use waylode_lib::engine::GitReader;
+use waylode_lib::graph::{
     hidden_ref_namespaces, hidden_ref_warning, history_rev_args, is_named_ref,
     list_ref_decorations, probe_hidden_history, HiddenHistory, RefKind, RefScope,
 };
-use tempfile::TempDir;
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     common::unmetered_spawns();
@@ -360,7 +360,7 @@ fn a_ref_mirror_cannot_produce_an_unbounded_decoration_list() {
     );
     assert_eq!(
         listing.other_dropped,
-        5_000 - gitpulse_lib::graph::REFS_OTHER_CAP,
+        5_000 - waylode_lib::graph::REFS_OTHER_CAP,
         "the cap dropped refs and must report how many"
     );
     let note = listing

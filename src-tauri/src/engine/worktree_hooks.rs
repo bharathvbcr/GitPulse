@@ -304,7 +304,7 @@ fn approval_store() -> Result<PathBuf, CommandError> {
     {
         crate::tool_config::default_config_dir()
             .map(|dir| dir.join(APPROVAL_DIR))
-            .ok_or_else(|| "Cannot resolve GitPulse hook approval storage".to_string())
+            .ok_or_else(|| "Cannot resolve Waylode hook approval storage".to_string())
             .map_err(CommandError::from)
     }
 }

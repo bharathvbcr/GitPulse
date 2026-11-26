@@ -37,6 +37,8 @@ export interface StartRequest {
   acknowledged?: boolean;
   model?: string;
   resume?: string;
+  /** The page's `ThreadRecord.key`: names the thread that owns terminal tabs its agent starts. */
+  threadKey?: string;
 }
 
 export type Probe = MaviProbe;

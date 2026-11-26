@@ -36,12 +36,12 @@ mod common;
 mod imp {
     use super::common::fixture::{build_repo, Spec};
     use super::common::{interleave, Case, Report, Sample};
-    use gitpulse_lib::devmap::live::{clear_live_echo_cooldown, maybe_refresh};
-    use gitpulse_lib::devmap::repo_map::repo_map_path;
-    use gitpulse_lib::devmap::viz::code_graph_path;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
+    use waylode_lib::devmap::live::{clear_live_echo_cooldown, maybe_refresh};
+    use waylode_lib::devmap::repo_map::repo_map_path;
+    use waylode_lib::devmap::viz::code_graph_path;
 
     /// How long the stub's `build` takes: a short incremental build.
     const BUILD_MS: u64 = 300;
@@ -49,7 +49,7 @@ mod imp {
     const TICK: Duration = Duration::from_millis(250);
 
     pub fn main() {
-        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+        waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("live_index");
         // The same storm in smoke and full mode (only the sample count differs),
         // so the row name and its `ticks` counter match the baseline's.

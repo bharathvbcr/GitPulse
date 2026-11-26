@@ -363,8 +363,15 @@ describe("annotated but unregistered commands", () => {
     // continue in Mavi, asked before the tab is ended): 344 + the eleven Mavi
     // handlers. 361 with both: 344 + 6 idle + 11 Mavi. 365 with
     // cmd_browser_discover_local_servers, cmd_list_turn_checkpoints,
-    // cmd_diff_turn_checkpoint and cmd_github_pr_diff.
-    expect(found.size).toBe(365);
+    // cmd_diff_turn_checkpoint and cmd_github_pr_diff. 367 with
+    // cmd_host_relief_status and cmd_host_relief_request_resume (the memory
+    // supervisor's published status, and a person's request to resume what it
+    // paused). 369 with cmd_host_relief_request_terminate and
+    // cmd_host_relief_request_pause (a person's request to end a paused tree,
+    // and to pause one of an agent GitPulse did not launch). 370 with
+    // cmd_mavi_close_thread_children (forgetting a Mavi thread closes its
+    // terminal children).
+    expect(found.size).toBe(370);
     for (const legacy of ["hosts", "kill", "transcript"]) {
       expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
     }

@@ -12,7 +12,7 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::analyzer::LanguageDetector as D;
+use waylode_lib::analyzer::LanguageDetector as D;
 
 /// Paths chosen to break assumptions rather than to be realistic.
 fn adversarial_paths() -> Vec<String> {
@@ -82,7 +82,7 @@ fn path_classifiers_are_total() {
         let _ = D::coverage_family(info.name);
         // Counting runs for every file in a language-stats scan, and a
         // panic there aborts the whole report rather than one file.
-        let counts = gitpulse_lib::analyzer::LocCounter::count_for_language(
+        let counts = waylode_lib::analyzer::LocCounter::count_for_language(
             "a\n/* b */\n\n# c\n\"\"\"d\"\"\"\n<!-- e -->\n",
             info.name,
         );

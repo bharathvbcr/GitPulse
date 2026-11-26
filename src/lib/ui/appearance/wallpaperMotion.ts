@@ -173,7 +173,7 @@ export function motionReasonText(state: MotionState): string | null {
     case "unknown":
       return "Still: the power source or system load can't be read right now, so it doesn't move.";
     case "sensing-off":
-      return "Still: host load sampling is off, so GitPulse can't tell whether the Mac has room. Turn it on in Settings, Agents, Host load.";
+      return "Still: host load sampling is off, so Waylode can't tell whether the Mac has room. Turn it on in Settings, Agents, Host load.";
     case "battery":
       return "Still: running on battery. It moves again when plugged in.";
     case "thermal":

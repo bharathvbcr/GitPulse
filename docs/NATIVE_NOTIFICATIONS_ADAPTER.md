@@ -7,7 +7,7 @@
 > `/tmp/...` evidence path.
 
 Manvi schema seven now owns notification settings and delivery records alongside
-the durable activity inbox introduced in schema six. GitPulse implements the
+the durable activity inbox introduced in schema six. Waylode implements the
 macOS adapter, preference controls and recovered review view. Source compilation,
 store/native boundary tests and browser interaction are verified below. Actual
 OS banner display and installed-app activation remain unverified.
@@ -22,7 +22,7 @@ managed callback type now has a producer; see
 
 ## Approved macOS bindings
 
-The user approved adding the four bindings. GitPulse now declares these versions
+The user approved adding the four bindings. Waylode now declares these versions
 already present in Cargo.lock as direct, macOS-only dependencies: `objc2` 0.6.4,
 `block2` 0.6.2, `objc2-foundation` 0.3.2 and `objc2-user-notifications` 0.3.2.
 All four declarations disable default features. Selected APIs cover the
@@ -97,7 +97,7 @@ actions instead of presenting inactive controls.
   callback is persisted can still lose that activation; the activity inbox
   remains the recovery surface. This is not an exactly-once OS callback claim.
 - An activity banner carries **Snooze 1 hour** beside Open task. It is a
-  background action: it does not raise GitPulse. The coordinator checks the
+  background action: it does not raise Waylode. The coordinator checks the
   banner identity against the saved delivery, as Open does, then writes the
   same `attention.update` snooze the inbox's own button sends. The duration is
   `SNOOZE_SECONDS` in `workbench/notifications.rs`.
@@ -136,7 +136,7 @@ actions instead of presenting inactive controls.
 ## Forwarding to Graft (phone)
 
 Graft.app, the Mac side of the user's phone pairing, listens on a local Unix
-socket (Graft `PROTOCOL.md` §10.13, "Local submission"). GitPulse offers it the
+socket (Graft `PROTOCOL.md` §10.13, "Local submission"). Waylode offers it the
 banners it has already shown, so they also reach the paired phone. The code is
 `workbench/notifications/graft.rs`; it uses `std::os::unix::net` and adds no
 dependency.
@@ -147,7 +147,7 @@ dependency.
   Nothing is forwarded for `failed` or `uncertain`, so the phone never shows a
   banner the Mac did not. Withdrawal sends `remove` for each banner the
   withdrawal pass takes down; session banners have no withdrawal, and Graft
-  drops held items after 24 hours (its contract, not something GitPulse
+  drops held items after 24 hours (its contract, not something Waylode
   checked). The banner's sound setting becomes the
   request's `silent` flag.
 - **Key.** The banner's own identity (`gitpulse.<profile>.event-N`, or
@@ -171,15 +171,15 @@ dependency.
 - **Refusals.** `disabled`, `source-not-allowed`, `rate-limited`, `bad-request`
   and `too-large`, and a timeout or I/O error, are logged once per code
   (`graft-notify`), with the code and never a title, text or key.
-- **The gate is Graft's.** GitPulse has no switch for this: none was added.
+- **The gate is Graft's.** Waylode has no switch for this: none was added.
   The activity preferences live in the Manvi store, where a schema change
   cascades to DevCouncil, Manvi and Jarvis, so a switch cannot go there. A
   GitPulse-local key in `tools.json` (where `session_alerts` lives) could hold
   one for both banner kinds if it is ever wanted; it was left out because
   Graft's own master switch (off by default) and per-program allow list already
-  are the user's control. Graft lists GitPulse in its settings the first time
+  are the user's control. Graft lists Waylode in its settings the first time
   it is refused `source-not-allowed` (per its contract). The phone only ever
-  receives banners that GitPulse's own settings (enabled, quiet hours, mutes,
+  receives banners that Waylode's own settings (enabled, quiet hours, mutes,
   background) let through.
 - **One cost on the coordinator's path.** After the OS accepts an activity
   banner, `deliver` re-reads the saved delivery (one store read) to confirm it
@@ -193,7 +193,7 @@ socket and a stale socket file; a server that never answers and one that drips
 bytes (both bounded by the one-second budget and not retried); a full queue
 dropping while the caller is not delayed; the delivery record being unchanged
 with a listening Graft and with none. **Unverified:** a real Graft.app (the
-Graft side was not running), delivery to the phone, and the installed GitPulse
+Graft side was not running), delivery to the phone, and the installed Waylode
 bundle posting through the socket.
 
 ## Verification and remaining qualification

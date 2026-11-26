@@ -71,7 +71,7 @@ describe("stopping a legacy session", () => {
     expect(await stopLegacySession(4, found, { invoke: invoke as never, confirm })).toBe(false);
     expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ destructive: true, confirmLabel: "Stop" }));
     expect(invoke).not.toHaveBeenCalled();
-    expect(legacyStopQuestion(found).message).toContain("previous GitPulse version's terminal host");
+    expect(legacyStopQuestion(found).message).toContain("previous Waylode version's terminal host");
   });
 
   it("stops through its own command with the protocol, never through cmd_terminal_kill", async () => {

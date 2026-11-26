@@ -54,7 +54,7 @@ describe("TrustExtensionBanner", () => {
 
   it("says what is currently unreadable, not just that trust is old", () => {
     const banner = source.slice(source.indexOf("{#if trustExtendable}"));
-    expect(banner).toMatch(/before GitPulse covered worktrees/i);
+    expect(banner).toMatch(/before Waylode covered worktrees/i);
     expect(banner).toMatch(/left out of comparisons and collision checks/i);
     expect(banner).toContain("Extend trust to every worktree");
   });

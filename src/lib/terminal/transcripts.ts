@@ -68,7 +68,7 @@ export function readTranscripts(raw: unknown, asked: readonly string[]): Map<str
     }
   }
   for (const id of asked) {
-    if (!answers.has(id)) answers.set(id, { state: "unknown", reason: "GitPulse did not get an answer for it." });
+    if (!answers.has(id)) answers.set(id, { state: "unknown", reason: "Waylode did not get an answer for it." });
   }
   return answers;
 }

@@ -1,5 +1,8 @@
 //! Public UserNotifications APIs; no permissions are requested during setup.
-use super::{Event, Status, WorkbenchError};
+use super::{
+    Event, Status, WorkbenchError, RELIEF_PAUSE_ACTION, RELIEF_RESUME_ACTION,
+    RELIEF_SETTINGS_ACTION, RELIEF_TERMINATE_ACTION,
+};
 use block2::{DynBlock, RcBlock};
 use objc2::{
     define_class, msg_send,
@@ -55,6 +58,78 @@ define_class!(
             completion: &DynBlock<dyn Fn()>,
         ) {
             let native = response.notification().request().identifier().to_string();
+            // A pressure-relief banner is not an activity or session notice and
+            // has no durable claim behind it. "Resume now" leaves the request
+            // file the supervisor reads (`relief_status::request_resume`), here,
+            // so it works in whichever launch macOS delivered it to; Settings
+            // and the body click open Settings.
+            let category = response
+                .notification()
+                .request()
+                .content()
+                .categoryIdentifier()
+                .to_string();
+            if matches!(
+                category.as_str(),
+                RELIEF_CATEGORY | RELIEF_OFFER_CATEGORY | RELIEF_ADVICE_CATEGORY
+            ) {
+                // Every request file is written off the delegate's thread
+                // (the write is a sync and a rename, and AppKit is waiting on
+                // this thread); the banner's own identifier says which tree.
+                let action = response.actionIdentifier().to_string();
+                let spawn = |name: &'static str,
+                             what: &'static str,
+                             body: Box<dyn FnOnce() + Send>| {
+                    if let Err(error) = crate::supervisor::spawn_once(name, what, body) {
+                        log::warn!(target:"workbench","{what} from a banner was not started: {error}");
+                    }
+                };
+                match super::relief_tap(&category, &action, &native) {
+                    super::ReliefTap::Resume => spawn(
+                        "relief-resume",
+                        "pressure relief resume request",
+                        Box::new(|| {
+                            if let Err(error) =
+                                crate::sysload::relief_status::request_resume("notification")
+                            {
+                                log::warn!(target:"workbench","resume request from a banner was not written: {error}");
+                            }
+                        }),
+                    ),
+                    super::ReliefTap::Terminate(id) => spawn(
+                        "relief-terminate",
+                        "pressure relief end request",
+                        Box::new(move || {
+                            if let Err(error) =
+                                crate::sysload::relief_status::request_terminate("notification", id)
+                            {
+                                log::warn!(target:"workbench","end request from a banner was not written: {error}");
+                            }
+                        }),
+                    ),
+                    super::ReliefTap::Pause(id) => spawn(
+                        "relief-pause",
+                        "pressure relief pause request",
+                        Box::new(move || {
+                            if let Err(error) =
+                                crate::sysload::relief_status::request_pause("notification", id)
+                            {
+                                log::warn!(target:"workbench","pause request from a banner was not written: {error}");
+                            }
+                        }),
+                    ),
+                    super::ReliefTap::Settings => {
+                        if let Err(error) = self.ivars().sender.try_send(Event::Relief) {
+                            log::warn!(target:"workbench","relief banner activation could not be queued: {error}");
+                        }
+                    }
+                    super::ReliefTap::Ignore => {
+                        log::warn!(target:"workbench","a relief banner button named no tree and was ignored: {native}");
+                    }
+                }
+                completion.call(());
+                return;
+            }
             // Snooze is the only action that is not an open: the body click
             // (UNNotificationDefaultActionIdentifier) and the Open button both
             // open. Dismiss never arrives — no category sets CustomDismissAction.
@@ -84,7 +159,7 @@ fn center() -> Result<Retained<UNUserNotificationCenter>, WorkbenchError> {
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
         return Err(WorkbenchError::new(
             "unsupported",
-            "Native notifications require a bundled GitPulse application.",
+            "Native notifications require a bundled Waylode application.",
         ));
     }
     Ok(UNUserNotificationCenter::currentNotificationCenter())
@@ -142,6 +217,57 @@ pub(super) fn install(
             UNNotificationCategoryOptions::empty(),
         )
     })
+    .chain(
+        // Resume, End it and Pause it are background actions: pressing one
+        // must not bring GitPulse forward over the thing the person is trying
+        // to get back to. A banner that offers a pause carries only Pause it
+        // and Settings; advice about an untrusted repository carries Settings
+        // alone, because there is no pause to offer.
+        [
+            (
+                RELIEF_CATEGORY,
+                vec![
+                    (RELIEF_RESUME_ACTION, "Resume now", false),
+                    (RELIEF_TERMINATE_ACTION, "End it", false),
+                    (RELIEF_SETTINGS_ACTION, "Settings", true),
+                ],
+            ),
+            (
+                RELIEF_OFFER_CATEGORY,
+                vec![
+                    (RELIEF_PAUSE_ACTION, "Pause it", false),
+                    (RELIEF_SETTINGS_ACTION, "Settings", true),
+                ],
+            ),
+            (
+                RELIEF_ADVICE_CATEGORY,
+                vec![(RELIEF_SETTINGS_ACTION, "Settings", true)],
+            ),
+        ]
+        .into_iter()
+        .map(|(category, buttons)| {
+            let actions: Vec<_> = buttons
+                .into_iter()
+                .map(|(identifier, title, foreground)| {
+                    UNNotificationAction::actionWithIdentifier_title_options(
+                        &NSString::from_str(identifier),
+                        &NSString::from_str(title),
+                        if foreground {
+                            UNNotificationActionOptions::Foreground
+                        } else {
+                            UNNotificationActionOptions::empty()
+                        },
+                    )
+                })
+                .collect();
+            UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+                &NSString::from_str(category),
+                &NSArray::from_retained_slice(&actions),
+                &NSArray::<NSString>::new(),
+                UNNotificationCategoryOptions::empty(),
+            )
+        }),
+    )
     .collect();
     center.setNotificationCategories(&NSSet::from_retained_slice(&categories));
     Ok(())
@@ -155,6 +281,13 @@ pub(super) const WORKBENCH_CATEGORY: &str = "gitpulse-workbench";
 pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
 /// Action identifier of an activity banner's Snooze button.
 const SNOOZE_ACTION: &str = "snooze";
+/// Category and thread of the pressure-relief supervisor's banners
+/// (`desktop::pressure`).
+pub(super) const RELIEF_CATEGORY: &str = "gitpulse-relief";
+/// The category of a banner that offers to pause a tree, and of one that only
+/// advises. The buttons' identifiers are `notifications`' (`RELIEF_*_ACTION`).
+pub(super) const RELIEF_OFFER_CATEGORY: &str = "gitpulse-relief-offer";
+pub(super) const RELIEF_ADVICE_CATEGORY: &str = "gitpulse-relief-advice";
 
 fn timeout() -> WorkbenchError {
     WorkbenchError::new("timeout","macOS notification reply was not confirmed. Recheck status; a delivery will not be sent again automatically.")
@@ -378,6 +511,10 @@ mod tests {
         assert_eq!(SESSION_CATEGORY, "gitpulse-session");
         assert_eq!(SNOOZE_ACTION, "snooze");
         assert_ne!(WORKBENCH_CATEGORY, SESSION_CATEGORY);
+        assert_eq!(RELIEF_CATEGORY, "gitpulse-relief");
+        assert_ne!(RELIEF_RESUME_ACTION, RELIEF_SETTINGS_ACTION);
+        assert_ne!(RELIEF_CATEGORY, SESSION_CATEGORY);
+        assert_ne!(RELIEF_CATEGORY, WORKBENCH_CATEGORY);
 
         let minute = local_minute().expect("local_minute succeeds");
         assert!(minute < 1440, "minute out of range: {minute}");

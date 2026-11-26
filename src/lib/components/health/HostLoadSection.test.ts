@@ -47,7 +47,7 @@ describe("HostLoadSection", () => {
     const fullBody = render(HostLoadSection).body;
     const withTotalDd = fullBody.match(/data-testid="host-load-free-disk">([^<]+)</)?.[1] ?? "";
     expect(withTotalDd).toContain(" of ");
-    expect(fullBody).toContain("Measures immediate unallocated space available to GitPulse");
+    expect(fullBody).toContain("Measures immediate unallocated space available to Waylode");
 
     const withoutTotal = hostLoadStatusFixture();
     withoutTotal.snapshot!.host.total_disk = { status: "unavailable", value: "older" };

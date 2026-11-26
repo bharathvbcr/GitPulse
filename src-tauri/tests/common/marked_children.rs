@@ -5,10 +5,10 @@
 //! marker is both its name and the head of its full argument list. They are
 //! killed, by the pids this test holds, when the group is dropped.
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
 pub struct Marked {
     pub marker: String,

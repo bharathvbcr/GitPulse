@@ -107,12 +107,12 @@ export function quitQuestion(
     .join("\n");
   const omitted = count !== null && count > LISTED ? `\n…and ${count - LISTED} more` : "";
   const what =
-    count === null ? "Terminal sessions may still be running (GitPulse couldn't list them)."
+    count === null ? "Terminal sessions may still be running (Waylode couldn't list them)."
       : count === 1 ? "A terminal session is still running:"
       : `${count} terminal sessions are still running:`;
   return {
     title: count === 1 ? "Leave the Terminal Running?" : "Leave the Terminals Running?",
-    message: `${what}${listed ? `\n${listed}${omitted}` : ""}\nLeft running, they keep working while GitPulse is closed, and the next launch shows them again with what they printed. Stopped, they end now, with whatever they are in the middle of.`,
+    message: `${what}${listed ? `\n${listed}${omitted}` : ""}\nLeft running, they keep working while Waylode is closed, and the next launch shows them again with what they printed. Stopped, they end now, with whatever they are in the middle of.`,
     confirmLabel: "Quit and Leave Running",
     alternateLabel: count === 1 ? "Stop It and Quit" : "Stop Them and Quit",
     cancelLabel: "Keep Working",
@@ -197,7 +197,7 @@ export function quitManagedQuestion(
   let what: string;
   let title: string;
   if (count === null) {
-    what = "Managed agent runs may still be working (GitPulse couldn't list them).";
+    what = "Managed agent runs may still be working (Waylode couldn't list them).";
     title = "Quit While Managed Runs May Be Working?";
   } else if (!complete) {
     what = count === 0
@@ -210,7 +210,7 @@ export function quitManagedQuestion(
   }
   return {
     title,
-    message: `${what}${listed ? `\n${listed}${omitted}` : ""}\nQuitting GitPulse closes the agent runtime, which stops every managed run and whatever it is in the middle of. A terminal host does not keep them.`,
+    message: `${what}${listed ? `\n${listed}${omitted}` : ""}\nQuitting Waylode closes the agent runtime, which stops every managed run and whatever it is in the middle of. A terminal host does not keep them.`,
     confirmLabel: "Stop and Quit",
     cancelLabel: "Keep Working",
     destructive: true,
@@ -248,7 +248,7 @@ export function quitManagedHostedQuestion(
   const omitted = count !== null && count > LISTED ? `\n…and ${count - LISTED} more` : "";
   const noun = (n: number) => (n === 1 ? "managed run is" : "managed runs are");
   let what: string;
-  if (count === null) what = "Managed agent runs may still be working (GitPulse couldn't list them).";
+  if (count === null) what = "Managed agent runs may still be working (Waylode couldn't list them).";
   else if (!complete) {
     what = count === 0
       ? "The list of managed agent runs couldn't be read in full, so some may still be working."
@@ -257,7 +257,7 @@ export function quitManagedHostedQuestion(
   const plural = count !== 1;
   return {
     title: count === 1 ? "Leave the Managed Run Working?" : "Leave the Managed Runs Working?",
-    message: `${what}${listed ? `\n${listed}${omitted}` : ""}\nLeft running, ${plural ? "they keep" : "it keeps"} working while GitPulse is closed, and the next launch picks ${plural ? "them" : "it"} up again. Stopped, ${plural ? "they end" : "it ends"} now, with whatever ${plural ? "they are" : "it is"} in the middle of.`,
+    message: `${what}${listed ? `\n${listed}${omitted}` : ""}\nLeft running, ${plural ? "they keep" : "it keeps"} working while Waylode is closed, and the next launch picks ${plural ? "them" : "it"} up again. Stopped, ${plural ? "they end" : "it ends"} now, with whatever ${plural ? "they are" : "it is"} in the middle of.`,
     confirmLabel: "Quit and Leave Running",
     alternateLabel: count === 1 ? "Stop It and Quit" : "Stop Them and Quit",
     cancelLabel: "Keep Working",

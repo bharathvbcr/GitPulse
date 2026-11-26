@@ -573,7 +573,7 @@
         {:else}
           <Globe size={18} />
           <span>Open a local development server, like <code>localhost:3000</code> or just <code>5173</code>.</span>
-          <span class="text-micro max-w-sm">The page runs in its own browser with no access to GitPulse and its own storage. Only localhost addresses open; sessions close when the window reloads.</span>
+          <span class="text-micro max-w-sm">The page runs in its own browser with no access to Waylode and its own storage. Only localhost addresses open; sessions close when the window reloads.</span>
         {/if}
 
         {#if (serverDiscovery?.servers.length ?? 0) > 0 || serverDiscovery?.run_script}

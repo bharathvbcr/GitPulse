@@ -87,13 +87,13 @@ jobs:
           cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup
 
-      - name: Kani bounded model checking (gitpulse-worktree)
+      - name: Kani bounded model checking (waylode-worktree)
         shell: bash
         run: |
           set -euo pipefail
           kani_log="$(mktemp)"
           trap 'rm -f "$kani_log"' EXIT
-          cargo kani --manifest-path crates/gitpulse-worktree/Cargo.toml 2>&1 | tee "$kani_log"
+          cargo kani --manifest-path crates/waylode-worktree/Cargo.toml 2>&1 | tee "$kani_log"
           grep -q "VERIFICATION:- SUCCESSFUL" "$kani_log"
           grep -Eq "Complete - [1-9][0-9]* successfully verified harnesses, 0 failures" "$kani_log"
           if grep -q "VERIFICATION:- FAILED" "$kani_log"; then exit 1; fi

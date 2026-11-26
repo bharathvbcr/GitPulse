@@ -149,7 +149,7 @@
           <div class="font-medium">Policy gate failed — mutations blocked</div>
           <p class="text-textMuted leading-relaxed">{harnessPermissionSummary(harness)}</p>
           <p class="text-textMuted leading-relaxed">
-            Press Reconnect after resolving the failure. GitPulse will not treat a timed-out,
+            Press Reconnect after resolving the failure. Waylode will not treat a timed-out,
             busy, unavailable, or incompatible policy check as approval.
           </p>
         </div>
@@ -169,7 +169,7 @@
       <h3 class="gp-label">Capability boundary</h3>
       <p class="text-textMuted leading-relaxed">
         No autonomous PTY or app-control API is exposed by <span class="font-mono">manvi serve</span>.
-        GitPulse adds narrow, explicit controls around the planes Manvi actually provides.
+        Waylode adds narrow, explicit controls around the planes Manvi actually provides.
       </p>
     </div>
 

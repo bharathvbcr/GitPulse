@@ -72,7 +72,7 @@ describe("WorktreesPanel agent worktree affordances", () => {
     // The chip used to print the raw directory name, so GitPulse's own task
     // worktrees read as an agent called "gitpulse".
     expect(source).toContain("{agentKindLabel(kind)}</span>");
-    expect(source).toContain("isGitPulseLane(kind) ? 'GitPulse task worktree'");
+    expect(source).toContain("isGitPulseLane(kind) ? 'Waylode task worktree'");
     expect(source).not.toContain("Agent session ");
     expect(source).toContain("Agent worktree (");
   });
@@ -397,7 +397,7 @@ describe("WorktreesPanel DevMap seeding and sparse-cone provisioning", () => {
     expect(source).toContain("let zeroCopyDevmap = $state(false);");
     expect(source).toContain("let sparsePathsInput = $state(\"\");");
     expect(source).toContain("Seed the code map index (copy-on-write clone, then built here)");
-    expect(source).toContain("Link to the main code map instead of copying it (GitPulse only)");
+    expect(source).toContain("Link to the main code map instead of copying it (Waylode only)");
     expect(source).toContain('aria-label="Sparse checkout paths"');
     expect(source).toContain("seedDevmap,");
     expect(source).toContain("zeroCopyDevmap,");

@@ -9,13 +9,13 @@
 
 mod common;
 use common::{run_git, trust_repo};
-#[cfg(unix)]
-use gitpulse_lib::engine::git_writer::MergeMode;
-use gitpulse_lib::engine::{GitReader, GitWriter};
-use gitpulse_lib::graph::RefScope;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
+#[cfg(unix)]
+use waylode_lib::engine::git_writer::MergeMode;
+use waylode_lib::engine::{GitReader, GitWriter};
+use waylode_lib::graph::RefScope;
+use waylode_lib::procguard::LockedSpawn;
 
 fn repo() -> tempfile::TempDir {
     common::unmetered_spawns();
@@ -478,7 +478,7 @@ fn stash_show_never_runs_a_textconv_driver() {
     trust_repo(dir.path());
 
     let shown =
-        gitpulse_lib::engine::stash::show(dir.path().to_str().unwrap(), &oid).expect("stash show");
+        waylode_lib::engine::stash::show(dir.path().to_str().unwrap(), &oid).expect("stash show");
     assert!(!marker.exists(), "the textconv driver ran for stash show");
     assert!(
         !shown.text.contains("CONVERTED") && shown.text.contains("+two"),

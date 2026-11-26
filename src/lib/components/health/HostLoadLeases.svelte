@@ -156,7 +156,7 @@
       <p class="text-textMuted" data-testid="host-load-idle-summary">
         {idle.idle} idle for {Math.round(idle.idle_after_s / 60)} min or more, {idle.unknown} not known either way.
         A session is idle only when it reported that it is waiting, its processes are nearly still and its terminal
-        is quiet; anything GitPulse couldn't read counts as not known.
+        is quiet; anything Waylode couldn't read counts as not known.
       </p>
     {/if}
     {#if idle.sessions.length > 0}

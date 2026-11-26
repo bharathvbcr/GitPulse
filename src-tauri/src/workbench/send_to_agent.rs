@@ -106,11 +106,11 @@ impl Route {
                 "session_id": session,
                 "listening": listening,
                 "reason": if provider == "agy" {
-                    "This agent's Antigravity session is live. The message is left in its GitPulse mailbox and injected at its next hook boundary (or when delivered from its terminal banner)."
+                    "This agent's Antigravity session is live. The message is left in its Waylode mailbox and injected at its next hook boundary (or when delivered from its terminal banner)."
                 } else if *listening {
-                    "This agent's Claude Code session is live and a GitPulse hook is waiting on it. The message is handed to the hook and shown to the agent as a reminder."
+                    "This agent's Claude Code session is live and a Waylode hook is waiting on it. The message is handed to the hook and shown to the agent as a reminder."
                 } else {
-                    "No GitPulse hook is waiting on this agent's Claude Code session right now, and GitPulse cannot see why (it may be mid-turn, idle too long, or running a hook build without deliver). The message is held for two hours and is shown only if a hook on this session picks it up."
+                    "No Waylode hook is waiting on this agent's Claude Code session right now, and Waylode cannot see why (it may be mid-turn, idle too long, or running a hook build without deliver). The message is held for two hours and is shown only if a hook on this session picks it up."
                 },
             }),
             Self::Resume { found } => {
@@ -341,7 +341,7 @@ pub(super) fn decide_with_liveness(
         (Some("external_terminal"), true, _) => {
             if !matches!(provider, "claude" | "agy") {
                 return unavailable(
-                    "Only a Claude Code or Antigravity session can be sent a message from GitPulse; this agent is not Claude Code or Antigravity.",
+                    "Only a Claude Code or Antigravity session can be sent a message from Waylode; this agent is not Claude Code or Antigravity.",
                 );
             }
             match session_of(run) {
@@ -398,7 +398,7 @@ pub(super) fn decide_with_liveness(
         }
         (_, false, false) => unavailable(match state {
             "prepared" => "This attempt has not started, so there is no agent to send a message to.",
-            "unresolved" => "This attempt's outcome is unresolved, so GitPulse cannot say whether an agent is still running to hear a message.",
+            "unresolved" => "This attempt's outcome is unresolved, so Waylode cannot say whether an agent is still running to hear a message.",
             _ => "This attempt is not in a state that can take a message.",
         }),
         _ => unavailable("This attempt is not in a state that can take a message."),
@@ -408,7 +408,7 @@ pub(super) fn decide_with_liveness(
 fn resume_or(provider: &str, resumable: impl FnOnce() -> Value) -> Route {
     if !matches!(provider, "claude" | "agy") {
         return unavailable(
-            "This attempt has ended, and only a Claude Code or Antigravity conversation can be resumed from GitPulse.",
+            "This attempt has ended, and only a Claude Code or Antigravity conversation can be resumed from Waylode.",
         );
     }
     let found = resumable();

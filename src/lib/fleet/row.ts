@@ -308,7 +308,7 @@ function watchWarningFor(facts: RepoFacts): string | null {
     return facts.hydrated ? "Live updates are not confirmed for this repository." : null;
   }
   if (facts.watch.status === "parked") {
-    return "Live updates paused: more repositories are open than GitPulse watches at once. Open it to resume.";
+    return "Live updates paused: more repositories are open than Waylode watches at once. Open it to resume.";
   }
   return facts.watch.reason
     ? `Not receiving live updates: ${facts.watch.reason}`

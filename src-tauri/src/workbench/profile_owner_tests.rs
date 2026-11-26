@@ -87,7 +87,7 @@ fn the_app_upgrades_an_older_profile_once_and_reports_when_it_cannot() {
     );
     assert_eq!(refused.code, "schema_upgrade_required");
     assert!(
-        refused.message.contains("restart GitPulse"),
+        refused.message.contains("restart Waylode"),
         "{}",
         refused.message
     );

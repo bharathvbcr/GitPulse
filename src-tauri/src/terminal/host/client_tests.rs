@@ -37,6 +37,13 @@ struct FakeHost {
 
 impl FakeHost {
     fn start() -> Self {
+        Self::start_on(PROTOCOL)
+    }
+
+    /// A fake host of `protocol`: its socket is named for it and its hello
+    /// says it. The frames it answers are the subset every protocol shares
+    /// (`compat_v4`), so it stands in for an older host as well as this one.
+    fn start_on(protocol: u32) -> Self {
         // A socket path has a short limit: the system temp directory, not a
         // long scratch one.
         let dir = tempfile::Builder::new()
@@ -45,7 +52,7 @@ impl FakeHost {
             .unwrap();
         let listener = UnixListener::bind(
             dir.path()
-                .join(crate::terminal::host::socket_name(PROTOCOL)),
+                .join(crate::terminal::host::socket_name(protocol)),
         )
         .unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -80,7 +87,9 @@ impl FakeHost {
                 writers.lock().unwrap().push(writer.clone());
                 let (calls, hung, garbage, listed) =
                     (calls.clone(), hung.clone(), garbage.clone(), listed.clone());
-                std::thread::spawn(move || serve(stream, writer, &calls, &hung, &garbage, &listed));
+                std::thread::spawn(move || {
+                    serve(protocol, stream, writer, &calls, &hung, &garbage, &listed)
+                });
             }
         });
         fake
@@ -142,6 +151,7 @@ impl Drop for FakeHost {
 }
 
 fn serve(
+    protocol: u32,
     stream: UnixStream,
     writer: Writer,
     calls: &AtomicUsize,
@@ -159,7 +169,7 @@ fn serve(
             Request::Hello { .. } => {
                 calls.fetch_add(1, Ordering::AcqRel);
                 serde_json::to_value(Hello {
-                    protocol: PROTOCOL,
+                    protocol,
                     build: crate::updates::CURRENT_VERSION.to_owned(),
                     pid: std::process::id(),
                     sessions: 1,
@@ -526,21 +536,23 @@ fn rapid_disconnect_and_relaunch_never_refuses_successor_as_duplicate_window() {
 /// A protocol bump must not orphan the sessions of the host it leaves behind:
 /// an app of a later protocol that finds a host with sessions records them,
 /// can list, read and stop them, and a probe that finds nothing clears the
-/// record. The fake host here is the protocol-4 host; the app is "protocol 5".
+/// record. The host is a protocol-4 host left running across the update; the
+/// app is this build.
 #[test]
 fn a_probe_from_a_later_protocol_records_what_the_older_host_still_holds() {
     use crate::terminal::host::legacy::{LegacyError, LegacyStatus};
-    let fake = FakeHost::start();
+    const { assert!(PROTOCOL > 4, "this build is the later protocol") };
+    let fake = FakeHost::start_on(4);
     let client = HostClient::new(fake.config());
     assert!(
         client.legacy_hosts().is_empty(),
         "nothing is known before a probe"
     );
 
-    client.inner.probe_other_protocols_for(5);
+    client.inner.probe_other_protocols_for(PROTOCOL);
     let hosts = client.legacy_hosts();
     assert_eq!(hosts.len(), 1, "{hosts:?}");
-    assert_eq!(hosts[0].protocol, PROTOCOL);
+    assert_eq!(hosts[0].protocol, 4);
     let LegacyStatus::Listed { info, sessions } = &hosts[0].status else {
         panic!("not listed: {:?}", hosts[0].status);
     };
@@ -551,7 +563,8 @@ fn a_probe_from_a_later_protocol_records_what_the_older_host_still_holds() {
         client
             .trouble()
             .iter()
-            .any(|t| t.contains("speaks protocol 5") && t.contains("1 session(s)")),
+            .any(|t| t.contains(&format!("speaks protocol {PROTOCOL}"))
+                && t.contains("1 session(s)")),
         "the skew is still reported: {:?}",
         client.trouble()
     );
@@ -573,7 +586,7 @@ fn a_probe_from_a_later_protocol_records_what_the_older_host_still_holds() {
         LegacyStatus::Listed { sessions, .. } if sessions.len() == 1
     ));
 
-    client.legacy_kill(PROTOCOL, "term-live").unwrap();
+    client.legacy_kill(4, "term-live").unwrap();
     assert!(matches!(
         client.legacy_kill(3, "term-live"),
         Err(LegacyError::NoCompat(3))
@@ -581,6 +594,6 @@ fn a_probe_from_a_later_protocol_records_what_the_older_host_still_holds() {
 
     // Once the app speaks this host's own protocol it is not another host,
     // and the earlier record is replaced by the empty one.
-    client.inner.probe_other_protocols_for(PROTOCOL);
+    client.inner.probe_other_protocols_for(4);
     assert!(client.legacy_hosts().is_empty());
 }

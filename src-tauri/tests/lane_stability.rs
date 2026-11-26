@@ -23,8 +23,8 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::graph::{LaneSolver, RawCommitNode, VisualCommitRow};
 use std::collections::{BTreeMap, BTreeSet};
+use waylode_lib::graph::{LaneSolver, RawCommitNode, VisualCommitRow};
 
 fn make_commit(id: &str, parents: Vec<&str>) -> RawCommitNode {
     RawCommitNode {

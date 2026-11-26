@@ -690,7 +690,17 @@ export interface HostLoadSettings {
    * `host_load_profile`, never inside `host_load`.
    */
   profile: ProfileChoice;
+  /** What the memory-pressure supervisor may do. Stored as the top-level `host_load_supervisor`. */
+  supervisor: SupervisorMode;
+  /**
+   * Rung C, opt-in: a paused build still paused at the 10-minute cap is ended
+   * instead of resumed. Stored as the top-level `host_load_supervisor_terminate`.
+   */
+  supervisor_terminate: boolean;
 }
+
+/** Off does nothing, Advise only says what it would pause, Act pauses. */
+export type SupervisorMode = "off" | "advise" | "act";
 
 /** Mirrors `HostLoadLeases::default` in Rust. */
 export const DEFAULT_LEASES: HostLoadLeases = {
@@ -1109,6 +1119,8 @@ export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   leases: DEFAULT_LEASES,
   idle: DEFAULT_IDLE,
   profile: "auto",
+  supervisor: "act",
+  supervisor_terminate: false,
 };
 
 /**

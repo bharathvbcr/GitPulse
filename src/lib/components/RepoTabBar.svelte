@@ -201,7 +201,7 @@
    * is as old as its last read, or nothing if it was never read.
    */
   const PARKED_TITLE =
-    "Live updates paused: more repositories are open than GitPulse watches at once. Opening this tab reads it and resumes them.";
+    "Live updates paused: more repositories are open than Waylode watches at once. Opening this tab reads it and resumes them.";
 
   function memberOf(info: StackHeaderItem, tab: OpenRepoTab) {
     return checkoutName(tab.path, tab.label, info.root, identity);
@@ -1187,7 +1187,7 @@
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = "move";
       e.dataTransfer.setData("text/plain", id);
-      e.dataTransfer.setData("application/x-gitpulse-repo-tab", id);
+      e.dataTransfer.setData("application/x-waylode-repo-tab", id);
     }
   }
 

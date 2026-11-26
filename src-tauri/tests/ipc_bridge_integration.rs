@@ -11,11 +11,11 @@
 //! the real path: `invoke_handler` dispatch, serde deserialization of the body,
 //! the command, then serialization of the response.
 
-use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::json;
 use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::{ipc::CallbackFn, WebviewWindowBuilder};
+use waylode_lib::procguard::LockedSpawn;
 
 /// A mock app exposing the commands under test, wired the way lib.rs wires
 /// them so dispatch and (de)serialization are the real implementations.
@@ -36,43 +36,43 @@ fn webview_labeled(label: &str) -> tauri::WebviewWindow<tauri::test::MockRuntime
         // from the crate that defined it, which an external test crate cannot
         // see by bare name.
         .invoke_handler(tauri::generate_handler![
-            gitpulse_lib::commands::cmd_compute_word_diff,
-            gitpulse_lib::commands::cmd_list_branches,
-            gitpulse_lib::commands::cmd_get_status,
-            gitpulse_lib::commands::cmd_stage_file,
-            gitpulse_lib::commands::cmd_change_index,
-            gitpulse_lib::commands::cmd_stash_list,
-            gitpulse_lib::commands::cmd_stash_show,
-            gitpulse_lib::commands::cmd_stash_save,
-            gitpulse_lib::commands::cmd_get_commit_graph,
-            gitpulse_lib::commands::cmd_cancel_read,
-            gitpulse_lib::commands::cmd_branch_stats,
-            gitpulse_lib::commands::cmd_get_file_diff,
-            gitpulse_lib::commands::cmd_get_file_content,
-            gitpulse_lib::commands::cmd_write_file_content,
-            gitpulse_lib::commands::cmd_list_tags,
-            gitpulse_lib::commands::cmd_get_commit_details,
-            gitpulse_lib::commands::cmd_get_commit_files,
-            gitpulse_lib::commands::cmd_get_compare_diff,
-            gitpulse_lib::commands::cmd_get_compare_files,
-            gitpulse_lib::commands::cmd_get_commit_notes,
-            gitpulse_lib::commands::cmd_get_commit_bodies,
-            gitpulse_lib::commands::cmd_get_reflog,
-            gitpulse_lib::commands::cmd_hygiene_prepare,
-            gitpulse_lib::commands::cmd_hygiene_execute,
-            gitpulse_lib::commands::cmd_hygiene_cancel,
-            gitpulse_lib::commands::cmd_cleaner_state,
-            gitpulse_lib::commands::cmd_cleaner_save,
-            gitpulse_lib::commands::cmd_cleaner_run,
-            gitpulse_lib::desktop::cmd_resolve_git_root
+            waylode_lib::commands::cmd_compute_word_diff,
+            waylode_lib::commands::cmd_list_branches,
+            waylode_lib::commands::cmd_get_status,
+            waylode_lib::commands::cmd_stage_file,
+            waylode_lib::commands::cmd_change_index,
+            waylode_lib::commands::cmd_stash_list,
+            waylode_lib::commands::cmd_stash_show,
+            waylode_lib::commands::cmd_stash_save,
+            waylode_lib::commands::cmd_get_commit_graph,
+            waylode_lib::commands::cmd_cancel_read,
+            waylode_lib::commands::cmd_branch_stats,
+            waylode_lib::commands::cmd_get_file_diff,
+            waylode_lib::commands::cmd_get_file_content,
+            waylode_lib::commands::cmd_write_file_content,
+            waylode_lib::commands::cmd_list_tags,
+            waylode_lib::commands::cmd_get_commit_details,
+            waylode_lib::commands::cmd_get_commit_files,
+            waylode_lib::commands::cmd_get_compare_diff,
+            waylode_lib::commands::cmd_get_compare_files,
+            waylode_lib::commands::cmd_get_commit_notes,
+            waylode_lib::commands::cmd_get_commit_bodies,
+            waylode_lib::commands::cmd_get_reflog,
+            waylode_lib::commands::cmd_hygiene_prepare,
+            waylode_lib::commands::cmd_hygiene_execute,
+            waylode_lib::commands::cmd_hygiene_cancel,
+            waylode_lib::commands::cmd_cleaner_state,
+            waylode_lib::commands::cmd_cleaner_save,
+            waylode_lib::commands::cmd_cleaner_run,
+            waylode_lib::desktop::cmd_resolve_git_root
         ])
         // State the commands above take, managed as lib.rs manages it:
         // cmd_get_status reads through the repository's watch.
-        .manage(gitpulse_lib::watcher::WatcherState::default())
+        .manage(waylode_lib::watcher::WatcherState::default())
         // The app's own context, from the same accessor run() uses, so the
         // capabilities deciding whether a command may be invoked are the real
         // ones — and the bundle metadata is embedded once, not twice.
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .expect("mock app builds");
     WebviewWindowBuilder::new(&app, label, Default::default())
         .build()
@@ -478,7 +478,7 @@ fn repo_with_a_hidden_commit() -> tempfile::TempDir {
     dir
 }
 
-/// The routing contract behind [`gitpulse_lib::commands::GraphNotes`]: a
+/// The routing contract behind [`waylode_lib::commands::GraphNotes`]: a
 /// repository fact and a malfunction travel in different lists, because the
 /// client files one in the fault log and shows the other on screen.
 ///
@@ -1046,7 +1046,7 @@ fn global_cleaner_state_crosses_ipc_without_an_open_repository() {
 #[test]
 fn global_cleaner_ipc_rejects_invalid_policies_and_caller_supplied_execution_authority() {
     let mut config =
-        serde_json::to_value(gitpulse_lib::storage::hygiene::global::CleanerConfig::default())
+        serde_json::to_value(waylode_lib::storage::hygiene::global::CleanerConfig::default())
             .unwrap();
     config["retention_days"] = json!(0);
     let error = invoke("cmd_cleaner_save", json!({"config":config})).unwrap_err();

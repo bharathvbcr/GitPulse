@@ -40,12 +40,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 /// The plugin's hook manifest: the one owner of which hooks run and when.
-const PLUGIN_HOOKS: &str = include_str!("../../../plugins/gitpulse/hooks/hooks.json");
+const PLUGIN_HOOKS: &str = include_str!("../../../plugins/waylode/hooks/hooks.json");
 
 /// The hook events injected, by the plugin manifest's own name for each.
 ///
 /// `PreToolUse` is the safety gate. `UserPromptSubmit` and `PostToolUse` also
-/// carry `gitpulse-hook peer-inbox` (`timeout: 5`), injecting pending peer or
+/// carry `waylode-hook peer-inbox` (`timeout: 5`), injecting pending peer or
 /// human-confirmed mailbox messages at `0ms` hook boundaries in trusted repos.
 /// The remaining entries are the notification hooks that say what a session is
 /// doing: a question asked (`PermissionRequest`), a tool run (`PostToolUse`,
@@ -53,11 +53,11 @@ const PLUGIN_HOOKS: &str = include_str!("../../../plugins/gitpulse/hooks/hooks.j
 /// (`Stop`) and a session ended (`SessionEnd`). Without them a Claude launched
 /// under a configuration that does not enable the plugin reports only a bell,
 /// which says something happened and never what, and stays "signalled" until
-/// someone types. `gitpulse-hook notify` writes nothing to stdout, so it can
+/// someone types. `waylode-hook notify` writes nothing to stdout, so it can
 /// neither allow nor deny anything; `peer-inbox` claims one-shot mailbox files
 /// under `flock`, so dual plugin + `--settings` loading never double-delivers.
 ///
-/// `Stop` also carries `gitpulse-hook deliver`, the `asyncRewake` entry that
+/// `Stop` also carries `waylode-hook deliver`, the `asyncRewake` entry that
 /// lets a person's message reach an idle session (`hooks::deliver`). It rides
 /// in with the rest of `Stop`'s manifest entries, unchanged but for the binary's
 /// path: its `timeout` (1800 s) and `asyncRewake` are the manifest's own, and
@@ -101,7 +101,7 @@ const INJECTED_EVENTS: [&str; 7] = [
 pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = crate::hooks::SESSION_END_HOST_TIMEOUT.as_secs();
 
 /// The name the plugin manifest invokes the hook by.
-const HOOK_NAME: &str = "gitpulse-hook";
+const HOOK_NAME: &str = "waylode-hook";
 
 /// What a launch does about the hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,11 +141,11 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// The hook binary: `GITPULSE_HOOK_PATH`, else the one beside this
-/// executable (the app bundle's `Contents/MacOS`, or `target/<profile>` in
-/// development) — the way the app finds `gitpulse-mcp`. An explicit path that
-/// is not a file ends the search rather than falling through to a different
-/// binary than the one asked for.
+/// The hook binary: `WAYLODE_HOOK_PATH` (or legacy `GITPULSE_HOOK_PATH`), else
+/// the one beside this executable (the app bundle's `Contents/MacOS`, or
+/// `target/<profile>` in development) — the way the app finds `waylode-mcp`.
+/// An explicit path that is not a file ends the search rather than falling
+/// through to a different binary than the one asked for.
 pub(crate) fn resolve_binary(
     explicit: Option<&Path>,
     exe: Option<&Path>,
@@ -155,13 +155,13 @@ pub(crate) fn resolve_binary(
             Ok(explicit.to_path_buf())
         } else {
             Err(format!(
-                "GITPULSE_HOOK_PATH is {}, which is not an executable file",
+                "WAYLODE_HOOK_PATH is {}, which is not an executable file",
                 explicit.display()
             ))
         };
     }
     let name = if cfg!(windows) {
-        "gitpulse-hook.exe"
+        "waylode-hook.exe"
     } else {
         HOOK_NAME
     };
@@ -190,7 +190,7 @@ pub(crate) fn for_launch(provider: &str) -> HookInjection {
     if provider != "claude" {
         return HookInjection::NotApplicable;
     }
-    let explicit = std::env::var_os("GITPULSE_HOOK_PATH")
+    let explicit = crate::env_compat::var_os_compat("WAYLODE_HOOK_PATH", "GITPULSE_HOOK_PATH")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
     let exe = std::env::current_exe().ok();
@@ -198,7 +198,7 @@ pub(crate) fn for_launch(provider: &str) -> HookInjection {
     if let HookInjection::BinaryMissing(reason) = &decision {
         log::warn!(
             target: "workbench",
-            "claude launches without the GitPulse command gate: {reason}"
+            "claude launches without the Waylode command gate: {reason}"
         );
     }
     decision
@@ -345,19 +345,19 @@ mod tests {
 
     fn hook() -> Result<PathBuf, String> {
         Ok(PathBuf::from(
-            "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook",
+            "/Applications/Waylode.app/Contents/MacOS/waylode-hook",
         ))
     }
 
     /// The incident case: the seat a wrapper picks may not enable the
-    /// plugin even when every configuration GitPulse can see does. So the
+    /// plugin even when every configuration Waylode can see does. So the
     /// launch entry point reads no configuration at all: given the binary, a
     /// claude launch is injected.
     #[test]
     fn every_claude_launch_is_injected_when_the_binary_is_there() {
         let dir = temp("launch");
-        let binary = dir.join("gitpulse-hook");
-        write(&dir, "gitpulse-hook", "#!/bin/sh\n");
+        let binary = dir.join("waylode-hook");
+        write(&dir, "waylode-hook", "#!/bin/sh\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -368,8 +368,9 @@ mod tests {
         // an assertion fails before the end of the test.
         let decision = {
             let serial = crate::test_support::env::env_serial();
-            let _env =
-                crate::test_support::env::bind_env(&serial).set("GITPULSE_HOOK_PATH", &binary);
+            let _env = crate::test_support::env::bind_env(&serial)
+                .remove("GITPULSE_HOOK_PATH")
+                .set("WAYLODE_HOOK_PATH", &binary);
             for_launch("claude")
         };
         assert_eq!(decision, HookInjection::Inject(binary));
@@ -377,10 +378,10 @@ mod tests {
 
     #[test]
     fn a_missing_binary_is_reported_not_injected() {
-        let decision = decide(Err("gitpulse-hook is not at /x".into()));
+        let decision = decide(Err("waylode-hook is not at /x".into()));
         assert_eq!(
             decision,
-            HookInjection::BinaryMissing("gitpulse-hook is not at /x".into())
+            HookInjection::BinaryMissing("waylode-hook is not at /x".into())
         );
         assert!(decision.binary().is_none());
     }
@@ -415,11 +416,11 @@ mod tests {
     #[test]
     fn the_binary_is_found_beside_the_app_and_a_missing_one_says_where_it_looked() {
         let dir = temp("binary");
-        let exe = dir.join("gitpulse");
+        let exe = dir.join("waylode");
         let hook_path = dir.join(if cfg!(windows) {
-            "gitpulse-hook.exe"
+            "waylode-hook.exe"
         } else {
-            "gitpulse-hook"
+            "waylode-hook"
         });
         let err = resolve_binary(None, Some(&exe)).unwrap_err();
         assert!(err.contains(&hook_path.display().to_string()), "{err}");
@@ -440,13 +441,13 @@ mod tests {
         // An explicit path that is wrong does not fall back to the sibling.
         let wrong = dir.join("elsewhere");
         let err = resolve_binary(Some(&wrong), Some(&exe)).unwrap_err();
-        assert!(err.contains("GITPULSE_HOOK_PATH"), "{err}");
+        assert!(err.contains("WAYLODE_HOOK_PATH"), "{err}");
         assert_eq!(resolve_binary(Some(&hook_path), None), Ok(hook_path));
     }
 
     #[test]
     fn the_injected_hooks_are_the_manifests_pre_tool_use_by_absolute_path() {
-        let binary = Path::new("/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook");
+        let binary = Path::new("/Applications/Waylode App.app/Contents/MacOS/waylode-hook");
         let hooks = settings_hooks(binary).unwrap();
         let mut keys: Vec<&str> = hooks
             .as_object()
@@ -467,10 +468,10 @@ mod tests {
             assert_eq!(injected["matcher"], shipped["matcher"]);
             let command = invocation(&injected["hooks"][0]);
             let original = shipped["hooks"][0]["command"].as_str().unwrap();
-            let subcommand = original.strip_prefix("gitpulse-hook ").unwrap();
+            let subcommand = original.strip_prefix("waylode-hook ").unwrap();
             // Shell form quotes the path; Windows runs the bare path with the
             // subcommand in `args` (see `settings_hooks_for`).
-            let path = "/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook";
+            let path = "/Applications/Waylode App.app/Contents/MacOS/waylode-hook";
             assert_eq!(
                 command,
                 if cfg!(windows) {
@@ -582,7 +583,7 @@ mod tests {
     fn the_stop_event_carries_the_waiter_in_the_manifest_and_in_every_launch() {
         let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
         let injected =
-            settings_hooks(Path::new("/Applications/Git Pulse.app/gitpulse-hook")).unwrap();
+            settings_hooks(Path::new("/Applications/Waylode App.app/waylode-hook")).unwrap();
         for (label, stop) in [
             ("manifest", &manifest["hooks"]["Stop"]),
             ("injected", &injected["Stop"]),
@@ -630,9 +631,9 @@ mod tests {
         assert_eq!(
             command,
             if cfg!(windows) {
-                "/Applications/Git Pulse.app/gitpulse-hook deliver"
+                "/Applications/Waylode App.app/waylode-hook deliver"
             } else {
-                "'/Applications/Git Pulse.app/gitpulse-hook' deliver"
+                "'/Applications/Waylode App.app/waylode-hook' deliver"
             }
         );
     }
@@ -688,10 +689,10 @@ mod tests {
     fn adv_unix_output_is_byte_identical_to_the_base_renderer() {
         let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
         for binary in [
-            "/opt/gitpulse/gitpulse-hook",
-            "/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook",
-            "/tmp/it's/a\"b$c`d/gitpulse-hook",
-            "/tmp/\u{e9}\u{4e16}/gitpulse-hook",
+            "/opt/waylode/waylode-hook",
+            "/Applications/Waylode App.app/Contents/MacOS/waylode-hook",
+            "/tmp/it's/a\"b$c`d/waylode-hook",
+            "/tmp/\u{e9}\u{4e16}/waylode-hook",
         ] {
             let quoted = format!("'{}'", binary.replace('\'', r"'\''"));
             let mut out = Map::new();
@@ -700,7 +701,7 @@ mod tests {
                 for group in groups.as_array_mut().unwrap() {
                     for hook in group["hooks"].as_array_mut().unwrap() {
                         let command = hook["command"].as_str().unwrap().to_owned();
-                        if let Some(rest) = command.strip_prefix("gitpulse-hook ") {
+                        if let Some(rest) = command.strip_prefix("waylode-hook ") {
                             hook["command"] = json!(format!("{quoted} {rest}"));
                             if event == "SessionEnd" {
                                 hook["timeout"] = json!(SESSION_END_TIMEOUT_SECS);
@@ -757,7 +758,7 @@ mod tests {
                         .zip(gg["hooks"].as_array().unwrap())
                     {
                         let cmd = sh["command"].as_str().unwrap();
-                        let rest = cmd.strip_prefix("gitpulse-hook ").unwrap();
+                        let rest = cmd.strip_prefix("waylode-hook ").unwrap();
                         assert_eq!(gh["command"], binary);
                         let words: Vec<&str> = rest.split_whitespace().collect();
                         assert_eq!(gh["args"], json!(words));

@@ -72,7 +72,7 @@ The new performance records contain no command arguments or result bodies.
 tail -n 200 "$HOME/Library/Logs/GitPulse/gitpulse.log"
 ```
 
-For a native stall that does not finish, identify the running GitPulse PID
+For a native stall that does not finish, identify the running Waylode PID
 and take a bounded sample using macOS `sample <PID> 5 -file <output-path>`.
 Native stack sampling includes waiting threads and does not profile the
 separate WebKit JavaScript process. Interpret sample counts as stack
@@ -593,7 +593,7 @@ a read-only connection (`ledger::latest_binding_readonly`) that is never
 cached and cannot chmod, set pragmas or run DDL. It never consolidates: if a
 sibling ledger holds rows the anchor has not imported, the binding cannot be
 ruled out and the lookup fails closed (`legacy_ledger_unconsolidated`) until
-GitPulse has consolidated. Missing, untrusted, unrelated and foreign-row
+Waylode has consolidated. Missing, untrusted, unrelated and foreign-row
 outcomes are unchanged. The app's `guard_command`/`guard_file` resolve the
 family once (`repository_address`) and hand that answer to both the scope
 lookup (`bindings::binding_at`) and `record_gate`. A commit is still two gated
@@ -698,12 +698,12 @@ taken.
 ### `gitpulse-hook notify` by stdin size (S1-15)
 
 The plugin runs `notify` on every tool call of every Claude Code session, and
-GitPulse now injects the same notification hooks into every `claude` it
+Waylode now injects the same notification hooks into every `claude` it
 launches, so what `notify` costs before it has anything to say is paid a lot.
 It used to read and parse up to 4 MiB of stdin first, and refused anything
 larger, losing the `tool_finished` that answers a question. It now reads no
 stdin at all when the event is unknown or is a state or a resolution outside a
-GitPulse terminal, and otherwise reads once (up to 16 MiB) and builds only the
+Waylode terminal, and otherwise reads once (up to 16 MiB) and builds only the
 fields it uses.
 
 **Measured** (`src-tauri/benches/notify_stdin_bench.rs`, then an `#[ignore]`d
@@ -735,7 +735,7 @@ These are the numbers for the code that ships: B validates every skipped field
 (a number out of range or a bad escape refuses the payload, as the whole parse
 did), measured after that change, load average 5, same N, A first. `outside` is
 a `tool_finished` with no `GITPULSE_SESSION_ID`; `inside` is the same from a
-GitPulse terminal, delivered to a socket that acknowledges it. At 4 MiB
+Waylode terminal, delivered to a socket that acknowledges it. At 4 MiB
 `outside` saves about 1.6 ms per call (the 4 MiB of stdin A read), to the
 process-start floor of about 5.8 ms; at 0 B and 100 KiB there is nothing to
 save, and the 0.1 to 0.2 ms B leads by there is within the spread of A against
@@ -781,7 +781,7 @@ fails it), and feeds the hook seven kinds of wrong answer plus a control
 
 ## 2026-10-17: collision-guard over the app mailbox
 
-`gitpulse-hook collision-guard` runs on every Edit/Write of an agent GitPulse
+`gitpulse-hook collision-guard` runs on every Edit/Write of an agent Waylode
 launched, as a fresh process, and each run read `git worktree list` and then
 `git status --porcelain -z` in every worktree (up to `MAX_COLLISION_SCANS`,
 16). Sampled on the live app that was 127 hook runs and at least 297 git
@@ -846,7 +846,7 @@ app, or the reverse, scans for itself and behaves as before.
 caller supplies a worktree path and a relative file; the app re-derives trust
 and the listing itself (`validate_repo`), so an untrusted repository is refused
 exactly as it is in the hook's process. The reply discloses the paths of dirty
-files in a repository GitPulse is trusted in, to any process of the same user
+files in a repository Waylode is trusted in, to any process of the same user
 on the mailbox, which can run `git status` itself. The reply is trimmed to the
 requested file's row and the counts so it fits one frame. Same-uid, 0700 profile
 and 0600 socket rules are the gate's.
@@ -855,7 +855,7 @@ and 0600 socket rules are the gate's.
 
 Previously, every `SessionStart` hook (`hooks::run_session_brief`) called
 `insights::snapshot` directly, listing all worktrees and running `git status`
-across every checkout even when GitPulse was running and already held a fresh
+across every checkout even when Waylode was running and already held a fresh
 read of the same facts (`17` worktrees on this repository on 2026-11-10, `24`
 `git` children per session start on a 17-worktree synthetic repository).
 
@@ -1069,7 +1069,7 @@ and reinstalled.
 
 **Security impact.** Read-only; no write path, no new socket, mode or
 permission. A caller can now ask for the `worktrees`, `changes` and `collisions`
-facets of a repository GitPulse is trusted in. It could already read them by
+facets of a repository Waylode is trusted in. It could already read them by
 running `git` there itself (and `gitpulse-mcp` does exactly that), and the
 paths and counts are what `gitpulse_insights` already returns. Trust, the
 same-uid peer check, the 0700 directory and the 0600 socket are the mailbox's
@@ -1091,7 +1091,7 @@ collision-guard itself scans are all logged at debug level (`collision guard: sc
 why`): the sink not attached, "busy" past `MAX_GATE_HANDLERS` (shared with gate
 verdicts), the mailbox's 24-connection admission (a connection past it is closed
 without a greeting), an answer older than 10 s, a reply that read no worktree,
-the 2 s deadline under load, the app quitting mid-ask ("GitPulse is quitting"),
+the 2 s deadline under load, the app quitting mid-ask ("Waylode is quitting"),
 and an owner on an incompatible protocol version (`reach_owner` returns none).
 
 ## 2026-10-12: benchmark harness and the loaded-host baseline (ft-c0d9313f)
@@ -1126,7 +1126,7 @@ uploaded by `.github/workflows/benches.yml` (nightly 05:37 UTC and
   that legitimately varies (bytes with a duration in them, MB/s, wakeups/s,
   messages under a race) is a *metric*: reported, never gated. Git process
   counts come from git's own `trace2` (`trace2.eventTarget` in the hermetic global
-  config; `GIT_TRACE*` is stripped from every child GitPulse starts, the config
+  config; `GIT_TRACE*` is stripped from every child Waylode starts, the config
   key is not), in a separate untimed pass, because the log append would add to
   every process.
 * **Host-load snapshot with every run.** `host.start` and `host.end` are the
@@ -1195,7 +1195,7 @@ measurement.
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details, and `PreToolUse` hook collision guard (`hook collision guard uncontended`, `hook collision guard contended`) on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards and `PreToolUse` collision latency (ft-9cfd557403d57dca25e3cfdb97144689); `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
 | `alerts_worker_throughput` | sustained notices/s through the intake, the 64-slot queue and the real notification worker: hook state reports and renderer answers over 64 sessions, 50,000 per sample, a full queue retried and counted. Time is gated like every bench (the producer/worker hand-off is the work); counters gated: `notices`, `sessions`, and `drained`, 1 when the worker took a probe offered after the last notice | ft-9cfd5474 (S1-08; row in ft-c0d9313f) |
-| `notify_stdin_bench` | `gitpulse-hook notify` per call (median of 20) at 0 B, 100 KiB and 4 MiB of stdin, outside a GitPulse terminal and inside one against a socket that acknowledges; `(base)` rows beside each when `GITPULSE_BENCH_BASE_HOOK` names a hook built before a change (printed, never written to the JSON, so never in a baseline). Time is **recorded, not gated** (a process start); counters gated: `calls`, `stdin_bytes` and `reports_acked` (the reports the socket acknowledged). A hook that delivers but is slower is not caught: a 100 ms sleep added to it compared `OK` | ft-9cfd5174 (S1-15) |
+| `notify_stdin_bench` | `gitpulse-hook notify` per call (median of 20) at 0 B, 100 KiB and 4 MiB of stdin, outside a Waylode terminal and inside one against a socket that acknowledges; `(base)` rows beside each when `GITPULSE_BENCH_BASE_HOOK` names a hook built before a change (printed, never written to the JSON, so never in a baseline). Time is **recorded, not gated** (a process start); counters gated: `calls`, `stdin_bytes` and `reports_acked` (the reports the socket acknowledged). A hook that delivers but is slower is not caught: a 100 ms sleep added to it compared `OK` | ft-9cfd5174 (S1-15) |
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions, an idle mailbox, 8 / 24 idle watches, an idle alerts bridge and the host-load sampler | terminal-reader-kqueue; always-on-pollers; ft-79394019 (Wave 0) |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
@@ -1640,7 +1640,7 @@ the repository's other mutations while it does.
 ## 2026-10-13: `git status` against user-enabled `core.untrackedCache` / `core.fsmonitor` (spike ft-7450105d)
 
 Question: is there a case for a Health hint that tells a user how to turn these
-two git features on? **Owner decision, unchanged by this spike:** GitPulse never
+two git features on? **Owner decision, unchanged by this spike:** Waylode never
 writes repo config and never passes `-c core.untrackedCache` or
 `-c core.fsmonitor`. Two reasons stand independent of the numbers:
 
@@ -1650,7 +1650,7 @@ writes repo config and never passes `-c core.untrackedCache` or
   persist;
 * `-c core.fsmonitor=true` starts a long-lived `git fsmonitor--daemon` per
   repository that procguard and the spawn gate do not own, and that outlives
-  GitPulse.
+  Waylode.
 
 `storage/mod.rs` passes `core.fsmonitor=false` on `ls-files`, so a read there
 cannot start the daemon. `tests/git_config_posture.rs` scans the production
@@ -1668,7 +1668,7 @@ keep the default variant default. Per round every variant runs once, the order
 rotated; the figure is min-of-N (and p50) of the warm rounds, after two plain
 `git status` runs (the user's own, which populate the cache and start the
 daemon). Two invocations: **gitpulse** (`STATUS_ARGV` with
-`GIT_OPTIONAL_LOCKS=0`, what GitPulse runs) and **plain** (a terminal). Cold is
+`GIT_OPTIONAL_LOCKS=0`, what Waylode runs) and **plain** (a terminal). Cold is
 the first GitPulse-style status after configuring, with the OS page cache not
 dropped, so it is indicative only. Every clone's daemon is stopped with `git
 fsmonitor--daemon stop` before its directory is removed, on normal exit and on
@@ -1683,12 +1683,12 @@ this repository (2,798 tracked files), DevCouncil (6,220) and Manvi (977) as
 read-only clone sources, plus **synthetic** repositories (flat `src/pkgNNNN/`
 trees of one-line files) standing in for repositories too large to keep around.
 
-### Result: warm `git status`, min of N, GitPulse invocation
+### Result: warm `git status`, min of N, Waylode invocation
 
 | repository | tracked | default | untrackedCache | fsmonitor | both |
 | --- | --- | --- | --- | --- | --- |
 | Manvi | 977 | 9.6 ms | 9.0 (0.94x) | 11.6 (**1.21x**) | 10.2 (1.07x) |
-| GitPulse | 2,798 | 13.2 ms | 13.2 (1.00x) | 18.2 (**1.38x**) | 13.8 (1.05x) |
+| Waylode | 2,798 | 13.2 ms | 13.2 (1.00x) | 18.2 (**1.38x**) | 13.8 (1.05x) |
 | DevCouncil | 6,220 | 22.1 ms | 21.7 (0.98x) | 20.1 (0.91x) | 19.5 (0.88x) |
 | synthetic | 40,000 | 49 to 51 ms | 48.9 to 52.0 (1.00 to 1.02x) | 27.8 to 39.0 (**0.55 to 0.80x**) | 29.0 to 30.9 (0.59 to 0.63x) |
 | synthetic | 100,000 | 115.1 ms | 113.3 (0.98x) | 64.6 (**0.56x**) | 65.1 (0.57x) |
@@ -1705,7 +1705,7 @@ below ("Untracked cache, corrected twice") measured the same cache with the
 default untracked mode and found it about a quarter to a third faster there, and
 found that `-u` is what removes the gain; a re-run of this script on 2026-11-06
 reproduced the 1.00x here. The two agree: the cache does not help the
-invocation GitPulse itself uses.
+invocation Waylode itself uses.
 
 Daemon cost, per repository with the daemon on: **one extra process, about 8 MB
 resident, about 0.02 s of CPU over the whole run, 0.0 idle wakeups per second
@@ -1721,7 +1721,7 @@ continuously costs the daemon one event per write).
   that are the common case, because every status then waits on a round trip to the
   daemon. The absolute saving at the top of the range, 20 to 50 ms per status,
   is on a background read. `core.untrackedCache` showed no effect on these `-u` invocations, and under
-  `GIT_OPTIONAL_LOCKS=0` GitPulse's own status cannot refresh it.
+  `GIT_OPTIONAL_LOCKS=0` Waylode's own status cannot refresh it.
 * **If a hint is ever added**, it is for `core.fsmonitor` only, shown only when
   the repository has at least 40,000 tracked files, `core.fsmonitor` is unset,
   and git is new enough to ship the built-in daemon; it shows the `git config`
@@ -1991,7 +1991,7 @@ so rename times (32 to 38 s here) and the 8-worker maxima are noisy.
 - **Best case for a multi-path op.** One request carrying all 5,001 paths pays
   one round trip and sends the scope once. The gate keeps Manvi's per-path
   evaluation (not measurable from here, so it is not subtracted) and
-  GitPulse's per-verdict ledger record (the full gate is about 0.45 s above the
+  Waylode's per-verdict ledger record (the full gate is about 0.45 s above the
   calls-only wall of 0.68 s unbound). So it saves at most about 0.7 s (2%) in
   the realistic states and at most about 3.6 s (10%) in the all-listed state,
   where the saving is the repeated scope payload (inferred from the 186-byte
@@ -2273,7 +2273,7 @@ own JSON line, kept beside the harness until that harness can ingest it.
 
 ## 2026-10-16: commit-graph off, on, and with Bloom filters (ft-9cfa487403d331dc25e75cdb97176bf7, S4-05)
 
-GitPulse now reads whether a repository has a commit-graph (`storage/commit_graph.rs`, surfaced under Git internals in the Storage view with the command to run). It reads the graph files and HEAD from the git directory and spawns nothing; writing or refreshing a graph from the app was Owner Decision 3, approved 2026-10-19 and built as a user-clicked, gated action (see "Update" below). This section measures what a missing graph costs.
+Waylode now reads whether a repository has a commit-graph (`storage/commit_graph.rs`, surfaced under Git internals in the Storage view with the command to run). It reads the graph files and HEAD from the git directory and spawns nothing; writing or refreshing a graph from the app was Owner Decision 3, approved 2026-10-19 and built as a user-clicked, gated action (see "Update" below). This section measures what a missing graph costs.
 
 `cargo bench --manifest-path src-tauri/Cargo.toml --bench commit_graph_history` (`-- --smoke`, `-- --json <path>`). Argv mirrors `engine/git_reader.rs` (topo-order history page, `--parents` path log, `for-each-ref %(ahead-behind:)`, `rev-list --count`, `blame --line-porcelain`), run through `git_cli::git_text` so the readers' caches do not hide the walk. Fixture: bare repositories built with `git fast-import`, 5k and 50k linear commits on `main`, a path (`rare/target.txt`) touched by 50 of them, and 20 branches three commits ahead of fork points along `main`. Each size is cloned three times (graph-off; `commit-graph write --reachable --no-changed-paths`; `--changed-paths`) and the 3 states are measured interleaved, 9 samples per row after 1 warm-up round, warm page cache. Each copy's state is asserted with the new detector, and each operation's output is asserted identical across the three, so a row cannot get faster by answering differently. The graph writes are fixture setup only.
 
@@ -2296,7 +2296,7 @@ Not measured: a repository where auto-maintenance keeps the graph fresh (this re
 
 **Not in the committed baseline.** `benches/baselines/` is untouched and the bench is not wired into the scheduled `benches.yml` gate; whether to baseline it is a separate decision. The numbers above are a one-off run.
 
-**Update 2026-10-19: the write (Owner Decision 3, approved; part 2 of this card).** The table above is the case for it: at 50k commits no graph costs about 10x on history pages and ahead/behind. The Storage panel now offers "Write commit-graph..." when the detector reports `missing`, `stale` or `no_bloom`, and runs exactly `git commit-graph write --reachable --changed-paths` after the person has seen that line and the common directory it writes under and confirmed it. `--changed-paths` is in the argv on these numbers: Bloom filters are another 3.0x on a path log (115.4 to 38.7 ms) and 2.0x on blame (91.1 to 44.5 ms) at 50k, file history and blame are screens GitPulse opens constantly, and without the flag a graph that lacks Bloom data (`no_bloom`) could never be fixed from the button. Blame's gain is 2x rather than 3x, so this is a judgement on a one-off, loaded-host run, not a measured need; dropping the flag is a one-line change to `COMMIT_GRAPH_WRITE_ARGV` and the contract that pins it. No `--split` (one file, no chain to maintain) and no git config write: `core.commitGraph` and `gc.writeCommitGraph` are untouched. The cost of the write itself is still not measured (listed under "Not measured" above); the run is bounded at 600 s, cancellable, and one per common directory.
+**Update 2026-10-19: the write (Owner Decision 3, approved; part 2 of this card).** The table above is the case for it: at 50k commits no graph costs about 10x on history pages and ahead/behind. The Storage panel now offers "Write commit-graph..." when the detector reports `missing`, `stale` or `no_bloom`, and runs exactly `git commit-graph write --reachable --changed-paths` after the person has seen that line and the common directory it writes under and confirmed it. `--changed-paths` is in the argv on these numbers: Bloom filters are another 3.0x on a path log (115.4 to 38.7 ms) and 2.0x on blame (91.1 to 44.5 ms) at 50k, file history and blame are screens Waylode opens constantly, and without the flag a graph that lacks Bloom data (`no_bloom`) could never be fixed from the button. Blame's gain is 2x rather than 3x, so this is a judgement on a one-off, loaded-host run, not a measured need; dropping the flag is a one-line change to `COMMIT_GRAPH_WRITE_ARGV` and the contract that pins it. No `--split` (one file, no chain to maintain) and no git config write: `core.commitGraph` and `gc.writeCommitGraph` are untouched. The cost of the write itself is still not measured (listed under "Not measured" above); the run is bounded at 600 s, cancellable, and one per common directory.
 
 ## 2026-10-14: xterm WebGL renderer, built and NOT yet measured (ft-406d1f4a)
 
@@ -2368,7 +2368,7 @@ rule, the renderer and the dependency are removed.
 
 ### The bench, and why it has not run
 
-`scripts/tui-redraw-bench.mjs` runs inside a GitPulse terminal session, so
+`scripts/tui-redraw-bench.mjs` runs inside a Waylode terminal session, so
 its bytes take the production path: PTY → reader → per-session output
 Channel → xterm → ack. The bench does not use the legacy events sink that
 `terminal_pty` measures.
@@ -2504,7 +2504,7 @@ Against the 2026-10-13 baseline, this pre-wave WebContent grew. WebKit Malloc di
 
 ### What was not attributed
 
-No Web Inspector heap snapshot of this WebContent was taken. The running release view was not started inspectable, and a second GitPulse or `tauri dev` cannot sit beside the single-instance app. A Node heap is not WebKit Malloc. The top five retainers of the 669 MB are not named here because they were not measured.
+No Web Inspector heap snapshot of this WebContent was taken. The running release view was not started inspectable, and a second Waylode or `tauri dev` cannot sit beside the single-instance app. A Node heap is not WebKit Malloc. The top five retainers of the 669 MB are not named here because they were not measured.
 
 The class costs below are V8, from `node --expose-gc scripts/memory-footprint.mjs` on this run. The terminal figure does not call `term.open()`, so it has no DOM.
 
@@ -2561,7 +2561,7 @@ Symptoms reported: a blank or flickering pane and laggy output, with GPU renderi
 
   **What a held context occupies**, read in the same run at a 1100 × 720 CSS-pixel pane: a drawing buffer of 10.5 MiB (WKWebView, DPR 2) or 9.3 MiB (Chrome, DPR 2), and one 512 × 512 atlas page, 1.0 MiB. The browser may keep more than one buffer per context; that is not visible from the page. At most 8 contexts exist, the on-screen ones included, so the hold can keep up to 7 hidden panes' buffers alive for 5 minutes, about 80 MiB at this pane size, scaling with pane area. The addon's ceiling is `min(32, MAX_TEXTURE_IMAGE_UNITS)` = 16 atlas pages of up to 4096² here; the agent-CLI screen used one.
 - **WebGL atlas corruption at DPR 2** (xterm.js #5847/#5883, not transparency). Corrupted runs were 2–5 of 5 on 0.19 in both engines, 0 of 5 on the 6.1.0-beta.316 / 0.20.0-beta.310 pair, and 0 of 5 when the atlas is cleared every 25 chunks. Repro: `node scripts/glass-atlas-repro.mjs webkit "arms=glass-a0&runs=5&frames=300&pace=3&ops=8"`. The branch pins 6.1.0-beta.317 / 0.20.0-beta.311, whose `lib/` matches .316 / .310 apart from the version string.
-- **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs GitPulse uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
+- **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs Waylode uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
 - **The WebGL A/B win rule (§ 2026-10-14) is still owed.** It needs the installed app quit and an attended window, and its first blocker, the `allowTransparency` decision (ft-cc4be67b), is still open. The atlas repro above says the corruption that card was opened for is the atlas bug, not transparency.
 
 
@@ -2571,9 +2571,9 @@ Owner report: flicker is fixed, scrolling could be smoother. This section is the
 
 ### What xterm 6.1.0-beta.317 does (source read, not remembered)
 
-- Defaults: `smoothScrollDuration` 0, `scrollSensitivity` 1, `fastScrollSensitivity` 5 (`node_modules/@xterm/xterm/src/common/services/OptionsService.ts:23,38,40`). GitPulse set none of them.
+- Defaults: `smoothScrollDuration` 0, `scrollSensitivity` 1, `fastScrollSensitivity` 5 (`node_modules/@xterm/xterm/src/common/services/OptionsService.ts:23,38,40`). Waylode set none of them.
 - A wheel event's distance comes from `wheelDeltaY / 120` when the event has it, else `-deltaY / 40`, times 50 px (`browser/scrollable/mouseEvent.ts:233,247`, `browser/scrollable/scrollableElement.ts:23`). How many rows a notch moves therefore depends on the `wheelDeltaY` the platform reports for it: a Chromium-on-Windows notch (`deltaY` 100, `wheelDeltaY` 120) is 50 px, about 3 rows at the 13 px / 1.15 line height this terminal uses; a faster or accelerated wheel is more.
-- With a duration set, xterm animates only what its `MouseWheelClassifier` calls a physical wheel (`scrollableElement.ts:56,423-425`). That classifier scores a whole-number delta stream as a wheel, and a trackpad can send whole numbers, so GitPulse does not rely on it alone (`isWheelNotch`, below).
+- With a duration set, xterm animates only what its `MouseWheelClassifier` calls a physical wheel (`scrollableElement.ts:56,423-425`). That classifier scores a whole-number delta stream as a wheel, and a trackpad can send whole numbers, so Waylode does not rely on it alone (`isWheelNotch`, below).
 - The viewport is row-quantized: `Viewport._handleScroll` rounds the pixel position to a row (`browser/Viewport.ts:212`) and both renderers index rows as `y + ydisp` (`addon-webgl/src/WebglRenderer.ts:458`; `browser/renderer/dom/DomRenderer.ts:537`). "Smooth" can only mean the same distance in smaller row steps.
 - No public call scrolls without the smooth viewport: `Terminal.scrollLines`, `scrollPages` and `scrollToLine` all go through `Viewport.scrollLines` (`browser/CoreBrowserTerminal.ts:702-707,728-732`), and `Terminal.scrollToBottom()` passes no argument (`browser/public/Terminal.ts:213-215`), though the core method has a `disableSmoothScroll` parameter (`CoreBrowserTerminal.ts:720`).
 
@@ -2700,7 +2700,7 @@ Keep a WebKit page under about 15 WebGL trials (`3 arms x rounds`); a Chrome pag
 
 ## 2026-11-06: git spawn profile (ft-bb756f5e, Phase 1)
 
-Bench: `cargo bench --manifest-path src-tauri/Cargo.toml --bench git_inprocess_reads`. The question was which git processes GitPulse starts on its hot read paths, so that an in-process reader is built only for reads that are hot.
+Bench: `cargo bench --manifest-path src-tauri/Cargo.toml --bench git_inprocess_reads`. The question was which git processes Waylode starts on its hot read paths, so that an in-process reader is built only for reads that are hot.
 
 **Method.** A fixture repository (600 files, 61 commits, 18 worktrees with a dirty file in each linked one, 120 branches, 30 tags) is driven through one *refresh*: `get_status`, `current_branch`, `head_id`, `list_branches`, `list_tags`, `branch_stats`, `read_commit_history_paged`, `list_worktrees` (Full and Listing) and `insights::snapshot`. Git's own trace2 logs every process (`GIT_TRACE2_EVENT` through the hermetic global config), so nothing can escape the count. Each process is reduced to an argv shape (subcommand and flags; refs, paths, oids and the app's `-c` pairs dropped). Wall time is trace2's own start-to-exit figure: it leaves out fork/exec and pipe drain, so it is a floor on what the caller waited. Nested processes (git starting git) are reported separately; there were none.
 
@@ -2832,7 +2832,7 @@ After one `git maintenance run --task=loose-objects` on the 15,235-object reposi
 
 ### Untracked cache (`files`), corrected twice
 
-The first version of this section compared a plain repository against one with `feature.manyFiles` whose index had been rewritten and whose untracked cache primed, and showed `status` at 0.28 to 0.87x. A review control (a plain repository after one ordinary, index-refreshing `git status`) matched the primed arm, so that comparison is withdrawn, with its index-size figures. The re-measurement below replaced it, and a second pass then found that its headline number did not apply to GitPulse's own status reads.
+The first version of this section compared a plain repository against one with `feature.manyFiles` whose index had been rewritten and whose untracked cache primed, and showed `status` at 0.28 to 0.87x. A review control (a plain repository after one ordinary, index-refreshing `git status`) matched the primed arm, so that comparison is withdrawn, with its index-size figures. The re-measurement below replaced it, and a second pass then found that its headline number did not apply to Waylode's own status reads.
 
 **Method.** Four repositories per size from one `fast-import` commit (N files in 100 directories, one untracked `extra.txt`): `default`, `default-b` (a second plain copy, the identical-arm control), `manyFiles` (`feature.manyFiles=true`) and `untracked cache only` (`core.untrackedCache=true`). In all four, one ordinary `git status` with `GIT_OPTIONAL_LOCKS` unset, so git may write the index. Then reads with `GIT_OPTIONAL_LOCKS=0` are timed, interleaved, min of 11 to 15 rounds. Load average 10 to 30 on 18 cores. `scripts/bench-git-tuning.mjs files`.
 
@@ -2845,7 +2845,7 @@ Noise floor: the identical-arm control differed from `default` by 0.96 to 1.06x 
 | | 100,000 | 0.63, 0.66, 0.89 (heavy load) | 0.93 (heavy load) |
 | `git status --porcelain -z` | 20,000 | 0.68 | 0.74 |
 | **`git status --porcelain -u`** (all untracked files) | 20,000 | 0.97 | 1.01 |
-| **GitPulse's argv** (`-c core.quotepath=off status --porcelain=v1 -u -z`) | 20,000 | 0.98, 1.04 | 0.98, 1.04 |
+| **Waylode's argv** (`-c core.quotepath=off status --porcelain=v1 -u -z`) | 20,000 | 0.98, 1.04 | 0.98, 1.04 |
 | | 40,000 | 1.00 | 0.97 |
 
 (Each cell is one run; the control, `ls-files` and one-file `add` stayed 0.90 to 1.07x throughout.)
@@ -2853,12 +2853,12 @@ Noise floor: the identical-arm control differed from `default` by 0.96 to 1.06x 
 What it shows, and what it does not:
 
 * **An ordinary `git status` is about a quarter to a third faster** with the untracked cache, in nearly every run at 20,000 and 40,000 files, well outside the noise floor. One 40,000-file run showed no gain and one 100,000-file run under heavy load showed 0.89 to 0.93x.
-* **`-u` is what removes the gain, not `-z`.** With `--untracked-files=all` the cache did nothing measurable (0.97 to 1.04x). GitPulse's own status reads (`GitReader::STATUS_ARGV`) pass `-u`, so **this change does not speed up GitPulse's own reads**. It speeds up a person's own `git status` in a terminal, and any tool that runs it in the default mode. The earlier table was labelled "GitPulse-style" because it set `GIT_OPTIONAL_LOCKS=0`, but it used the default untracked mode; that label was wrong.
+* **`-u` is what removes the gain, not `-z`.** With `--untracked-files=all` the cache did nothing measurable (0.97 to 1.04x). Waylode's own status reads (`GitReader::STATUS_ARGV`) pass `-u`, so **this change does not speed up Waylode's own reads**. It speeds up a person's own `git status` in a terminal, and any tool that runs it in the default mode. The earlier table was labelled "GitPulse-style" because it set `GIT_OPTIONAL_LOCKS=0`, but it used the default untracked mode; that label was wrong.
 * **The gain is the untracked cache's, not the index format's.** After the refreshing `status` the `manyFiles` index was still format 2 (read from the header) and about 4.6 KB (4,586 to 4,587 bytes) **larger** than the plain one (the untracked-cache extension), not smaller. The cache-only arm matched `manyFiles`. `index.version=4` and `index.skipHash` were not shown to help, and they carry the compatibility costs (git older than 2.40 reports a corrupt skipHash index on `fsck`, git older than 2.13 refuses the index). So the offer is `core.untrackedCache`, not `feature.manyFiles`; the latter is detected and reported, never offered or written.
-* **The gain needs git to write the index once with the cache**, which is the next ordinary `git status` (with locks) after the key is set. Nothing changes at the click, and GitPulse's own reads cannot do it, because `GIT_OPTIONAL_LOCKS=0` never lets `status` write the index. The preview says so.
+* **The gain needs git to write the index once with the cache**, which is the next ordinary `git status` (with locks) after the key is set. Nothing changes at the click, and Waylode's own reads cannot do it, because `GIT_OPTIONAL_LOCKS=0` never lets `status` write the index. The preview says so.
 * Direct evidence for the cache alone is the `untracked cache only` column (five runs). The `manyFiles` cells attribute to it by inference.
 
-**Reconciliation with the 2026-10-13 spike below.** That spike's "`core.untrackedCache` showed no effect" does not contradict this; both are right for the invocation they measured. The spike timed GitPulse's argv in `gitpulse` mode and `status --porcelain=v1 -u -z` in `plain` mode, both with `-u`; it did let git write the index (two ordinary priming runs) and checked the `UNTR` extension was present. I re-ran that script today on a synthetic 40,000-file repository: `untrackedCache` 1.00x (gitpulse argv) and 0.95x (plain argv, which still has `-u`) with `UNTR` present, and `fsmonitor` 0.71x and 0.75x, the same picture as its table. The difference is the untracked-files mode, `-u` against the default, shown directly in the table above. The spike's table stands for the invocation it measured, and that note is added under it.
+**Reconciliation with the 2026-10-13 spike below.** That spike's "`core.untrackedCache` showed no effect" does not contradict this; both are right for the invocation they measured. The spike timed Waylode's argv in `gitpulse` mode and `status --porcelain=v1 -u -z` in `plain` mode, both with `-u`; it did let git write the index (two ordinary priming runs) and checked the `UNTR` extension was present. I re-ran that script today on a synthetic 40,000-file repository: `untrackedCache` 1.00x (gitpulse argv) and 0.95x (plain argv, which still has `-u`) with `UNTR` present, and `fsmonitor` 0.71x and 0.75x, the same picture as its table. The difference is the untracked-files mode, `-u` against the default, shown directly in the table above. The spike's table stands for the invocation it measured, and that note is added under it.
 
 **Threshold.** 20,000 tracked files, the smallest size measured. The offer is a strict subset of what the owner approved (one of the two config keys, `core.untrackedCache`, in place of `feature.manyFiles`). A repository whose index is a split index (the `link` extension, or a `sharedindex.*` file beside an unreadable index), with `core.splitIndex` set, or with a split index in another worktree, is never offered it. On git 2.54, `feature.manyFiles` over a split index was reproduced breaking add-then-commit and crashing `git status`; `core.untrackedCache` alone over a split index (in config, as the index's own extension, and with a delta past `splitIndex.maxPercentChange`) was run for several add, commit and status rounds at 5,000 and 30,000 files and did not reproduce it. It is refused anyway, because which part of `feature.manyFiles` breaks the split index was not isolated.
 
@@ -2872,7 +2872,7 @@ Unchanged from the 2026-10-13 spike below: 1.29 to 1.73x slower under about 10,0
 
 | change | offered when | evidence |
 | --- | --- | --- |
-| `core.untrackedCache` | 20,000 or more tracked files (exact count, index walked and valid), key unset, `feature.manyFiles` not on, no split index here or in another worktree | the corrected `files` table; speeds an ordinary `git status`, not GitPulse's own `-u` reads. `feature.manyFiles` is detected, never offered |
+| `core.untrackedCache` | 20,000 or more tracked files (exact count, index walked and valid), key unset, `feature.manyFiles` not on, no split index here or in another worktree | the corrected `files` table; speeds an ordinary `git status`, not Waylode's own `-u` reads. `feature.manyFiles` is detected, never offered |
 | `core.fsmonitor` | 40,000 or more tracked files, macOS, key unset, git 2.36.0 or newer | the 2026-10-13 spike |
 | `git maintenance start` | about 6,700 or more loose objects and past `gc.auto`, not registered, `gc.auto` and `maintenance.auto` not turned off | the `loose` table and the `loose-objects` task row |
 | pack count, multi-pack-index | never offered; reported only | the `packs` tables |
@@ -2946,13 +2946,13 @@ Both sides are reduced to sorted `(path, X, Y)` rows; git runs with `GIT_CONFIG_
 | status run inside a linked worktree while the main checkout is dirty differently | 1 | match |
 | merge conflict (both modified) | 1 | **diverges**: git `UU a.txt`, gix reports ` U a.txt` |
 
-The one mismatch is the conflict code only. gix's `index_worktree::Item::summary()` collapses a conflict to `Summary::Conflict` and the harness maps it to the worktree letter, so the stage pair (`UU`, `AA`, `DU`, ...) is lost; the path is reported, so "this file is conflicted" is right and the exact two-letter code is not. The detailed stages are in `EntryStatus::Conflict`, which this harness does not decode; an adoption would map them. GitPulse's own use of the porcelain codes decides whether that matters.
+The one mismatch is the conflict code only. gix's `index_worktree::Item::summary()` collapses a conflict to `Summary::Conflict` and the harness maps it to the worktree letter, so the stage pair (`UU`, `AA`, `DU`, ...) is lost; the path is reported, so "this file is conflicted" is right and the exact two-letter code is not. The detailed stages are in `EntryStatus::Conflict`, which this harness does not decode; an adoption would map them. Waylode's own use of the porcelain codes decides whether that matters.
 
 Not covered, said plainly: other conflict shapes, rewrites in the worktree (`index_worktree_rewrites`, git does not report them in porcelain v1), copy detection, `core.fsmonitor`/untracked-cache interplay, `skip-worktree` set by hand outside a sparse checkout, paths that are not UTF-8, and nested repositories that are not submodules. A fixture that passes is evidence about that fixture, not a proof for every repository. Read against the one pinned case: the oracle can fail, it did.
 
 ### Per-scan cost
 
-Fixture shape (the phase-1 profile, scaled): one main checkout plus 17 linked worktrees, **every one dirty** (3 modified files and 1 untracked file each; 72 status rows per sweep), 30 directories. Two sizes: 600 tracked files (the profile's) and 3,000. One **sweep** is one status of all 18 worktrees in order (one GitPulse refresh), and the per-scan figure is the sweep divided by 18. Each round runs every arm once with a rotating start (interleaved); round 1 is a warm-up and is dropped. Arms: `git status --porcelain=v1 -u -z` spawned (output parsed to rows); the same arm a second time under another label (the noise floor); `git status -uno`; gix with `Repository` handles opened once outside the timing (warm) and with `gix::open` inside the timing (cold), each with untracked `Files` and `None`. Before any timing the bench asserts gix's rows equal git's for every worktree (0 mismatches in all runs). Release profile, git 2.54.0 (Apple Git-157), M5 Pro, 18 cores, APFS, hermetic git config (the app's `-c` pairs are not added, and the profile's 47.6 ms was taken under load 17; these runs were under load 18 to 39, so absolute milliseconds are not comparable with it, ratios are).
+Fixture shape (the phase-1 profile, scaled): one main checkout plus 17 linked worktrees, **every one dirty** (3 modified files and 1 untracked file each; 72 status rows per sweep), 30 directories. Two sizes: 600 tracked files (the profile's) and 3,000. One **sweep** is one status of all 18 worktrees in order (one Waylode refresh), and the per-scan figure is the sweep divided by 18. Each round runs every arm once with a rotating start (interleaved); round 1 is a warm-up and is dropped. Arms: `git status --porcelain=v1 -u -z` spawned (output parsed to rows); the same arm a second time under another label (the noise floor); `git status -uno`; gix with `Repository` handles opened once outside the timing (warm) and with `gix::open` inside the timing (cold), each with untracked `Files` and `None`. Before any timing the bench asserts gix's rows equal git's for every worktree (0 mismatches in all runs). Release profile, git 2.54.0 (Apple Git-157), M5 Pro, 18 cores, APFS, hermetic git config (the app's `-c` pairs are not added, and the profile's 47.6 ms was taken under load 17; these runs were under load 18 to 39, so absolute milliseconds are not comparable with it, ratios are).
 
 **Noise floor** (git spawn timed twice per round): paired ratio 0.94x to 1.16x at n=15 (600 files, lean); 0.53x to 1.25x at n=40 (3,000 files, lean, load 39); 0.77x to 1.43x at n=40 (3,000 files, max-performance). Min over min of the two copies is 1.00x to 1.03x. A gap has to clear the min/min figure and, for a claim about one round, the paired range.
 
@@ -2975,7 +2975,7 @@ What it says:
 - **Cheaper, by more than the noise.** With gix's own performance bundle, a sweep is about 4x cheaper than spawning (76 against 316 ms, 4.3 against 17.5 ms per scan, n=40, floor 1.01x). With the lean feature set it is 3.8x cheaper at 600 files and only about 1.5x at 3,000 files under load 39, so the lean set (no `parallel`) leaves most of the win on the table at size. The bundle enables more of gix's own optional dependencies (not counted here); that choice is the owner's and is not made here.
 - **Warm against cold open barely matters** (0 to 25% across the three columns): opening a repository is not the cost, the index read and the stat/hash pass are.
 - **Untracked `None` against `Files`:** small here (a few percent with the bundle; up to 1.3x lean at 3,000 files), because the fixture has only one untracked file and no large ignored trees. `git -uno` saves 11 to 15%. The fixture says nothing about a worktree with a large untracked or ignored tree (`node_modules`); that cost is in the directory walk and was not measured.
-- Not measured: a clean tree, a repository with 20,000+ files, memory, CPU time (only wall time), and the cost of building the snapshot rows GitPulse needs beyond (path, X, Y).
+- Not measured: a clean tree, a repository with 20,000+ files, memory, CPU time (only wall time), and the cost of building the snapshot rows Waylode needs beyond (path, X, Y).
 
 ### Verdict: adopt with fallback
 
@@ -3072,18 +3072,18 @@ The skip exists only on macOS, where the root watch is recursive (`ROOT_WATCH_MO
 
 Unknown is never clean: the poll reads, and keeps nothing, when the root watch is not recursive (Linux, Windows: `ROOT_WATCH_MODE`), the watch has ended or was never registered (failed registration, parked, evicted), the worktree root is no longer the directory that was registered (checked by device and inode, since a moved root sends no event), or the watch is convicted. A kept read older than 60 s is not served, and an answer of more than 4096 rows is not kept (it is logged once; such a worktree reads every poll).
 
-#### Does GitPulse's own read move the epoch?
+#### Does Waylode's own read move the epoch?
 
-Measured with a recursive FSEvents watch while the read set of a refresh ran five times (status, `diff --numstat` both ways, refs, `rev-parse`, stash, log) with `GIT_OPTIONAL_LOCKS=0`, which every GitPulse git child already has and which this change does not depend on:
+Measured with a recursive FSEvents watch while the read set of a refresh ran five times (status, `diff --numstat` both ways, refs, `rev-parse`, stash, log) with `GIT_OPTIONAL_LOCKS=0`, which every Waylode git child already has and which this change does not depend on:
 
-| config | events from GitPulse's own reads |
+| config | events from Waylode's own reads |
 | --- | --- |
 | default | 0 |
 | `core.untrackedCache`, `feature.manyFiles`, `index.version=4` | 0 |
 | `core.fsmonitor=true` | 15: `.git/fsmonitor--daemon/cookies/<pid>-<n>`, one per read |
 | `core.splitIndex=true` | 10: `.git/sharedindex.<sha>` touched by every index read |
 
-On the default configuration an idle worktree and ten rounds of the whole refresh read set move the epoch zero times with the real watcher (`an_idle_worktree_and_its_own_reads_move_no_epoch_so_the_poll_is_skipped`). Under `core.fsmonitor` and `core.splitIndex` git itself writes under `.git` on a read, the epoch moves on every read, and the poll reads every time, which is what it did before: the skip is inert there, not wrong. Excluding those two paths would be a path-based guess about which events cannot matter, which is the thing this design refuses to do; preventing them at the source would mean disabling fsmonitor or the split index for GitPulse's own reads, which costs the users who turned them on for speed. Not done.
+On the default configuration an idle worktree and ten rounds of the whole refresh read set move the epoch zero times with the real watcher (`an_idle_worktree_and_its_own_reads_move_no_epoch_so_the_poll_is_skipped`). Under `core.fsmonitor` and `core.splitIndex` git itself writes under `.git` on a read, the epoch moves on every read, and the poll reads every time, which is what it did before: the skip is inert there, not wrong. Excluding those two paths would be a path-based guess about which events cannot matter, which is the thing this design refuses to do; preventing them at the source would mean disabling fsmonitor or the split index for Waylode's own reads, which costs the users who turned them on for speed. Not done.
 
 #### How stale can an answer be
 
@@ -3114,7 +3114,7 @@ The counters are also appended to the existing periodic gate line (`log_refusals
 
 Load average (1 min) at the start of the run 12.0, at the end 10.0, below the 30 line, so this run is a result. A first run of the same test started at load 43.9 (the build of the test binary raised it) and is not a result; it printed the same counts. The ten polls span 54 s, inside the 60 s cap, so "1" is the first read; in steady state the cap adds one capped read per minute, so an idle worktree makes about one read per minute against ten before. The churn arm shows the cost of the dumb rule on purpose: a build writing in an ignored directory ends the skip for every poll, exactly as before this change.
 
-A separate, contaminated indication from a review (load average 41 falling to 25, so not a result): with GitPulse running, 13 of 20 six-second windows were quiet on the main checkout and on a lane; the windows that were not quiet were other lanes' `.git/worktrees/<lane>/index.lock` and files under the common directory. Any event moves the epoch, so another worktree's activity in the shared common directory costs this one a read that window, which is the safe direction.
+A separate, contaminated indication from a review (load average 41 falling to 25, so not a result): with Waylode running, 13 of 20 six-second windows were quiet on the main checkout and on a lane; the windows that were not quiet were other lanes' `.git/worktrees/<lane>/index.lock` and files under the common directory. Any event moves the epoch, so another worktree's activity in the shared common directory costs this one a read that window, which is the safe direction.
 
 Not measured: a real app over wall-clock time with other tools writing in the worktree (DevMap and ledger writes under `.devcouncil` in a checkout are events and end the skip like any other), a worktree under `core.fsmonitor` or `core.splitIndex` (inert by construction), and anything on Linux or Windows.
 
@@ -3379,16 +3379,16 @@ Explorer's content search (`cmd_search_content`) and its file listing (`cmd_list
 
 ### Reproduce
 
-`node scripts/bench-dcgrep.mjs --repo <path> [--rounds 15] [--dcgrep <bin>] [--json <file>]`. Each arm runs the request or argv GitPulse sends, without its spawn gate.
+`node scripts/bench-dcgrep.mjs --repo <path> [--rounds 15] [--dcgrep <bin>] [--json <file>]`. Each arm runs the request or argv Waylode sends, without its spawn gate.
 
 - **Parity is checked before timing.** Both arms must agree, unlimited, on each case's match count, and the dcgrep listing unioned with the index must equal `git ls-files`. A case that disagrees is reported and not timed, and the exit code is 1.
 - **Interleaving.** Rounds are interleaved ABBA after one discarded warm-up. A dcgrep-against-itself arm ("null") gives the spread on the same host.
-- **The git search arm is cut at 500 records**, as GitPulse's observer cuts it (`DEFAULT_MAX_MATCHES`).
-- **The dcgrep listing arm is `dcgrep files` alone.** GitPulse also reads `.git/index` in-process and unions the two, so that arm is a lower bound.
+- **The git search arm is cut at 500 records**, as Waylode's observer cuts it (`DEFAULT_MAX_MATCHES`).
+- **The dcgrep listing arm is `dcgrep files` alone.** Waylode also reads `.git/index` in-process and unions the two, so that arm is a lower bound.
 
 ### Measured
 
-GitPulse main checkout, about 4,000 files. dcgrep 0.2.5 (`~/.local/bin/dcgrep`), git 2.56.0, one M-series Mac. 15 rounds, warm page cache, about 30 other agent sessions and a cargo build on the host, load 14.2 at start and 19.0 at end. Times are min / p50 in ms.
+Waylode main checkout, about 4,000 files. dcgrep 0.2.5 (`~/.local/bin/dcgrep`), git 2.56.0, one M-series Mac. 15 rounds, warm page cache, about 30 other agent sessions and a cargo build on the host, load 14.2 at start and 19.0 at end. Times are min / p50 in ms.
 
 | case | matches (dcgrep / git) | dcgrep | git | null | git ÷ dcgrep (min) |
 | --- | --- | --- | --- | --- | --- |
@@ -3401,7 +3401,7 @@ GitPulse main checkout, about 4,000 files. dcgrep 0.2.5 (`~/.local/bin/dcgrep`),
 An earlier run of the same comparison at load 8–12, from a shell prototype of the script, gave the same shape: search 2.4–3.8× faster with dcgrep, listing 52 vs 21 ms min.
 
 - **Content search: dcgrep is 2.7–3.8× faster** by minimum on every case. Medians differ by more than the null arm's spread in every case.
-- **File listing: dcgrep is 2.4× slower** than `git ls-files`, and GitPulse's dcgrep listing path also reads the index on top of it.
+- **File listing: dcgrep is 2.4× slower** than `git ls-files`, and Waylode's dcgrep listing path also reads the index on top of it.
 - **Cold cache and repositories larger than this one were not measured**, nor was the installed app. The installed GitPulse.app predates the dcgrep wiring.
 
 ### Why the listing is slower
@@ -3411,7 +3411,7 @@ Process start is not the cost: `dcgrep health` takes 3.5 ms (min of 12). For com
 - **It walks serially**, with `walker.build()` rather than `build_parallel()`.
 - **It stats every file again.** `entry.metadata()` runs for every regular file, even when `include_oversized` makes the size unused. On unix, walkdir 2.5.0's `DirEntry::metadata()` is a fresh `lstat` (`src/dent.rs:139`), contrary to the comment beside the call.
 - **It probes every directory for `.git`**, about 395 of them here.
-- **It answers a larger question than GitPulse asks.** GitPulse takes tracked paths from the index and needs only the untracked ones from dcgrep. dcgrep still walks all of them, while `git ls-files --others --exclude-standard` alone takes 22 ms.
+- **It answers a larger question than Waylode asks.** Waylode takes tracked paths from the index and needs only the untracked ones from dcgrep. dcgrep still walks all of them, while `git ls-files --others --exclude-standard` alone takes 22 ms.
 
 The split of the ~21 ms above `rg -j1` between the second and third causes is inferred, not profiled. The work is filed as ft-2dbd0e846139e15afef8d63a90db01f7: keep the listing on git unless a dcgrep listing measures faster, and fix the upstream walk.
 

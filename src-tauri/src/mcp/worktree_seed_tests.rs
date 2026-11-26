@@ -79,7 +79,7 @@ fn assert_build_runs_in(log: &Path, dir: &Path) {
     }
 }
 
-/// `gitpulse_worktree_isolate` seeds a worktree that has no store, then starts
+/// `waylode_worktree_isolate` seeds a worktree that has no store, then starts
 /// that worktree's own build.
 #[cfg(unix)]
 #[test]
@@ -103,20 +103,20 @@ fn isolate_seeds_the_store_and_starts_the_worktrees_own_build() {
     );
 
     let isolated = handle_tool_call(
-        "gitpulse_worktree_isolate",
+        "waylode_worktree_isolate",
         &json!({
             "repo_path": anchor.path().to_str().unwrap(),
             "worktree_path": lane.to_str().unwrap(),
         }),
     )
-    .expect("gitpulse_worktree_isolate succeeds");
+    .expect("waylode_worktree_isolate succeeds");
     assert_eq!(isolated["devmap_seeded"], true, "{isolated}");
     assert!(devmap_query::paths::store_path(lane.canonicalize().unwrap()).is_file());
     assert_build_runs_in(&log, &lane);
 }
 
 /// `codeintel`'s indexed fixture moved to `<sandbox>/repo`, with its store
-/// rebound to the new path. `gitpulse_worktree_create` and `switch` place a
+/// rebound to the new path. `waylode_worktree_create` and `switch` place a
 /// worktree beside the repository (`../<repo>.<branch>`), so the repository
 /// must sit inside a sandbox for that to stay inside the test's own tempdir.
 fn indexed_checkout_in(sandbox: &Path) -> PathBuf {
@@ -139,7 +139,7 @@ fn indexed_checkout_in(sandbox: &Path) -> PathBuf {
     repo
 }
 
-/// `gitpulse_worktree_create` (no pointer) and `gitpulse_worktree_switch`
+/// `waylode_worktree_create` (no pointer) and `waylode_worktree_switch`
 /// with `create_if_missing` both seed the new worktree and start its build.
 #[cfg(unix)]
 #[test]
@@ -152,14 +152,14 @@ fn create_and_switch_seed_the_store_and_start_the_worktrees_own_build() {
     let sandbox_root = sandbox.path().canonicalize().unwrap();
 
     let created = handle_tool_call(
-        "gitpulse_worktree_create",
+        "waylode_worktree_create",
         &json!({
             "repo_path": repo.to_str().unwrap(),
             "branch": "feat/seeded-create",
             "share_cache": false,
         }),
     )
-    .expect("gitpulse_worktree_create succeeds");
+    .expect("waylode_worktree_create succeeds");
     let made = PathBuf::from(created["worktree_path"].as_str().unwrap())
         .canonicalize()
         .unwrap();
@@ -171,14 +171,14 @@ fn create_and_switch_seed_the_store_and_start_the_worktrees_own_build() {
     assert_build_runs_in(&log, &made);
 
     let switched = handle_tool_call(
-        "gitpulse_worktree_switch",
+        "waylode_worktree_switch",
         &json!({
             "repo_path": repo.to_str().unwrap(),
             "branch": "feat/seeded-switch",
             "create_if_missing": true,
         }),
     )
-    .expect("gitpulse_worktree_switch succeeds");
+    .expect("waylode_worktree_switch succeeds");
     assert_eq!(switched["devmap_seeded"], true, "{switched}");
     let made = PathBuf::from(switched["worktree_path"].as_str().unwrap())
         .canonicalize()
@@ -210,14 +210,14 @@ fn isolate_with_the_zero_copy_pointer_starts_no_build() {
         ],
     );
     handle_tool_call(
-        "gitpulse_worktree_isolate",
+        "waylode_worktree_isolate",
         &json!({
             "repo_path": anchor.path().to_str().unwrap(),
             "worktree_path": lane.to_str().unwrap(),
             "zero_copy": true,
         }),
     )
-    .expect("gitpulse_worktree_isolate succeeds");
+    .expect("waylode_worktree_isolate succeeds");
     let seen = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
         !seen.lines().any(|line| line.contains(" build")),

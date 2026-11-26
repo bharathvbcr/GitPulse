@@ -2276,7 +2276,7 @@ mod tests {
         assert_eq!(events[0].session_id.as_deref(), Some("S1"));
         assert!(
             events[0].verdict_json.is_none(),
-            "GitPulse's gate never saw this; a verdict here would be a fabrication"
+            "Waylode's gate never saw this; a verdict here would be a fabrication"
         );
     }
 
@@ -2918,7 +2918,7 @@ mod tests {
         let out = with_transcript_root(tdir.path(), || ingest_transcripts(repo));
         assert_eq!(
             out.recorded, 1,
-            "a terminal opened in GitPulse hid an agent edit from catch-up"
+            "a terminal opened in Waylode hid an agent edit from catch-up"
         );
     }
 

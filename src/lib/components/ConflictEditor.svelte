@@ -591,7 +591,7 @@
           {#if chunks.length > PAGE_SIZE}<div class="resolution-toolbar"><span>Showing conflicts {blockPage * PAGE_SIZE + 1}–{Math.min(chunks.length, (blockPage + 1) * PAGE_SIZE)} of {chunks.length}</span><button class="gp-btn" data-variant="ghost" data-size="sm" disabled={blockPage === 0} onclick={() => blockPage -= 1}>Previous blocks</button><button class="gp-btn" data-variant="ghost" data-size="sm" disabled={(blockPage + 1) * PAGE_SIZE >= chunks.length} onclick={() => blockPage += 1}>Next blocks</button></div>{/if}
           <div class="editor-panes" class:preview-expanded={previewExpanded}>
             <div class="conflict-inspector" bind:this={inspector}>
-              {#if chunks.length === 0}<div class="source-notice">No text conflict blocks were found. Review the file result carefully before staging; this may be a conflict resolved outside GitPulse.</div>{/if}
+              {#if chunks.length === 0}<div class="source-notice">No text conflict blocks were found. Review the file result carefully before staging; this may be a conflict resolved outside Waylode.</div>{/if}
               {#each parsedDoc.segments.filter(segment => segment.Conflict ? Math.floor(segment.Conflict.chunk_index / PAGE_SIZE) === blockPage : blockPage === 0) as segment, segmentIndex (segmentIndex)}
                 {#if segment.Conflict}
                   {@const chunk = segment.Conflict}

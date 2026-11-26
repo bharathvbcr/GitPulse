@@ -79,7 +79,7 @@
       <SettingToggle label="Archived" description="Hide this workspace unless Show archived workspaces is on. Unrelated to the task Archive, which holds completed tasks." checked={draft.archived} onchange={(next) => { draft.archived = next; }} />
       <fieldset><legend>Repositories</legend><p>A repository can belong to several workspaces.</p>{#each known as repo (repo.id)}<label class="check"><Checkbox ariaLabel={repo.name} checked={draft.repository_ids.includes(repo.id)} onchange={(next) => { draft.repository_ids = next ? [...new Set([...draft.repository_ids, repo.id])] : draft.repository_ids.filter((id) => id !== repo.id); }} />{repo.name}</label>{/each}
       {#if addable.length}
-        <p>Open in GitPulse</p>
+        <p>Open in Waylode</p>
         {#each addable as tab (tab.path)}
           <label class="check" title={tab.path}>
             <Checkbox ariaLabel={`Add ${tab.label}`} checked={false} disabled={adding} onchange={() => { void addOpenPaths([tab.path]); }} />

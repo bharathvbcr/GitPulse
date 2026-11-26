@@ -116,11 +116,13 @@ pub fn complete(params: &Value) -> Result<Value, CompleteError> {
 /// that exist.
 fn template_arguments(uri: &str) -> Result<Vec<&'static str>, CompleteError> {
     // A client completing a template sends the template itself
-    // (`gitpulse://insights{+repo_path}`), while one completing a partially
-    // typed URI sends the concrete form (`gitpulse://insights/Users/...`).
+    // (`waylode://insights{+repo_path}`), while one completing a partially
+    // typed URI sends the concrete form (`waylode://insights/Users/...`).
+    // Legacy `gitpulse://` URIs are accepted identically during transition.
     // The facet is what precedes the first `/` or `{` in either.
     let facet = uri
         .strip_prefix(super::uri::SCHEME)
+        .or_else(|| uri.strip_prefix(super::uri::LEGACY_SCHEME))
         .map(|rest| rest.split(['/', '{']).next().unwrap_or_default())
         .unwrap_or_default();
     if super::resources::facet_names().contains(&facet) {
@@ -228,7 +230,7 @@ mod tests {
     #[test]
     fn a_prompt_argument_completes_with_a_bounded_well_formed_result() {
         let result = ok(json!({
-            "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" },
+            "ref": { "type": "ref/prompt", "name": "waylode_preflight" },
             "argument": { "name": "repo_path", "value": "" }
         }));
         let completion = &result["completion"];
@@ -243,21 +245,32 @@ mod tests {
         for value in values {
             assert!(value.is_string());
         }
+        // Legacy prompt name completes identically.
+        let legacy = ok(json!({
+            "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" },
+            "argument": { "name": "repo_path", "value": "" }
+        }));
+        assert_eq!(legacy, result);
     }
 
     #[test]
     fn a_resource_template_reference_completes_the_same_argument() {
         let result = ok(json!({
-            "ref": { "type": "ref/resource", "uri": "gitpulse://insights{+repo_path}" },
+            "ref": { "type": "ref/resource", "uri": "waylode://insights{+repo_path}" },
             "argument": { "name": "repo_path", "value": "" }
         }));
         assert!(result["completion"]["values"].is_array());
+        let legacy = ok(json!({
+            "ref": { "type": "ref/resource", "uri": "gitpulse://insights{+repo_path}" },
+            "argument": { "name": "repo_path", "value": "" }
+        }));
+        assert_eq!(legacy, result);
     }
 
     #[test]
     fn an_absent_argument_value_is_an_empty_prefix_not_an_error() {
         let result = ok(json!({
-            "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" },
+            "ref": { "type": "ref/prompt", "name": "waylode_preflight" },
             "argument": { "name": "repo_path" }
         }));
         assert!(result["completion"]["values"].is_array());
@@ -270,13 +283,13 @@ mod tests {
             "argument": { "name": "repo_path", "value": "" }
         }))
         .expect_err("unknown prompt");
-        assert!(error.message().contains("gitpulse_preflight"));
+        assert!(error.message().contains("waylode_preflight"));
     }
 
     #[test]
     fn an_unknown_template_is_invalid_params_and_names_the_facets() {
         let error = complete(&json!({
-            "ref": { "type": "ref/resource", "uri": "gitpulse://nope{+repo_path}" },
+            "ref": { "type": "ref/resource", "uri": "waylode://nope{+repo_path}" },
             "argument": { "name": "repo_path", "value": "" }
         }))
         .expect_err("unknown template");
@@ -288,7 +301,7 @@ mod tests {
         // An empty list here would read as "no matches" for an argument that
         // does not exist at all.
         let error = complete(&json!({
-            "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" },
+            "ref": { "type": "ref/prompt", "name": "waylode_preflight" },
             "argument": { "name": "not_an_argument", "value": "" }
         }))
         .expect_err("unknown argument");
@@ -300,7 +313,7 @@ mod tests {
         for (params, needle) in [
             (json!({}), "missing ref"),
             (
-                json!({ "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" } }),
+                json!({ "ref": { "type": "ref/prompt", "name": "waylode_preflight" } }),
                 "missing argument",
             ),
             (
@@ -320,7 +333,7 @@ mod tests {
                 "ref.uri",
             ),
             (
-                json!({ "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" }, "argument": { "value": "x" } }),
+                json!({ "ref": { "type": "ref/prompt", "name": "waylode_preflight" }, "argument": { "value": "x" } }),
                 "argument.name",
             ),
         ] {
@@ -350,6 +363,9 @@ mod tests {
         // A client may send either. Splitting only on `/` read the whole of
         // `insights{+repo_path}` as the facet name and refused the template.
         for uri in [
+            "waylode://insights{+repo_path}",
+            "waylode://insights",
+            "waylode://insights/Users/me/half-typed",
             "gitpulse://insights{+repo_path}",
             "gitpulse://insights",
             "gitpulse://insights/Users/me/half-typed",

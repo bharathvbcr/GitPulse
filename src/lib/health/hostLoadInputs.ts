@@ -81,7 +81,7 @@ export const INPUT_SPECS: readonly InputSpec[] = [
     settingId: "host-load-disk",
     label: "Free disk space",
     description:
-      "Free space on the volume GitPulse keeps its state on, which is what slows background work and refuses launches; the command gate checks the volume an agent's command runs in. Lower is worse: below the first number background work is slowed, below the second launches may be refused. Swap files share this space, so by default both numbers follow this computer's memory: half of it and a quarter of it, never under 20 and 10 GiB. A number you set is kept as you set it.",
+      "Free space on the volume Waylode keeps its state on, which is what slows background work and refuses launches; the command gate checks the volume an agent's command runs in. Lower is worse: below the first number background work is slowed, below the second launches may be refused. Swap files share this space, so by default both numbers follow this computer's memory: half of it and a quarter of it, never under 20 and 10 GiB. A number you set is kept as you set it.",
     rule: { unit: "GiB free", step: 1, max: 1_048_576, lowerIsWorse: true, elevatedLabel: "Slow background work below", severeLabel: "Refuse launches below" },
     canRefuse: true,
   },
@@ -89,7 +89,7 @@ export const INPUT_SPECS: readonly InputSpec[] = [
 
 export const MODE_LABELS: Record<InputMode, string> = {
   off: "Off",
-  shed: "Slow GitPulse's background work",
+  shed: "Slow Waylode's background work",
   refuse: "Also refuse agent launches",
 };
 

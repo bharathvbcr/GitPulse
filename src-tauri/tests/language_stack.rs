@@ -1,7 +1,7 @@
-use gitpulse_lib::analyzer::CoverageScanner;
-use gitpulse_lib::engine::GitReader;
 use std::fs;
 use tempfile::TempDir;
+use waylode_lib::analyzer::CoverageScanner;
+use waylode_lib::engine::GitReader;
 
 mod common;
 use common::run_git;

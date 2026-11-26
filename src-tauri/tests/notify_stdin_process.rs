@@ -8,8 +8,6 @@
 
 mod common;
 
-use gitpulse_lib::alerts::bridge::{SESSION_ENV, SOCKET_ENV};
-use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
@@ -18,6 +16,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use waylode_lib::alerts::bridge::{SESSION_ENV, SOCKET_ENV};
+use waylode_lib::procguard::LockedSpawn;
 
 struct Socket {
     _dir: tempfile::TempDir,
@@ -89,7 +89,7 @@ struct Ran {
 fn run(socket: &Socket, event: &str, session: Option<&str>, stdin: Vec<u8>) -> Ran {
     let hook = std::env::var_os("GITPULSE_TEST_HOOK")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_gitpulse-hook")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_waylode-hook")));
     let logs = tempfile::Builder::new()
         .prefix("nl")
         .tempdir_in("/tmp")
@@ -97,7 +97,7 @@ fn run(socket: &Socket, event: &str, session: Option<&str>, stdin: Vec<u8>) -> R
     let mut command = Command::new(hook);
     command
         .args(["notify", event])
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .env(SOCKET_ENV, &socket.path)
         .env_remove(SESSION_ENV)
         .stdin(Stdio::piped())

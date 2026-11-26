@@ -6,13 +6,13 @@
 
 mod common;
 
-use gitpulse_lib::engine::agent_bus::{post_peer_message, read_messages_for_peer, MessageOrigin};
-use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use tempfile::TempDir;
+use waylode_lib::engine::agent_bus::{post_peer_message, read_messages_for_peer, MessageOrigin};
+use waylode_lib::procguard::LockedSpawn;
 
 fn repo() -> TempDir {
     common::unmetered_spawns();
@@ -25,12 +25,12 @@ fn repo() -> TempDir {
 
 /// One gitpulse-mcp call in a child process: (exit code, parsed stdout or the raw text).
 fn call(tool: &str, args: &[(&str, String)]) -> (i32, Value, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_waylode-mcp"));
     cmd.arg("call").arg(tool);
     // The child logs into the hermetic home this process runs under, not the
     // user's real log directory (tests/test_log_isolation.rs).
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
-    cmd.env(gitpulse_lib::logging::LOG_DIR_ENV, home.join("logs"));
+    cmd.env(waylode_lib::logging::LOG_DIR_ENV, home.join("logs"));
     for (k, v) in args {
         cmd.arg(format!("{k}={v}"));
     }

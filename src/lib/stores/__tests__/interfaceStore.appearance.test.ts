@@ -144,4 +144,31 @@ describe("appearance preferences", () => {
     expect(get(interfaceStore).density).toBe("comfortable");
     expect(get(interfaceStore).materialIntensity).toEqual({ light: 0, dark: 0 });
   });
+
+  it("stores logoStyle and logoPalette, falls back on corrupt values, and resets to way-arc / cobalt", async () => {
+    const { interfaceStore } = await fresh();
+    expect(get(interfaceStore).logoStyle).toBe("way-arc");
+    expect(get(interfaceStore).logoPalette).toBe("cobalt");
+
+    interfaceStore.setLogoStyle("folded-ribbon");
+    interfaceStore.setLogoPalette("oxblood");
+    expect(get(interfaceStore).logoStyle).toBe("folded-ribbon");
+    expect(get(interfaceStore).logoPalette).toBe("oxblood");
+    interfaceStore.flush();
+
+    const reloaded = get((await fresh()).interfaceStore);
+    expect(reloaded.logoStyle).toBe("folded-ribbon");
+    expect(reloaded.logoPalette).toBe("oxblood");
+
+    storage.setItem(KEY, JSON.stringify({ logoStyle: "unknown", logoPalette: "ultraviolet" }));
+    const sanitized = get((await fresh()).interfaceStore);
+    expect(sanitized.logoStyle).toBe("way-arc");
+    expect(sanitized.logoPalette).toBe("cobalt");
+
+    interfaceStore.setLogoStyle("lode-compass");
+    interfaceStore.setLogoPalette("gilded");
+    interfaceStore.resetAppearance();
+    expect(get(interfaceStore).logoStyle).toBe("way-arc");
+    expect(get(interfaceStore).logoPalette).toBe("cobalt");
+  });
 });

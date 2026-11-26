@@ -3098,7 +3098,7 @@
           Your saved default for {launcherLabel(launcher)} is
           <span class="text-textPrimary">{PERMISSION_LABELS.bypass.label}</span>. This session will
           run without permission prompts and without a sandbox, in
-          <span class="font-mono">{workPath.split(/[\\/]/).pop()}</span>. GitPulse asks every time
+          <span class="font-mono">{workPath.split(/[\\/]/).pop()}</span>. Waylode asks every time
           rather than remembering the answer.
         </p>
         <div class="flex items-center gap-2 mt-1">

@@ -5251,7 +5251,7 @@
             ondragstart={(event) => {
               draggedGroupId = null;
               draggedTabId = tab.id;
-              event.dataTransfer?.setData("application/x-gitpulse-terminal-tab", tab.id);
+              event.dataTransfer?.setData("application/x-waylode-terminal-tab", tab.id);
               if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
             }}
             ondragend={() => {
@@ -5409,7 +5409,7 @@
                 ondragstart={(event) => {
                   draggedTabId = null;
                   draggedGroupId = segment.group.id;
-                  event.dataTransfer?.setData("application/x-gitpulse-terminal-group", segment.group.id);
+                  event.dataTransfer?.setData("application/x-waylode-terminal-group", segment.group.id);
                   if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
                 }}
                 ondragend={() => {
@@ -7164,7 +7164,7 @@
               }
               const inApp = terminalDropZones.currentInAppDrag();
               const isFileDrag = Boolean(
-                inApp || event.dataTransfer?.types.includes("application/x-gitpulse-filepath"),
+                inApp || event.dataTransfer?.types.includes("application/x-waylode-filepath"),
               );
               if (!isFileDrag) return;
               event.preventDefault();
@@ -7261,7 +7261,7 @@
                 return;
               }
               const inApp = terminalDropZones.currentInAppDrag();
-              const transferred = event.dataTransfer?.getData("application/x-gitpulse-filepath")?.trim();
+              const transferred = event.dataTransfer?.getData("application/x-waylode-filepath")?.trim();
               const paths = inApp?.paths ?? (transferred ? [transferred] : []);
               if (paths.length === 0) return;
               event.preventDefault();
@@ -7304,7 +7304,7 @@
                   }
                   draggedGroupId = null;
                   draggedTabId = tab.id;
-                  event.dataTransfer?.setData("application/x-gitpulse-terminal-tab", tab.id);
+                  event.dataTransfer?.setData("application/x-waylode-terminal-tab", tab.id);
                   if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
                 }}
                 ondragend={() => {

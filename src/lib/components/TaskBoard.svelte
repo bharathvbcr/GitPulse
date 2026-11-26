@@ -2458,7 +2458,7 @@
     const repository = repositories.find((repo) => repo.id === repositoryId);
     if (!repository) return "its repository is not loaded, so there is no remote to file on";
     const checkout = checkoutCandidates(repository.id, repositories, openTabRefs, pathOpts)[0];
-    if (!checkout) return `no working checkout of ${repository.name} is known; open it in GitPulse first`;
+    if (!checkout) return `no working checkout of ${repository.name} is known; open it in Waylode first`;
     return { repositoryName: repository.name, checkout: checkout.path, derived: checkout.source === "derived" };
   }
   /** Carry a freshly linked task into the editor tab that has it open. */

@@ -54,7 +54,7 @@ fn ledger_events_with_heavy_rows_holds_the_64k_budget_and_a_continuable_cursor()
         assert!(id.is_some(), "row {n} was not recorded");
     }
     let payload = handle_tool_call(
-        "gitpulse_ledger_events",
+        "waylode_ledger_events",
         &json!({ "repo_path": repo, "limit": 300 }),
     )
     .expect("ledger events");
@@ -69,7 +69,7 @@ fn ledger_events_with_heavy_rows_holds_the_64k_budget_and_a_continuable_cursor()
         "cut without saying so"
     );
     let violations: Vec<String> =
-        validate::validate(&structured, &schema_of("gitpulse_ledger_events"))
+        validate::validate(&structured, &schema_of("waylode_ledger_events"))
             .iter()
             .map(validate::Violation::render)
             .collect();
@@ -112,7 +112,7 @@ fn list_tasks_with_many_long_tasks_holds_the_64k_budget() {
             ["zz", "yy", "xx", "ww"][n % 4]
         );
         let outcome = handle_tool_call(
-            "gitpulse_add_task",
+            "waylode_add_task",
             &json!({
                 "repo_path": repo,
                 "task_id": format!("probe-{n}"),
@@ -128,7 +128,7 @@ fn list_tasks_with_many_long_tasks_holds_the_64k_budget() {
     }
     assert!(filed >= 3, "only {filed} tasks could be filed");
     let payload = handle_tool_call(
-        "gitpulse_list_tasks",
+        "waylode_list_tasks",
         &json!({ "repo_path": repo, "limit": 100 }),
     )
     .expect("list tasks");
@@ -139,7 +139,7 @@ fn list_tasks_with_many_long_tasks_holds_the_64k_budget() {
             assert!(wire(&fitted) <= BUDGET, "{} bytes", wire(&fitted));
             let structured = fitted.structured.expect("structured");
             let violations: Vec<String> =
-                validate::validate(&structured, &schema_of("gitpulse_list_tasks"))
+                validate::validate(&structured, &schema_of("waylode_list_tasks"))
                     .iter()
                     .map(validate::Violation::render)
                     .collect();
@@ -218,7 +218,7 @@ fn oversized_sessions_report_cuts_within_budget_and_conforms_to_schema() {
     let returned = structured["returned"].as_u64().expect("returned");
     assert!((1..400).contains(&returned), "returned={returned}");
     assert!(structured[TRUNCATION_KEY].is_object());
-    let violations: Vec<String> = validate::validate(&structured, &schema_of("gitpulse_sessions"))
+    let violations: Vec<String> = validate::validate(&structured, &schema_of("waylode_sessions"))
         .iter()
         .map(validate::Violation::render)
         .collect();

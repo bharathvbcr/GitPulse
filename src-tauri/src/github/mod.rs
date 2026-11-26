@@ -5436,19 +5436,21 @@ mod tests {
              setlocal EnableDelayedExpansion\r\n\
              set \"FIRST=%~1\"\r\n\
              set \"SECOND=%~2\"\r\n\
-             if \"%~1\"==\"--version\" (\r\n\
+             if \"!FIRST!\"==\"--version\" (\r\n\
                echo gh version 2.102.0\r\n\
                exit /b 0\r\n\
              )\r\n\
              set \"LINE=\"\r\n\
              set \"BAD=0\"\r\n\
              :loop\r\n\
-             if \"%~1\"==\"\" if \"%1\"==\"\" goto done\r\n\
-             if \"%~1\"==\"--hostname\" set \"BAD=1\"\r\n\
+             set \"RAW=%1\"\r\n\
+             if not defined RAW goto done\r\n\
+             set \"ARG=%~1\"\r\n\
+             if \"!ARG!\"==\"--hostname\" set \"BAD=1\"\r\n\
              if defined LINE (\r\n\
-               set \"LINE=!LINE! %~1\"\r\n\
+               set \"LINE=!LINE! !ARG!\"\r\n\
              ) else (\r\n\
-               set \"LINE=%~1\"\r\n\
+               set \"LINE=!ARG!\"\r\n\
              )\r\n\
              shift\r\n\
              goto loop\r\n\

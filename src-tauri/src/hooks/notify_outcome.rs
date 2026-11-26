@@ -220,7 +220,7 @@ pub fn diagnostic(error: &HookError) -> Diagnostic {
     };
     Diagnostic {
         level,
-        line: format!("gitpulse-hook: {error}"),
+        line: format!("waylode-hook: {error}"),
         exit_code: if matches!(error, HookError::Wake(_)) {
             2
         } else {

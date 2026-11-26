@@ -430,7 +430,7 @@ mod tests {
         let tools = crate::mcp::tools();
         let schema = tools
             .iter()
-            .find(|t| t["name"] == "gitpulse_codeintel_suspects")
+            .find(|t| t["name"] == "waylode_codeintel_suspects")
             .expect("the tool is advertised");
         assert_eq!(
             schema["inputSchema"]["properties"]["depth"]["maximum"]

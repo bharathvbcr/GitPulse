@@ -197,7 +197,7 @@ fn attribute(state: &WorkbenchState, error: WorkbenchError) -> WorkbenchError {
     WorkbenchError::new(
         &error.code,
         format!(
-            "{} This Manvi build does not report which managed adapters it has, so GitPulse \
+            "{} This Manvi build does not report which managed adapters it has, so Waylode \
              could not check the provider before launching; the wording above may describe a \
              different provider than the one you chose. Updating Manvi is the usual fix.",
             error.message
@@ -397,7 +397,7 @@ pub(crate) fn follow_up_answer(
             {
                 return Err(WorkbenchError::new(
                     "protocol_error",
-                    "Manvi answered a follow-up with a state GitPulse does not know.",
+                    "Manvi answered a follow-up with a state Waylode does not know.",
                 ));
             }
             let mut answer = json!({
@@ -462,7 +462,7 @@ pub(crate) fn follow_up_answer(
             "state": "unconfirmed",
             "code": error.code,
             "reason": format!(
-                "Manvi answered with an error GitPulse does not recognise ({}): {}. If a follow-up was being sent, it is not known whether it reached the agent.",
+                "Manvi answered with an error Waylode does not recognise ({}): {}. If a follow-up was being sent, it is not known whether it reached the agent.",
                 error.code, error.message
             ),
             "retryable": false,

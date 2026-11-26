@@ -18,14 +18,14 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::analyzer::CommitFilter;
-use gitpulse_lib::commands::{assemble_commit_graph, resolve_mainline_hint, GraphNotes};
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::graph::{
+use std::collections::{HashMap, HashSet};
+use waylode_lib::analyzer::CommitFilter;
+use waylode_lib::commands::{assemble_commit_graph, resolve_mainline_hint, GraphNotes};
+use waylode_lib::engine::GitReader;
+use waylode_lib::graph::{
     hidden_ref_warning, list_ref_decorations, probe_hidden_history, LaneSolver, MainlineHint,
     RawCommitNode, RefKind, RefScope, VisualCommitRow, MAINLINE_COLOR, MAINLINE_COLUMN,
 };
-use std::collections::{HashMap, HashSet};
 
 /// The repository the smoke run reads, from `GITPULSE_SMOKE_REPO`.
 ///
@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 /// gate's 192-token burst partway through. The switch is order-independent and
 /// idempotent, like the other integration suites'.
 fn smoke_repo() -> String {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path")
 }
 
@@ -288,8 +288,8 @@ fn check_mainline_invariants(
 fn mainline_for(
     repo: &str,
 ) -> (
-    gitpulse_lib::commands::ResolvedMainline,
-    Vec<gitpulse_lib::graph::RefDecoration>,
+    waylode_lib::commands::ResolvedMainline,
+    Vec<waylode_lib::graph::RefDecoration>,
     Option<String>,
     Option<String>,
 ) {
@@ -337,7 +337,7 @@ fn check_no_stub_points_at_a_loaded_row(rows: &[VisualCommitRow]) {
 #[test]
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_filtered_graphs_stay_connected() {
-    use gitpulse_lib::graph::{mainline_chain_ids, MAINLINE_COLOR, MAINLINE_COLUMN};
+    use waylode_lib::graph::{mainline_chain_ids, MAINLINE_COLOR, MAINLINE_COLUMN};
     let repo = smoke_repo();
     let commits = load_history(&repo, 2_000);
     assert!(
@@ -589,7 +589,7 @@ fn real_repository_history_solves_clean() {
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_status_smoke() {
     let repo = smoke_repo();
-    let statuses = gitpulse_lib::engine::GitReader::get_status(&repo).expect("get_status");
+    let statuses = waylode_lib::engine::GitReader::get_status(&repo).expect("get_status");
     println!("Real repository status count: {}", statuses.len());
     let mut total_add = 0;
     let mut total_del = 0;

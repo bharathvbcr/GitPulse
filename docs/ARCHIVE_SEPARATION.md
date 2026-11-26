@@ -68,10 +68,10 @@ profile's path).
 The ladder is a hard fence: a host built against an older schema refuses a
 newer profile (`schema_unsupported`), and a host refuses one newer than itself.
 That is deliberate — a host that builds a task body without `archived` would
-silently unarchive every task it saved. GitPulse, DevCouncil and Manvi each link
+silently unarchive every task it saved. Waylode, DevCouncil and Manvi each link
 dc-store, so all three must be rebuilt from the same dc-store before any of them
 opens a migrated profile: once Manvi's dc-store takes a shared profile to 13, a
-GitPulse built at 12 refuses it.
+Waylode built at 12 refuses it.
 
 `items.put` accepts `archived`, `checklist` and `links`. Each follows the
 `locked_fields` rule: a request that **omits** the field keeps the stored
@@ -98,12 +98,12 @@ task and its deepest subtask — holds more than 256 tasks; a parent the task
 already has is not checked again, so another task's edit never makes it
 unsaveable.
 
-`dcstore --version` reports the `workbench_schema` it opens. GitPulse hands
+`dcstore --version` reports the `workbench_schema` it opens. Waylode hands
 Manvi only a `dcstore` that reports this build's schema (`MANVI_STORE_BINARY`)
 and shows any other as needing an update: both 0.2.4 builds answered the same
 version, and a schema 10 one on `PATH` refused every workbench request.
 
-## GitPulse
+## Waylode
 
 [`src/lib/workbench/taskArchive.ts`](../src/lib/workbench/taskArchive.ts) is
 still the one module that says what archived means:

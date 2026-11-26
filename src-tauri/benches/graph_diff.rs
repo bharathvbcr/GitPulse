@@ -27,8 +27,8 @@
 mod common;
 
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::diff::word_diff::{compute_word_diff, DiffChunkKind};
-use gitpulse_lib::graph::{LaneSolver, RawCommitNode};
+use waylode_lib::diff::word_diff::{compute_word_diff, DiffChunkKind};
+use waylode_lib::graph::{LaneSolver, RawCommitNode};
 
 /// A line of about `chars` characters made of `word_N` tokens, and the same
 /// line with every seventh word replaced.

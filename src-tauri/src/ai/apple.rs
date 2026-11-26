@@ -403,7 +403,7 @@ mod tests {
             notes: "the board menu cannot set a due date".to_string(),
             title: String::new(),
             description: String::new(),
-            context: "Repository: GitPulse".to_string(),
+            context: "Repository: Waylode".to_string(),
         }
     }
 

@@ -35,11 +35,11 @@ mod common;
 
 use common::fixture::{argv_shape, build_repo, git, git_process_profile, GitProc, Repo, Spec};
 use common::Report;
-use gitpulse_lib::engine::git_reader::GitReader;
-use gitpulse_lib::engine::worktree::ScanDepth;
-use gitpulse_lib::graph::RefScope;
-use gitpulse_lib::insights;
 use std::collections::BTreeMap;
+use waylode_lib::engine::git_reader::GitReader;
+use waylode_lib::engine::worktree::ScanDepth;
+use waylode_lib::graph::RefScope;
+use waylode_lib::insights;
 
 const SPEC: Spec = Spec {
     files: 600,
@@ -67,8 +67,8 @@ fn refresh(path: &str) {
     GitReader::branch_stats(path).expect("branch_stats");
     GitReader::read_commit_history_paged(path, 0, 200, None, None, RefScope::All)
         .expect("read_commit_history_paged");
-    gitpulse_lib::engine::worktree::list_worktrees(path).expect("list_worktrees full");
-    gitpulse_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
+    waylode_lib::engine::worktree::list_worktrees(path).expect("list_worktrees full");
+    waylode_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
         .expect("list_worktrees listing");
     let snapshot = insights::snapshot(path);
     assert!(
@@ -172,14 +172,14 @@ fn render(title: &str, procs: &[GitProc], report: &mut Report) {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("git_inprocess_reads");
     let temp = tempfile::tempdir().expect("temp dir");
 
-    let preflight = gitpulse_lib::engine::git_cli::git_preflight();
+    let preflight = waylode_lib::engine::git_cli::git_preflight();
     assert_eq!(
         preflight.status,
-        gitpulse_lib::engine::git_cli::GitPreflightStatus::Ok,
+        waylode_lib::engine::git_cli::GitPreflightStatus::Ok,
         "git did not pass its preflight ({:?})",
         preflight.message
     );
@@ -256,8 +256,8 @@ fn main() {
 }
 
 fn update_refs(repo: &std::path::Path, commands: &str) {
-    use gitpulse_lib::procguard::LockedSpawn;
     use std::io::Write;
+    use waylode_lib::procguard::LockedSpawn;
     let mut child = std::process::Command::new("git")
         .args(["update-ref", "--stdin"])
         .current_dir(repo)

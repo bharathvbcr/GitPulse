@@ -1,9 +1,9 @@
-//! The one-owner lock for `gitpulsed`.
+//! The one-owner lock for `wayloded`.
 //!
 //! Nothing started, stopped or tracked the daemon: two copies ran silently
 //! against one ledger, and a daemon left over from before an upgrade kept
 //! writing with the old build's idea of the transcript cursors. A running
-//! daemon now holds an exclusive lock on `gitpulsed.lock` in its profile
+//! daemon now holds an exclusive lock on `wayloded.lock` in its profile
 //! directory for its whole life; the kernel drops it when the process ends,
 //! so there is no stale-lock cleanup to get wrong. The file also names the
 //! owner (`pid`, then the build's version) so the app can say which daemon is
@@ -15,7 +15,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const LOCK_FILE: &str = "gitpulsed.lock";
+pub const LOCK_FILE: &str = "wayloded.lock";
+pub const LEGACY_DIR: &str = "gitpulsed";
+pub const LEGACY_LOCK_FILE: &str = "gitpulsed.lock";
 
 /// The longest the owner record is read: pid and version are a few bytes.
 const MAX_RECORD: u64 = 256;
@@ -288,7 +290,48 @@ pub fn status_in(dir: &Path, app_version: &'static str) -> DaemonStatus {
 
 /// Where the daemon's lock lives: its own directory in the app's config dir.
 pub fn default_dir() -> Option<PathBuf> {
-    crate::tool_config::default_config_dir().map(|dir| dir.join("gitpulsed"))
+    crate::tool_config::default_config_dir().map(|dir| dir.join("wayloded"))
+}
+
+/// Where a pre-rename `gitpulsed` daemon kept its lock.
+pub fn legacy_default_dir() -> Option<PathBuf> {
+    crate::tool_config::legacy_config_dir().map(|dir| dir.join(LEGACY_DIR))
+}
+
+/// Status of `wayloded` in `dir`, falling back to probing `legacy_dir/gitpulsed.lock`
+/// when no `wayloded` owns `dir` so an orphaned pre-upgrade `gitpulsed` is surfaced
+/// as a version-mismatched running daemon.
+pub fn status_with_legacy(
+    dir: &Path,
+    legacy_dir: Option<&Path>,
+    app_version: &'static str,
+) -> DaemonStatus {
+    let primary = status_in(dir, app_version);
+    if primary.running || primary.error.is_some() {
+        return primary;
+    }
+    let Some(legacy_dir) = legacy_dir else {
+        return primary;
+    };
+    match running_named(legacy_dir, LEGACY_LOCK_FILE) {
+        Ok(Some(owner)) => DaemonStatus {
+            running: true,
+            pid: owner.pid,
+            version: owner.version,
+            app_version,
+            mismatch: true,
+            error: None,
+        },
+        Ok(None) => primary,
+        Err(error) => DaemonStatus {
+            running: false,
+            pid: None,
+            version: None,
+            app_version,
+            mismatch: false,
+            error: Some(error),
+        },
+    }
 }
 
 /// The Tauri command the diagnostics view reads. Off the GUI thread: it reads
@@ -297,7 +340,7 @@ pub fn default_dir() -> Option<PathBuf> {
 pub fn cmd_daemon_status() -> DaemonStatus {
     let app_version = env!("CARGO_PKG_VERSION");
     match default_dir() {
-        Some(dir) => status_in(&dir, app_version),
+        Some(dir) => status_with_legacy(&dir, legacy_default_dir().as_deref(), app_version),
         None => DaemonStatus {
             running: false,
             pid: None,
@@ -391,5 +434,33 @@ mod tests {
                 version: None
             }
         );
+    }
+
+    #[test]
+    fn wayloded_lock_name_and_legacy_gitpulsed_orphan_detection() {
+        assert_eq!(LOCK_FILE, "wayloded.lock");
+        assert!(default_dir().unwrap().ends_with("wayloded"));
+        assert!(legacy_default_dir().unwrap().ends_with("gitpulsed"));
+
+        let waylode_dir = tempfile::tempdir().unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+        // No daemon running anywhere.
+        let clean = status_with_legacy(waylode_dir.path(), Some(legacy_dir.path()), "0.2.0");
+        assert!(!clean.running);
+
+        // Orphaned pre-upgrade gitpulsed holds legacy gitpulsed.lock even with same version.
+        let orphan = match acquire_named(legacy_dir.path(), LEGACY_LOCK_FILE, "0.2.0") {
+            Acquire::Held(lock) => lock,
+            other => panic!("legacy lock was not acquired: {other:?}"),
+        };
+        let detected = status_with_legacy(waylode_dir.path(), Some(legacy_dir.path()), "0.2.0");
+        assert!(detected.running);
+        assert!(
+            detected.mismatch,
+            "orphaned legacy daemon must be flagged as mismatch"
+        );
+        assert_eq!(detected.pid, Some(std::process::id()));
+        assert_eq!(detected.version.as_deref(), Some("0.2.0"));
+        drop(orphan);
     }
 }

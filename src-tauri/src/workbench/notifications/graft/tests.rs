@@ -39,7 +39,7 @@ fn parsed(line: &[u8]) -> Value {
 fn a_post_is_one_json_line_in_the_contracted_shape() {
     let request = Request::Post {
         key: ACTIVITY.into(),
-        title: "GitPulse activity".into(),
+        title: "Waylode activity".into(),
         text: "Task enhancement ready to review".into(),
         silent: true,
     };
@@ -49,8 +49,8 @@ fn a_post_is_one_json_line_in_the_contracted_shape() {
     assert_eq!(
         sent,
         serde_json::json!({
-            "op":"post","src":"gitpulse","key":ACTIVITY,"app":"GitPulse",
-            "title":"GitPulse activity","text":"Task enhancement ready to review",
+            "op":"post","src":"gitpulse","key":ACTIVITY,"app":"Waylode",
+            "title":"Waylode activity","text":"Task enhancement ready to review",
             "silent":true,
         })
     );
@@ -529,7 +529,7 @@ fn the_process_wide_entry_points_reach_the_socket_named_by_the_environment() {
 
     // A banner the Mac showed with sound is audible on the phone; one it
     // showed silently is silent.
-    post(ACTIVITY, "GitPulse activity", "Run finished", true);
+    post(ACTIVITY, "Waylode activity", "Run finished", true);
     let line = fake
         .next_request(coverage_relaxed(Duration::from_secs(3)))
         .expect("the post arrived");

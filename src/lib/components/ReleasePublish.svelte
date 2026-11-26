@@ -185,7 +185,7 @@
           checked={releaseConfirmed}
           onchange={(next) => (releaseConfirmed = next)}
           label="I confirm the working tree is ready."
-          description="GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags."
+          description="Waylode will still require a clean, fully synchronized default branch and will refuse duplicate remote tags."
         />
       </div>
       {#if error}

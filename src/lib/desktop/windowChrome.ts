@@ -36,7 +36,7 @@ export async function syncWindowChrome(title: string, badgeCount: number): Promi
 }
 
 export function repoWindowTitle(path: string | null, branch: string | null): string {
-  if (!path) return "GitPulse";
+  if (!path) return "Waylode";
   const name = path.split(/[\\/]/).filter(Boolean).pop() || path;
   return branch ? `${name} — ${branch}` : name;
 }

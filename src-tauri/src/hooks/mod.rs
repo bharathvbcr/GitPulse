@@ -266,11 +266,20 @@ pub enum HostKind {
 /// Returns `true` when the environment explicitly identifies `gitpulse-hook` as
 /// running under an Antigravity plugin or hosted `agy` session, so early-exit /
 /// stdin-error paths still emit `"{}"` rather than 0-byte stdout.
+pub const HOST_ENV: &str = "WAYLODE_HOST";
+pub const LEGACY_HOST_ENV: &str = "GITPULSE_HOST";
+
+/// Returns `true` when the environment explicitly identifies `waylode-hook` as
+/// running under an Antigravity plugin or hosted `agy` session, so early-exit /
+/// stdin-error paths still emit `"{}"` rather than 0-byte stdout.
 pub fn is_antigravity_env() -> bool {
-    std::env::var("GITPULSE_HOST").ok().as_deref() == Some("antigravity")
-        || std::env::var(AGENT_KIND_ENV).ok().as_deref() == Some("agy")
-        || std::env::var_os("PLUGIN_ROOT")
-            .is_some_and(|p| p.to_string_lossy().contains("gitpulse-agy"))
+    crate::env_compat::var_compat(HOST_ENV, LEGACY_HOST_ENV).as_deref() == Some("antigravity")
+        || crate::env_compat::var_compat(AGENT_KIND_ENV, LEGACY_AGENT_KIND_ENV).as_deref()
+            == Some("agy")
+        || std::env::var_os("PLUGIN_ROOT").is_some_and(|p| {
+            let s = p.to_string_lossy();
+            s.contains("waylode-agy") || s.contains("gitpulse-agy")
+        })
 }
 
 /// Promotes a default `HostKind::Claude` payload to `HostKind::Antigravity` when
@@ -3481,7 +3490,7 @@ fn scratch_build_line(checkout: &str) -> String {
 /// the same binary, one request per command. Only a brief can say this — a
 /// server that never loaded produces no failure for any later hook to see.
 /// Under the header with the scratch line, so the cap never cuts it.
-pub const SHELL_FALLBACK_LINE: &str = "MCP tools missing or failing: gitpulse-mcp call <tool> key=value answers from the shell (gitpulse-mcp tools lists them; a write needs --write)";
+pub const SHELL_FALLBACK_LINE: &str = "MCP tools missing or failing: waylode-mcp call <tool> key=value answers from the shell (waylode-mcp tools lists them; a write needs --write)";
 
 /// [`session_brief`] with two more lines right under the header, so they are
 /// never the part [`BRIEF_LIMIT`] cuts: what the published host-load snapshot
@@ -3738,7 +3747,8 @@ fn run_session_brief_with(
             &input.session_id,
             std::env::var_os("CLAUDE_ENV_FILE").as_deref(),
             crate::tool_config::default_config_dir().as_deref(),
-            std::env::var_os(lease_wrapper::BIN_ENV).is_some(),
+            crate::env_compat::var_os_compat(lease_wrapper::BIN_ENV, lease_wrapper::LEGACY_BIN_ENV)
+                .is_some(),
         );
         format!("{load_line}; {}", route.describe())
     };
@@ -3789,8 +3799,7 @@ fn report_agent_session_meta(repo_root: &str, input: &HookInput) {
         return;
     }
     let agent = if input.is_antigravity()
-        || std::env::var(AGENT_KIND_ENV)
-            .ok()
+        || crate::env_compat::var_compat(AGENT_KIND_ENV, LEGACY_AGENT_KIND_ENV)
             .is_some_and(|kind| kind == "agy")
     {
         "agy"
@@ -3995,7 +4004,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn identity() -> String {
     let served: Vec<&str> = SUBCOMMANDS.iter().chain(&BINARY_MODES).copied().collect();
     format!(
-        "gitpulse-hook {VERSION}\nsubcommands: {}\n",
+        "waylode-hook {VERSION}\nsubcommands: {}\n",
         served.join(", ")
     )
 }
@@ -4117,10 +4126,12 @@ fn upsert_hook_peer(root: &Path, input: &HookInput, turn_state: &str) -> Option<
     let (provider, surface) = peer_provider_and_surface(input);
     let (pid, proc_start_ns) = parent_agent_process_identity();
     let branch = fast_head_branch(root);
-    let run_id = std::env::var("GITPULSE_RUN_ID")
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty());
+    let run_id = crate::env_compat::var_compat(
+        crate::sysload::RUN_ID_ENV,
+        crate::sysload::LEGACY_RUN_ID_ENV,
+    )
+    .map(|s| s.trim().to_owned())
+    .filter(|s| !s.is_empty());
     let record = crate::engine::agent_bus::upsert_peer(
         &root.to_string_lossy(),
         crate::engine::agent_bus::PeerUpsert {
@@ -4593,7 +4604,9 @@ pub(crate) fn stop_continue_in(
 ///
 /// Set by GitPulse on the sessions it launches, where the launcher is known
 /// exactly. An external session has none and is identified from the payload.
-pub const AGENT_KIND_ENV: &str = "GITPULSE_AGENT_KIND";
+pub const AGENT_KIND_ENV: &str = "WAYLODE_AGENT_KIND";
+/// Legacy environment variable for [`AGENT_KIND_ENV`].
+pub const LEGACY_AGENT_KIND_ENV: &str = "GITPULSE_AGENT_KIND";
 
 /// Wall-clock ceiling on one notification report.
 ///
@@ -4693,7 +4706,10 @@ const INJECTED_TRANSPORT: bool = true;
 /// The socket a report goes to: `GITPULSE_NOTIFY_SOCKET` when set, else the
 /// one in GitPulse's configuration directory (`None` with no such directory).
 fn socket_path_from_env() -> Option<std::path::PathBuf> {
-    match std::env::var_os(crate::alerts::bridge::SOCKET_ENV) {
+    match crate::env_compat::var_os_compat(
+        crate::alerts::bridge::SOCKET_ENV,
+        crate::alerts::bridge::LEGACY_SOCKET_ENV,
+    ) {
         Some(value) if !value.is_empty() => Some(std::path::PathBuf::from(value)),
         _ => crate::alerts::bridge::socket_path(),
     }
@@ -4805,9 +4821,11 @@ fn missed_reply(
 /// whitespace, path-traversal, bidi, or oversized `GITPULSE_SESSION_ID` neither
 /// stuffs an oversized report into the socket nor poisons `peers.json`.
 fn session_env() -> Option<String> {
-    std::env::var(crate::alerts::bridge::SESSION_ENV)
-        .ok()
-        .filter(|session| crate::alerts::bridge::valid_key(session))
+    crate::env_compat::var_compat(
+        crate::alerts::bridge::SESSION_ENV,
+        crate::alerts::bridge::LEGACY_SESSION_ENV,
+    )
+    .filter(|session| crate::alerts::bridge::valid_key(session))
 }
 
 /// The most of a ledger caveat the brief carries: the brief is read by an
@@ -4928,8 +4946,8 @@ fn clip(text: &str, bytes: usize) -> &str {
 
 /// The JSON one report carries, matching `alerts::bridge::parse_report`.
 fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> String {
-    let agent = match std::env::var(AGENT_KIND_ENV) {
-        Ok(kind)
+    let agent = match crate::env_compat::var_compat(AGENT_KIND_ENV, LEGACY_AGENT_KIND_ENV) {
+        Some(kind)
             if crate::alerts::bridge::AGENTS
                 .iter()
                 .any(|(name, _)| *name == kind) =>
@@ -5156,18 +5174,18 @@ fn refusal_text(reply: Option<&Value>) -> String {
                 None => "the running app did not say which protocol it speaks".to_owned(),
             };
             format!(
-                "GitPulse refused the report: {token} (this gitpulse-hook sends protocol v{PROTOCOL_VERSION}; {theirs})"
+                "Waylode refused the report: {token} (this waylode-hook sends protocol v{PROTOCOL_VERSION}; {theirs})"
             )
         }
         Some(known) => format!(
-            "GitPulse refused the report: {} ({})",
+            "Waylode refused the report: {} ({})",
             known.token(),
             known.message()
         ),
         // A reason from an app newer than this hook. Shown as sent, minus
         // anything that is not printable and past a length no token has.
         None => format!(
-            "GitPulse refused the report: {}",
+            "Waylode refused the report: {}",
             crate::alerts::text::printable(token, 64)
         ),
     }
@@ -9580,7 +9598,7 @@ done
             1,
             "{cut}"
         );
-        assert!(SHELL_FALLBACK_LINE.contains("gitpulse-mcp call <tool>"));
+        assert!(SHELL_FALLBACK_LINE.contains("waylode-mcp call <tool>"));
         assert!(SHELL_FALLBACK_LINE.len() < 160);
     }
 
@@ -10703,7 +10721,7 @@ done
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("the crate has a parent directory")
-            .join("plugins/gitpulse/hooks/hooks.json");
+            .join("plugins/waylode/hooks/hooks.json");
         let parsed: Value = serde_json::from_str(
             &std::fs::read_to_string(&manifest)
                 .unwrap_or_else(|e| panic!("{}: {e}", manifest.display())),
@@ -10727,7 +10745,7 @@ done
                     let mut words = command.split_whitespace();
                     assert_eq!(
                         words.next(),
-                        Some("gitpulse-hook"),
+                        Some("waylode-hook"),
                         "{event_name} spawns something else: {command}"
                     );
                     let subcommand = words.next().unwrap_or_default();
@@ -10973,7 +10991,7 @@ done
         // turns a staleness check into an unresponsive binary.
         assert_eq!(
             lines.next(),
-            Some(format!("gitpulse-hook {VERSION}").as_str())
+            Some(format!("waylode-hook {VERSION}").as_str())
         );
         let listed = lines.next().expect("identity names its subcommands");
         let listed = listed
@@ -11048,7 +11066,7 @@ done
     fn the_manifest_matcher_and_the_judged_write_tools_agree() {
         let manifest: Value = serde_json::from_str(
             &std::fs::read_to_string(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json"),
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/waylode/hooks/hooks.json"),
             )
             .expect("the plugin ships a hooks manifest"),
         )
@@ -12525,27 +12543,27 @@ done
                     "--manifest-path",
                     concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
                     "--bin",
-                    "gitpulse-hook",
+                    "waylode-hook",
                     "--message-format=json",
                 ])
                 .output_locked()
-                .expect("build gitpulse-hook");
+                .expect("build waylode-hook");
             assert!(
                 built.status.success(),
-                "cargo build --bin gitpulse-hook failed: {}",
+                "cargo build --bin waylode-hook failed: {}",
                 String::from_utf8_lossy(&built.stderr)
             );
             let bin = String::from_utf8_lossy(&built.stdout)
                 .lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .filter(|m| {
-                    m["reason"] == "compiler-artifact" && m["target"]["name"] == "gitpulse-hook"
+                    m["reason"] == "compiler-artifact" && m["target"]["name"] == "waylode-hook"
                 })
                 .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
-                .expect("cargo reported no gitpulse-hook executable");
+                .expect("cargo reported no waylode-hook executable");
             let mut child = std::process::Command::new(&bin)
                 .arg("peer-inbox")
-                .env("GITPULSE_HOST", "antigravity")
+                .env("WAYLODE_HOST", "antigravity")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -12560,12 +12578,12 @@ done
                     .write_all(b"{}")
                     .expect("write {} stdin");
             }
-            let output = child.wait_with_output().expect("wait gitpulse-hook");
+            let output = child.wait_with_output().expect("wait waylode-hook");
             assert!(output.status.success());
             assert_eq!(
                 String::from_utf8_lossy(&output.stdout),
                 "{}\n",
-                "Antigravity hook must never emit 0-byte stdout under GITPULSE_HOST=antigravity"
+                "Antigravity hook must never emit 0-byte stdout under WAYLODE_HOST=antigravity"
             );
         }
 

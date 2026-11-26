@@ -2913,9 +2913,10 @@ fn on_path_in(stem: &str, path_var: Option<std::ffi::OsString>) -> bool {
     })
 }
 
-/// Resolves one bundled executable: an explicit `env_var` override, else this
-/// process itself or a file beside it (the app bundle's `Contents/MacOS`).
-fn resolve_bundled_binary(env_var: &str, stem: &str) -> BinaryStatus {
+/// Resolves one bundled executable: an explicit `primary_env` (or `legacy_env`)
+/// override, else this process itself or a file beside it (the app bundle's
+/// `Contents/MacOS`).
+fn resolve_bundled_binary(primary_env: &str, legacy_env: &str, stem: &str) -> BinaryStatus {
     let on_path = on_path_in(stem, std::env::var_os("PATH"));
     let missing = |error: String| BinaryStatus {
         error,
@@ -2928,13 +2929,22 @@ fn resolve_bundled_binary(env_var: &str, stem: &str) -> BinaryStatus {
         error: String::new(),
         on_path,
     };
-    if let Ok(explicit) = std::env::var(env_var) {
+    if let Some((explicit, which_env)) =
+        crate::env_compat::var_compat(primary_env, legacy_env).map(|val| {
+            let env_name = if std::env::var_os(primary_env).is_some() {
+                primary_env
+            } else {
+                legacy_env
+            };
+            (val, env_name)
+        })
+    {
         if Path::new(&explicit).is_file() {
             return found(explicit);
         }
         return BinaryStatus {
             path: explicit,
-            ..missing(format!("{env_var} does not point at a file"))
+            ..missing(format!("{which_env} does not point at a file"))
         };
     }
     let exe = match std::env::current_exe() {
@@ -2961,21 +2971,31 @@ fn resolve_bundled_binary(env_var: &str, stem: &str) -> BinaryStatus {
         }
     }
     missing(format!(
-        "{stem} is not next to this app. Build it with `cargo build --bin {stem} --manifest-path src-tauri/Cargo.toml`, or set {env_var}."
+        "{stem} is not next to this app. Build it with `cargo build --bin {stem} --manifest-path src-tauri/Cargo.toml`, or set {primary_env}."
     ))
 }
 
 /// The path of a helper executable that ships beside the app (the bundle's
-/// `Contents/MacOS`), or why it could not be found. `env_var` overrides, as it
-/// does for the copy-paste setup above.
+/// `Contents/MacOS`), or why it could not be found. `primary_env`/`legacy_env`
+/// override, as they do for the copy-paste setup above.
 #[cfg(unix)]
-pub(crate) fn bundled_binary(env_var: &str, stem: &str) -> Result<std::path::PathBuf, String> {
-    let status = resolve_bundled_binary(env_var, stem);
+pub(crate) fn bundled_binary_compat(
+    primary_env: &str,
+    legacy_env: &str,
+    stem: &str,
+) -> Result<std::path::PathBuf, String> {
+    let status = resolve_bundled_binary(primary_env, legacy_env, stem);
     if status.found {
         Ok(status.path.into())
     } else {
         Err(status.error)
     }
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn bundled_binary(env_var: &str, stem: &str) -> Result<std::path::PathBuf, String> {
+    bundled_binary_compat(env_var, env_var, stem)
 }
 
 /// Single-quotes `text` for a POSIX shell.
@@ -3124,16 +3144,25 @@ pub(crate) fn windows_hook_handler(
     Ok(())
 }
 
-/// The plugin's MCP manifest with `gitpulse` started by `binary`'s absolute
-/// path. A bare `gitpulse-mcp` only works when something put it on `PATH`, and
-/// a released app does not.
+/// The plugin's MCP manifest with `waylode` (or legacy `gitpulse`) started by
+/// `binary`'s absolute path. A bare `waylode-mcp` only works when something put
+/// it on `PATH`, and a released app does not.
 fn mcp_config_with(template: &str, binary: &str) -> Result<String, String> {
     let mut value: serde_json::Value =
         serde_json::from_str(template).map_err(|e| format!("the MCP manifest is not JSON: {e}"))?;
-    let server = value
-        .pointer_mut("/mcpServers/gitpulse")
+    let servers = value
+        .pointer_mut("/mcpServers")
         .and_then(|s| s.as_object_mut())
-        .ok_or("the MCP manifest has no gitpulse server")?;
+        .ok_or("the MCP manifest has no waylode server")?;
+    let key = if servers.contains_key("waylode") {
+        "waylode"
+    } else {
+        "gitpulse"
+    };
+    let server = servers
+        .get_mut(key)
+        .and_then(|s| s.as_object_mut())
+        .ok_or("the MCP manifest has no waylode server")?;
     server.insert(
         "command".into(),
         serde_json::Value::String(binary.to_string()),
@@ -3199,7 +3228,10 @@ fn hooks_config_for(
                 };
                 let command = command.as_str();
                 let (bare, launched) = crate::hooks::worktree::strip_launcher(command);
-                let Some(args) = bare.strip_prefix("gitpulse-hook ") else {
+                let Some(args) = bare
+                    .strip_prefix("waylode-hook ")
+                    .or_else(|| bare.strip_prefix("gitpulse-hook "))
+                else {
                     return Err(format!("unexpected hook command: {command}"));
                 };
                 let worktree_event = matches!(
@@ -3259,7 +3291,9 @@ fn is_native_plugin_root(path: &Path) -> bool {
 }
 
 fn resolve_plugin_root() -> (bool, String, String) {
-    if let Ok(explicit) = std::env::var("GITPULSE_PLUGIN_ROOT") {
+    if let Some(explicit) =
+        crate::env_compat::var_compat("WAYLODE_PLUGIN_ROOT", "GITPULSE_PLUGIN_ROOT")
+    {
         let path = Path::new(&explicit);
         if is_native_plugin_root(path) {
             return (true, explicit, String::new());
@@ -3267,21 +3301,21 @@ fn resolve_plugin_root() -> (bool, String, String) {
         return (
             false,
             explicit,
-            "GITPULSE_PLUGIN_ROOT has no .codex-plugin/plugin.json or .mcp.json".into(),
+            "WAYLODE_PLUGIN_ROOT has no .codex-plugin/plugin.json or .mcp.json".into(),
         );
     }
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // macOS app bundle: Contents/MacOS/gitpulse reads the package that
+            // macOS app bundle: Contents/MacOS/waylode reads the package that
             // Tauri copied to Contents/Resources/plugin.
             candidates.push(dir.join("../Resources/plugin"));
             candidates.push(dir.join("plugin"));
             // Development binaries live under src-tauri/target/<profile>.
-            candidates.push(dir.join("../../../plugins/gitpulse"));
+            candidates.push(dir.join("../../../plugins/waylode"));
         }
     }
-    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse"));
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/waylode"));
     for candidate in candidates {
         if is_native_plugin_root(&candidate) {
             let canon = candidate
@@ -3295,7 +3329,7 @@ fn resolve_plugin_root() -> (bool, String, String) {
     (
         false,
         String::new(),
-        "Codex plugin package not found next to this app (expected plugin/.codex-plugin/plugin.json and plugin/.mcp.json). Set GITPULSE_PLUGIN_ROOT."
+        "Codex plugin package not found next to this app (expected plugin/.codex-plugin/plugin.json and plugin/.mcp.json). Set WAYLODE_PLUGIN_ROOT."
             .into(),
     )
 }
@@ -3304,8 +3338,8 @@ fn resolve_plugin_root() -> (bool, String, String) {
 /// manifests, and the tool catalog. Never claims a binary is present when the
 /// file could not be found.
 pub fn mcp_info() -> McpInfo {
-    let mcp = resolve_bundled_binary("GITPULSE_MCP_PATH", "gitpulse-mcp");
-    let hook = resolve_bundled_binary("GITPULSE_HOOK_PATH", "gitpulse-hook");
+    let mcp = resolve_bundled_binary("WAYLODE_MCP_PATH", "GITPULSE_MCP_PATH", "waylode-mcp");
+    let hook = resolve_bundled_binary("WAYLODE_HOOK_PATH", "GITPULSE_HOOK_PATH", "waylode-hook");
     let (plugin_found, plugin_path, mut plugin_error) = resolve_plugin_root();
     let (plugin_manifest_json, plugin_mcp_json, mcp_config_json, hooks_config_json) =
         if plugin_found {
@@ -3345,7 +3379,7 @@ pub fn mcp_info() -> McpInfo {
             let mcp_config = check(
                 mcp_config_with(
                     &mcp_template,
-                    if mcp.found { &mcp.path } else { "gitpulse-mcp" },
+                    if mcp.found { &mcp.path } else { "waylode-mcp" },
                 ),
                 mcp.found,
             );
@@ -3356,7 +3390,7 @@ pub fn mcp_info() -> McpInfo {
                         if hook.found {
                             &hook.path
                         } else {
-                            "gitpulse-hook"
+                            "waylode-hook"
                         },
                         &plugin_path,
                     ),
@@ -5630,7 +5664,8 @@ mod tests {
         let serial = crate::harness::sidecar::test_serial();
         // Force the miss path: an explicit env that is not a file.
         let _env = crate::test_support::env::bind_env(&serial)
-            .set("GITPULSE_MCP_PATH", "/no/such/gitpulse-mcp");
+            .remove("GITPULSE_MCP_PATH")
+            .set("WAYLODE_MCP_PATH", "/no/such/waylode-mcp");
         let info = mcp_info();
         assert!(!info.binary_found);
         assert!(!info.binary_error.is_empty());
@@ -5641,7 +5676,7 @@ mod tests {
 
     fn shipped_plugin_root() -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../plugins/gitpulse")
+            .join("../plugins/waylode")
             .canonicalize()
             .expect("the plugin package is in the tree")
             .to_string_lossy()
@@ -5650,7 +5685,7 @@ mod tests {
 
     fn plugin_hooks_template() -> String {
         fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/waylode/hooks/hooks.json"),
         )
         .expect("the plugin ships a hooks manifest")
     }
@@ -5699,7 +5734,7 @@ mod tests {
         let unix: serde_json::Value = serde_json::from_str(
             &hooks_config_for(
                 &plugin_hooks_template(),
-                "/opt/gitpulse-hook",
+                "/opt/waylode-hook",
                 "/plugin",
                 false,
             )
@@ -5712,7 +5747,7 @@ mod tests {
                 .unwrap();
             assert!(
                 command.starts_with(
-                    "sh '/plugin/hooks/gitpulse-worktree.sh' '/opt/gitpulse-hook' worktree-"
+                    "sh '/plugin/hooks/waylode-worktree.sh' '/opt/waylode-hook' worktree-"
                 ),
                 "{event}: {command}"
             );
@@ -5723,23 +5758,22 @@ mod tests {
     /// name the binary by path. The shipped one names it bare.
     #[test]
     fn the_generated_hooks_and_mcp_manifests_name_the_binary_by_absolute_path() {
-        let commands =
-            generated_commands("/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook");
+        let commands = generated_commands("/Applications/Waylode.app/Contents/MacOS/waylode-hook");
         assert!(!commands.is_empty());
         for (_, command) in &commands {
             assert!(
-                command.contains("/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook"),
+                command.contains("/Applications/Waylode.app/Contents/MacOS/waylode-hook"),
                 "{command}"
             );
-            assert!(!command.starts_with("gitpulse-hook "), "{command}");
+            assert!(!command.starts_with("waylode-hook "), "{command}");
         }
         let mcp = mcp_config_with(
-            r#"{"mcpServers":{"gitpulse":{"type":"stdio","command":"gitpulse-mcp"}}}"#,
-            "/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp",
+            r#"{"mcpServers":{"waylode":{"type":"stdio","command":"waylode-mcp"}}}"#,
+            "/Applications/Waylode.app/Contents/MacOS/waylode-mcp",
         )
         .unwrap();
         assert!(
-            mcp.contains("\"command\": \"/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp\""),
+            mcp.contains("\"command\": \"/Applications/Waylode.app/Contents/MacOS/waylode-mcp\""),
             "{mcp}"
         );
         assert!(mcp_config_with("{}", "/x").is_err());
@@ -5751,7 +5785,7 @@ mod tests {
         .is_err());
         // The launcher is for the worktree events only, and they need it.
         let launched = format!(
-            "{}gitpulse-hook notify turn_finished",
+            "{}waylode-hook notify turn_finished",
             crate::hooks::worktree::LAUNCHER_PREFIX
         );
         assert!(hooks_config_with(
@@ -5761,7 +5795,7 @@ mod tests {
         )
         .is_err());
         assert!(hooks_config_with(
-            r#"{"hooks":{"WorktreeCreate":[{"hooks":[{"command":"gitpulse-hook worktree-create"}]}]}}"#,
+            r#"{"hooks":{"WorktreeCreate":[{"hooks":[{"command":"waylode-hook worktree-create"}]}]}}"#,
             "/x",
             "/plugin"
         )
@@ -6086,30 +6120,27 @@ mod tests {
     fn a_bare_command_is_not_reachable_on_an_empty_path() {
         let dir = tempfile::tempdir().unwrap();
         let name = if cfg!(windows) {
-            "gitpulse-hook.exe"
+            "waylode-hook.exe"
         } else {
-            "gitpulse-hook"
+            "waylode-hook"
         };
         fs::write(dir.path().join(name), "").unwrap();
         assert!(on_path_in(
-            "gitpulse-hook",
+            "waylode-hook",
             Some(dir.path().as_os_str().to_owned())
         ));
+        assert!(!on_path_in("waylode-hook", Some(std::ffi::OsString::new())));
+        assert!(!on_path_in("waylode-hook", None));
         assert!(!on_path_in(
-            "gitpulse-hook",
-            Some(std::ffi::OsString::new())
-        ));
-        assert!(!on_path_in("gitpulse-hook", None));
-        assert!(!on_path_in(
-            "gitpulse-mcp",
+            "waylode-mcp",
             Some(dir.path().as_os_str().to_owned())
         ));
         assert!(looks_like_binary(
-            "gitpulse-hook-aarch64-apple-darwin",
-            "gitpulse-hook"
+            "waylode-hook-aarch64-apple-darwin",
+            "waylode-hook"
         ));
-        assert!(looks_like_binary("gitpulse-hook.exe", "gitpulse-hook"));
-        assert!(!looks_like_binary("gitpulse-hookah", "gitpulse-hook"));
+        assert!(looks_like_binary("waylode-hook.exe", "waylode-hook"));
+        assert!(!looks_like_binary("waylode-hookah", "waylode-hook"));
     }
 
     /// With the hook binary unresolved nothing is offered to copy: a manifest
@@ -6118,11 +6149,12 @@ mod tests {
     fn mcp_info_offers_no_hooks_manifest_for_a_hook_binary_it_did_not_find() {
         let serial = crate::harness::sidecar::test_serial();
         let _env = crate::test_support::env::bind_env(&serial)
-            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+            .remove("GITPULSE_HOOK_PATH")
+            .set("WAYLODE_HOOK_PATH", "/no/such/waylode-hook");
         let info = mcp_info();
         assert!(!info.hook_found);
         assert!(
-            info.hook_error.contains("GITPULSE_HOOK_PATH"),
+            info.hook_error.contains("WAYLODE_HOOK_PATH"),
             "{}",
             info.hook_error
         );
@@ -6149,15 +6181,18 @@ mod tests {
 
         let package = plugin_package("{}", r#"{"hooks":{}}"#);
         let _env = crate::test_support::env::bind_env(&serial)
-            .set("GITPULSE_PLUGIN_ROOT", package.path().to_str().unwrap())
-            .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
-            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+            .remove("GITPULSE_PLUGIN_ROOT")
+            .remove("GITPULSE_MCP_PATH")
+            .remove("GITPULSE_HOOK_PATH")
+            .set("WAYLODE_PLUGIN_ROOT", package.path().to_str().unwrap())
+            .set("WAYLODE_MCP_PATH", exe.to_str().unwrap())
+            .set("WAYLODE_HOOK_PATH", "/no/such/waylode-hook");
         let info = mcp_info();
         assert!(info.plugin_found);
         assert!(info.binary_found);
         assert!(info.mcp_config_json.is_empty());
         assert!(
-            info.plugin_error.contains("no gitpulse server"),
+            info.plugin_error.contains("no waylode server"),
             "{:?}",
             info.plugin_error
         );
@@ -6166,9 +6201,12 @@ mod tests {
         // Not JSON at all, and the binary was not found: still reported.
         let package = plugin_package("not json", r#"{"hooks":{}}"#);
         let _env = crate::test_support::env::bind_env(&serial)
-            .set("GITPULSE_PLUGIN_ROOT", package.path().to_str().unwrap())
-            .set("GITPULSE_MCP_PATH", "/no/such/gitpulse-mcp")
-            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+            .remove("GITPULSE_PLUGIN_ROOT")
+            .remove("GITPULSE_MCP_PATH")
+            .remove("GITPULSE_HOOK_PATH")
+            .set("WAYLODE_PLUGIN_ROOT", package.path().to_str().unwrap())
+            .set("WAYLODE_MCP_PATH", "/no/such/waylode-mcp")
+            .set("WAYLODE_HOOK_PATH", "/no/such/waylode-hook");
         let info = mcp_info();
         assert!(!info.binary_found);
         assert!(
@@ -6180,13 +6218,16 @@ mod tests {
 
         // A hooks manifest that is there but cannot be read is a read error,
         // not an empty file.
-        let package = plugin_package(r#"{"mcpServers":{"gitpulse":{}}}"#, "{}");
+        let package = plugin_package(r#"{"mcpServers":{"waylode":{}}}"#, "{}");
         fs::remove_file(package.path().join("hooks/hooks.json")).unwrap();
         fs::create_dir(package.path().join("hooks/hooks.json")).unwrap();
         let _env = crate::test_support::env::bind_env(&serial)
-            .set("GITPULSE_PLUGIN_ROOT", package.path().to_str().unwrap())
-            .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
-            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+            .remove("GITPULSE_PLUGIN_ROOT")
+            .remove("GITPULSE_MCP_PATH")
+            .remove("GITPULSE_HOOK_PATH")
+            .set("WAYLODE_PLUGIN_ROOT", package.path().to_str().unwrap())
+            .set("WAYLODE_MCP_PATH", exe.to_str().unwrap())
+            .set("WAYLODE_HOOK_PATH", "/no/such/waylode-hook");
         let info = mcp_info();
         assert!(
             info.plugin_error.contains("could not read"),
@@ -6201,20 +6242,22 @@ mod tests {
 
     #[test]
     fn mcp_info_reads_the_native_codex_package() {
-        // `GITPULSE_PLUGIN_ROOT` is process-global. A parallel test points it
+        // `WAYLODE_PLUGIN_ROOT` is process-global. A parallel test points it
         // at a temp package; reading it without the env serial reports that
         // temp dir as the native Codex package.
         let serial = crate::test_support::env::env_serial();
-        let _env = crate::test_support::env::bind_env(&serial).remove("GITPULSE_PLUGIN_ROOT");
+        let _env = crate::test_support::env::bind_env(&serial)
+            .remove("WAYLODE_PLUGIN_ROOT")
+            .remove("GITPULSE_PLUGIN_ROOT");
         let info = mcp_info();
         assert!(info.plugin_found, "{}", info.plugin_error);
         assert!(
-            Path::new(&info.plugin_path).ends_with("plugins/gitpulse"),
+            Path::new(&info.plugin_path).ends_with("plugins/waylode"),
             "unexpected plugin root: {}",
             info.plugin_path
         );
         assert!(info.plugin_manifest_json.contains("\"mcpServers\""));
-        assert!(info.plugin_mcp_json.contains("\"gitpulse\""));
+        assert!(info.plugin_mcp_json.contains("\"waylode\""));
         assert!(!info.plugin_mcp_json.contains("$schema"));
     }
 

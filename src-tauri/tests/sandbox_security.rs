@@ -1,19 +1,19 @@
 //! Integration tests for sandbox hardening: symlink escapes through
 //! `sandbox_write` and working-tree reads, plus the bounded `gh` CLI probe.
 
-#[cfg(unix)]
-use gitpulse_lib::engine::git_cli::git_text;
-#[cfg(unix)]
-use gitpulse_lib::engine::git_cli::sandbox_write;
-#[cfg(unix)]
-use gitpulse_lib::engine::git_reader::GitReader;
-use gitpulse_lib::engine::git_writer::{
-    validate_clone_url, validate_oid_or_revision, validate_ref_name, GitWriter,
-};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use waylode_lib::engine::git_cli::git_text;
+#[cfg(unix)]
+use waylode_lib::engine::git_cli::sandbox_write;
+#[cfg(unix)]
+use waylode_lib::engine::git_reader::GitReader;
+use waylode_lib::engine::git_writer::{
+    validate_clone_url, validate_oid_or_revision, validate_ref_name, GitWriter,
+};
+use waylode_lib::procguard::LockedSpawn;
 
 /// Creates a plain (no commits needed) git repo so `validate_repo` accepts it.
 fn init_repo(dir: &std::path::Path) {
@@ -233,7 +233,7 @@ fn hung_gh_probe_is_bounded() {
             "PATH",
             format!("{}:{}", fake_bin.path().display(), old_path),
         );
-        present = gitpulse_lib::github::gh_cli_present();
+        present = waylode_lib::github::gh_cli_present();
     }
 
     assert!(!present, "a hanging gh must not count as present");
@@ -594,7 +594,7 @@ fn writing_dot_git_config_is_refused_and_the_config_is_untouched() {
     let before = dot_git_config(repo_dir.path());
 
     for path in [".git/config", ".GIT/config", ".git./config", ".git /config"] {
-        let edited = gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+        let edited = waylode_lib::engine::git_cli::sandbox_write_edited_text(
             &repo_str,
             path,
             HOSTILE_CONFIG,
@@ -610,8 +610,8 @@ fn writing_dot_git_config_is_refused_and_the_config_is_untouched() {
     }
 }
 
-fn sandbox_write_raw(repo: &str, path: &str) -> Result<(), gitpulse_lib::ipc_error::CommandError> {
-    gitpulse_lib::engine::git_cli::sandbox_write(repo, path, HOSTILE_CONFIG)
+fn sandbox_write_raw(repo: &str, path: &str) -> Result<(), waylode_lib::ipc_error::CommandError> {
+    waylode_lib::engine::git_cli::sandbox_write(repo, path, HOSTILE_CONFIG)
 }
 
 #[test]
@@ -638,7 +638,7 @@ fn ordinary_dot_git_prefixed_names_still_write() {
     init_repo(repo_dir.path());
     let repo_str = repo_dir.path().to_string_lossy().into_owned();
     for path in [".gitignore", ".gitkeep", ".github/x", "sub/.gitattributes"] {
-        gitpulse_lib::engine::git_cli::sandbox_write(&repo_str, path, "ok\n")
+        waylode_lib::engine::git_cli::sandbox_write(&repo_str, path, "ok\n")
             .unwrap_or_else(|e| panic!("{path}: {e}", e = e.message()));
         assert_eq!(
             std::fs::read_to_string(repo_dir.path().join(path)).unwrap(),
@@ -658,7 +658,7 @@ fn a_symlink_alias_of_dot_git_cannot_be_written_through() {
     let before = dot_git_config(&repo);
 
     assert!(sandbox_write_raw(&repo_str, "meta/config").is_err());
-    assert!(gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+    assert!(waylode_lib::engine::git_cli::sandbox_write_edited_text(
         &repo_str,
         "meta/config",
         HOSTILE_CONFIG
@@ -682,7 +682,7 @@ fn a_gitdir_file_layout_protects_the_real_git_directory() {
     let before = std::fs::read(repo.join(".bare/config")).unwrap();
 
     assert!(sandbox_write_raw(&repo_str, ".bare/config").is_err());
-    assert!(gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+    assert!(waylode_lib::engine::git_cli::sandbox_write_edited_text(
         &repo_str,
         ".bare/hooks/pre-commit",
         HOSTILE_CONFIG

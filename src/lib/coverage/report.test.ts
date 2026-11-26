@@ -173,7 +173,7 @@ describe("formatCoverageAgentPrompt", () => {
     expect(prompt).toContain("Do not fabricate");
     expect(prompt).not.toContain("\ufffd");
     expect(prompt.endsWith(
-      "\n\n[GitPulse context clipped; inspect the repository for the remaining languages, paths and coverage details.]",
+      "\n\n[Waylode context clipped; inspect the repository for the remaining languages, paths and coverage details.]",
     )).toBe(true);
   });
 
@@ -489,8 +489,8 @@ describe("buildCoverageIssueDraft", () => {
   it("clips hostile multi-byte MANVI prose by UTF-8 bytes with an explicit note", () => {
     const draft = buildCoverageIssueDraft(representativeReport(), "/repo", "🧪".repeat(40_000));
     expect(draft.clipped).toBe(true);
-    expect(draft.body).toContain("GitPulse clipped this draft");
-    expect(draft.body.endsWith("\n\n[GitPulse clipped this draft to stay below GitHub's body limit.]")).toBe(true);
+    expect(draft.body).toContain("Waylode clipped this draft");
+    expect(draft.body.endsWith("\n\n[Waylode clipped this draft to stay below GitHub's body limit.]")).toBe(true);
     expect(new TextEncoder().encode(draft.body).byteLength).toBeLessThanOrEqual(60 * 1024);
     expect(draft.body).not.toContain("\uFFFD");
   });

@@ -11,16 +11,16 @@
 //! helper itself by `decoding_valid_captured_output_does_not_copy_the_buffer`
 //! in the library's tests.
 
-#[cfg(unix)]
-use gitpulse_lib::engine::git_cli::{
-    git_bytes_capped, git_text, git_text_capped, git_text_partial, git_text_with_timeout,
-};
-#[cfg(unix)]
-use gitpulse_lib::engine::process::MAX_OUTPUT_BYTES;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 #[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
+use waylode_lib::engine::git_cli::{
+    git_bytes_capped, git_text, git_text_capped, git_text_partial, git_text_with_timeout,
+};
+#[cfg(unix)]
+use waylode_lib::engine::process::MAX_OUTPUT_BYTES;
 
 mod common;
 

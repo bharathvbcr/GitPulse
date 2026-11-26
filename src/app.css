@@ -1161,9 +1161,9 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     --field-focus-edge: rgb(var(--c-accent) / 0.45);
     --brand-gradient: linear-gradient(
       135deg,
-      #22d3ee 0%,
-      #7da2ff 52%,
-      #ab8bff 100%
+      #7dd3fc 0%,
+      #38bdf8 52%,
+      #3b82f6 100%
     );
   }
 
@@ -1228,9 +1228,9 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     --field-focus-edge: rgb(var(--c-accent) / 0.55);
     --brand-gradient: linear-gradient(
       135deg,
-      #06b6d4 0%,
-      #4f74e8 52%,
-      #8b5cf6 100%
+      #0284c7 0%,
+      #2563eb 52%,
+      #1d4ed8 100%
     );
 
     color-scheme: light;

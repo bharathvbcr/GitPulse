@@ -107,7 +107,7 @@ pub fn glass_plan(requested: bool, compiled_in: bool, appkit_version: Option<f64
     }
     match appkit_version {
         None => GlassPlan::Refuse(
-            "GitPulse couldn't read this Mac's AppKit version, so it didn't try Liquid Glass.".to_string(),
+            "Waylode couldn't read this Mac's AppKit version, so it didn't try Liquid Glass.".to_string(),
         ),
         Some(version) if !version.is_finite() || version < APPKIT_VERSION_LIQUID_GLASS => GlassPlan::Refuse(
             "Liquid Glass needs macOS 26 or later. This Mac is older, so the window keeps its standard material."
@@ -131,7 +131,7 @@ pub fn glass_outcome(plan: &GlassPlan, glass_view_present: Option<bool>) -> Flag
                 "AppKit didn't add the glass view, so the window keeps its standard material.",
             ),
             None => FlagStatus::refused(
-                "GitPulse couldn't check the window for the glass view, so it can't say Liquid Glass is on.",
+                "Waylode couldn't check the window for the glass view, so it can't say Liquid Glass is on.",
             ),
         },
     }
@@ -191,7 +191,7 @@ pub fn refresh_plan(
     }
     let Some(probe) = probe else {
         return unavailable(
-            "GitPulse couldn't reach the main webview, so frame pacing is unchanged.".to_string(),
+            "Waylode couldn't reach the main webview, so frame pacing is unchanged.".to_string(),
         );
     };
     if let Some(missing) = probe.missing() {
@@ -252,7 +252,7 @@ pub fn refresh_outcome(
 
 /// The status when the main-thread work could not be run or finished.
 pub fn failed(liquid_glass: bool, high_refresh: bool, error: &str) -> NativeRenderingStatus {
-    let reason = format!("GitPulse couldn't reach the window to apply this: {error}");
+    let reason = format!("Waylode couldn't reach the window to apply this: {error}");
     let one = |requested: bool| {
         if requested {
             FlagStatus::refused(reason.clone())

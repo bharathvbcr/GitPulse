@@ -79,7 +79,7 @@ fn without_a_process_only_a_provably_gone_owner_releases() {
     let decide = |owner: Liveness| judge(&held, Some(false), no_child, move |_, _| owner.clone());
     assert!(matches!(decide(Liveness::Gone), Verdict::Release(_)));
     assert!(
-        matches!(decide(Liveness::Alive), Verdict::Keep(r) if r.contains("Another running GitPulse"))
+        matches!(decide(Liveness::Alive), Verdict::Keep(r) if r.contains("Another running Waylode"))
     );
     assert!(matches!(
         decide(Liveness::Unknown("denied".into())),
@@ -504,7 +504,7 @@ fn lane_fixture(
     (dir, repo, lane, tip)
 }
 
-/// Where no process table can be read (Windows), a teardown is refused before
+/// Where no process table can be read (`procscan::SCAN_SUPPORTED` false), a teardown is refused before
 /// it merges or removes anything: a worktree whose use cannot be checked is
 /// left alone, by design.
 fn assert_refused_unchecked(err: crate::engine::worktree::MergeTeardownError) {
@@ -541,7 +541,7 @@ fn a_wave_merge_of_an_unverified_candidate_is_refused() {
         &allow_merge,
     )
     .unwrap_err();
-    if cfg!(windows) {
+    if !crate::sysload::procscan::SCAN_SUPPORTED {
         assert_refused_unchecked(err);
     } else {
         let crate::engine::worktree::MergeTeardownError::CandidateFailed { message, .. } = err
@@ -581,7 +581,7 @@ fn a_fast_forward_of_the_verified_tip_lands_without_a_task_record() {
         Some("ft-missing"),
         &allow_merge,
     );
-    if cfg!(windows) {
+    if !crate::sysload::procscan::SCAN_SUPPORTED {
         assert_refused_unchecked(outcome.unwrap_err());
         // Refused before the merge: main did not move, the lane is whole.
         assert_ne!(

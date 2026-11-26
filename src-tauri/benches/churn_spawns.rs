@@ -28,9 +28,9 @@ mod common;
 
 use common::fixture::{git, git_process_argvs, trust_repo};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::Path;
+use waylode_lib::procguard::LockedSpawn;
 
 const BRANCHES: usize = 32;
 
@@ -112,7 +112,7 @@ fn advance(repo: &str, n: usize) {
 
 fn branch_stats(repo: &str) -> usize {
     let report =
-        tauri::async_runtime::block_on(gitpulse_lib::commands::cmd_branch_stats(repo.to_string()))
+        tauri::async_runtime::block_on(waylode_lib::commands::cmd_branch_stats(repo.to_string()))
             .unwrap_or_else(|error| panic!("cmd_branch_stats failed: {error}"));
     assert_eq!(
         report.updates.len(),
@@ -158,7 +158,7 @@ impl Spawns {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("churn_spawns");
     let temp = tempfile::tempdir().expect("temp dir");
     let stopped = build(&temp.path().join("stopped"));

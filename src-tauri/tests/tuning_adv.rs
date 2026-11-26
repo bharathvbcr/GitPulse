@@ -8,15 +8,15 @@
 
 mod common;
 use common::{run_git, trust_repo};
-use gitpulse_lib::engine::tuning_apply::{tuning_apply, tuning_plan};
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::storage::repo_tuning::{
-    inspect_with, plan_apply, recommend, GitEnv, TuningChange,
-};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
+use waylode_lib::engine::tuning_apply::{tuning_apply, tuning_plan};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::storage::repo_tuning::{
+    inspect_with, plan_apply, recommend, GitEnv, TuningChange,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -348,7 +348,7 @@ fn env_with(version: (u32, u32, u32)) -> GitEnv {
     }
 }
 
-fn report_for(dir: &Path) -> gitpulse_lib::storage::repo_tuning::RepoTuningReport {
+fn report_for(dir: &Path) -> waylode_lib::storage::repo_tuning::RepoTuningReport {
     inspect_with(dir, dir, dir, None, Ok(&[]))
 }
 

@@ -106,7 +106,7 @@ pub(crate) fn judge_at(
     match tracked_here {
         Some(true) => {
             return Verdict::Keep(
-                "This GitPulse window still holds the agent's terminal; its own exit record comes first."
+                "This Waylode window still holds the agent's terminal; its own exit record comes first."
                     .into(),
             )
         }
@@ -117,7 +117,7 @@ pub(crate) fn judge_at(
             if let Some((pid, _)) = run["owner_id"].as_str().and_then(native_owner) {
                 if pid == std::process::id() {
                     return Verdict::Keep(
-                        "This GitPulse launched it and could not check its terminal registry."
+                        "This Waylode launched it and could not check its terminal registry."
                             .into(),
                     );
                 }
@@ -188,17 +188,17 @@ pub(crate) fn judge_at(
     }
     let Some((owner, stamp)) = run["owner_id"].as_str().and_then(native_owner) else {
         return Verdict::Keep(
-            "No agent process was recorded, and the host that launched it is not a GitPulse terminal, so nothing here can prove it ended."
+            "No agent process was recorded, and the host that launched it is not a Waylode terminal, so nothing here can prove it ended."
                 .into(),
         );
     };
     match owner_since(owner, stamp) {
         Liveness::Gone => Verdict::Release(format!(
-            "the GitPulse process {owner} that launched it has exited, and no agent process was recorded; anything it started lost its terminal with it"
+            "the Waylode process {owner} that launched it has exited, and no agent process was recorded; anything it started lost its terminal with it"
         )),
         Liveness::Alive if owner == std::process::id() && state == "unresolved" => {
             Verdict::Release(
-                "this GitPulse recorded the launch as unresolved after stopping the agent, and no agent process was recorded"
+                "this Waylode recorded the launch as unresolved after stopping the agent, and no agent process was recorded"
                     .into(),
             )
         }
@@ -206,10 +206,10 @@ pub(crate) fn judge_at(
             Verdict::Keep("This launch is still starting.".into())
         }
         Liveness::Alive => Verdict::Keep(format!(
-            "Another running GitPulse (pid {owner}) launched it and still owns its outcome."
+            "Another running Waylode (pid {owner}) launched it and still owns its outcome."
         )),
         Liveness::Unknown(reason) => Verdict::Keep(format!(
-            "Could not check whether the GitPulse process {owner} that launched it is still running: {reason}"
+            "Could not check whether the Waylode process {owner} that launched it is still running: {reason}"
         )),
     }
 }

@@ -30,12 +30,12 @@ mod common;
 
 use common::fixture::{build_repo, count_git_processes, git_process_argvs, Repo, Spec};
 use common::{interleave, require_no_failed_facets, Case, Report, Sample};
-use gitpulse_lib::engine::git_reader::GitReader;
-use gitpulse_lib::engine::worktree::ScanDepth;
-use gitpulse_lib::hooks::{self, HookInput, PermissionDecision};
-use gitpulse_lib::{docs, ingest, insights};
 use serde_json::json;
 use std::path::Path;
+use waylode_lib::engine::git_reader::GitReader;
+use waylode_lib::engine::worktree::ScanDepth;
+use waylode_lib::hooks::{self, HookInput, PermissionDecision};
+use waylode_lib::{docs, ingest, insights};
 
 const SPEC: Spec = Spec {
     files: 600,
@@ -82,8 +82,8 @@ fn git_lines(repo: &Path, args: &[&str]) -> Vec<String> {
 /// Applies `commands` (`git update-ref --stdin` lines) in one process.
 #[cfg(unix)]
 fn update_refs(repo: &Path, commands: &str) {
-    use gitpulse_lib::procguard::LockedSpawn;
     use std::io::Write;
+    use waylode_lib::procguard::LockedSpawn;
     let mut child = std::process::Command::new("git")
         .args(["update-ref", "--stdin"])
         .current_dir(repo)
@@ -177,8 +177,8 @@ const ALLOW_VERIFIER_ENV: &str = "GITPULSE_BENCH_ALLOW_VERIFIER";
 /// Writes one object of `kind` and returns its id.
 #[cfg(unix)]
 fn hash_object(repo: &Path, kind: &str, content: &[u8]) -> String {
-    use gitpulse_lib::procguard::LockedSpawn;
     use std::io::Write;
+    use waylode_lib::procguard::LockedSpawn;
     let mut child = std::process::Command::new("git")
         .args(["hash-object", "-t", kind, "-w", "--stdin"])
         .current_dir(repo)
@@ -356,8 +356,8 @@ fn peak_rss_mb() -> f64 {
 #[cfg(unix)]
 fn unsigned_chain(root: &Path, commits: usize) -> String {
     use common::fixture::{git, trust_repo};
-    use gitpulse_lib::procguard::LockedSpawn;
     use std::io::Write;
+    use waylode_lib::procguard::LockedSpawn;
     let dir = root.join(format!("unsigned-{commits}"));
     std::fs::create_dir_all(&dir).expect("create chain dir");
     git(&dir, &["init", "-q", "-b", "main"]);
@@ -545,7 +545,7 @@ fn hook_collision_cases(repo: &Repo) -> Vec<Case<'static>> {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("command_timings");
     let temp = tempfile::tempdir().expect("temp dir");
 
@@ -569,10 +569,10 @@ fn main() {
     }
     // `git_preflight` caches a passing answer: warm it so a counted pass below
     // is its own work and not charged for the one-time `git version` probe.
-    let preflight = gitpulse_lib::engine::git_cli::git_preflight();
+    let preflight = waylode_lib::engine::git_cli::git_preflight();
     assert_eq!(
         preflight.status,
-        gitpulse_lib::engine::git_cli::GitPreflightStatus::Ok,
+        waylode_lib::engine::git_cli::GitPreflightStatus::Ok,
         "git did not pass its preflight ({:?})",
         preflight.message
     );
@@ -673,7 +673,7 @@ fn main() {
     };
     let divergence_rows = || {
         let listed =
-            gitpulse_lib::engine::worktree::list_worktrees(&refs_path).unwrap_or_else(|error| {
+            waylode_lib::engine::worktree::list_worktrees(&refs_path).unwrap_or_else(|error| {
                 panic!("list_worktrees failed: {error}", error = error.message())
             });
         assert!(
@@ -808,7 +808,7 @@ fn main() {
     };
     // The Worktrees panel's explicit opt-in: `ScanDepth::Full`.
     let list_full = |path: &str| {
-        gitpulse_lib::engine::worktree::list_worktrees(path).unwrap_or_else(|error| {
+        waylode_lib::engine::worktree::list_worktrees(path).unwrap_or_else(|error| {
             panic!(
                 "list_worktrees full failed: {error}",
                 error = error.message()
@@ -821,7 +821,7 @@ fn main() {
     // so the only way to time a degraded answer is a short list.
     let list_listing = |path: &str| {
         let worktrees =
-            gitpulse_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
+            waylode_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
                 .unwrap_or_else(|error| {
                     panic!(
                         "list_worktrees listing failed: {error}",
@@ -841,10 +841,10 @@ fn main() {
     // first caller to trigger it. Production pays that once, off the per-call
     // path, so warm it here: each row's counter is then its own work, and a
     // row that happens to run first is not charged for the probe.
-    let preflight = gitpulse_lib::engine::git_cli::git_preflight();
+    let preflight = waylode_lib::engine::git_cli::git_preflight();
     assert_eq!(
         preflight.status,
-        gitpulse_lib::engine::git_cli::GitPreflightStatus::Ok,
+        waylode_lib::engine::git_cli::GitPreflightStatus::Ok,
         "git did not pass its preflight ({:?}), so the warm-up did not cache and a counted row would pay the probe",
         preflight.message
     );

@@ -658,11 +658,11 @@ export function resolveLinkAction(
     }
     return {
       kind: "refused",
-      reason: `${target.path} is outside this repository — GitPulse only opens files inside it.`,
+      reason: `${target.path} is outside this repository — Waylode only opens files inside it.`,
     };
   }
   return {
     kind: "refused",
-    reason: "GitPulse only opens http and https links, and files inside this repository.",
+    reason: "Waylode only opens http and https links, and files inside this repository.",
   };
 }

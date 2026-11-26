@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 
 /// Runs `git` in `cwd` with a fixed identity and asserts success. Returns
 /// stdout.
@@ -37,8 +37,8 @@ pub fn git(cwd: &Path, args: &[&str]) -> String {
 /// a session grant on non-Unix where terminals run in-process.
 pub fn trust_repo(repo: &Path) {
     let path = repo.to_str().expect("fixture path is UTF-8");
-    let preview = gitpulse_lib::repository_trust::inspect(path).expect("inspect fixture");
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, cfg!(unix))
+    let preview = waylode_lib::repository_trust::inspect(path).expect("inspect fixture");
+    waylode_lib::repository_trust::grant(path, &preview.identity, cfg!(unix))
         .expect("approve fixture");
 }
 

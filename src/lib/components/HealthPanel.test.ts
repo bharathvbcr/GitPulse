@@ -16,7 +16,7 @@ describe("HealthPanel rendering", () => {
     const { body } = render(HealthPanel);
     expect(body).toContain("Health");
     expect(body).toContain("Scan");
-    expect(body).toContain("GitHub alerts are checked when GitPulse starts");
+    expect(body).toContain("GitHub alerts are checked when Waylode starts");
     // With no repository open there is nothing to have checked, so the
     // Dependabot state chip stays out of the header entirely.
     expect(body).not.toContain("Dependabot not checked");

@@ -1,1 +1,1 @@
-GitPulse is MIT-licensed · [Source](https://github.com/bharathvbcr/GitPulse) · [Releases](https://github.com/bharathvbcr/GitPulse/releases) · [Security advisories](https://github.com/bharathvbcr/GitPulse/security) · [Website](https://gitpulse.vbcr.dev/)
+Waylode is MIT-licensed · [Source](https://github.com/bharathvbcr/GitPulse) · [Releases](https://github.com/bharathvbcr/GitPulse/releases) · [Security advisories](https://github.com/bharathvbcr/GitPulse/security) · [Website](https://gitpulse.vbcr.dev/)

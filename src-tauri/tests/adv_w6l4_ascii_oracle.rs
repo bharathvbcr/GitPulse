@@ -9,9 +9,9 @@
 //! review report (same helper, same shape as scan_briefs' `.md`).
 
 mod common;
-use gitpulse_lib::github::parse_github_remote_url;
-use gitpulse_lib::tasks::scan_briefs;
 use proptest::prelude::*;
+use waylode_lib::github::parse_github_remote_url;
+use waylode_lib::tasks::scan_briefs;
 
 /// OLD `trim_git_suffix`, verbatim.
 fn old_trim_git_suffix(path: &str) -> &str {

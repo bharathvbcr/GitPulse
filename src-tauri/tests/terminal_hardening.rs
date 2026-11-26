@@ -10,15 +10,15 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{
-    acknowledge_output, kill_session, list_sessions, resize_session, spawn_session,
-    write_to_session, KillOrigin, TerminalSessions,
-};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{
+    acknowledge_output, kill_session, list_sessions, resize_session, spawn_session,
+    write_to_session, KillOrigin, TerminalSessions,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -31,7 +31,7 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("PTY test cleanup incomplete: {error}");
         }
     }
@@ -40,7 +40,7 @@ impl Drop for TerminalCleanup {
 fn repo() -> tempfile::TempDir {
     // The 100-session test opens sessions faster than the production spawn
     // rate allows, and what it measures is lifetime, not that rate.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -123,7 +123,7 @@ fn collecting(
 fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_threads() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -141,7 +141,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), program_args.into()]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(&handle),
+            waylode_lib::terminal::OutputSink::events(&handle),
         )
     };
 
@@ -211,7 +211,7 @@ fn half_a_gigabyte_nobody_reads_keeps_memory_bounded_and_the_session_alive() {
 fn unread_flood(total: usize, budget: Duration) {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -242,7 +242,7 @@ fn unread_flood(total: usize, budget: Duration) {
             format!("head -c {total} /dev/zero | tr '\\000' x; echo finished"),
         ]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let mut peak = rss_before;
@@ -282,7 +282,7 @@ fn unread_flood(total: usize, budget: Duration) {
 fn invalid_utf8_and_split_multibyte_sequences_arrive_byte_exact_at_every_alignment() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -317,7 +317,7 @@ fn invalid_utf8_and_split_multibyte_sequences_arrive_byte_exact_at_every_alignme
                 ),
             ]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(app.handle()),
+            waylode_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         let exit = exits
@@ -339,7 +339,7 @@ fn invalid_utf8_and_split_multibyte_sequences_arrive_byte_exact_at_every_alignme
 fn a_resize_storm_with_degenerate_sizes_leaves_the_session_usable() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -354,7 +354,7 @@ fn a_resize_storm_with_degenerate_sizes_leaves_the_session_usable() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "read go; stty size".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let started = Instant::now();
@@ -391,7 +391,7 @@ fn a_resize_storm_with_degenerate_sizes_leaves_the_session_usable() {
 fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -406,7 +406,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exit 0".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     exits
@@ -433,7 +433,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "sleep 300".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     kill_session(&state, &live.id, KillOrigin::Unspecified).unwrap();

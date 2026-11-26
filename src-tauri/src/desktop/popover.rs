@@ -294,13 +294,29 @@ fn emit_state<R: Runtime>(app: &AppHandle<R>, state: &MenuState) -> Result<(), S
     Ok(())
 }
 
+/// The browser arguments the `main` window is configured with.
+///
+/// WebView2 runs one browser process per user data folder, and refuses to
+/// create a webview whose environment options differ from that process's
+/// (`HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`). The popover shares main's data
+/// folder, so it is created with main's arguments rather than wry's defaults.
+/// Other platforms ignore the value.
+fn main_browser_args<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    app.config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .and_then(|window| window.additional_browser_args.clone())
+}
+
 /// The popover window, built hidden if it does not exist.
 fn ensure_window<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindow<R>, String> {
     let window = if let Some(window) = app.get_webview_window(LABEL) {
         window
     } else {
         let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("status.html".into()))
-            .title("GitPulse Status")
+            .title("Waylode Status")
             .inner_size(WIDTH, 400.0)
             .decorations(false)
             .resizable(false)
@@ -311,6 +327,10 @@ fn ensure_window<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindow<R>, Str
             .visible_on_all_workspaces(true)
             .transparent(true)
             .shadow(true);
+        let builder = match main_browser_args(app) {
+            Some(args) => builder.additional_browser_args(&args),
+            None => builder,
+        };
         // Not in this crate's unit tests: they run on the mock runtime, which has
         // no NSWindow for the material to be applied to. The material itself is
         // exercised on AppKit by tests/native_status_material.rs.
@@ -690,6 +710,37 @@ mod lifecycle_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         done()
+    }
+
+    /// WebView2 refuses a second webview on main's data folder unless its
+    /// environment options match, so the popover reads main's arguments.
+    #[test]
+    fn the_popover_is_given_the_main_windows_browser_arguments() {
+        const ARGS: &str = "--disable-features=msWebOOUI --enable-zero-copy";
+        let mut context = crate::context::<MockRuntime>();
+        let windows = &mut context.config_mut().app.windows;
+        let main = windows
+            .iter_mut()
+            .find(|window| window.label == "main")
+            .expect("the bundled config declares a main window");
+        main.additional_browser_args = Some(ARGS.into());
+        let app = mock_builder()
+            .manage(DesktopState::default())
+            .build(context)
+            .unwrap();
+        assert_eq!(main_browser_args(app.handle()).as_deref(), Some(ARGS));
+
+        let mut context = crate::context::<MockRuntime>();
+        context
+            .config_mut()
+            .app
+            .windows
+            .retain(|window| window.label != "main");
+        let app = mock_builder()
+            .manage(DesktopState::default())
+            .build(context)
+            .unwrap();
+        assert_eq!(main_browser_args(app.handle()), None);
     }
 
     #[test]

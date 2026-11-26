@@ -4,7 +4,7 @@ on:
   push:
     tags:
       - 'v*'
-  # Manual dispatch (GitHub UI or GitPulse's workflow trigger) requires an
+  # Manual dispatch (GitHub UI or Waylode's workflow trigger) requires an
   # explicit tag, since a branch ref has no tag name to release. The tag must
   # already exist: preflight resolves it once and every later job uses that
   # exact commit. Remote tag identity is checked again before uploads.
@@ -32,7 +32,7 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   # Keep in lockstep with ci.yml / coverage.yml / test-parallel.yml so preflight
   # tests the exact devmap and manvi commits CI verifies.
-  DEVMAP_REV: 2acef200df69622b459278e1d88745bfb393d043
+  DEVMAP_REV: 135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1
   MANVI_REV: abb2a72276269c63f6300a59a26e774a0383a8ab
 
 jobs:
@@ -404,11 +404,11 @@ jobs:
       - name: Inspect macOS Universal App Bundle
         if: ${{ startsWith(matrix.platform, 'macos-') }}
         shell: bash
-        run: node scripts/check-release-assets.mjs --app src-tauri/target/universal-apple-darwin/release/bundle/macos/GitPulse.app --universal
+        run: node scripts/check-release-assets.mjs --app src-tauri/target/universal-apple-darwin/release/bundle/macos/Waylode.app --universal
 
       # Prove LTO did not leak window-runtime symbols (RunObserver, tauri_runtime_wry)
       # into the release terminal daemon binary on Unix legs.
-      - name: Verify gitpulse-ptyd Release Symbols
+      - name: Verify waylode-ptyd Release Symbols
         if: ${{ !startsWith(matrix.platform, 'windows-') }}
         shell: bash
         env:
@@ -416,14 +416,14 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$MATRIX_PLATFORM" == macos-* ]]; then
-            if [ -f src-tauri/target/universal-apple-darwin/release/gitpulse-ptyd ]; then
-              node scripts/check-ptyd-release.mjs --binary src-tauri/target/universal-apple-darwin/release/gitpulse-ptyd
+            if [ -f src-tauri/target/universal-apple-darwin/release/waylode-ptyd ]; then
+              node scripts/check-ptyd-release.mjs --binary src-tauri/target/universal-apple-darwin/release/waylode-ptyd
             else
-              node scripts/check-ptyd-release.mjs --binary src-tauri/target/aarch64-apple-darwin/release/gitpulse-ptyd
-              node scripts/check-ptyd-release.mjs --binary src-tauri/target/x86_64-apple-darwin/release/gitpulse-ptyd
+              node scripts/check-ptyd-release.mjs --binary src-tauri/target/aarch64-apple-darwin/release/waylode-ptyd
+              node scripts/check-ptyd-release.mjs --binary src-tauri/target/x86_64-apple-darwin/release/waylode-ptyd
             fi
           else
-            node scripts/check-ptyd-release.mjs --binary src-tauri/target/release/gitpulse-ptyd
+            node scripts/check-ptyd-release.mjs --binary src-tauri/target/release/waylode-ptyd
           fi
 
   # Every installer is on the draft. Add the SHA-256 manifest and the two
@@ -489,9 +489,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo cyclonedx --manifest-path src-tauri/Cargo.toml --format json --spec-version 1.5 --target all --override-filename gitpulse.cargo.cdx
+          cargo cyclonedx --manifest-path src-tauri/Cargo.toml --format json --spec-version 1.5 --target all --override-filename waylode.cargo.cdx
           git diff --exit-code -- src-tauri/Cargo.lock
-          mv src-tauri/gitpulse.cargo.cdx.json "$RUNNER_TEMP/sbom.cargo.cdx.json"
+          mv src-tauri/waylode.cargo.cdx.json "$RUNNER_TEMP/sbom.cargo.cdx.json"
 
       - name: Upload Checksums And SBOMs To The Draft
         env:

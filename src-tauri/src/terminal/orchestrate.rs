@@ -34,8 +34,10 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Capability token environment variable injected into every GitPulse PTY.
-pub const SESSION_TOKEN_ENV: &str = "GITPULSE_SESSION_TOKEN";
+/// Capability token environment variable injected into every Waylode PTY.
+pub const SESSION_TOKEN_ENV: &str = "WAYLODE_SESSION_TOKEN";
+/// Legacy environment variable for [`SESSION_TOKEN_ENV`].
+pub const LEGACY_SESSION_TOKEN_ENV: &str = "GITPULSE_SESSION_TOKEN";
 /// Prefix on every minted [`SESSION_TOKEN_ENV`] value so capability tokens can
 /// be recognized and scrubbed unconditionally from terminal screen reads.
 pub const SESSION_TOKEN_PREFIX: &str = "gpst_";
@@ -89,6 +91,195 @@ pub(crate) fn is_valid_external_caller_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+
+/// Owner-key prefix of terminal children launched by a Mavi thread:
+/// `ext-mavi-<thread key>`, where the thread key is the page's
+/// `ThreadRecord.key`, a UUID (45 bytes in all, under the caller-id limit).
+pub(crate) const MAVI_OWNER_PREFIX: &str = "ext-mavi-";
+
+/// Environment variable a host sets on an agent process so that agent's
+/// `waylode-mcp` / `waylode-hook` orchestrate as a stable external caller
+/// (today only `ext-mavi-<uuid>`) instead of the per-process `mcp-<pid>`.
+pub const ORCHESTRATE_CALLER_ENV: &str = "WAYLODE_ORCHESTRATE_CALLER";
+/// Legacy `GITPULSE_*` alias for [`ORCHESTRATE_CALLER_ENV`].
+pub const LEGACY_ORCHESTRATE_CALLER_ENV: &str = "GITPULSE_ORCHESTRATE_CALLER";
+
+/// A canonical (lowercase, hyphenated, 36-byte) UUID, as `crypto.randomUUID`
+/// writes it. Anything else is not a Mavi thread key.
+fn is_canonical_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+        })
+}
+
+/// The owner key for a Mavi thread's children, or `None` when the thread key
+/// is not a UUID (an older fallback key, or anything a page made up). Upper
+/// case is folded so the key is one spelling per thread.
+pub(crate) fn mavi_owner_key(thread_key: &str) -> Option<String> {
+    let lower = thread_key.trim().to_ascii_lowercase();
+    is_canonical_uuid(&lower).then(|| format!("{MAVI_OWNER_PREFIX}{lower}"))
+}
+
+/// The Mavi thread key an owner key names, or `None` when the key is not
+/// exactly `ext-mavi-<canonical uuid>`.
+pub(crate) fn mavi_thread_of_owner(owner_key: &str) -> Option<&str> {
+    owner_key
+        .strip_prefix(MAVI_OWNER_PREFIX)
+        .filter(|rest| is_canonical_uuid(rest))
+}
+
+/// The external caller id a process with no terminal credentials orchestrates
+/// as: the Mavi owner key its host put in [`ORCHESTRATE_CALLER_ENV`], or
+/// `fallback()` (the per-process `mcp-<pid>` / `ext-<ppid>`) when the variable
+/// is unset or blank.
+///
+/// A value that is not exactly `ext-mavi-<uuid>` is an error, never a quiet
+/// fallback: the caller would otherwise orchestrate under an owner the host
+/// did not name, and its children would be unreachable from the thread.
+///
+/// The key carries no secret. Any same-user process that sets the variable can
+/// act as that thread's orchestrator over its own children in a trusted
+/// repository; that is no wider than the `ext-*` / `mcp-*` keys any same-user
+/// process can already claim, and repository trust still gates every call.
+pub fn standalone_caller_id(fallback: impl FnOnce() -> String) -> Result<String, String> {
+    let raw = crate::env_compat::var_compat(ORCHESTRATE_CALLER_ENV, LEGACY_ORCHESTRATE_CALLER_ENV);
+    standalone_caller_id_from(raw.as_deref(), fallback)
+}
+
+/// [`standalone_caller_id`] over a value the caller already read from the
+/// environment, so a parser that takes its environment as arguments (the hook
+/// CLI) reads no process state.
+pub fn standalone_caller_id_from(
+    raw: Option<&str>,
+    fallback: impl FnOnce() -> String,
+) -> Result<String, String> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(fallback());
+    };
+    if mavi_thread_of_owner(value).is_some() {
+        return Ok(value.to_owned());
+    }
+    let shown: String = value.chars().take(64).collect();
+    Err(format!(
+        "{ORCHESTRATE_CALLER_ENV} must be ext-mavi-<thread uuid> (got {shown:?}); unset it to orchestrate as a standalone caller"
+    ))
+}
+
+/// The process id inside a standalone owner key (`mcp-<pid>` or `ext-<pid>`),
+/// or `None` for any other key (a terminal session id, `ext-mavi-<uuid>`).
+fn standalone_owner_pid(key: &str) -> Option<u32> {
+    let digits = key
+        .strip_prefix("mcp-")
+        .or_else(|| key.strip_prefix("ext-"))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether a process with this id exists. `EPERM` means it exists and is not
+/// ours (macOS answers it for a process group that is all zombies too), so it
+/// counts as alive: only `ESRCH` proves the owner gone.
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Without a cheap probe, an owner is never declared dead.
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    true
+}
+
+/// Whether `key` names a standalone orchestrator (`mcp-<pid>` / `ext-<pid>`)
+/// whose process is gone. A Mavi thread key, or a terminal session id, is
+/// never dead by this test: a resumed thread owns its children again.
+pub(crate) fn owner_is_dead(key: &str) -> bool {
+    standalone_owner_pid(key).is_some_and(|pid| !process_exists(pid))
+}
+
+/// What [`close_owner_children`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerCloseSummary {
+    pub closed: usize,
+    pub skipped_protected: usize,
+}
+
+/// Closes every live child owned by the Mavi thread key `owner_key`, as the
+/// user's "stop children" does: a protected session is left running and
+/// counted. Only the app calls this (the user forgot the thread); no MCP
+/// caller reaches it, and children of any other owner are never touched.
+pub(crate) fn close_owner_children(
+    state: &TerminalSessions,
+    ui: &dyn OrchestrateUiSink,
+    owner_key: &str,
+) -> Result<OwnerCloseSummary, String> {
+    if mavi_thread_of_owner(owner_key).is_none() {
+        return Err("not a Mavi thread owner key".into());
+    }
+    let targets: Vec<(String, String)> = {
+        let inner = state.orchestration.lock();
+        inner
+            .sessions
+            .iter()
+            .filter(|(_, rec)| !rec.ended && rec.parent_session_id.as_deref() == Some(owner_key))
+            .map(|(id, rec)| (id.clone(), rec.repo_path.clone()))
+            .collect()
+    };
+    let mut summary = OwnerCloseSummary {
+        closed: 0,
+        skipped_protected: 0,
+    };
+    let mut failures = Vec::new();
+    for (id, repo_path) in targets {
+        match crate::terminal::kill_session_as(
+            state,
+            &id,
+            KillOrigin::StopChildren,
+            Some(owner_key),
+        ) {
+            Ok(KillOutcome::Killed) => {
+                state.orchestration.mark_ended(&id, None);
+                ui.child_closed(TerminalChildClosedPayload {
+                    id,
+                    parent_session_id: owner_key.to_owned(),
+                    repo_path,
+                });
+                summary.closed += 1;
+            }
+            Ok(KillOutcome::SkippedProtected) => summary.skipped_protected += 1,
+            Err(error) => failures.push(format!("{id}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(summary)
+    } else {
+        Err(format!(
+            "closed {}, left {} protected, and could not close {}: {}",
+            summary.closed,
+            summary.skipped_protected,
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Permission modes a spawned agent child may ask for: the shared table without
+/// `bypass`, which no MCP caller can select.
+pub const CHILD_PERMISSION_MODES: [&str; 5] =
+    ["inspect", "ask", "edit", "auto_review", "preapproved"];
 
 /// Allowed child launchers for `Spawn`.
 pub const ALLOWED_CHILD_LAUNCHERS: [&str; 6] = ["shell", "claude", "agy", "codex", "manvi", "grok"];
@@ -184,6 +375,72 @@ impl<R: tauri::Runtime> OrchestrateUiSink for AppOrchestrateUiSink<R> {
             state.session_ledger.clone(),
         ))
     }
+}
+
+/// Tauri event telling a Mavi thread's page that one of its terminal children
+/// needs the user, stopped needing them, or ended.
+pub const MAVI_CHILD_STATE_EVENT: &str = "mavi-child-state";
+
+/// Payload of [`MAVI_CHILD_STATE_EVENT`], snake_case on the wire. `state` is
+/// `needs_input` (a dialog is open), `cleared` (it was answered while the
+/// child lives), `done` (the child exited 0) or `ended` (any other end).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaviChildStatePayload {
+    pub thread_id: String,
+    pub child_session_id: String,
+    pub title: Option<String>,
+    pub state: String,
+    pub detail: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
+/// Where [`MaviChildStatePayload`]s go. The app's sink emits a Tauri event;
+/// tests record them.
+pub trait ChildStateEmitter: Send + Sync {
+    fn mavi_child_state(&self, payload: MaviChildStatePayload);
+}
+
+impl<R: tauri::Runtime> ChildStateEmitter for AppOrchestrateUiSink<R> {
+    fn mavi_child_state(&self, payload: MaviChildStatePayload) {
+        use tauri::Emitter as _;
+        if let Err(error) = self.app.emit(MAVI_CHILD_STATE_EVENT, payload) {
+            log::warn!(target: "terminal", "could not announce a Mavi child's state: {error}");
+        }
+    }
+}
+
+type ChildEmitterSlot = Mutex<Option<Arc<dyn ChildStateEmitter>>>;
+
+fn emit_child_state(emitter: &ChildEmitterSlot, payload: Option<MaviChildStatePayload>) {
+    let Some(payload) = payload else {
+        return;
+    };
+    let sink = emitter
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(sink) = sink {
+        sink.mavi_child_state(payload);
+    }
+}
+
+/// The payload for a child owned by a Mavi thread, `None` for any other.
+fn mavi_child_payload(
+    session_id: &str,
+    record: &OrchestratedRecord,
+    state: &str,
+    detail: Option<String>,
+    exit_code: Option<i32>,
+) -> Option<MaviChildStatePayload> {
+    let thread = mavi_thread_of_owner(record.parent_session_id.as_deref()?)?;
+    Some(MaviChildStatePayload {
+        thread_id: thread.to_owned(),
+        child_session_id: session_id.to_owned(),
+        title: record.title.clone(),
+        state: state.to_owned(),
+        detail,
+        exit_code,
+    })
 }
 
 /// Mints a fresh 256-bit CSPRNG session capability token (`gpst_<64 lowercase hex>`).
@@ -549,6 +806,16 @@ struct OrchestratedRecord {
     telemetry: SharedSessionTelemetry,
 }
 
+/// The app's telemetry scanner over the output it mirrors from the terminal
+/// host. It reads no agent dialogs: the host reads them (it sees every
+/// session, attached or not) and says so in a notice, which
+/// [`OrchestrationRegistry::note_prompt_notice`] takes.
+fn host_scanner() -> crate::alerts::scan::Scanner {
+    let mut scanner = crate::alerts::scan::Scanner::new();
+    scanner.set_agent_prompts(false);
+    scanner
+}
+
 #[cfg(unix)]
 fn apply_scanner_telemetry(
     scanner: &mut crate::alerts::scan::Scanner,
@@ -593,6 +860,8 @@ pub struct OrchestrationRegistry {
     changed: Arc<Condvar>,
     feed: Arc<ScreenFeed>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Where `mavi-child-state` goes; set once the app exists.
+    child_emitter: Arc<ChildEmitterSlot>,
 }
 
 /// What a reader got from [`OrchestrationRegistry::sync_screen`].
@@ -645,7 +914,7 @@ fn apply_screen_batch(inner: &Mutex<RegistryInner>, feed: &ScreenFeed, batch: &B
                     blocks.resync();
                 }
                 if record.host_scanner.is_some() {
-                    record.host_scanner = Some(crate::alerts::scan::Scanner::new());
+                    record.host_scanner = Some(host_scanner());
                 }
             }
             if let Some(parser) = record.parser.as_mut() {
@@ -794,7 +1063,7 @@ impl OrchestrationRegistry {
         let parser = track_screen.then(|| {
             vt100::Parser::new(nz_u16(size.rows), nz_u16(size.cols), PARSER_SCROLLBACK_ROWS)
         });
-        let host_scanner = track_screen.then(crate::alerts::scan::Scanner::new);
+        let host_scanner = track_screen.then(host_scanner);
         let blocks = track_screen.then(CommandBlockRecorder::default);
         let mut inner = self.lock();
         inner.sessions.insert(
@@ -910,6 +1179,7 @@ impl OrchestrationRegistry {
                 self.feed.register(&snap.session_id);
                 tracked = true;
             }
+            let host_scanner = track_screen.then(host_scanner);
             let telemetry = crate::terminal::new_shared_telemetry();
             *telemetry
                 .0
@@ -937,7 +1207,7 @@ impl OrchestrationRegistry {
                             PARSER_SCROLLBACK_ROWS,
                         )
                     }),
-                    host_scanner: track_screen.then(crate::alerts::scan::Scanner::new),
+                    host_scanner,
                     blocks: track_screen.then(CommandBlockRecorder::default),
                     telemetry,
                 },
@@ -1000,11 +1270,28 @@ impl OrchestrationRegistry {
     /// can complete a post-exit `wait` or `read`.
     pub(crate) fn mark_ended(&self, session_id: &str, exit_code: Option<i32>) {
         let mut inner = self.lock();
+        let mut announce = None;
         let retain = match inner.sessions.get_mut(session_id) {
             Some(record) => {
+                if !record.ended {
+                    let state = if exit_code == Some(0) {
+                        "done"
+                    } else {
+                        "ended"
+                    };
+                    announce = mavi_child_payload(session_id, record, state, None, exit_code);
+                }
                 record.token_hash = None;
                 record.ended = true;
                 record.exit_code = exit_code;
+                // Nobody can answer a dialog in a session that is gone.
+                crate::terminal::clear_agent_prompt(
+                    &mut record
+                        .telemetry
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
                 record.parent_session_id.is_some() || record.launcher == "shell"
             }
             None => return,
@@ -1029,6 +1316,119 @@ impl OrchestrationRegistry {
         }
         drop(inner);
         self.changed.notify_all();
+        emit_child_state(&self.child_emitter, announce);
+    }
+
+    /// Where `mavi-child-state` events go. Called once, when the app exists.
+    pub(crate) fn set_child_state_emitter(&self, emitter: Arc<dyn ChildStateEmitter>) {
+        *self
+            .child_emitter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(emitter);
+    }
+
+    /// Keystrokes written to `session_id`'s PTY. Anything but cursor
+    /// navigation answers or dismisses a standing dialog.
+    pub(crate) fn note_input(&self, session_id: &str, bytes: &[u8]) {
+        if crate::terminal::input_answers_prompt(bytes) {
+            self.clear_prompt(session_id, true);
+        }
+    }
+
+    /// A hook reported the agent working again in `session_id`: a dialog read
+    /// off its screen is no longer open.
+    pub(crate) fn note_hook_resolution(&self, session_id: &str) {
+        self.clear_prompt(session_id, true);
+    }
+
+    /// Drops the dialog read off `session_id`'s screen, wakes waiters, resolves
+    /// the banner and tells the Mavi page. Nothing happens when none is open.
+    fn clear_prompt(&self, session_id: &str, resolve_banner: bool) {
+        let (cleared, announce, label, place) = {
+            let inner = self.lock();
+            let Some(record) = inner.sessions.get(session_id) else {
+                return;
+            };
+            let cleared = crate::terminal::clear_agent_prompt(
+                &mut record
+                    .telemetry
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            (
+                cleared,
+                (cleared && !record.ended)
+                    .then(|| mavi_child_payload(session_id, record, "cleared", None, None))
+                    .flatten(),
+                crate::terminal::agent_launcher("agy").unwrap_or("Antigravity"),
+                Path::new(&record.cwd)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            )
+        };
+        if !cleared {
+            return;
+        }
+        self.changed.notify_all();
+        if resolve_banner {
+            crate::alerts::offer(crate::alerts::bridge::screen_prompt_notice(
+                session_id,
+                label,
+                place,
+                "prompt_submitted",
+                None,
+            ));
+        }
+        emit_child_state(&self.child_emitter, announce);
+    }
+
+    /// A session is waiting on the person (or no longer is), said in a notice:
+    /// either the terminal host read the dialog off the screen (agy, which has
+    /// no hook for it), or the agent's own hook reported it (Claude, Codex).
+    /// Records it in the session's telemetry so `wait` and `read` can say so,
+    /// and tells the Mavi page. Bells, OSC sequences and other channels carry
+    /// no dialog and are ignored.
+    pub(crate) fn note_prompt_notice(&self, notice: &crate::alerts::Notice) {
+        if notice.channel != crate::alerts::bridge::SCREEN_CHANNEL
+            && notice.channel != crate::alerts::bridge::HOOK_CHANNEL
+        {
+            return;
+        }
+        match notice.event {
+            Some("permission_prompt") => {
+                let announce = {
+                    let inner = self.lock();
+                    let Some(record) = inner.sessions.get(&notice.key) else {
+                        return;
+                    };
+                    if record.ended {
+                        return;
+                    }
+                    let (lock, cvar) = &*record.telemetry;
+                    let mut state = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let before = state.last_prompt_event_seq;
+                    crate::terminal::apply_telemetry_events(
+                        &mut state,
+                        vec![crate::alerts::scan::TelemetryEvent::AgentPrompt {
+                            detail: notice.detail.clone().unwrap_or_default(),
+                        }],
+                    );
+                    if state.last_prompt_event_seq == before {
+                        return;
+                    }
+                    cvar.notify_all();
+                    let detail = state.agent_prompt.as_ref().and_then(|p| p.detail.clone());
+                    mavi_child_payload(&notice.key, record, "needs_input", detail, None)
+                };
+                self.changed.notify_all();
+                emit_child_state(&self.child_emitter, announce);
+            }
+            Some("prompt_submitted") => self.clear_prompt(&notice.key, false),
+            _ => {}
+        }
     }
 
     /// Registers a synthetic parent session for hermetic unit/contract tests
@@ -1050,6 +1450,24 @@ impl OrchestrationRegistry {
         .expect("register test parent");
         token
     }
+}
+
+/// What a `Spawn` of an agent launcher may choose beyond the prompt. Every
+/// field is optional; absent means the launch default (`ask` mode, the user's
+/// configured model, no extra settings).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLaunchOptions {
+    /// A model id the launcher accepts (`--model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// A permission mode from the shared table, never `bypass`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Repo-relative path of an existing settings file (`--settings`), for
+    /// `claude` and `agy` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<String>,
 }
 
 /// Wire request carried inside `desktop::instance::Request::TerminalOrchestrate`.
@@ -1080,6 +1498,8 @@ pub enum OrchestrateCall {
         rows: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cols: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentLaunchOptions>,
     },
     Exec {
         repo_path: String,
@@ -1672,19 +2092,120 @@ fn authorize_readable_session<'a>(
     Err(LINEAGE_REFUSAL.to_string())
 }
 
+/// The largest settings file a spawn may pass on (it is read whole for
+/// `claude`, which takes it inline).
+const MAX_SETTINGS_FILE_BYTES: u64 = 64 * 1024;
+
+/// `--settings <value>` for a spawned agent, from a repo-relative file that
+/// must already exist inside the repository (symlinks resolve first, and one
+/// that leaves the repository is refused).
+///
+/// Claude Code takes the object inline, so its launch's own `--settings` (the
+/// notification channel, the command gate's hook) can be folded into it
+/// rather than dropped, which is what a bare file path would cause. `agy` takes
+/// the path. A file that would turn the permission model off is refused,
+/// because `bypass` is not available over MCP and a file must not be the way
+/// around that.
+fn settings_flags(launcher: &str, relative: &str, repo_root: &Path) -> Result<Vec<String>, String> {
+    if !matches!(launcher, "claude" | "agy") {
+        return Err(format!(
+            "settings applies only to the claude and agy launchers (they take --settings); {launcher} does not"
+        ));
+    }
+    let path = sandbox_join_canonical(repo_root, relative.trim())?;
+    let meta = std::fs::metadata(&path)
+        .map_err(|_| format!("settings file {relative} does not exist inside the repository"))?;
+    if !meta.is_file() {
+        return Err(format!("settings {relative} is not a file"));
+    }
+    if meta.len() > MAX_SETTINGS_FILE_BYTES {
+        return Err(format!(
+            "settings file {relative} is larger than {MAX_SETTINGS_FILE_BYTES} bytes"
+        ));
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("settings file {relative} is not readable text: {e}"))?;
+    let object = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(object)) => object,
+        _ => {
+            return Err(format!(
+                "settings file {relative} must hold one JSON object"
+            ))
+        }
+    };
+    let default_mode = object
+        .get("permissions")
+        .and_then(|p| p.get("defaultMode"))
+        .and_then(Value::as_str);
+    if default_mode == Some("bypassPermissions")
+        || object.get("disableAllHooks").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(format!(
+            "settings file {relative} turns off permission checks or hooks; that is not available over MCP"
+        ));
+    }
+    let value = if launcher == "agy" {
+        path.to_string_lossy().into_owned()
+    } else {
+        Value::Object(object).to_string()
+    };
+    Ok(vec!["--settings".to_string(), value])
+}
+
 fn build_agent_child_args(
     launcher: &str,
     prompt: Option<&str>,
+    options: &AgentLaunchOptions,
+    repo_root: &Path,
 ) -> Result<Option<Vec<String>>, String> {
-    let prompt_args = match prompt.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(text) => match launcher {
-            "claude" => Some(vec!["--".to_string(), text.to_string()]),
-            "agy" => Some(vec!["--prompt-interactive".to_string(), text.to_string()]),
-            _ => Some(vec![text.to_string()]),
-        },
-        None => None,
+    // The mode is validated against the shared table here, and `bypass` is not
+    // in the list a spawn may pick from, so it stays unreachable: it would also
+    // need an acknowledgement, and `apply_permission_mode` is never given one.
+    let mode = match options.mode.as_deref() {
+        None => "ask",
+        Some(mode) if CHILD_PERMISSION_MODES.contains(&mode) => mode,
+        Some(other) => {
+            return Err(format!(
+                "unsupported permission mode {other:?}; expected one of {} (bypass is never available over MCP)",
+                CHILD_PERMISSION_MODES.join(", ")
+            ))
+        }
     };
+    // `manvi` takes no permission-mode flag.
+    let mode = if matches!(launcher, "claude" | "agy" | "codex" | "grok") {
+        Some(mode)
+    } else if options.mode.is_some() {
+        return Err(format!("{launcher} does not take a permission mode"));
+    } else {
+        None
+    };
+
     let defaults = crate::tool_config::agent_defaults();
+    let model_choice = match options.model.as_deref() {
+        Some(model) => {
+            let mut choice = defaults.model_for(launcher).cloned().unwrap_or_default();
+            choice.model = Some(model.to_owned());
+            crate::workbench::terminal_command::validate_model_choice(launcher, &choice)?;
+            Some(choice)
+        }
+        None => defaults.model_for(launcher).cloned(),
+    };
+
+    let mut leading = match options.settings.as_deref() {
+        Some(relative) => settings_flags(launcher, relative, repo_root)?,
+        None => Vec::new(),
+    };
+    let prompt_args = match prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => {
+            match launcher {
+                "claude" => leading.extend(["--".to_string(), text.to_string()]),
+                "agy" => leading.extend(["--prompt-interactive".to_string(), text.to_string()]),
+                _ => leading.push(text.to_string()),
+            }
+            Some(leading)
+        }
+        None => (!leading.is_empty()).then_some(leading),
+    };
     let sources = defaults.claude_setting_sources_arg();
     let hook = crate::workbench::claude_hook::for_launch(launcher);
     let with_flags = crate::workbench::terminal_command::with_launch_flags(
@@ -1692,19 +2213,11 @@ fn build_agent_child_args(
         &crate::workbench::terminal_command::LaunchOptions {
             notify: crate::tool_config::session_alerts().configure_agents,
             setting_sources: sources.as_deref(),
-            model: defaults.model_for(launcher),
+            model: model_choice.as_ref(),
             hook: hook.binary(),
         },
         prompt_args,
     )?;
-    // `manvi` takes no permission-mode flag; every other supported agent CLI
-    // starts in `"ask"` mode with `acknowledged = false`, making `bypass`
-    // structurally unreachable from orchestrated child spawns.
-    let mode = if matches!(launcher, "claude" | "agy" | "codex" | "grok") {
-        Some("ask")
-    } else {
-        None
-    };
     crate::workbench::terminal_command::apply_permission_mode(
         Some(launcher),
         mode,
@@ -1752,10 +2265,14 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
             let mut local_tel = lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if remote_tel.event_seq >= local_tel.event_seq || remote_tel != *local_tel {
-                let ended = local_tel.ended || remote_tel.ended;
-                *local_tel = remote_tel;
-                local_tel.ended = ended;
+            // The host reads no dialogs off the screen (the app does, from the
+            // output it mirrors), so what the app holds about one survives the sync.
+            let mut merged = remote_tel;
+            merged.agent_prompt = local_tel.agent_prompt.clone();
+            merged.last_prompt_event_seq = local_tel.last_prompt_event_seq;
+            merged.ended = local_tel.ended || merged.ended;
+            if merged != *local_tel {
+                *local_tel = merged;
                 cvar.notify_all();
             }
         }
@@ -1816,7 +2333,7 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
                         blocks.feed(&raw, dims.1);
                         rec.blocks = Some(blocks);
                         if !remote_tel_synced {
-                            let mut scanner = crate::alerts::scan::Scanner::new();
+                            let mut scanner = host_scanner();
                             apply_scanner_telemetry(&mut scanner, &rec.telemetry, &raw);
                             rec.host_scanner = Some(scanner);
                         }
@@ -1976,6 +2493,7 @@ fn encode_exec_wrapper(command: &str, exec_tag: &str, exit_after: bool) -> Strin
 }
 
 struct SpawnParams {
+    agent: Option<AgentLaunchOptions>,
     launcher: Option<String>,
     cwd: Option<String>,
     command: Option<String>,
@@ -2006,11 +2524,30 @@ fn spawn_child_internal(
 ) -> Result<SpawnResult, String> {
     {
         let inner = state.orchestration.lock();
+        // A child whose standalone owner process is gone is orphaned, not
+        // active: it stays open for the user to close, but it must not keep
+        // the next orchestrator out. One probe per distinct owner.
+        let mut dead_owners: HashMap<String, bool> = HashMap::new();
+        let mut counts_toward_caps = |rec: &OrchestratedRecord| {
+            !rec.ended
+                && rec.parent_session_id.as_deref().is_some_and(|owner| {
+                    let dead = match dead_owners.get(owner) {
+                        Some(known) => *known,
+                        None => {
+                            let probed = owner_is_dead(owner);
+                            dead_owners.insert(owner.to_owned(), probed);
+                            probed
+                        }
+                    };
+                    !dead
+                })
+        };
         let active_children = inner
             .sessions
             .values()
             .filter(|rec| {
-                !rec.ended && rec.parent_session_id.as_deref() == Some(caller.parent_key())
+                rec.parent_session_id.as_deref() == Some(caller.parent_key())
+                    && counts_toward_caps(rec)
             })
             .count();
         if active_children >= MAX_CHILDREN_PER_PARENT {
@@ -2023,11 +2560,10 @@ fn spawn_child_internal(
                 .sessions
                 .values()
                 .filter(|rec| {
-                    !rec.ended
-                        && rec
-                            .parent_session_id
-                            .as_deref()
-                            .is_some_and(is_valid_external_caller_id)
+                    rec.parent_session_id
+                        .as_deref()
+                        .is_some_and(is_valid_external_caller_id)
+                        && counts_toward_caps(rec)
                 })
                 .count();
             if active_external >= MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
@@ -2068,6 +2604,12 @@ fn spawn_child_internal(
         if params.prompt.is_some() {
             return Err("prompt applies only to agent launchers; pass command for shell".into());
         }
+        if params.agent.is_some() {
+            return Err(
+                "model, mode and settings apply only to an agent launcher; use launcher claude, agy, codex or grok instead of shell"
+                    .into(),
+            );
+        }
         if let Some(cmd) = params.command {
             validate_child_input_bytes(&cmd)?;
             let (checked, notice) = gate_lines(&resolved_cwd_str, &cmd)?;
@@ -2081,7 +2623,12 @@ fn spawn_child_internal(
                 "command applies only to shell launcher; pass prompt for agent launchers".into(),
             );
         }
-        let agent_args = build_agent_child_args(&launcher, params.prompt.as_deref())?;
+        let agent_args = build_agent_child_args(
+            &launcher,
+            params.prompt.as_deref(),
+            &params.agent.clone().unwrap_or_default(),
+            repo_buf,
+        )?;
         (Some(launcher.clone()), agent_args, None, true, None)
     };
 
@@ -2161,6 +2708,8 @@ struct WaitOutcome {
     last_exit_code: Option<i32>,
     herdr_status: Option<String>,
     dev_server_url: Option<String>,
+    /// The dialog the child is blocked on, when one is open.
+    agent_prompt: Option<crate::terminal::AgentPrompt>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2264,7 +2813,7 @@ fn wait_child_internal(
         let herdr = herdr_state_str(&tel.herdr_status);
 
         let exit_known = ended && !behind;
-        let matched_reason = if let Some(tag) = required_exec_tag {
+        let mut matched_reason = if let Some(tag) = required_exec_tag {
             if let Some(pat) = pattern {
                 let (screen, _, _, _) = render_redacted_screen(rec, MAX_READ_LINES);
                 if screen.contains(pat) {
@@ -2312,6 +2861,12 @@ fn wait_child_internal(
         } else {
             None
         };
+        // A child blocked on a dialog is not progressing, whatever else its
+        // screen says: that outranks every reason but its exit. A dialog still
+        // open answers every wait, since it still holds.
+        if tel.agent_prompt.is_some() && matched_reason != Some("ended") {
+            matched_reason = Some("needs_input");
+        }
 
         if let Some(reason) = matched_reason {
             if owned {
@@ -2331,6 +2886,7 @@ fn wait_child_internal(
                 last_exit_code: tel.last_exit_code,
                 herdr_status: herdr,
                 dev_server_url: tel.dev_server_url,
+                agent_prompt: tel.agent_prompt,
             });
         }
 
@@ -2347,6 +2903,7 @@ fn wait_child_internal(
                 last_exit_code: tel.last_exit_code,
                 herdr_status: herdr,
                 dev_server_url: tel.dev_server_url,
+                agent_prompt: tel.agent_prompt,
             });
         }
 
@@ -2434,6 +2991,7 @@ pub(crate) fn execute_with_shell_reads(
             split,
             rows,
             cols,
+            agent,
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
@@ -2459,6 +3017,7 @@ pub(crate) fn execute_with_shell_reads(
                     split,
                     rows,
                     cols,
+                    agent,
                 },
             )?;
             Ok(json!({
@@ -2537,6 +3096,7 @@ pub(crate) fn execute_with_shell_reads(
                         split: Some(split.unwrap_or(keep)),
                         rows: None,
                         cols: None,
+                        agent: None,
                     },
                 )?;
                 (res.child_session_id, true, res.cwd)
@@ -2673,6 +3233,7 @@ pub(crate) fn execute_with_shell_reads(
                 "truncated": truncated,
                 "cwd": active_cwd,
                 "dev_server_url": wait.dev_server_url,
+                "agent_prompt": wait.agent_prompt,
                 "screen": state.orchestration.screen_status(&target_id),
                 "gate_checked": gate_checked,
                 "gate_notice": gate_notice,
@@ -2784,12 +3345,17 @@ pub(crate) fn execute_with_shell_reads(
                                 "cwd": active_cwd,
                                 "title": rec.title,
                                 "owned": owned,
+                                "orphaned": rec
+                                    .parent_session_id
+                                    .as_deref()
+                                    .is_some_and(owner_is_dead),
                                 "ended": ended,
                                 "exit_code": exit_code,
                                 "command_running": tel.command_running,
                                 "last_exit_code": tel.last_exit_code,
                                 "herdr_status": herdr_state_str(&tel.herdr_status),
                                 "dev_server_url": tel.dev_server_url,
+                                "agent_prompt": tel.agent_prompt,
                             }),
                         ))
                     })
@@ -2852,6 +3418,7 @@ pub(crate) fn execute_with_shell_reads(
                 "last_exit_code": outcome.last_exit_code,
                 "herdr_status": outcome.herdr_status,
                 "dev_server_url": outcome.dev_server_url,
+                "agent_prompt": outcome.agent_prompt,
                 "screen": state.orchestration.screen_status(&child_session_id),
             }))
         }
@@ -2945,6 +3512,7 @@ pub(crate) fn execute_with_shell_reads(
                 "last_exit_code": tel.last_exit_code,
                 "herdr_status": herdr_state_str(&tel.herdr_status),
                 "dev_server_url": tel.dev_server_url,
+                "agent_prompt": tel.agent_prompt,
                 "screen": state.orchestration.screen_status(&child_session_id),
             }))
         }
@@ -3082,6 +3650,39 @@ pub(crate) mod tests {
     use crate::procguard::LockedSpawn;
     use crate::terminal::{SessionEnded, TerminalLossPayload};
     use std::sync::Arc;
+
+    #[test]
+    fn mavi_owner_key_accepts_only_canonical_uuid_thread_keys() {
+        let key = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+        let owner = mavi_owner_key(key).expect("uuid thread key");
+        assert_eq!(owner, format!("ext-mavi-{key}"));
+        assert!(owner.len() <= 64);
+        assert!(is_valid_external_caller_id(&owner));
+        assert_eq!(mavi_thread_of_owner(&owner), Some(key));
+        // Upper case folds to one spelling per thread.
+        assert_eq!(mavi_owner_key(&key.to_ascii_uppercase()), Some(owner));
+        for bad in [
+            "",
+            "t1795634163229abc",
+            "0f8e2b9a1c3d4e5f8a6b7c8d9e0f1a2b",
+            "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2",
+            "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2bb",
+            "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2g",
+            "../../../../etc/passwd-0000-0000-0000",
+        ] {
+            assert_eq!(mavi_owner_key(bad), None, "{bad:?}");
+        }
+        for not_mavi in [
+            "ext-1234",
+            "mcp-99",
+            "ext-mavi-",
+            "ext-mavi-not-a-uuid",
+            "ext-mavi-0F8E2B9A-1C3D-4E5F-8A6B-7C8D9E0F1A2B",
+            "term-1-ab",
+        ] {
+            assert_eq!(mavi_thread_of_owner(not_mavi), None, "{not_mavi:?}");
+        }
+    }
 
     #[derive(Default)]
     struct RecordingEvents;
@@ -3252,6 +3853,7 @@ pub(crate) mod tests {
                 split: Some(true),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("parent_a spawns child");
@@ -3376,6 +3978,7 @@ pub(crate) mod tests {
                 split: Some(true),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         );
         assert!(
@@ -3399,6 +4002,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("clean child spawn")["child_session_id"]
@@ -3503,6 +4107,7 @@ pub(crate) mod tests {
                 split: Some(true),
                 rows: Some(24),
                 cols: Some(100),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -3672,6 +4277,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -3752,6 +4358,275 @@ pub(crate) mod tests {
         );
 
         let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
+    /// A shell child that prints agy's permission dialog, driven only through
+    /// `execute`. The command is typed with printf escapes, so the echoed input
+    /// line never starts with the marker and only the output can raise it.
+    #[cfg(unix)]
+    #[test]
+    fn a_shown_agy_permission_dialog_ends_a_wait_as_needs_input_and_input_clears_it() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let parent = "term-90007-1";
+        let token = state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let spawned = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: Some("agy-dialog".into()),
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(100),
+                agent: None,
+            },
+        )
+        .expect("spawn child");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        let call = |call: OrchestrateCall| execute(&state, &ui, call).expect("call");
+        let wait = |ms: u64| {
+            call(OrchestrateCall::Wait {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                child_session_id: child.clone(),
+                timeout_ms: Some(ms),
+                pattern: None,
+                wait_for_idle: Some(true),
+                since_seq: None,
+            })
+        };
+        let read = || {
+            call(OrchestrateCall::Read {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                child_session_id: child.clone(),
+                max_lines: None,
+                offset_lines: None,
+                grep: None,
+                last_command_only: None,
+            })
+        };
+        // Let the shell's own startup marks settle so the dialog is the news.
+        let _ = wait(1_500);
+        call(OrchestrateCall::Send {
+            repo_path: repo.clone(),
+            caller_session_id: Some(parent.into()),
+            caller_token: Some(token.clone()),
+            external_caller_id: None,
+            child_session_id: child.clone(),
+            input: r#"printf 'Requesting permission for:\r\n   git status\r\n\r\nRun this command?\r\n> 1. Yes, run command\r\n  4. No, cancel\r\n'; sleep 30"#
+                .into(),
+            append_newline: Some(true),
+        });
+        let first = wait(8_000);
+        assert_eq!(
+            first["matched_reason"],
+            "needs_input",
+            "{first}\nscreen: {}",
+            read()["text"]
+        );
+        assert_eq!(first["agent_prompt"]["kind"], "permission", "{first}");
+        assert!(
+            first["agent_prompt"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("git status")),
+            "{first}"
+        );
+        let seen = read();
+        assert_eq!(seen["agent_prompt"]["kind"], "permission", "{seen}");
+
+        // The user answers in the tab: the question is no longer open.
+        call(OrchestrateCall::Send {
+            repo_path: repo.clone(),
+            caller_session_id: Some(parent.into()),
+            caller_token: Some(token.clone()),
+            external_caller_id: None,
+            child_session_id: child.clone(),
+            input: "1".into(),
+            append_newline: Some(true),
+        });
+        let after = read();
+        assert!(after["agent_prompt"].is_null(), "{after}");
+
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
+    #[derive(Default)]
+    struct RecordedChildStates(Mutex<Vec<MaviChildStatePayload>>);
+
+    impl ChildStateEmitter for RecordedChildStates {
+        fn mavi_child_state(&self, payload: MaviChildStatePayload) {
+            self.0.lock().unwrap().push(payload);
+        }
+    }
+
+    fn registry_with_child(
+        repo: &str,
+        parent: &str,
+        child: &str,
+    ) -> (OrchestrationRegistry, Arc<RecordedChildStates>) {
+        let registry = OrchestrationRegistry::default();
+        let seen = Arc::new(RecordedChildStates::default());
+        registry.set_child_state_emitter(seen.clone());
+        let token = mint_session_token().unwrap();
+        registry
+            .register_session(
+                child,
+                &token,
+                Path::new(repo),
+                Path::new(repo),
+                "shell",
+                24,
+                100,
+                crate::terminal::new_shared_telemetry(),
+                Some(ChildSpawnMeta {
+                    parent_session_id: parent.into(),
+                    launcher: "shell".into(),
+                    title: Some("audit".into()),
+                }),
+            )
+            .unwrap();
+        (registry, seen)
+    }
+
+    #[test]
+    fn a_mavi_childs_end_is_announced_once_as_done_or_ended() {
+        let (_dir, repo) = init_trusted_repo();
+        let thread = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+        let owner = mavi_owner_key(thread).unwrap();
+        for (code, state) in [(Some(0), "done"), (Some(2), "ended"), (None, "ended")] {
+            let (registry, seen) = registry_with_child(&repo, &owner, "term-91000-1");
+            registry.mark_ended("term-91000-1", code);
+            registry.mark_ended("term-91000-1", code);
+            let seen = seen.0.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].thread_id, thread);
+            assert_eq!(seen[0].child_session_id, "term-91000-1");
+            assert_eq!(seen[0].title.as_deref(), Some("audit"));
+            assert_eq!((seen[0].state.as_str(), seen[0].exit_code), (state, code));
+            let wire = serde_json::to_value(&seen[0]).unwrap();
+            assert_eq!(wire["thread_id"], thread);
+        }
+    }
+
+    #[test]
+    fn only_mavi_owned_children_are_announced() {
+        let (_dir, repo) = init_trusted_repo();
+        for parent in ["term-90001-1", "ext-4242", "ext-mavi-not-a-uuid"] {
+            let (registry, seen) = registry_with_child(&repo, parent, "term-91001-1");
+            registry.mark_ended("term-91001-1", Some(0));
+            assert!(seen.0.lock().unwrap().is_empty(), "{parent}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_dialog_is_announced_cleared_by_input_not_by_navigation_and_dropped_at_exit() {
+        let (_dir, repo) = init_trusted_repo();
+        let owner = mavi_owner_key("0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b").unwrap();
+        let child = "term-91002-1";
+        let (registry, seen) = registry_with_child(&repo, &owner, child);
+        let telemetry = registry.telemetry_for(child).unwrap();
+        let open = |detail: &str| {
+            registry.note_prompt_notice(&crate::alerts::bridge::screen_prompt_notice(
+                child,
+                "Antigravity",
+                None,
+                "permission_prompt",
+                Some(detail.to_owned()),
+            ));
+        };
+        open("git status");
+        {
+            let seen = seen.0.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].state, "needs_input");
+            assert_eq!(seen[0].detail.as_deref(), Some("git status"));
+        }
+        // The host repeating the same dialog is the same dialog.
+        open("git status");
+        assert_eq!(seen.0.lock().unwrap().len(), 1);
+        // Moving the highlight answers nothing; typing does.
+        registry.note_input(child, b"\x1b[B\x1b[A");
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_some());
+        registry.note_input(child, b"1\r");
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+        assert_eq!(seen.0.lock().unwrap().last().unwrap().state, "cleared");
+        // A second answer with nothing open announces nothing.
+        let count = seen.0.lock().unwrap().len();
+        registry.note_input(child, b"\r");
+        assert_eq!(seen.0.lock().unwrap().len(), count);
+
+        // A hook saying the agent works again closes it too.
+        open("git log");
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_some());
+        registry.note_hook_resolution(child);
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+
+        // And so does the session ending, which says `ended`, never `cleared`.
+        open("git diff");
+        let before = seen.0.lock().unwrap().len();
+        registry.mark_ended(child, Some(1));
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(seen.len(), before + 1);
+        assert_eq!(seen.last().unwrap().state, "ended");
+    }
+
+    /// A Claude or Codex child reports its permission prompt through its hook,
+    /// not on the screen. That report must stand as the child's agent prompt
+    /// too, or `wait` keeps answering "working" for an agent parked on the
+    /// person, which is the stall this branch exists to end.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_reported_permission_prompt_stands_as_the_childs_agent_prompt() {
+        let (_dir, repo) = init_trusted_repo();
+        let owner = mavi_owner_key("0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b").unwrap();
+        let child = "term-91003-1";
+        let (registry, seen) = registry_with_child(&repo, &owner, child);
+        let telemetry = registry.telemetry_for(child).unwrap();
+        let hook = |event: &'static str, detail: Option<&str>| {
+            let mut notice = crate::alerts::bridge::screen_prompt_notice(
+                child,
+                "Claude Code",
+                None,
+                event,
+                detail.map(str::to_owned),
+            );
+            notice.channel = crate::alerts::bridge::HOOK_CHANNEL;
+            notice
+        };
+        registry.note_prompt_notice(&hook("permission_prompt", Some("Bash(git -C /r log)")));
+        {
+            let state = telemetry.0.lock().unwrap();
+            let prompt = state.agent_prompt.as_ref().expect("hook prompt stands");
+            assert_eq!(prompt.kind, "permission");
+            assert_eq!(prompt.detail.as_deref(), Some("Bash(git -C /r log)"));
+        }
+        {
+            let seen = seen.0.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].state, "needs_input");
+        }
+        // The agent's next hook report that it works again closes it.
+        registry.note_hook_resolution(child);
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+        assert_eq!(seen.0.lock().unwrap().last().unwrap().state, "cleared");
     }
 
     #[cfg(unix)]
@@ -3867,6 +4742,7 @@ pub(crate) mod tests {
                     split: Some(false),
                     rows: Some(24),
                     cols: Some(80),
+                    agent: None,
                 },
             )
             .expect("spawn child within cap");
@@ -3890,6 +4766,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .unwrap_err();
@@ -3970,6 +4847,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn replacement in freed slot");
@@ -4076,6 +4954,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -4120,6 +4999,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -4157,6 +5037,383 @@ pub(crate) mod tests {
             .any(|s| s.id == child && !s.ending));
         assert!(ledger.set_protected(&child, false));
         assert_eq!(close().expect("close once unprotected")["ok"], true);
+    }
+
+    fn child_args(
+        launcher: &str,
+        options: AgentLaunchOptions,
+        repo: &Path,
+    ) -> Result<Vec<String>, String> {
+        build_agent_child_args(launcher, Some("do the audit"), &options, repo)
+            .map(Option::unwrap_or_default)
+    }
+
+    fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+        args.iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == flag)
+            .filter_map(|(i, _)| args.get(i + 1).map(String::as_str))
+            .collect()
+    }
+
+    fn opts(model: Option<&str>, mode: Option<&str>, settings: Option<&str>) -> AgentLaunchOptions {
+        AgentLaunchOptions {
+            model: model.map(str::to_owned),
+            mode: mode.map(str::to_owned),
+            settings: settings.map(str::to_owned),
+        }
+    }
+
+    /// Before: every agent child started in `ask` whatever the caller asked
+    /// for, which sent the Mavi agent to `launcher: shell` and hand-typed flags.
+    #[test]
+    fn an_agent_child_takes_a_permission_mode_and_defaults_to_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = AgentLaunchOptions::default();
+        assert_eq!(
+            flag_values(
+                &child_args("claude", none.clone(), dir.path()).unwrap(),
+                "--permission-mode"
+            ),
+            ["manual"]
+        );
+        assert_eq!(
+            flag_values(
+                &child_args("claude", opts(None, Some("edit"), None), dir.path()).unwrap(),
+                "--permission-mode"
+            ),
+            ["acceptEdits"]
+        );
+        assert_eq!(
+            flag_values(
+                &child_args("agy", opts(None, Some("inspect"), None), dir.path()).unwrap(),
+                "--mode"
+            ),
+            ["plan"]
+        );
+        let codex = child_args("codex", opts(None, Some("edit"), None), dir.path()).unwrap();
+        assert_eq!(flag_values(&codex, "--sandbox"), ["workspace-write"]);
+        assert!(flag_values(&child_args("agy", none, dir.path()).unwrap(), "--mode").is_empty());
+    }
+
+    #[test]
+    fn bypass_unknown_and_inapplicable_modes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["bypass", "yolo", "", "EDIT"] {
+            let err = child_args("claude", opts(None, Some(bad), None), dir.path()).expect_err(bad);
+            assert!(!err.is_empty(), "{bad}");
+        }
+        let err = child_args("manvi", opts(None, Some("edit"), None), dir.path()).unwrap_err();
+        assert!(err.contains("manvi"), "{err}");
+    }
+
+    #[test]
+    fn an_agent_child_takes_a_model_where_the_launcher_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = child_args("claude", opts(Some("opus"), None, None), dir.path()).unwrap();
+        assert_eq!(flag_values(&claude, "--model"), ["opus"]);
+        let agy = child_args("agy", opts(Some("gemini-3-pro"), None, None), dir.path()).unwrap();
+        assert_eq!(flag_values(&agy, "--model"), ["gemini-3-pro"]);
+        assert!(child_args("manvi", opts(Some("opus"), None, None), dir.path()).is_err());
+        for bad in ["--evil", "a b", "x,y", ""] {
+            assert!(
+                child_args("claude", opts(Some(bad), None, None), dir.path()).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_file_inside_the_repo_reaches_claude_and_agy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gitpulse")).unwrap();
+        std::fs::write(
+            dir.path().join(".gitpulse/review.json"),
+            r#"{"permissions":{"allow":["Bash(git -C /repo log:*)"]}}"#,
+        )
+        .unwrap();
+        let claude = child_args(
+            "claude",
+            opts(None, None, Some(".gitpulse/review.json")),
+            dir.path(),
+        )
+        .unwrap();
+        let settings = flag_values(&claude, "--settings");
+        assert_eq!(settings.len(), 1, "one --settings object: {claude:?}");
+        let object: serde_json::Value = serde_json::from_str(settings[0]).unwrap();
+        assert_eq!(
+            object["permissions"]["allow"][0],
+            "Bash(git -C /repo log:*)"
+        );
+        let at = |flag: &str| claude.iter().position(|a| a == flag).unwrap();
+        assert!(at("--settings") < at("--"), "{claude:?}");
+
+        let agy = child_args(
+            "agy",
+            opts(None, None, Some(".gitpulse/review.json")),
+            dir.path(),
+        )
+        .unwrap();
+        let canonical = std::fs::canonicalize(dir.path().join(".gitpulse/review.json")).unwrap();
+        assert_eq!(
+            flag_values(&agy, "--settings"),
+            [canonical.to_str().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_an_existing_file_in_the_repo_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("s.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("ok.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("array.json"), "[]").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let try_settings = |launcher: &str, path: &str| {
+            child_args(launcher, opts(None, None, Some(path)), dir.path())
+        };
+        assert!(try_settings("claude", "../escape.json").is_err());
+        assert!(try_settings("claude", "/etc/hosts").is_err());
+        assert!(try_settings("claude", "missing.json").is_err());
+        assert!(try_settings("claude", "sub").is_err(), "a directory");
+        assert!(
+            try_settings("claude", "array.json").is_err(),
+            "claude needs a JSON object"
+        );
+        for launcher in ["codex", "grok", "manvi"] {
+            let err = try_settings(launcher, "ok.json").unwrap_err();
+            assert!(
+                err.contains("--settings") || err.contains("settings"),
+                "{launcher}: {err}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path().join("s.json"), dir.path().join("link.json"))
+                .unwrap();
+            assert!(
+                try_settings("claude", "link.json").is_err(),
+                "symlink out of the repo"
+            );
+            assert!(
+                try_settings("agy", "link.json").is_err(),
+                "symlink out of the repo"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_file_cannot_turn_off_permissions_or_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bypass.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("nohooks.json"),
+            r#"{"disableAllHooks":true}"#,
+        )
+        .unwrap();
+        for file in ["bypass.json", "nohooks.json"] {
+            for launcher in ["claude", "agy"] {
+                let err =
+                    child_args(launcher, opts(None, None, Some(file)), dir.path()).expect_err(file);
+                assert!(
+                    err.contains("not available over MCP"),
+                    "{launcher} {file}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shell_child_takes_none_of_the_agent_options() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        for agent in [
+            opts(Some("opus"), None, None),
+            opts(None, Some("edit"), None),
+            opts(None, None, Some("src/main.rs")),
+        ] {
+            let mut call = external_spawn(&repo, &format!("mcp-{}", std::process::id()));
+            if let OrchestrateCall::Spawn { agent: slot, .. } = &mut call {
+                *slot = Some(agent);
+            }
+            let err = execute(&state, &ui, call).expect_err("shell takes no agent options");
+            assert!(err.contains("agent launcher"), "{err}");
+        }
+        assert!(crate::terminal::list_sessions(&state).unwrap().is_empty());
+    }
+
+    /// A pid no process can have: past the kernel's pid ceiling on every
+    /// supported system, so `kill(pid, 0)` answers ESRCH.
+    const DEAD_PID_OWNER: &str = "ext-2000000000";
+    const THREAD_A: &str = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+    const THREAD_B: &str = "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
+    /// A child with no PTY, owned by `owner`, for tests about ownership alone.
+    fn register_fake_child(state: &TerminalSessions, repo: &str, id: &str, owner: &str) {
+        state
+            .orchestration
+            .register_session(
+                id,
+                &mint_session_token().unwrap(),
+                Path::new(repo),
+                Path::new(repo),
+                "shell",
+                24,
+                80,
+                crate::terminal::new_shared_telemetry(),
+                Some(ChildSpawnMeta {
+                    parent_session_id: owner.into(),
+                    launcher: "shell".into(),
+                    title: None,
+                }),
+            )
+            .unwrap();
+    }
+
+    fn external_spawn(repo: &str, owner: &str) -> OrchestrateCall {
+        OrchestrateCall::Spawn {
+            repo_path: repo.into(),
+            caller_session_id: None,
+            caller_token: None,
+            external_caller_id: Some(owner.into()),
+            launcher: Some("shell".into()),
+            cwd: None,
+            command: None,
+            prompt: None,
+            title: None,
+            split: Some(false),
+            rows: Some(24),
+            cols: Some(80),
+            agent: None,
+        }
+    }
+
+    /// Before: sixteen children of owners whose process was gone filled the
+    /// external cap for good, so every later external spawn was refused.
+    #[test]
+    fn children_of_a_dead_owner_do_not_fill_the_external_cap() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        for n in 0..MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
+            register_fake_child(&state, &repo, &format!("term-91001-{n}"), DEAD_PID_OWNER);
+        }
+        let live_owner = format!("mcp-{}", std::process::id());
+        let spawned = execute(&state, &ui, external_spawn(&repo, &live_owner))
+            .expect("a dead owner's children must not count toward the cap");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
+    /// A live owner's children still count, so the cap is not simply gone.
+    #[test]
+    fn children_of_a_live_owner_still_fill_the_external_cap() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let live_owner = format!("mcp-{}", std::process::id());
+        for n in 0..MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
+            register_fake_child(&state, &repo, &format!("term-91002-{n}"), &live_owner);
+        }
+        let err = execute(
+            &state,
+            &ui,
+            external_spawn(&repo, "ext-mavi-0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("external terminal orchestrators already have"),
+            "{err}"
+        );
+    }
+
+    /// Before: nothing said a child's owner was gone, and nothing kept the
+    /// rest of the world from reaching a dead owner's children.
+    #[test]
+    fn a_dead_owners_children_are_marked_orphaned_and_unreachable_to_others() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let live_owner = format!("mcp-{}", std::process::id());
+        register_fake_child(&state, &repo, "term-91003-1", DEAD_PID_OWNER);
+        register_fake_child(&state, &repo, "term-91003-2", &live_owner);
+        let list = |owner: &str| {
+            execute(
+                &state,
+                &ui,
+                OrchestrateCall::List {
+                    repo_path: repo.clone(),
+                    caller_session_id: None,
+                    caller_token: None,
+                    external_caller_id: Some(owner.into()),
+                    include_repo_shells: None,
+                },
+            )
+            .expect("list")
+        };
+        let dead = list(DEAD_PID_OWNER);
+        assert_eq!(dead["children"][0]["child_session_id"], "term-91003-1");
+        assert_eq!(dead["children"][0]["orphaned"], true, "{dead}");
+        let live = list(&live_owner);
+        assert_eq!(live["total"], 1, "a live owner sees only its own: {live}");
+        assert_eq!(live["children"][0]["orphaned"], false, "{live}");
+        let refusal = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Close {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: Some(live_owner),
+                child_session_id: "term-91003-1".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal, LINEAGE_REFUSAL);
+    }
+
+    /// New entry point: closing a forgotten thread's children closes its own,
+    /// leaves another thread's alone, and leaves a protected one running.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_threads_children_skips_protected_and_other_threads() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let owner_a = mavi_owner_key(THREAD_A).unwrap();
+        let owner_b = mavi_owner_key(THREAD_B).unwrap();
+        let spawn = |owner: &str| {
+            let out = execute(&state, &ui, external_spawn(&repo, owner)).expect("spawn");
+            out["child_session_id"].as_str().unwrap().to_string()
+        };
+        let (a1, a2, a3) = (spawn(&owner_a), spawn(&owner_a), spawn(&owner_a));
+        let b1 = spawn(&owner_b);
+        assert!(state.session_ledger().set_protected(&a3, true));
+
+        let summary = close_owner_children(&state, &ui, &owner_a).expect("close thread children");
+        assert_eq!((summary.closed, summary.skipped_protected), (2, 1));
+        let live: Vec<String> = crate::terminal::list_sessions(&state)
+            .unwrap()
+            .into_iter()
+            .filter(|s| !s.ending)
+            .map(|s| s.id)
+            .collect();
+        assert!(!live.contains(&a1) && !live.contains(&a2), "{live:?}");
+        assert!(live.contains(&a3), "a protected child stays: {live:?}");
+        assert!(live.contains(&b1), "another thread's child stays: {live:?}");
+        assert_eq!(ui.closed.lock().unwrap().len(), 2);
+
+        // Not a Mavi owner key: refused, nothing closed.
+        assert!(close_owner_children(&state, &ui, "mcp-1234").is_err());
+        assert!(live.contains(&b1));
+        for id in [&a3, &b1] {
+            let _ = crate::terminal::kill_session(&state, id, KillOrigin::Unspecified);
+        }
     }
 
     #[test]

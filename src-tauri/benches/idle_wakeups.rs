@@ -52,11 +52,11 @@ mod common;
 mod imp {
     use super::common::fixture::{git, trust_repo};
     use super::common::{interleave, Case, Report, Sample};
-    use gitpulse_lib::terminal::{
-        acknowledge_output, kill_session, shutdown_sessions, spawn_session, KillOrigin,
-    };
     use std::time::{Duration, Instant};
     use tauri::Listener;
+    use waylode_lib::terminal::{
+        acknowledge_output, kill_session, shutdown_sessions, spawn_session, KillOrigin,
+    };
 
     /// (interrupt wakeups, idle wakeups) on macOS; (voluntary ctx switches, 0)
     /// on Linux.
@@ -108,7 +108,7 @@ mod imp {
     const SHORT_TMP: &str = "/tmp";
 
     pub fn main() {
-        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+        waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("idle_wakeups");
         let window = if report.opts.smoke {
             Duration::from_millis(1500)
@@ -116,7 +116,7 @@ mod imp {
             Duration::from_secs(5)
         };
         let app = tauri::test::mock_builder()
-            .build(gitpulse_lib::context())
+            .build(waylode_lib::context())
             .expect("mock app");
         let state = super::common::terminals();
         {
@@ -149,7 +149,7 @@ mod imp {
                         Some("/bin/cat".into()),
                         Some(Vec::new()),
                         None,
-                        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+                        waylode_lib::terminal::OutputSink::events(app.handle()),
                     )
                     .unwrap_or_else(|error| panic!("spawn cat: {error}", error = error.message()))
                     .id
@@ -190,10 +190,10 @@ mod imp {
                 dir.to_str().expect("utf-8").to_owned()
             })
             .collect();
-        let watch_state = gitpulse_lib::watcher::WatcherState::default();
+        let watch_state = waylode_lib::watcher::WatcherState::default();
         let idle_watches = |count: usize| -> Sample {
             for path in &repos[..count] {
-                gitpulse_lib::watcher::bench_seam::start_idle_watch(&watch_state, path)
+                waylode_lib::watcher::bench_seam::start_idle_watch(&watch_state, path)
                     .unwrap_or_else(|error| {
                         panic!("watch {path}: {error}", error = error.message())
                     });
@@ -204,7 +204,7 @@ mod imp {
             let (before, started) = (counters(), Instant::now());
             std::thread::sleep(window);
             let (elapsed, after) = (started.elapsed(), counters());
-            let _ = gitpulse_lib::watcher::unwatch_all(&watch_state);
+            let _ = waylode_lib::watcher::unwatch_all(&watch_state);
             std::thread::sleep(Duration::from_millis(600));
             let secs = elapsed.as_secs_f64();
             Sample::default()
@@ -218,7 +218,7 @@ mod imp {
         let profile = temp.path().join("profile");
         #[cfg(target_os = "macos")]
         let idle_mailbox = || -> Sample {
-            use gitpulse_lib::desktop::instance::{claim, Claim};
+            use waylode_lib::desktop::instance::{claim, Claim};
             let Claim::Primary(owner) = claim(&profile, Duration::from_secs(2)) else {
                 panic!("the bench profile is not claimable as Primary");
             };
@@ -248,8 +248,8 @@ mod imp {
                 .expect("short home");
             let saved = std::env::var_os("HOME");
             std::env::set_var("HOME", home.path());
-            gitpulse_lib::alerts::bridge::apply(true);
-            let status = gitpulse_lib::alerts::bridge::status();
+            waylode_lib::alerts::bridge::apply(true);
+            let status = waylode_lib::alerts::bridge::status();
             assert!(
                 status.listening,
                 "the alerts bridge did not bind: {:?}",
@@ -259,7 +259,7 @@ mod imp {
             let (before, started) = (counters(), Instant::now());
             std::thread::sleep(window);
             let (elapsed, after) = (started.elapsed(), counters());
-            gitpulse_lib::alerts::bridge::apply(false);
+            waylode_lib::alerts::bridge::apply(false);
             std::thread::sleep(Duration::from_millis(500));
             match saved {
                 Some(value) => std::env::set_var("HOME", value),
@@ -275,7 +275,7 @@ mod imp {
         let sampler_dir = temp.path().join("sampler");
         std::fs::create_dir_all(&sampler_dir).expect("sampler dir");
         let idle_host_load = || -> Sample {
-            let handle = gitpulse_lib::sysload::start(gitpulse_lib::sysload::SamplerOptions::new(
+            let handle = waylode_lib::sysload::start(waylode_lib::sysload::SamplerOptions::new(
                 sampler_dir.clone(),
             ))
             .unwrap_or_else(|error| panic!("host-load sampler: {error}"));
@@ -301,7 +301,7 @@ mod imp {
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&external_dir).expect("external dir");
         let idle_external = |visible: bool| -> Sample {
-            let looped = gitpulse_lib::workbench::external_changes::bench_seam::IdleLoop::start(
+            let looped = waylode_lib::workbench::external_changes::bench_seam::IdleLoop::start(
                 &external_dir,
                 visible,
             )
@@ -329,7 +329,7 @@ mod imp {
             let lifetime = window + Duration::from_millis(1500);
             let seconds = format!("{}", lifetime.as_secs() + 1);
             let waiter = std::thread::spawn(move || {
-                gitpulse_lib::engine::process::capture_command(
+                waylode_lib::engine::process::capture_command(
                     "sleep",
                     &[seconds.as_str()],
                     None,

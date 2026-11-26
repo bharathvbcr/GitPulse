@@ -3,13 +3,13 @@
 
 mod common;
 
-use gitpulse_lib::engine::agent_bus::{
+use std::process::Command;
+use tempfile::TempDir;
+use waylode_lib::engine::agent_bus::{
     answer_ask, list_inbox_threads, list_lanes, post_message, post_thread_message, read_messages,
     read_thread_messages, register_or_update_lane, release_lane, withdraw_ask, MAX_BUS_MESSAGES,
 };
-use gitpulse_lib::procguard::LockedSpawn;
-use std::process::Command;
-use tempfile::TempDir;
+use waylode_lib::procguard::LockedSpawn;
 
 /// Helper to create a fake repository with a real initialized Git repo and granted trust.
 fn create_test_repo() -> TempDir {
@@ -30,7 +30,7 @@ fn test_agent_bus_message_delivery_and_monotonic_sequence() {
     // 1. Post sequential messages to agent bus
     let msg1 = post_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-alpha",
         Some("agent-beta"),
         "handshake",
@@ -46,7 +46,7 @@ fn test_agent_bus_message_delivery_and_monotonic_sequence() {
 
     let msg2 = post_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-beta",
         Some("agent-alpha"),
         "ack",
@@ -85,7 +85,7 @@ fn test_vespin_threaded_asks_lifecycle_and_answering() {
 
     let ask_msg = post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "worker-claude",
         Some("orchestrator"),
         Some(thread_key),
@@ -110,7 +110,7 @@ fn test_vespin_threaded_asks_lifecycle_and_answering() {
     let answer_body = r#"{"selected":"SQLite","notes":"Optimized for WAL concurrency"}"#;
     let answer_msg = answer_ask(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "orchestrator",
         thread_key,
         answer_body,
@@ -144,7 +144,7 @@ fn test_vespin_ask_withdrawal() {
 
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "worker-agy",
         Some("orchestrator"),
         Some(thread_key),
@@ -157,7 +157,7 @@ fn test_vespin_ask_withdrawal() {
     // Withdraw the ask
     let withdraw_msg = withdraw_ask(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "worker-agy",
         thread_key,
         "No longer needed - PR merged automatically",
@@ -180,7 +180,7 @@ fn test_agent_bus_ring_buffer_cap_preserves_bounds() {
     for i in 1..=total_to_post {
         post_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-chatter",
             None,
             "ping",
@@ -294,7 +294,7 @@ fn test_inbox_threads_multibyte_utf8_truncation_without_panic() {
     let body_emoji = format!("{}🚀{}", "A".repeat(55), "tail_exceeding_sixty_chars_limit");
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-emoji",
         None,
         Some("thread-emoji"),
@@ -309,7 +309,7 @@ fn test_inbox_threads_multibyte_utf8_truncation_without_panic() {
     let body_cjk = format!("{}中{}", "B".repeat(56), "tail_exceeding_sixty_chars_limit");
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-cjk",
         None,
         Some("thread-cjk"),
@@ -324,7 +324,7 @@ fn test_inbox_threads_multibyte_utf8_truncation_without_panic() {
     let body_accent = format!("{}é{}", "C".repeat(56), "tail_exceeding_sixty_chars_limit");
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-accent",
         None,
         Some("thread-accent"),

@@ -1,6 +1,6 @@
 # Cross-Platform Testing (Linux & Windows)
 
-GitPulse ships native installers for macOS (universal), Linux (`x86_64` and `aarch64` on the Ubuntu 22.04 glibc/WebKitGTK 4.1 floor), and Windows (`x64` and `arm64` on WebView2 / ConPTY). This guide documents how to run the exact Linux and Windows engines locally and how GitHub Actions enforces them before every release.
+Waylode ships native installers for macOS (universal), Linux (`x86_64` and `aarch64` on the Ubuntu 22.04 glibc/WebKitGTK 4.1 floor), and Windows (`x64` and `arm64` on WebView2 / ConPTY). This guide documents how to run the exact Linux and Windows engines locally and how GitHub Actions enforces them before every release.
 
 ## 1. Local Linux Testing in Podman (Ubuntu 22.04 Floor)
 
@@ -31,7 +31,7 @@ Pass `--platform linux/amd64` on Apple Silicon when you specifically need x86_64
 
 ## 2. Native-Engine UI Regression Runner (`framework/tao` + `framework/wry`)
 
-`src-tauri/examples/webview_regressions.rs` compiles against GitPulse's vendored `framework/tao` and `framework/wry` crates and is wired directly into `scripts/browser-regressions.mjs`:
+`src-tauri/examples/webview_regressions.rs` compiles against Waylode's vendored `framework/tao` and `framework/wry` crates and is wired directly into `scripts/browser-regressions.mjs`:
 
 | Platform | Command | Engine |
 | :--- | :--- | :--- |
@@ -52,7 +52,7 @@ Use `bun run test:native -- --harness <slug>` for one page or `bun run test:nati
 4. `tauri-plugin-single-instance` second-launch handoff (`04-single-instance-handoff.png`)
 5. Clean shutdown with zero orphaned app processes (`summary.json`)
 
-Repository trust for the disposable E2E fixture repos is persisted inside the isolated profile via the test-only `e2e_seed_trust` example binary, keeping the shipping binary's trust boundary unchanged. On Windows, close any running GitPulse instance before launching E2E smoke because `tauri-plugin-single-instance` coordinates via a Win32 named mutex keyed on `com.gitpulse.desktop`.
+Repository trust for the disposable E2E fixture repos is persisted inside the isolated profile via the test-only `e2e_seed_trust` example binary, keeping the shipping binary's trust boundary unchanged. On Windows, close any running Waylode instance before launching E2E smoke because `tauri-plugin-single-instance` coordinates via a Win32 named mutex keyed on `com.gitpulse.desktop`.
 
 ```bash
 # Build frontend dist, the app (with embedded assets via custom-protocol),

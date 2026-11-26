@@ -88,7 +88,7 @@
     <fieldset disabled={busy || !!pending}>
       <Checkbox label="Enable desktop notifications" checked={draft.enabled} onchange={(next) => { if (draft) draft.enabled = next; }} />
       <Checkbox label="Play a sound" checked={draft.sound} onchange={(next) => { if (draft) draft.sound = next; }} />
-      <Checkbox label="Notify while GitPulse is hidden or minimized" checked={draft.background} onchange={(next) => { if (draft) draft.background = next; }} />
+      <Checkbox label="Notify while Waylode is hidden or minimized" checked={draft.background} onchange={(next) => { if (draft) draft.background = next; }} />
       <Checkbox label="Quiet hours in this computer’s local time" checked={quiet} onchange={(next) => (quiet = next)} />
       {#if quiet}<div class="times"><label>From <input class="gp-field" type="time" bind:value={start} /></label><label>Until <input class="gp-field" type="time" bind:value={end} /></label></div>{/if}
       {#if taskID || scope.kind !== "global"}<Checkbox label={`Mute this ${taskID ? "task" : scope.kind}`} checked={muted} onchange={toggleMute} />{/if}

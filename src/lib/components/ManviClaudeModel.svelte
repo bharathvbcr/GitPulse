@@ -146,7 +146,7 @@
     </label>
     <p class="text-meta text-textMuted">
       Task suggestions and Manvi's own model calls are billed to {account ? "this account" : "this key"}.
-      GitPulse's own AI features (commit messages, commit explanations, branch names, health and
+      Waylode's own AI features (commit messages, commit explanations, branch names, health and
       coverage plans) use this model too, so their diffs are sent to the Claude API through Manvi.
       Claude Code agents Manvi launches keep their own login. Manvi keeps the key from every program it
       starts.
@@ -169,10 +169,10 @@
             No workspace id is recorded for this account; requests use the organisation's default workspace.
           {/if}
         </div>
-        <div class="text-textMuted">Change it with <span class="font-mono">anthropic-account</span>; GitPulse never reads the key.</div>
+        <div class="text-textMuted">Change it with <span class="font-mono">anthropic-account</span>; Waylode never reads the key.</div>
         {#if keySaved}
           <div class="flex items-center gap-2 text-textMuted" data-testid="manvi-claude-unused-key">
-            <span>A key is also saved in GitPulse's Keychain entry; it is not used while this account is.</span>
+            <span>A key is also saved in Waylode's Keychain entry; it is not used while this account is.</span>
             <button
               class="hover:text-textPrimary underline disabled:opacity-50"
               disabled={working}

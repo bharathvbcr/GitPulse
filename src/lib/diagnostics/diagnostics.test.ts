@@ -1299,7 +1299,7 @@ describe("build stamping", () => {
 
   it("names the running build in the report header", () => {
     const report = formatDiagnosticReport([entry({ version: "0.0.3" })], generatedAt, "0.0.3");
-    expect(report).toContain("Generated: 2026-08-25T12:00:00.000Z by GitPulse 0.0.3");
+    expect(report).toContain("Generated: 2026-08-25T12:00:00.000Z by Waylode 0.0.3");
   });
 
   it("never folds a repeat into an entry from a different build", () => {

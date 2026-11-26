@@ -75,7 +75,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 
 const CARGO_MANIFEST = "src-tauri/Cargo.toml";
 // Its own workspace, Cargo.lock and target dir: not a member of src-tauri.
-const WORKTREE_MANIFEST = "crates/gitpulse-worktree/Cargo.toml";
+const WORKTREE_MANIFEST = "crates/waylode-worktree/Cargo.toml";
 
 /**
  * The gates, in the order CI runs them.
@@ -166,6 +166,13 @@ export const GATES = [
     program: "bun",
     args: ["run", "check:release"],
     covers: ["bun run check:release"],
+  },
+  {
+    id: "brand-assets",
+    name: "Brand assets parity check",
+    program: "bun",
+    args: ["run", "check:brand-assets"],
+    covers: ["bun run check:brand-assets"],
   },
   {
     // docs/design/UI_RULES.md section 1, mechanically. --strict fails on any violation

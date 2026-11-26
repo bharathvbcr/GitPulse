@@ -1,10 +1,10 @@
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
-use gitpulse_lib::engine::{GitReader, GitWriter};
 use std::fs::File;
 use std::io::Write;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::engine::{GitReader, GitWriter};
 
 fn create_temp_git_repo() -> TempDir {
     common::unmetered_spawns();

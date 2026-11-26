@@ -6,10 +6,10 @@
 
 mod common;
 
-use gitpulse_lib::engine::agent_bus::{answer_ask, withdraw_ask};
-use gitpulse_lib::mcp::{process_request, Era, JsonRpcRequest, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use waylode_lib::engine::agent_bus::{answer_ask, withdraw_ask};
+use waylode_lib::mcp::{process_request, Era, JsonRpcRequest, PROTOCOL_VERSION};
 
 fn create_test_repo() -> TempDir {
     common::unmetered_spawns();
@@ -278,7 +278,7 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 1. Direct Rust API: withdraw_ask with empty string
     let err_wd_empty = withdraw_ask(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         "",
         "Valid reason",
@@ -295,7 +295,7 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 2. Direct Rust API: withdraw_ask with whitespace-only string
     let err_wd_ws = withdraw_ask(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         "   \t\n  ",
         "Valid reason",
@@ -310,7 +310,7 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 3. Direct Rust API: answer_ask with empty string
     let err_ans_empty = answer_ask(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         "",
         "Valid answer",
@@ -327,7 +327,7 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 4. Direct Rust API: answer_ask with whitespace-only string
     let err_ans_ws = answer_ask(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         "   \r\n  ",
         "Valid answer",
@@ -403,9 +403,9 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     );
 
     // 8. post_thread_message normalizes whitespace-only thread_key to None (unthreaded broadcast)
-    let msg_ws = gitpulse_lib::engine::agent_bus::post_thread_message(
+    let msg_ws = waylode_lib::engine::agent_bus::post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-tester",
         None,
         Some("   \t\n  "),

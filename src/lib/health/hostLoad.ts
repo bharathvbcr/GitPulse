@@ -8,6 +8,7 @@
  * and is never shown as zero.
  */
 import { humanBytes } from "../storage/format";
+import { NO_RELIEF_CHIP, type ReliefChipInput } from "./hostRelief";
 import type {
   AgentKind,
   AgentSession,
@@ -104,7 +105,32 @@ export interface StatusChip {
  * is meant to run. A sensor the user switched off is their choice, and
  * Settings already says so.
  */
-export function statusChip(pulse: HostLoadPulse | null): StatusChip | null {
+export function statusChip(
+  pulse: HostLoadPulse | null,
+  relief: ReliefChipInput = NO_RELIEF_CHIP,
+): StatusChip | null {
+  const base = pressureChip(pulse);
+  if (relief.paused === 0 && !relief.unverified) return base;
+  // The relief supervisor's word, appended to whatever the bar already says,
+  // or said alone when the bar would have been quiet. A status that was
+  // stale or unreadable says so: it is never "nothing paused".
+  const note =
+    relief.paused > 0
+      ? ` · ${relief.paused} paused${relief.unverified ? " (unverified)" : ""}`
+      : " · pause status unverified";
+  const title =
+    relief.paused > 0
+      ? "Waylode's memory protection paused a build or test under an agent. It resumes automatically. Open Health, Host load, to resume it now."
+      : "Waylode couldn't verify whether its memory protection has paused anything. Open Health, Host load.";
+  if (base) return { ...base, text: base.text + note, title: `${base.title} ${title}` };
+  return {
+    text: `Memory protection${note}`,
+    tone: relief.paused > 0 ? "warn" : "muted",
+    title,
+  };
+}
+
+function pressureChip(pulse: HostLoadPulse | null): StatusChip | null {
   if (!pulse || pulse.role === "unsupported" || pulse.role === "not_sampling") return null;
   if (!pulse.enabled && pulse.state !== "dead") return null;
   if (pulse.state === "dead" || pulse.state === "stale_old") {
@@ -125,7 +151,7 @@ export function statusChip(pulse: HostLoadPulse | null): StatusChip | null {
       text: `Memory: ${levelLabel(pulse.level)}${thrash}${governing}${stale}`,
       tone: pulse.level === "critical" ? "danger" : "warn",
       title:
-        "The kernel reports memory pressure. Heavy work started now competes for memory; open Health for what is using it and what GitPulse is shedding.",
+        "The kernel reports memory pressure. Heavy work started now competes for memory; open Health for what is using it and what Waylode is shedding.",
     };
   }
   if (pulse.compressor_thrash) {
@@ -143,7 +169,7 @@ export function statusChip(pulse: HostLoadPulse | null): StatusChip | null {
       text: `Host load: ${bindingLabel(pulse.governor.binding)}${governing}${stale}`,
       tone: refused ? "danger" : "warn",
       title:
-        "GitPulse is acting on a host reading other than memory pressure. Open Health for which one, its value and the threshold it crossed. Thresholds are in Settings, Agents, Host load.",
+        "Waylode is acting on a host reading other than memory pressure. Open Health for which one, its value and the threshold it crossed. Thresholds are in Settings, Agents, Host load.",
     };
   }
   return null;
@@ -487,7 +513,7 @@ export function previousBootLines(previous: PreviousBoot): string[] {
     `Highest memory pressure: ${p.max_pressure === null ? "unreadable" : levelLabel(p.max_pressure)}. Governor: ${p.max_tier ?? "unknown"}${p.refused ? ", launches were refused" : ", launches were admitted"}.`,
     `Swap used, at most ${readOrUnknown(p.max_swap_used, bytes)}. Compressor segments, at most ${readOrUnknown(p.max_segment_fraction, (f) => f.toFixed(2))} of the limit.`,
     `1-minute load, at most ${readOrUnknown(p.max_load_1m, (l) => l.toFixed(1))}. Free disk, at least ${readOrUnknown(p.min_free_disk, bytes)}.`,
-    `GitPulse's launched trees, at most ${readOrUnknown(p.max_launched_footprint, bytes)}. Largest other process, at most ${readOrUnknown(p.max_largest_foreign, bytes)}.`,
+    `Waylode's launched trees, at most ${readOrUnknown(p.max_launched_footprint, bytes)}. Largest other process, at most ${readOrUnknown(p.max_largest_foreign, bytes)}.`,
     `Thermal state, worst ${p.worst_thermal ?? "unreadable"}.`,
   ];
 }

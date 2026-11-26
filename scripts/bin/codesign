@@ -19,7 +19,7 @@ self_dir=$(cd "$(dirname "$0")" && pwd -P)
 manifest="$self_dir/../../src-tauri/Cargo.toml"
 tauri_conf="$self_dir/../../src-tauri/tauri.conf.json"
 
-REAL_CODESIGN="${GITPULSE_REAL_CODESIGN:-}"
+REAL_CODESIGN="${WAYLODE_REAL_CODESIGN:-${GITPULSE_REAL_CODESIGN:-}}"
 if [ -z "$REAL_CODESIGN" ]; then
   for candidate in /usr/bin/codesign; do
     if [ -x "$candidate" ]; then
@@ -105,9 +105,9 @@ while read -r helper; do
   last=$((${#helper_args[@]} - 1))
   helper_args[$last]="$helper_path"
 
-  echo "[gitpulse-codesign] nested helper first: $helper_path" >&2
+  echo "[waylode-codesign] nested helper first: $helper_path" >&2
   if ! "$REAL_CODESIGN" "${helper_args[@]}"; then
-    echo "[gitpulse-codesign] failed to sign nested helper $helper_path" >&2
+    echo "[waylode-codesign] failed to sign nested helper $helper_path" >&2
     status=1
   fi
 done < <(declared_binaries)

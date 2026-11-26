@@ -261,7 +261,7 @@
   <legend class="text-textPrimary text-meta">Agent models</legend>
   {#if rows.length === 0}
     <p class="text-textMuted text-micro leading-snug mt-1" data-testid="agent-models-unavailable">
-      This build of GitPulse's backend does not offer model settings.
+      This build of Waylode's backend does not offer model settings.
     </p>
   {:else}
     <div class="mt-1.5 flex flex-col gap-2.5" data-testid="agent-models">
@@ -304,9 +304,9 @@
     </div>
   {/if}
   <p class="text-textMuted text-micro leading-snug mt-1.5" data-testid="agent-models-note">
-    The model each agent starts with when GitPulse starts it in a terminal, for task runs and new agent tabs alike. Empty means the CLI's own choice.
+    The model each agent starts with when Waylode starts it in a terminal, for task runs and new agent tabs alike. Empty means the CLI's own choice.
     A task run first checks that the installed CLI offers each control (and the effort level you picked), and refuses to start if it does not.
-    GitPulse checks that a name is well-formed, not that the model exists — the CLI reports a model it cannot use in the session.
+    Waylode checks that a name is well-formed, not that the model exists — the CLI reports a model it cannot use in the session.
     Antigravity does not stop for an unknown name: it falls back to its default model and prints a warning in the terminal. Its names are the ones <span class="font-mono">agy models</span> lists.
     Claude's advisor needs access to the advisor model, and Claude Code reports a pairing it cannot use (the advisor must be at least as capable as the main model).
     "Ask agent to commit" can start on a smaller model than the one above: a commit entry replaces the whole entry above for that launch (nothing is carried over from it, so name the advisor again if you want one), and leaving it empty means the model above.

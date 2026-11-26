@@ -44,13 +44,13 @@ describe("AttentionInbox", () => {
     expect(style).not.toMatch(/background(?:-color)?:\s*rgb\(var\(--c-(?:bg|surface|surface-hover)\)\)/);
   });
 
-  it("renders the Inbox header alongside the current GitPulse badge Logo inside aria-hidden", () => {
+  it("renders the Inbox header alongside the current Waylode badge Logo inside aria-hidden", () => {
     const { body } = render(AttentionInbox, {
       props: { scope: { kind: "global" }, onopen: async () => {} },
     });
     expect(body).toContain("<strong>Inbox</strong>");
-    expect(body).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
-    expect(body).toMatch(/id="gp-[a-z0-9]+-badge"/);
-    expect(body).toMatch(/<span[^>]*aria-hidden="true"[^>]*>[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
+    expect(body).toContain("M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8");
+    expect(body).toMatch(/id="wl-[a-z0-9]+-badge"/);
+    expect(body).toMatch(/<span[^>]*aria-hidden="true"[^>]*>[\s\S]*?<svg[^>]*aria-label="Waylode"/);
   });
 });

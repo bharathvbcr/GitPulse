@@ -84,7 +84,7 @@ export function hookReplyMisses(status: SessionAlertStatus): HookReplyMisses {
   return {
     line:
       count > 0
-        ? `${reports} in the last 7 days got no reply from GitPulse in time${last}. ` +
+        ? `${reports} in the last 7 days got no reply from Waylode in time${last}. ` +
           "A missed SessionEnd can leave that agent's banner standing; hooks do not retry."
         : null,
     error: status.hook_drop_record_error,

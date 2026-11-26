@@ -18,7 +18,7 @@ import { bareHookCommand, WORKTREE_LAUNCHER_PREFIX } from "./check-mcp-install.m
  * package.
  */
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN = path.join(ROOT, "plugins", "gitpulse");
+const PLUGIN = path.join(ROOT, "plugins", "waylode");
 const PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 const MCP_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 
@@ -44,7 +44,7 @@ describe("Agent Plugins 1.0 plugin.json", () => {
 
   it("declares the 1.0.0 schema and a valid plugin name", () => {
     expect(manifest.$schema).toBe(PLUGIN_SCHEMA);
-    expect(manifest.name).toBe("gitpulse");
+    expect(manifest.name).toBe("waylode");
     const name = String(manifest.name);
     expect(name.length).toBeGreaterThanOrEqual(1);
     expect(name.length).toBeLessThanOrEqual(64);
@@ -74,14 +74,14 @@ describe("Agent Plugins 1.0 mcp.json", () => {
 
   it("declares a stdio server whose command is one executable token", () => {
     const servers = mcp.mcpServers as Record<string, Record<string, unknown>>;
-    expect(servers.gitpulse).toBeDefined();
-    const server = servers.gitpulse;
+    expect(servers.waylode).toBeDefined();
+    const server = servers.waylode;
     expect(server.type).toBe("stdio");
     expect(typeof server.command).toBe("string");
     const command = String(server.command);
     expect(command.length).toBeGreaterThan(0);
     expect(command).not.toContain(" ");
-    expect(command === "gitpulse-mcp" || command.startsWith("./")).toBe(true);
+    expect(command === "waylode-mcp" || command.startsWith("./")).toBe(true);
   });
 });
 
@@ -135,7 +135,7 @@ describe("plugin hooks", () => {
     const declared = /pub const LAUNCHER_PREFIX: &str = "((?:[^"\\]|\\.)*)";/.exec(rust)?.[1];
     expect(declared, "LAUNCHER_PREFIX is no longer a plain string in hooks/worktree.rs").toBeTruthy();
     expect(JSON.parse(`"${declared}"`)).toBe(WORKTREE_LAUNCHER_PREFIX);
-    expect(existsSync(path.join(PLUGIN, "hooks", "gitpulse-worktree.sh"))).toBe(true);
+    expect(existsSync(path.join(PLUGIN, "hooks", "waylode-worktree.sh"))).toBe(true);
     for (const [event, groups] of Object.entries(hooks.hooks)) {
       for (const group of groups) {
         for (const handler of group.hooks) {
@@ -144,8 +144,8 @@ describe("plugin hooks", () => {
         }
       }
     }
-    expect(bareHookCommand(String(hooks.hooks.WorktreeCreate[0].hooks[0].command))).toBe("gitpulse-hook worktree-create");
-    expect(bareHookCommand(String(hooks.hooks.WorktreeRemove[0].hooks[0].command))).toBe("gitpulse-hook worktree-remove");
+    expect(bareHookCommand(String(hooks.hooks.WorktreeCreate[0].hooks[0].command))).toBe("waylode-hook worktree-create");
+    expect(bareHookCommand(String(hooks.hooks.WorktreeRemove[0].hooks[0].command))).toBe("waylode-hook worktree-remove");
   });
 
   it("never makes the agent wait on a report it could have sent in the background", () => {
@@ -236,11 +236,11 @@ describe("plugin hooks", () => {
     // It is not a hook: no manifest may ask the host to run it, or a host that
     // sent it would start a build wrapper with no command to wrap.
     const hooks = readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8");
-    expect(hooks).not.toMatch(/gitpulse-hook\s+lease/);
+    expect(hooks).not.toMatch(/waylode-hook\s+lease/);
   });
 
   it("invokes the same binary this repo builds, with a real subcommand", () => {
-    // The MCP manifest resolves `gitpulse-mcp` off PATH for the same reason a
+    // The MCP manifest resolves `waylode-mcp` off PATH for the same reason a
     // published plugin must: the client runs the installed server, not a path
     // baked into a manifest. The hook binary follows that, so the subcommand is
     // the part a typo can break silently.
@@ -249,7 +249,7 @@ describe("plugin hooks", () => {
       for (const group of groups) {
         for (const handler of group.hooks) {
           const [bin, ...rest] = bareHookCommand(String(handler.command)).split(/\s+/);
-          expect(bin).toBe("gitpulse-hook");
+          expect(bin).toBe("waylode-hook");
           expect(rest.length, `${handler.command} names no subcommand`).toBeGreaterThan(0);
           // Only `notify` takes a second word, and it is the notification type
           // the matcher routed. A stray argument anywhere else is a typo the
@@ -482,7 +482,7 @@ describe("the package's executables are installable", () => {
     }
 
     const agyHooks = JSON.parse(
-      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "hooks.json"), "utf8"),
+      readFileSync(path.join(ROOT, "plugins", "waylode-agy", "hooks.json"), "utf8"),
     ) as Record<string, Record<string, Array<{ command?: string; hooks?: Array<{ command?: string }> }>>>;
     for (const namedHook of Object.values(agyHooks)) {
       for (const entries of Object.values(namedHook)) {
@@ -496,7 +496,7 @@ describe("the package's executables are installable", () => {
       }
     }
     const agyMcp = JSON.parse(
-      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "mcp_config.json"), "utf8"),
+      readFileSync(path.join(ROOT, "plugins", "waylode-agy", "mcp_config.json"), "utf8"),
     ) as { mcpServers?: Record<string, { command?: string }> };
     for (const server of Object.values(agyMcp.mcpServers ?? {})) {
       if (typeof server.command === "string" && server.command) found.add(server.command);
@@ -547,7 +547,7 @@ describe("the package's executables are installable", () => {
     // new [[bin]] becomes required in every bundle the moment it is declared.
     const cargo = readFileSync(path.join(ROOT, "src-tauri", "Cargo.toml"), "utf8");
     const bins = declaredBinaryNames(cargo);
-    expect([...bins].sort()).toEqual(["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"]);
+    expect([...bins].sort()).toEqual(["waylode", "waylode-hook", "waylode-mcp", "waylode-ptyd", "wayloded"]);
     for (const bin of spawnedExecutables()) {
       expect(bins, `a manifest spawns ${bin}, which no [[bin]] builds`).toContain(bin);
     }
@@ -764,7 +764,7 @@ function minHostTimeoutSeconds(subcommand: string, argument = ""): number {
 
 describe("hook budgets sit inside the host's timeouts", () => {
   function declaredTimeouts(): Array<{
-    manifest: "gitpulse" | "gitpulse-agy";
+    manifest: "waylode" | "waylode-agy";
     event: string;
     command: string;
     timeout: number;
@@ -773,7 +773,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
       readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8"),
     ) as { hooks: Record<string, Array<{ hooks: Array<{ command?: string; timeout?: number }> }>> };
     const rows: Array<{
-      manifest: "gitpulse" | "gitpulse-agy";
+      manifest: "waylode" | "waylode-agy";
       event: string;
       command: string;
       timeout: number;
@@ -782,7 +782,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
       for (const group of groups) {
         for (const handler of group.hooks) {
           rows.push({
-            manifest: "gitpulse",
+            manifest: "waylode",
             event,
             command: bareHookCommand(String(handler.command)),
             timeout: Number(handler.timeout),
@@ -791,7 +791,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
       }
     }
     const agyHooks = JSON.parse(
-      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "hooks.json"), "utf8"),
+      readFileSync(path.join(ROOT, "plugins", "waylode-agy", "hooks.json"), "utf8"),
     ) as Record<
       string,
       Record<
@@ -805,7 +805,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
           const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
           for (const handler of handlers) {
             rows.push({
-              manifest: "gitpulse-agy",
+              manifest: "waylode-agy",
               event,
               command: bareHookCommand(String(handler.command)),
               timeout: Number(handler.timeout),
@@ -819,8 +819,8 @@ describe("hook budgets sit inside the host's timeouts", () => {
 
   it("reads a budget and at least one declared timeout", () => {
     expect(hookBudgetSeconds()).toBeGreaterThan(0);
-    expect(declaredTimeouts().filter((r) => r.manifest === "gitpulse").length).toBeGreaterThan(0);
-    expect(declaredTimeouts().filter((r) => r.manifest === "gitpulse-agy").length).toBeGreaterThan(0);
+    expect(declaredTimeouts().filter((r) => r.manifest === "waylode").length).toBeGreaterThan(0);
+    expect(declaredTimeouts().filter((r) => r.manifest === "waylode-agy").length).toBeGreaterThan(0);
   });
 
   it("gives every hook longer than the work inside it is allowed to take", () => {
@@ -1050,13 +1050,13 @@ describe("notify routes", () => {
     }
     // The retarget a count cannot see: SessionEnd reporting turn_finished.
     const copy = structuredClone(shipped);
-    copy.SessionEnd[0].hooks[0].command = "gitpulse-hook notify turn_finished";
+    copy.SessionEnd[0].hooks[0].command = "waylode-hook notify turn_finished";
     expect(problems(copy)).toContain("EVENTS has session_ended, which nothing routes");
   });
 });
 
 
-describe("gitpulse:terminal plugin skill contract", () => {
+describe("waylode:terminal plugin skill contract", () => {
   const skillMd = readFileSync(
     path.join(PLUGIN, "skills", "terminal", "SKILL.md"),
     "utf8",
@@ -1077,21 +1077,22 @@ describe("gitpulse:terminal plugin skill contract", () => {
 
   it("documents exact session capability environment variable names without drift", () => {
     expect(skillMd).not.toContain("GITPULSE_TERMINAL_TOKEN");
-    expect(terminalModRs).toContain('TERMINAL_SESSION_ENV: &str = "GITPULSE_TERMINAL_SESSION"');
-    expect(alertsBridgeRs).toContain('SESSION_ENV: &str = "GITPULSE_SESSION_ID"');
-    expect(orchestrateRs).toContain('SESSION_TOKEN_ENV: &str = "GITPULSE_SESSION_TOKEN"');
+    expect(skillMd).not.toContain("WAYLODE_TERMINAL_TOKEN");
+    expect(terminalModRs).toContain('TERMINAL_SESSION_ENV: &str = "WAYLODE_TERMINAL_SESSION"');
+    expect(alertsBridgeRs).toContain('SESSION_ENV: &str = "WAYLODE_SESSION_ID"');
+    expect(orchestrateRs).toContain('SESSION_TOKEN_ENV: &str = "WAYLODE_SESSION_TOKEN"');
 
-    expect(skillMd).toContain("GITPULSE_TERMINAL_SESSION");
-    expect(skillMd).toContain("GITPULSE_SESSION_ID");
-    expect(skillMd).toContain("GITPULSE_SESSION_TOKEN");
+    expect(skillMd).toContain("WAYLODE_TERMINAL_SESSION");
+    expect(skillMd).toContain("WAYLODE_SESSION_ID");
+    expect(skillMd).toContain("WAYLODE_SESSION_TOKEN");
   });
 
-  it("stays in lockstep with every gitpulse_terminal_* MCP tool registered in Rust", () => {
+  it("stays in lockstep with every waylode_terminal_* MCP tool registered in Rust", () => {
     const mcpTools = new Set(
-      Array.from(mcpModRs.matchAll(/"(gitpulse_terminal_[a-z_]+)"/g), (m) => m[1]),
+      Array.from(mcpModRs.matchAll(/"(waylode_terminal_[a-z_]+)"/g), (m) => m[1]),
     );
     const skillTools = new Set(
-      Array.from(skillMd.matchAll(/`(gitpulse_terminal_[a-z_]+)`/g), (m) => m[1]),
+      Array.from(skillMd.matchAll(/`(waylode_terminal_[a-z_]+)`/g), (m) => m[1]),
     );
     expect(mcpTools.size).toBeGreaterThanOrEqual(6);
     expect(Array.from(skillTools).sort()).toEqual(Array.from(mcpTools).sort());
@@ -1116,8 +1117,8 @@ describe("gitpulse:terminal plugin skill contract", () => {
   });
 });
 
-describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
-  const AGY_PLUGIN = path.join(ROOT, "plugins", "gitpulse-agy");
+describe("Antigravity plugin (plugins/waylode-agy)", () => {
+  const AGY_PLUGIN = path.join(ROOT, "plugins", "waylode-agy");
 
   type AgyHandler = {
     type?: unknown;
@@ -1148,16 +1149,16 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
   const GROUP_KEYS = ["hooks", "matcher"];
 
   function validateAgyHooks(candidate: Record<string, Record<string, AgyEntry[]>>) {
-    expect(Object.keys(candidate)).toEqual(["gitpulse"]);
+    expect(Object.keys(candidate)).toEqual(["waylode"]);
     // No PreToolUse: Antigravity IDE 2.32.1 denied every call a pre-tool hook
     // answered without `"decision":"allow"` (`{}` included), so the collision
     // guard and command gate blocked every edit and command. Answering `allow`
     // would override the user's own approval settings.
     expect(
-      Object.keys(candidate.gitpulse),
+      Object.keys(candidate.waylode),
       "Antigravity must not get a PreToolUse hook",
     ).not.toContain("PreToolUse");
-    expect(Object.keys(candidate.gitpulse).sort()).toEqual([
+    expect(Object.keys(candidate.waylode).sort()).toEqual([
       "PostInvocation",
       "PostToolUse",
       "PreInvocation",
@@ -1170,7 +1171,7 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
     const groupedEvents = new Set(["PostToolUse"]);
     const routes: Array<string> = [];
 
-    for (const [event, entries] of Object.entries(candidate.gitpulse)) {
+    for (const [event, entries] of Object.entries(candidate.waylode)) {
       expect(entries.length, `${event} has no entries`).toBeGreaterThan(0);
       for (const item of entries) {
         if (groupedEvents.has(event)) {
@@ -1206,7 +1207,7 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
           ).toBe(false);
 
           const [bin, ...rest] = rawCommand.split(/\s+/);
-          expect(bin, `${event}`).toBe("gitpulse-hook");
+          expect(bin, `${event}`).toBe("waylode-hook");
           expect(rest.length, `${event}: ${rawCommand}`).toBeGreaterThan(0);
           const sub = rest[0];
           expect(implemented, `${event}: ${sub}`).toContain(sub);
@@ -1234,7 +1235,7 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
           // `agy` natively injects `PLUGIN_ROOT` into plugin hook subprocesses
           // and does NOT interpolate `$PLUGIN_ROOT` in JSON `env` maps.
           expect(handler.env, `${event}: ${rawCommand}`).toEqual({
-            GITPULSE_HOST: "antigravity",
+            WAYLODE_HOST: "antigravity",
           });
 
           const matcherKey = groupedEvents.has(event) ? String(item.matcher) : "";
@@ -1244,12 +1245,12 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
     }
 
     expect(routes).toEqual([
-      "PostToolUse|*|gitpulse-hook notify tool_finished",
-      "SessionStart||gitpulse-hook session-brief",
-      "SessionStart||gitpulse-hook peer-inbox",
-      "PreInvocation||gitpulse-hook peer-inbox",
-      "PostInvocation||gitpulse-hook peer-inbox",
-      "Stop||gitpulse-hook stop-or-notify",
+      "PostToolUse|*|waylode-hook notify tool_finished",
+      "SessionStart||waylode-hook session-brief",
+      "SessionStart||waylode-hook peer-inbox",
+      "PreInvocation||waylode-hook peer-inbox",
+      "PostInvocation||waylode-hook peer-inbox",
+      "Stop||waylode-hook stop-or-notify",
     ]);
   }
 
@@ -1265,17 +1266,17 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
     const mcp = loadJsonAt(path.join(AGY_PLUGIN, "mcp_config.json")) as Record<string, unknown>;
     expect(Object.keys(mcp)).toEqual(["mcpServers"]);
     const servers = mcp.mcpServers as Record<string, Record<string, unknown>>;
-    expect(Object.keys(servers)).toEqual(["gitpulse"]);
-    expect(servers.gitpulse).toEqual({
-      command: "gitpulse-mcp",
+    expect(Object.keys(servers)).toEqual(["waylode"]);
+    expect(servers.waylode).toEqual({
+      command: "waylode-mcp",
       args: [],
-      env: { GITPULSE_HOST: "antigravity" },
+      env: { WAYLODE_HOST: "antigravity" },
     });
 
     validateAgyHooks(hooks);
   });
 
-  it.runIf(gitAvailable)("keeps every file in plugins/gitpulse-agy committable", () => {
+  it.runIf(gitAvailable)("keeps every file in plugins/waylode-agy committable", () => {
     const files: string[] = [];
     const walk = (current: string) => {
       for (const name of readdirSync(current)) {
@@ -1293,24 +1294,24 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
   it("rejects millisecond, zero, negative, fractional, missing, or below-budget timeouts, invalid matchers, and uninterpolated env vars", () => {
     // Boundary acceptance: 60s (the synchronous ceiling) is valid.
     const atCeiling = structuredClone(hooks);
-    atCeiling.gitpulse.SessionStart[0].timeout = 60;
+    atCeiling.waylode.SessionStart[0].timeout = 60;
     expect(() => validateAgyHooks(atCeiling)).not.toThrow();
 
     // Invalid timeouts: missing, string, 0, negative, float, >60s, millisecond values, and below internal budget.
     const briefBudget = minHostTimeoutSeconds("session-brief", "");
     for (const badTimeout of [undefined, "10", 0, -5, 5.5, 61, 5000, 10000, briefBudget - 1]) {
       const copy = structuredClone(hooks);
-      copy.gitpulse.SessionStart[0].timeout = badTimeout;
+      copy.waylode.SessionStart[0].timeout = badTimeout;
       expect(() => validateAgyHooks(copy), `session-brief timeout=${String(badTimeout)}`).toThrow();
     }
     const belowPeerBudget = structuredClone(hooks);
-    belowPeerBudget.gitpulse.PreInvocation[0].timeout = 3;
+    belowPeerBudget.waylode.PreInvocation[0].timeout = 3;
     expect(() => validateAgyHooks(belowPeerBudget)).toThrow();
 
     // `notify tool_finished` waits 1.5s read + 1.5s send = 3.0s, plus 2s host margin = 5s.
     for (const badNotifyTimeout of [3, 4]) {
       const belowNotifyBudget = structuredClone(hooks);
-      belowNotifyBudget.gitpulse.PostToolUse[0].hooks![0].timeout = badNotifyTimeout;
+      belowNotifyBudget.waylode.PostToolUse[0].hooks![0].timeout = badNotifyTimeout;
       expect(
         () => validateAgyHooks(belowNotifyBudget),
         `notify tool_finished timeout=${badNotifyTimeout}`,
@@ -1319,48 +1320,48 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
 
     // `stop-or-notify` waits 2.0s read + 0.8s send + 2.0s host margin = 4.8s -> integer >= 5s.
     const belowStopOrNotifyBudget = structuredClone(hooks);
-    belowStopOrNotifyBudget.gitpulse.Stop[0].timeout = 4;
+    belowStopOrNotifyBudget.waylode.Stop[0].timeout = 4;
     expect(() => validateAgyHooks(belowStopOrNotifyBudget), "stop-or-notify timeout=4").toThrow();
 
     // `notify` with missing argument or unknown bridge event.
-    for (const badNotifyCmd of ["gitpulse-hook notify", "gitpulse-hook notify unknown_event"]) {
+    for (const badNotifyCmd of ["waylode-hook notify", "waylode-hook notify unknown_event"]) {
       const copy = structuredClone(hooks);
-      copy.gitpulse.PostToolUse[0].hooks![0].command = badNotifyCmd;
+      copy.waylode.PostToolUse[0].hooks![0].command = badNotifyCmd;
       expect(() => validateAgyHooks(copy), badNotifyCmd).toThrow();
     }
 
     // Claude worktree launcher or uninterpolated `$` variable in `command`.
     for (const badCommand of [
-      `${WORKTREE_LAUNCHER_PREFIX}gitpulse-hook session-brief`,
-      '"$PLUGIN_ROOT/gitpulse-hook" session-brief',
+      `${WORKTREE_LAUNCHER_PREFIX}waylode-hook session-brief`,
+      '"$PLUGIN_ROOT/waylode-hook" session-brief',
     ]) {
       const copy = structuredClone(hooks);
-      copy.gitpulse.SessionStart[0].command = badCommand;
+      copy.waylode.SessionStart[0].command = badCommand;
       expect(() => validateAgyHooks(copy), badCommand).toThrow();
     }
 
     // Unsupported extra fields on handler (`async`, `asyncRewake`, `timeoutMs`) or group wrapper.
     for (const extraField of ["async", "asyncRewake", "timeoutMs"]) {
       const copy = structuredClone(hooks);
-      (copy.gitpulse.PostToolUse[0].hooks![0] as Record<string, unknown>)[extraField] = true;
+      (copy.waylode.PostToolUse[0].hooks![0] as Record<string, unknown>)[extraField] = true;
       expect(() => validateAgyHooks(copy), `handler extra field ${extraField}`).toThrow();
     }
     const extraOnGroup = structuredClone(hooks);
-    extraOnGroup.gitpulse.PostToolUse[0].timeout = 5;
+    extraOnGroup.waylode.PostToolUse[0].timeout = 5;
     expect(() => validateAgyHooks(extraOnGroup), "group wrapper extra timeout").toThrow();
 
     // Re-adding a pre-tool gate, deleting the startup brief (`session-brief`), or retargeting `Stop`.
     for (const gate of ["collision-guard", "command-gate"]) {
       const regated = structuredClone(hooks);
-      regated.gitpulse.PreToolUse = [
+      regated.waylode.PreToolUse = [
         {
           matcher: gate === "command-gate" ? "^run_command$" : "^(edit_file|write_file)$",
           hooks: [
             {
               type: "command",
-              command: `gitpulse-hook ${gate}`,
+              command: `waylode-hook ${gate}`,
               timeout: 10,
-              env: { GITPULSE_HOST: "antigravity" },
+              env: { WAYLODE_HOST: "antigravity" },
             },
           ],
         },
@@ -1369,42 +1370,42 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
     }
 
     const deletedSessionBrief = structuredClone(hooks);
-    deletedSessionBrief.gitpulse.SessionStart.splice(0, 1);
+    deletedSessionBrief.waylode.SessionStart.splice(0, 1);
     expect(() => validateAgyHooks(deletedSessionBrief), "deleted session-brief").toThrow();
 
     const retargetedStop = structuredClone(hooks);
-    retargetedStop.gitpulse.Stop[0].command = "gitpulse-hook peer-inbox";
+    retargetedStop.waylode.Stop[0].command = "waylode-hook peer-inbox";
     expect(() => validateAgyHooks(retargetedStop), "retargeted Stop to peer-inbox").toThrow();
 
-    // Uninterpolated `$PLUGIN_ROOT` or missing `GITPULSE_HOST` in `env`.
+    // Uninterpolated `$PLUGIN_ROOT` or missing `WAYLODE_HOST` in `env`.
     const uninterpolatedEnv = structuredClone(hooks);
-    uninterpolatedEnv.gitpulse.Stop[0].env = {
-      GITPULSE_HOST: "antigravity",
-      GITPULSE_AGY_PLUGIN_ROOT: "$PLUGIN_ROOT",
+    uninterpolatedEnv.waylode.Stop[0].env = {
+      WAYLODE_HOST: "antigravity",
+      WAYLODE_AGY_PLUGIN_ROOT: "$PLUGIN_ROOT",
     };
     expect(() => validateAgyHooks(uninterpolatedEnv)).toThrow();
 
     const emptyEnv = structuredClone(hooks);
-    emptyEnv.gitpulse.Stop[0].env = {};
+    emptyEnv.waylode.Stop[0].env = {};
     expect(() => validateAgyHooks(emptyEnv)).toThrow();
 
     // Missing or invalid matchers on grouped vs flat events.
     for (const badPostMatcher of [undefined, ""]) {
       const copy = structuredClone(hooks);
-      copy.gitpulse.PostToolUse[0].matcher = badPostMatcher;
+      copy.waylode.PostToolUse[0].matcher = badPostMatcher;
       expect(() => validateAgyHooks(copy), `PostToolUse matcher=${String(badPostMatcher)}`).toThrow();
     }
     const flatWithMatcher = structuredClone(hooks);
-    flatWithMatcher.gitpulse.Stop[0].matcher = "*";
+    flatWithMatcher.waylode.Stop[0].matcher = "*";
     expect(() => validateAgyHooks(flatWithMatcher)).toThrow();
 
     // Empty event or handler arrays.
     const emptyGroup = structuredClone(hooks);
-    emptyGroup.gitpulse.PostToolUse[0].hooks = [];
+    emptyGroup.waylode.PostToolUse[0].hooks = [];
     expect(() => validateAgyHooks(emptyGroup)).toThrow();
 
     const emptyEvent = structuredClone(hooks);
-    emptyEvent.gitpulse.Stop = [];
+    emptyEvent.waylode.Stop = [];
     expect(() => validateAgyHooks(emptyEvent)).toThrow();
   });
 });

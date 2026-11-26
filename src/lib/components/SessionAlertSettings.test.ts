@@ -54,7 +54,7 @@ describe("the line about hook reports that got no reply", () => {
       status({ hook_replies_missed: 3, hook_reply_missed_last: "session_ended at 2026-10-27T12:00:00.000Z" }),
     );
     expect(line).toBe(
-      "3 hook reports in the last 7 days got no reply from GitPulse in time " +
+      "3 hook reports in the last 7 days got no reply from Waylode in time " +
         "(last: session_ended at 2026-10-27T12:00:00.000Z). " +
         "A missed SessionEnd can leave that agent's banner standing; hooks do not retry.",
     );
@@ -62,7 +62,7 @@ describe("the line about hook reports that got no reply", () => {
 
   it("is singular for one, and leaves out a last event it was not given", () => {
     const { line } = hookReplyMisses(status({ hook_replies_missed: 1 }));
-    expect(line).toMatch(/^1 hook report in the last 7 days got no reply from GitPulse in time\. A missed/);
+    expect(line).toMatch(/^1 hook report in the last 7 days got no reply from Waylode in time\. A missed/);
     expect(line).not.toContain("last:");
   });
 

@@ -27,7 +27,7 @@ permissions:
 env:
   # The DevCouncil commit `devmap` is built from, as in ci.yml. A copy that
   # drifts from the vendored crates fails `check:vendor-schema` below.
-  DEVMAP_REV: 2acef200df69622b459278e1d88745bfb393d043
+  DEVMAP_REV: 135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1
   # The Manvi commit the MANVI gate tests run against (see the manvi steps).
   # Its own scripts/module-pins.txt pins the DevCouncil and gusset it builds with.
   MANVI_REV: abb2a72276269c63f6300a59a26e774a0383a8ab

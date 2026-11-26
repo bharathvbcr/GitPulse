@@ -11,7 +11,7 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::ai::http::parse_base_url;
+use waylode_lib::ai::http::parse_base_url;
 
 #[test]
 fn a_hostname_that_merely_looks_like_loopback_is_refused() {

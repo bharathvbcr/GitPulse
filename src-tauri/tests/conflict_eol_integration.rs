@@ -2,13 +2,13 @@
 //! mixed-EOL file must rewrite only the conflict hunk, never re-normalize
 //! the whole document's line endings.
 
-use gitpulse_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
-use gitpulse_lib::engine::git_writer::MergeMode;
-use gitpulse_lib::engine::GitWriter;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
+use waylode_lib::engine::git_writer::MergeMode;
+use waylode_lib::engine::GitWriter;
+use waylode_lib::procguard::LockedSpawn;
 
 mod common;
 use common::run_git;
@@ -119,7 +119,7 @@ fn resolving_mixed_eol_conflict_rewrites_only_the_hunk_region() {
 
     let merge = GitWriter::merge_branch(&path, "theirs", MergeMode::Default, &mut |_| Ok(()));
     let conflicted = merge.is_err() || {
-        gitpulse_lib::engine::GitReader::get_status(&path)
+        waylode_lib::engine::GitReader::get_status(&path)
             .unwrap()
             .iter()
             .any(|s| s.is_conflicted)

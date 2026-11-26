@@ -23,8 +23,8 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::engine::process::capture_command;
 use std::time::Duration;
+use waylode_lib::engine::process::capture_command;
 
 const PRINT_PATH: [&str; 2] = ["-c", "printf '%s' \"$PATH\""];
 
@@ -57,7 +57,7 @@ fn child_path(extra_env: &[(&str, &str)]) -> String {
 #[test]
 #[cfg(unix)]
 fn concurrent_spawns_each_receive_the_same_complete_path() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     const THREADS: usize = 16;
     const PER_THREAD: usize = 12;
 
@@ -100,7 +100,7 @@ fn concurrent_spawns_each_receive_the_same_complete_path() {
 #[test]
 #[cfg(unix)]
 fn an_explicit_path_survives_contention() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     const THREADS: usize = 12;
     std::thread::scope(|scope| {
         for index in 0..THREADS {

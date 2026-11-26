@@ -48,6 +48,10 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
   [
+    "ResumeReason",
+    "why a pressure-relief freeze ended; it is written into the relief's last-action text, which the published status carries as a sentence, and no IPC command or file field carries the variant",
+  ],
+  [
     "SkipReason",
     "the secret scan's skip reason rides in a `secret_scan_blocked` error's detail; the commit view renders the refusal's message and never branches on the reason",
   ],
@@ -162,23 +166,23 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   [
     "LaneRole",
-    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`gitpulse_campaign_audit`, gitpulse://campaign) and by the gitpulse-worktree CLI; no Tauri command returns it and the frontend has no consumer",
+    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`waylode_campaign_audit`, waylode://campaign) and by the waylode-worktree CLI; no Tauri command returns it and the frontend has no consumer",
   ],
   [
     "LeaseMode",
-    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`gitpulse_campaign_audit`, gitpulse://campaign) and by the gitpulse-worktree CLI; no Tauri command returns it and the frontend has no consumer",
+    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`waylode_campaign_audit`, waylode://campaign) and by the waylode-worktree CLI; no Tauri command returns it and the frontend has no consumer",
   ],
   [
     "LeaseScope",
-    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`gitpulse_campaign_audit`, gitpulse://campaign) and by the gitpulse-worktree CLI; no Tauri command returns it and the frontend has no consumer",
+    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`waylode_campaign_audit`, waylode://campaign) and by the waylode-worktree CLI; no Tauri command returns it and the frontend has no consumer",
   ],
   [
     "CampaignViolation",
-    "campaign audit findings (engine/campaign_formal.rs): reported to agents over MCP (`gitpulse_campaign_audit`) and by the gitpulse-worktree CLI; no Tauri command returns them and the frontend has no consumer",
+    "campaign audit findings (engine/campaign_formal.rs): reported to agents over MCP (`waylode_campaign_audit`) and by the waylode-worktree CLI; no Tauri command returns them and the frontend has no consumer",
   ],
   [
     "LiveRefreshKind",
-    "devmap live-refresh outcome (devmap/live.rs): reaches agents as `devmap_refresh.kind` in the gitpulse-worktree CLI's JSON answer; no Tauri command returns it and the frontend has no consumer",
+    "devmap live-refresh outcome (devmap/live.rs): reaches agents as `devmap_refresh.kind` in the waylode-worktree CLI's JSON answer; no Tauri command returns it and the frontend has no consumer",
   ],
   // Argument-only enums found when this check began reading `Deserialize`
   // enums. Each is a known gap, named rather than fixed here.

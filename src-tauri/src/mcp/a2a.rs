@@ -1,5 +1,5 @@
-//! Bidirectional Agent-to-Agent (A2A) MCP handlers (`gitpulse_agent_*`) and
-//! unattended `gitpulse_kickoff_agent` `spawn` bridge.
+//! Bidirectional Agent-to-Agent (A2A) MCP handlers (`waylode_agent_*`) and
+//! unattended `waylode_kickoff_agent` `spawn` bridge.
 //!
 //! Coordinates Claude Code (`claude` hosted tab or external CLI), Antigravity
 //! (`agy` hosted tab, external CLI, or Antigravity IDE), and Manvi Managed runs
@@ -24,16 +24,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Environment variable overriding `gitpulse-mcp`'s per-request call budget.
-pub const CALL_BUDGET_ENV: &str = "GITPULSE_MCP_CALL_TIMEOUT_MS";
+/// Environment variable overriding `waylode-mcp`'s per-request call budget.
+pub const CALL_BUDGET_ENV: &str = "WAYLODE_MCP_CALL_TIMEOUT_MS";
+/// Legacy environment variable for [`CALL_BUDGET_ENV`].
+pub const LEGACY_CALL_BUDGET_ENV: &str = "GITPULSE_MCP_CALL_TIMEOUT_MS";
 /// Default MCP per-call watchdog budget (`60s`).
 pub const DEFAULT_CALL_BUDGET_MS: u64 = 60_000;
-/// Hard ceiling on `GITPULSE_MCP_CALL_TIMEOUT_MS` (`10m`).
+/// Hard ceiling on `WAYLODE_MCP_CALL_TIMEOUT_MS` (`10m`).
 pub const MAX_CALL_BUDGET_MS: u64 = 10 * 60 * 1_000;
-/// Maximum concurrent `gitpulse_agent_wait` calls per MCP server process so
+/// Maximum concurrent `waylode_agent_wait` calls per MCP server process so
 /// parked waiters can never starve `MAX_IN_FLIGHT` (`32`).
 pub const MAX_WAIT_CALLS: usize = 4;
-/// Hard ceiling on a single `gitpulse_agent_wait` call (`45s`), strictly inside
+/// Hard ceiling on a single `waylode_agent_wait` call (`45s`), strictly inside
 /// the `60s` default MCP call budget.
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 45_000;
 
@@ -55,10 +57,10 @@ pub(crate) fn notify_in_process_waiters() {
     }
 }
 
-/// Effective per-call budget in milliseconds from `GITPULSE_MCP_CALL_TIMEOUT_MS`.
+/// Effective per-call budget in milliseconds from `WAYLODE_MCP_CALL_TIMEOUT_MS`
+/// (falling back to `GITPULSE_MCP_CALL_TIMEOUT_MS`).
 pub fn effective_call_budget_ms() -> u64 {
-    std::env::var(CALL_BUDGET_ENV)
-        .ok()
+    crate::env_compat::var_compat(CALL_BUDGET_ENV, LEGACY_CALL_BUDGET_ENV)
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .map_or(DEFAULT_CALL_BUDGET_MS, |ms| ms.min(MAX_CALL_BUDGET_MS))
@@ -82,7 +84,7 @@ impl<'a> WaitCallSlot<'a> {
         loop {
             if cur >= MAX_WAIT_CALLS {
                 return Err(format!(
-                    "wait_slots_saturated: at most {MAX_WAIT_CALLS} concurrent gitpulse_agent_wait calls are allowed per server"
+                    "wait_slots_saturated: at most {MAX_WAIT_CALLS} concurrent waylode_agent_wait calls are allowed per server"
                 ));
             }
             match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
@@ -429,7 +431,7 @@ fn deposit_into_mailbox(
             false,
             Some("full"),
             Some(match &notice {
-                Ok(_) => "The session's mailbox is full of peer messages; the message is on the bus and an overflow notice points the recipient at gitpulse_agent_inbox.".to_string(),
+                Ok(_) => "The session's mailbox is full of peer messages; the message is on the bus and an overflow notice points the recipient at waylode_agent_inbox.".to_string(),
                 Err(e) => format!("The session's mailbox is full of peer messages and the overflow notice could not be left: {e}"),
             }),
             false,
@@ -626,7 +628,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         json!({
             "deposited": false,
             "reason": "hop_limit",
-            "detail": "The message is at its hop limit, so it is recorded on the bus only and not deposited in the recipient's mailbox; the recipient can still read it with gitpulse_agent_inbox.",
+            "detail": "The message is at its hop limit, so it is recorded on the bus only and not deposited in the recipient's mailbox; the recipient can still read it with waylode_agent_inbox.",
             "duplicate": false,
             "overflow_notice": false,
         })

@@ -169,7 +169,7 @@ describe("rows backed by a task run", () => {
   it("label kinds for people through the one owner the Worktrees panel also uses", () => {
     expect(kindLabel("claude")).toBe("Claude Code");
     expect(kindLabel("Codex")).toBe("Codex");
-    expect(kindLabel("GitPulse")).toBe("GitPulse task");
+    expect(kindLabel("GitPulse")).toBe("Waylode task");
     expect(kindLabel("shell")).toBe("Shell");
     expect(kindLabel("agy")).toBe("Antigravity");
     expect(kindLabel("agent")).toBe("Agent");

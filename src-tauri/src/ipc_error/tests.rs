@@ -453,15 +453,15 @@ fn every_replay_safe_read_is_a_command_that_does_not_write() {
 #[test]
 fn a_command_name_is_read_from_its_closure_type() {
     assert_eq!(
-        command_name("gitpulse_lib::commands::inspect::cmd_get_status::{{closure}}::{{closure}}"),
+        command_name("waylode_lib::commands::inspect::cmd_get_status::{{closure}}::{{closure}}"),
         Some("cmd_get_status")
     );
     assert_eq!(
-        command_name("gitpulse_lib::commands::off_thread_background::{{closure}}"),
+        command_name("waylode_lib::commands::off_thread_background::{{closure}}"),
         None
     );
     assert_eq!(
-        command_name("gitpulse_lib::ipc_error::tests::some_test::{{closure}}"),
+        command_name("waylode_lib::ipc_error::tests::some_test::{{closure}}"),
         None
     );
 }

@@ -44,7 +44,7 @@ function payload(version = "0.0.3", names = expectedAssetNames(version), size = 
 }
 
 async function runScript(tag: string, source: string) {
-  const dir = await mkdtemp(path.join(tmpdir(), "gitpulse-release-assets-"));
+  const dir = await mkdtemp(path.join(tmpdir(), "waylode-release-assets-"));
   tempDirs.push(dir);
   const jsonPath = path.join(dir, "assets.json");
   await writeFile(jsonPath, source);
@@ -79,14 +79,14 @@ describe("release asset completeness contract", () => {
 
   it("rejects stale, wrong-version, missing, and unexpected assets", async () => {
     const names = expectedAssetNames("0.0.3").filter((name) => !name.endsWith(".dmg"));
-    names.push("GitPulse_0.0.2_universal.dmg", "old-release.deb");
+    names.push("Waylode_0.0.2_universal.dmg", "old-release.deb");
     const result = inspectReleaseAssets({
       tag: "v0.0.3",
       json: payload("0.0.3", names),
     });
     expect(result.ok).toBe(false);
-    expect(result.violations.join("\n")).toMatch(/missing: GitPulse_0\.0\.3_universal\.dmg/);
-    expect(result.violations.join("\n")).toMatch(/unexpected: GitPulse_0\.0\.2_universal\.dmg/);
+    expect(result.violations.join("\n")).toMatch(/missing: Waylode_0\.0\.3_universal\.dmg/);
+    expect(result.violations.join("\n")).toMatch(/unexpected: Waylode_0\.0\.2_universal\.dmg/);
     expect(result.violations.join("\n")).toMatch(/unexpected: old-release\.deb/);
 
     const cli = await runScript("v0.0.3", payload("0.0.3", names));
@@ -127,7 +127,7 @@ describe("release asset completeness contract", () => {
     const payload = readFileSync(
       new URL("./fixtures/gh-release-view-v1.json", import.meta.url),
       "utf8",
-    );
+    ).replaceAll("GitPulse", "Waylode");
     //
     // That release predates the ARM legs and the attest stage, so its seven
     // names must all still be expected, and what it lacks must be exactly the
@@ -155,7 +155,7 @@ describe("release asset completeness contract", () => {
     );
     const result = inspectReleaseAssets({ tag: "v0.0.2", json: payload });
     expect(result.ok).toBe(false);
-    expect(result.violations).toContain("missing: GitPulse_0.0.2_universal.app.tar.gz");
+    expect(result.violations).toContain("missing: Waylode_0.0.2_universal.app.tar.gz");
     expect(result.violations).toContain("unexpected: GitPulse_universal.app.tar.gz");
   });
 
@@ -231,18 +231,18 @@ describe("a beta ships no rpm", () => {
     expect(expectedInstallerNames(beta)).toHaveLength(10);
     expect(rpms(expectedInstallerNames(beta))).toEqual([]);
     expect(expectedInstallerNames("0.2.0")).toHaveLength(12);
-    expect(rpms(expectedInstallerNames("0.2.0"))).toEqual(["GitPulse-0.2.0-1.aarch64.rpm", "GitPulse-0.2.0-1.x86_64.rpm"]);
+    expect(rpms(expectedInstallerNames("0.2.0"))).toEqual(["Waylode-0.2.0-1.aarch64.rpm", "Waylode-0.2.0-1.x86_64.rpm"]);
     // Only the rpms differ: every other installer is the same set by name.
     const stableWithoutRpm = expectedInstallerNames("0.2.0").filter((name) => !name.endsWith(".rpm"));
     expect(expectedInstallerNames(beta)).toEqual(stableWithoutRpm.map((name) => name.replace("0.2.0", beta)).sort());
   });
 
   it("accepts a beta's Linux deb and AppImage alone, and refuses an rpm the bundler should not have made", () => {
-    const linux = [`/b/deb/GitPulse_${beta}_arm64.deb`, `/b/appimage/GitPulse_${beta}_aarch64.AppImage`];
+    const linux = [`/b/deb/Waylode_${beta}_arm64.deb`, `/b/appimage/Waylode_${beta}_aarch64.AppImage`];
     expect(inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: linux }).ok).toBe(true);
-    const withRpm = inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: [...linux, `/b/rpm/GitPulse-${beta}-1.aarch64.rpm`] });
+    const withRpm = inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: [...linux, `/b/rpm/Waylode-${beta}-1.aarch64.rpm`] });
     expect(withRpm.ok).toBe(false);
-    expect(withRpm.violations).toEqual([`unexpected: GitPulse-${beta}-1.aarch64.rpm`]);
+    expect(withRpm.violations).toEqual([`unexpected: Waylode-${beta}-1.aarch64.rpm`]);
   });
 
   it("verifies a complete beta draft without rpms, and still requires both rpms of a stable one", () => {
@@ -254,7 +254,7 @@ describe("a beta ships no rpm", () => {
     const stable = expectedAssetNames("0.2.0").filter((name) => !name.endsWith(".rpm"));
     const result = inspectReleaseAssets({ tag: "v0.2.0", json: payload("0.2.0", stable) });
     expect(result.ok).toBe(false);
-    expect(result.violations.sort()).toEqual(["missing: GitPulse-0.2.0-1.aarch64.rpm", "missing: GitPulse-0.2.0-1.x86_64.rpm"]);
+    expect(result.violations.sort()).toEqual(["missing: Waylode-0.2.0-1.aarch64.rpm", "missing: Waylode-0.2.0-1.x86_64.rpm"]);
   });
 
   it("bundles a beta's Linux legs as deb and AppImage only, and leaves every other leg and every stable release to the config's targets", () => {
@@ -292,13 +292,13 @@ describe("a beta ships no rpm", () => {
 
 describe("local bundle names", () => {
   const linuxArm = [
-    "/w/src-tauri/target/release/bundle/deb/GitPulse_1.5.0_arm64.deb",
-    "/w/src-tauri/target/release/bundle/rpm/GitPulse-1.5.0-1.aarch64.rpm",
-    "/w/src-tauri/target/release/bundle/appimage/GitPulse_1.5.0_aarch64.AppImage",
+    "/w/src-tauri/target/release/bundle/deb/Waylode_1.5.0_arm64.deb",
+    "/w/src-tauri/target/release/bundle/rpm/Waylode-1.5.0-1.aarch64.rpm",
+    "/w/src-tauri/target/release/bundle/appimage/Waylode_1.5.0_aarch64.AppImage",
   ];
   const windowsArm = [
-    "D:\\a\\GitPulse\\src-tauri\\target\\release\\bundle\\msi\\GitPulse_1.5.0_arm64_en-US.msi",
-    "D:\\a\\GitPulse\\src-tauri\\target\\release\\bundle\\nsis\\GitPulse_1.5.0_arm64-setup.exe",
+    "D:\\a\\Waylode\\src-tauri\\target\\release\\bundle\\msi\\Waylode_1.5.0_arm64_en-US.msi",
+    "D:\\a\\Waylode\\src-tauri\\target\\release\\bundle\\nsis\\Waylode_1.5.0_arm64-setup.exe",
   ];
 
   it("accepts each ARM runner's bundler output, Windows separators included", () => {
@@ -310,12 +310,12 @@ describe("local bundle names", () => {
     const result = inspectBundles({
       platform: "ubuntu-22.04-arm",
       version: "1.5.0",
-      paths: [linuxArm[0], linuxArm[1], "/w/bundle/appimage/GitPulse_1.5.0_amd64.AppImage"],
+      paths: [linuxArm[0], linuxArm[1], "/w/bundle/appimage/Waylode_1.5.0_amd64.AppImage"],
     });
     expect(result.ok).toBe(false);
     expect(result.violations).toEqual([
-      "missing: GitPulse_1.5.0_aarch64.AppImage",
-      "unexpected: GitPulse_1.5.0_amd64.AppImage",
+      "missing: Waylode_1.5.0_aarch64.AppImage",
+      "unexpected: Waylode_1.5.0_amd64.AppImage",
     ]);
   });
 
@@ -325,21 +325,21 @@ describe("local bundle names", () => {
     expect(expectedInstallerNames(beta).some((name) => name.endsWith(".rpm"))).toBe(false);
     expect(expectedInstallerNames("0.2.0")).toHaveLength(12);
     const betaLinuxArm = [
-      `/w/bundle/deb/GitPulse_${beta}_arm64.deb`,
-      `/w/bundle/appimage/GitPulse_${beta}_aarch64.AppImage`,
+      `/w/bundle/deb/Waylode_${beta}_arm64.deb`,
+      `/w/bundle/appimage/Waylode_${beta}_aarch64.AppImage`,
     ];
     expect(inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: betaLinuxArm }).ok).toBe(true);
     const withRpm = [
       ...betaLinuxArm,
-      `/w/bundle/rpm/GitPulse-${beta}-1.aarch64.rpm`,
+      `/w/bundle/rpm/Waylode-${beta}-1.aarch64.rpm`,
     ];
     const unexpectedRpm = inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: withRpm });
     expect(unexpectedRpm.ok).toBe(false);
-    expect(unexpectedRpm.violations).toContain(`unexpected: GitPulse-${beta}-1.aarch64.rpm`);
+    expect(unexpectedRpm.violations).toContain(`unexpected: Waylode-${beta}-1.aarch64.rpm`);
   });
 
   it("refuses what it cannot judge rather than passing it", () => {
-    expect(() => inspectBundles({ platform: "macos-latest", version: "1.5.0", paths: ["/x/GitPulse.app.tar.gz"] })).toThrow(/rewritten at upload/);
+    expect(() => inspectBundles({ platform: "macos-latest", version: "1.5.0", paths: ["/x/Waylode.app.tar.gz"] })).toThrow(/rewritten at upload/);
     expect(() => inspectBundles({ platform: "solaris", version: "1.5.0", paths: linuxArm })).toThrow(/unknown release platform/);
     expect(() => inspectBundles({ platform: "windows-11-arm", version: "1.5.0", paths: [] })).toThrow(/non-empty array/);
   });
@@ -401,13 +401,13 @@ describe("declared binaries", () => {
 
   it("finds the five executables this crate builds, so a sixth would be required automatically", () => {
     const cargo = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
-    expect(declaredBinaryNames(cargo).sort()).toEqual(["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"]);
+    expect(declaredBinaryNames(cargo).sort()).toEqual(["waylode", "waylode-hook", "waylode-mcp", "waylode-ptyd", "wayloded"]);
   });
 });
 
 /** Builders for the installer layouts the bundle check opens. */
 const VERSION = "1.2.3";
-const BINS = ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"];
+const BINS = ["waylode", "waylode-hook", "waylode-mcp", "waylode-ptyd", "wayloded"];
 const ARM64 = 0x0100000c;
 const X86_64 = 0x01000007;
 
@@ -489,7 +489,7 @@ type Extracted = Record<string, Buffer | { symlink: string } | { hardlink: strin
 
 /** A scratch dir holding all seven bundled installers, with per-asset overrides. */
 async function bundles(overrides: Record<string, Buffer | Extracted> = {}, bins = BINS) {
-  const dir = await mkdtemp(path.join(tmpdir(), "gitpulse-bundles-"));
+  const dir = await mkdtemp(path.join(tmpdir(), "waylode-bundles-"));
   tempDirs.push(dir);
   const files: Record<string, string> = {};
   const windows = new Map<string, Extracted>();
@@ -499,7 +499,7 @@ async function bundles(overrides: Record<string, Buffer | Extracted> = {}, bins 
     const override = overrides[spec.asset];
     if (spec.format === "app-tar") {
       const body = override instanceof Buffer ? override
-        : gzipSync(tarball(...bins.map((bin) => tarEntry(`./GitPulse.app/Contents/MacOS/${bin}`, universal()))));
+        : gzipSync(tarball(...bins.map((bin) => tarEntry(`./Waylode.app/Contents/MacOS/${bin}`, universal()))));
       writeFileSync(target, body);
     } else if (spec.format === "deb") {
       const machine = spec.arch === "arm64" ? 0xb7 : 0x3e;
@@ -509,7 +509,7 @@ async function bundles(overrides: Record<string, Buffer | Extracted> = {}, bins 
     } else {
       writeFileSync(target, "installer");
       const machine = spec.arch === "arm64" ? 0xaa64 : 0x8664;
-      const id = (bin: string) => (spec.format === "msi" ? (bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`);
+      const id = (bin: string) => (spec.format === "msi" ? (bin === "waylode" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`);
       const layout = override === undefined || Buffer.isBuffer(override) ? undefined : override;
       windows.set(target, layout ?? Object.fromEntries(bins.map((bin) => [id(bin), pe(machine)])));
     }
@@ -529,21 +529,21 @@ async function bundles(overrides: Record<string, Buffer | Extracted> = {}, bins 
 }
 const check = (made: Awaited<ReturnType<typeof bundles>>, binaries = BINS, extra: Record<string, unknown> = {}) =>
   inspectBundleContents({ version: VERSION, binaries, files: made.files, extract: made.extract, ...extra });
-const MAC = `GitPulse_${VERSION}_universal.app.tar.gz`;
-const DEB = `GitPulse_${VERSION}_amd64.deb`;
-const DEB_ARM = `GitPulse_${VERSION}_arm64.deb`;
-const MSI = `GitPulse_${VERSION}_x64_en-US.msi`;
-const MSI_ARM = `GitPulse_${VERSION}_arm64_en-US.msi`;
-const NSIS = `GitPulse_${VERSION}_x64-setup.exe`;
-const NSIS_ARM = `GitPulse_${VERSION}_arm64-setup.exe`;
+const MAC = `Waylode_${VERSION}_universal.app.tar.gz`;
+const DEB = `Waylode_${VERSION}_amd64.deb`;
+const DEB_ARM = `Waylode_${VERSION}_arm64.deb`;
+const MSI = `Waylode_${VERSION}_x64_en-US.msi`;
+const MSI_ARM = `Waylode_${VERSION}_arm64_en-US.msi`;
+const NSIS = `Waylode_${VERSION}_x64-setup.exe`;
+const NSIS_ARM = `Waylode_${VERSION}_arm64-setup.exe`;
 const macTar = (...entries: Buffer[]) => gzipSync(tarball(...entries));
-const macBin = (bin: string, data = universal(), opts = {}) => tarEntry(`GitPulse.app/Contents/MacOS/${bin}`, data, opts);
+const macBin = (bin: string, data = universal(), opts = {}) => tarEntry(`Waylode.app/Contents/MacOS/${bin}`, data, opts);
 const allMacBins = (skip = "") => BINS.filter((bin) => bin !== skip).map((bin) => macBin(bin));
 
 describe("7z listing", () => {
   const listing = (...entries: string[]) => `\nListing archive: x\n\n--\nPath = /a/x.msi\nType = Compound\n----------\n${entries.join("\n\n")}\n`;
   it("accepts entries inside the output directory within the size bound", () => {
-    expect(() => checkSevenZipListing(listing("Path = gitpulse.exe\nSize = 10", "Path = $PLUGINSDIR\\System.dll\nSize = 5", "Path = dir\nFolder = +", "Path = [NSIS].nsi\nSize = \nPacked Size = "), 100, "msi")).not.toThrow();
+    expect(() => checkSevenZipListing(listing("Path = waylode.exe\nSize = 10", "Path = $PLUGINSDIR\\System.dll\nSize = 5", "Path = dir\nFolder = +", "Path = [NSIS].nsi\nSize = \nPacked Size = "), 100, "msi")).not.toThrow();
   });
   it.each([
     ["an absolute path", "Path = /etc/passwd\nSize = 1", /leaves the output directory/],
@@ -726,26 +726,26 @@ describe("bundle contents", () => {
 
   it("names the binary and the installer when one is missing from each format", async () => {
     const made = await bundles({
-      [MAC]: macTar(...allMacBins("gitpulse-hook")),
-      [DEB]: debOf("data.tar.gz", gzipSync(tarball(...BINS.filter((bin) => bin !== "gitpulse-hook").map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e)))))),
-      [MSI]: Object.fromEntries(BINS.filter((bin) => bin !== "gitpulse-hook").map((bin) => [bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)])),
-      [NSIS_ARM]: Object.fromEntries(BINS.filter((bin) => bin !== "gitpulse-hook").map((bin) => [`${bin}.exe`, pe(0xaa64)])),
+      [MAC]: macTar(...allMacBins("waylode-hook")),
+      [DEB]: debOf("data.tar.gz", gzipSync(tarball(...BINS.filter((bin) => bin !== "waylode-hook").map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e)))))),
+      [MSI]: Object.fromEntries(BINS.filter((bin) => bin !== "waylode-hook").map((bin) => [bin === "waylode" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)])),
+      [NSIS_ARM]: Object.fromEntries(BINS.filter((bin) => bin !== "waylode-hook").map((bin) => [`${bin}.exe`, pe(0xaa64)])),
     });
     const result = check(made);
     expect(result.ok).toBe(false);
     expect(result.invalid).toBe(false);
     expect(result.violations).toEqual([
-      `${MAC}: missing: gitpulse-hook`,
-      `${DEB}: missing: gitpulse-hook`,
-      `${MSI}: missing: gitpulse-hook`,
-      `${NSIS_ARM}: missing: gitpulse-hook`,
+      `${MAC}: missing: waylode-hook`,
+      `${DEB}: missing: waylode-hook`,
+      `${MSI}: missing: waylode-hook`,
+      `${NSIS_ARM}: missing: waylode-hook`,
     ]);
   });
 
   it("requires a sixth [[bin]] the moment one is declared", async () => {
-    const result = check(await bundles(), [...BINS, "gitpulse-newtool"]);
+    const result = check(await bundles(), [...BINS, "waylode-newtool"]);
     expect(result.violations).toHaveLength(7);
-    expect(result.violations.every((violation) => violation.endsWith(": missing: gitpulse-newtool"))).toBe(true);
+    expect(result.violations.every((violation) => violation.endsWith(": missing: waylode-newtool"))).toBe(true);
   });
 
   it("refuses an installer that was not provided rather than skipping it", async () => {
@@ -760,77 +760,77 @@ describe("bundle contents", () => {
   describe("architecture", () => {
     it("fails a thin Mach-O in the universal archive, in either arch", async () => {
       for (const thin of [fat([ARM64]), fat([X86_64]), fat([ARM64, X86_64, 7]), fat([ARM64, ARM64]), elf(0x3e)]) {
-        const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulsed"), macBin("gitpulsed", thin)) }));
-        expect(result.violations, String(thin.subarray(0, 12).toString("hex"))).toEqual([`${MAC}: wrong-arch: gitpulsed`]);
+        const result = check(await bundles({ [MAC]: macTar(...allMacBins("wayloded"), macBin("wayloded", thin)) }));
+        expect(result.violations, String(thin.subarray(0, 12).toString("hex"))).toEqual([`${MAC}: wrong-arch: wayloded`]);
       }
     });
 
     it("fails an amd64 ELF in the arm64 deb, an arm64 ELF in the amd64 deb, and a non-ELF", async () => {
-      const deb = (machine: number, bin = "gitpulsed") => debOf("data.tar.gz", gzipSync(tarball(
+      const deb = (machine: number, bin = "wayloded") => debOf("data.tar.gz", gzipSync(tarball(
         ...BINS.filter((name) => name !== bin).map((name) => tarEntry(`./usr/bin/${name}`, elf(machine === 0x3e ? 0xb7 : 0x3e))), tarEntry(`./usr/bin/${bin}`, elf(machine)))));
       const wrongArm = check(await bundles({ [DEB_ARM]: deb(0x3e) }));
-      expect(wrongArm.violations).toEqual([`${DEB_ARM}: wrong-arch: gitpulsed`]);
+      expect(wrongArm.violations).toEqual([`${DEB_ARM}: wrong-arch: wayloded`]);
       const wrongX64 = check(await bundles({ [DEB]: deb(0xb7) }));
-      expect(wrongX64.violations).toEqual([`${DEB}: wrong-arch: gitpulsed`]);
-      const notElf = check(await bundles({ [DEB]: debOf("data.tar.gz", gzipSync(tarball(...BINS.map((name) => tarEntry(`./usr/bin/${name}`, name === "gitpulsed" ? pe(0x8664) : elf(0x3e)))))) }));
-      expect(notElf.violations).toEqual([`${DEB}: wrong-arch: gitpulsed`]);
+      expect(wrongX64.violations).toEqual([`${DEB}: wrong-arch: wayloded`]);
+      const notElf = check(await bundles({ [DEB]: debOf("data.tar.gz", gzipSync(tarball(...BINS.map((name) => tarEntry(`./usr/bin/${name}`, name === "wayloded" ? pe(0x8664) : elf(0x3e)))))) }));
+      expect(notElf.violations).toEqual([`${DEB}: wrong-arch: wayloded`]);
     });
 
     it("fails an x64 PE in an arm64 installer and an arm64 PE in an x64 one, in MSI and NSIS", async () => {
       const layout = (machine: number, msi: boolean, bad: number) => Object.fromEntries(BINS.map((bin) =>
-        [msi ? (bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`, pe(bin === "gitpulsed" ? bad : machine)]));
+        [msi ? (bin === "waylode" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`, pe(bin === "wayloded" ? bad : machine)]));
       const result = check(await bundles({
         [MSI_ARM]: layout(0xaa64, true, 0x8664), [NSIS_ARM]: layout(0xaa64, false, 0x8664),
         [MSI]: layout(0x8664, true, 0xaa64), [NSIS]: layout(0x8664, false, 0xaa64),
       }));
-      expect(result.violations).toEqual([NSIS, MSI, NSIS_ARM, MSI_ARM].map((asset) => `${asset}: wrong-arch: gitpulsed`));
+      expect(result.violations).toEqual([NSIS, MSI, NSIS_ARM, MSI_ARM].map((asset) => `${asset}: wrong-arch: wayloded`));
     });
   });
 
   describe("tar entries", () => {
-    const only = (entry: Buffer, skip = "gitpulse-hook") => macTar(...allMacBins(skip), entry);
+    const only = (entry: Buffer, skip = "waylode-hook") => macTar(...allMacBins(skip), entry);
 
     it("fails a symlink, a hardlink, an empty file, a non-executable file and a directory named as the binary", async () => {
       const cases: [string, Buffer][] = [
-        ["symlink", tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "2" })],
-        ["hardlink", tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "1" })],
-        ["empty", macBin("gitpulse-hook", Buffer.alloc(0))],
-        ["not-executable", macBin("gitpulse-hook", universal(), { mode: 0o644 })],
-        ["not-regular", tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "5" })],
+        ["symlink", tarEntry("Waylode.app/Contents/MacOS/waylode-hook", Buffer.alloc(0), { type: "2" })],
+        ["hardlink", tarEntry("Waylode.app/Contents/MacOS/waylode-hook", Buffer.alloc(0), { type: "1" })],
+        ["empty", macBin("waylode-hook", Buffer.alloc(0))],
+        ["not-executable", macBin("waylode-hook", universal(), { mode: 0o644 })],
+        ["not-regular", tarEntry("Waylode.app/Contents/MacOS/waylode-hook", Buffer.alloc(0), { type: "5" })],
       ];
       for (const [violation, entry] of cases) {
-        expect(check(await bundles({ [MAC]: only(entry) })).violations, violation).toEqual([`${MAC}: ${violation}: gitpulse-hook`]);
+        expect(check(await bundles({ [MAC]: only(entry) })).violations, violation).toEqual([`${MAC}: ${violation}: waylode-hook`]);
       }
     });
 
     it("fails a binary listed twice, however the second copy is spelled", async () => {
-      const dup = check(await bundles({ [MAC]: macTar(...allMacBins(), tarEntry("./GitPulse.app/Contents/MacOS/gitpulse-hook", universal())) }));
-      expect(dup.violations).toEqual([`${MAC}: duplicate: gitpulse-hook`]);
+      const dup = check(await bundles({ [MAC]: macTar(...allMacBins(), tarEntry("./Waylode.app/Contents/MacOS/waylode-hook", universal())) }));
+      expect(dup.violations).toEqual([`${MAC}: duplicate: waylode-hook`]);
     });
 
     it("fails a path that climbs out of the archive", async () => {
-      const result = check(await bundles({ [MAC]: macTar(...allMacBins(), tarEntry("GitPulse.app/../../evil", universal())) }));
-      expect(result.violations).toEqual([`${MAC}: unsafe-path: GitPulse.app/../../evil`]);
+      const result = check(await bundles({ [MAC]: macTar(...allMacBins(), tarEntry("Waylode.app/../../evil", universal())) }));
+      expect(result.violations).toEqual([`${MAC}: unsafe-path: Waylode.app/../../evil`]);
     });
 
     it("counts the path an extractor would write: a pax path counts, and a decoy header name does not", async () => {
-      const smuggled = paxEntry({ path: "GitPulse.app/Contents/MacOS/gitpulse-hook" }, "decoy", universal());
-      expect(check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), smuggled) })).violations).toEqual([]);
-      const redirected = paxEntry({ path: "somewhere/else" }, "GitPulse.app/Contents/MacOS/gitpulse-hook", universal());
-      expect(check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), redirected) })).violations).toEqual([`${MAC}: missing: gitpulse-hook`]);
+      const smuggled = paxEntry({ path: "Waylode.app/Contents/MacOS/waylode-hook" }, "decoy", universal());
+      expect(check(await bundles({ [MAC]: macTar(...allMacBins("waylode-hook"), smuggled) })).violations).toEqual([]);
+      const redirected = paxEntry({ path: "somewhere/else" }, "Waylode.app/Contents/MacOS/waylode-hook", universal());
+      expect(check(await bundles({ [MAC]: macTar(...allMacBins("waylode-hook"), redirected) })).violations).toEqual([`${MAC}: missing: waylode-hook`]);
     });
 
     it("reads a GNU long name", async () => {
-      const longName = `GitPulse.app/Contents/MacOS/${"x".repeat(120)}`;
+      const longName = `Waylode.app/Contents/MacOS/${"x".repeat(120)}`;
       const entry = Buffer.concat([
-        tarEntry("././@LongLink", Buffer.from(`GitPulse.app/Contents/MacOS/gitpulse-hook\0`), { type: "L", mode: 0o644 }),
+        tarEntry("././@LongLink", Buffer.from(`Waylode.app/Contents/MacOS/waylode-hook\0`), { type: "L", mode: 0o644 }),
         tarEntry(longName.slice(0, 100), universal()),
       ]);
-      expect(check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), entry) })).violations).toEqual([]);
+      expect(check(await bundles({ [MAC]: macTar(...allMacBins("waylode-hook"), entry) })).violations).toEqual([]);
     });
 
     it("refuses an archive whose sizes lie, whose checksum is wrong, or that never ends", async () => {
-      const lying = macTar(...allMacBins("gitpulse-hook"), tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", universal(), { declaredSize: 4_000_000 }));
+      const lying = macTar(...allMacBins("waylode-hook"), tarEntry("Waylode.app/Contents/MacOS/waylode-hook", universal(), { declaredSize: 4_000_000 }));
       const corrupt = Buffer.from(tarball(...allMacBins()));
       corrupt[0] ^= 0xff;
       const unterminated = Buffer.concat(allMacBins());
@@ -843,8 +843,8 @@ describe("bundle contents", () => {
     });
 
     it("refuses a size on an entry that carries no data", async () => {
-      const entry = tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "2", declaredSize: 600 });
-      const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), entry) }));
+      const entry = tarEntry("Waylode.app/Contents/MacOS/waylode-hook", Buffer.alloc(0), { type: "2", declaredSize: 600 });
+      const result = check(await bundles({ [MAC]: macTar(...allMacBins("waylode-hook"), entry) }));
       expect(result.invalid).toBe(true);
     });
 
@@ -882,31 +882,31 @@ describe("bundle contents", () => {
 
   describe("windows installers", () => {
     const msiLayout = (change: (layout: Extracted) => void) => {
-      const layout: Extracted = Object.fromEntries(BINS.map((bin) => [bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)]));
+      const layout: Extracted = Object.fromEntries(BINS.map((bin) => [bin === "waylode" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)]));
       change(layout);
       return layout;
     };
 
     it("fails a symlink, a hardlink, an empty file and a duplicate", async () => {
       const cases: [string, (layout: Extracted) => void][] = [
-        ["symlink", (layout) => { layout.Bin_gitpulse_hook = { symlink: "Path" }; }],
-        ["hardlink", (layout) => { delete layout.Bin_gitpulse_hook; layout.Spare = pe(0x8664); layout.Bin_gitpulse_hook = { hardlink: "Spare" }; }],
-        ["empty", (layout) => { layout.Bin_gitpulse_hook = Buffer.alloc(0); }],
-        ["duplicate", (layout) => { layout.Bin_gitpulse_hook_1 = pe(0x8664); }],
-        ["wrong-arch", (layout) => { layout.Bin_gitpulse_hook = Buffer.from("MZ not a pe"); }],
+        ["symlink", (layout) => { layout.Bin_waylode_hook = { symlink: "Path" }; }],
+        ["hardlink", (layout) => { delete layout.Bin_waylode_hook; layout.Spare = pe(0x8664); layout.Bin_waylode_hook = { hardlink: "Spare" }; }],
+        ["empty", (layout) => { layout.Bin_waylode_hook = Buffer.alloc(0); }],
+        ["duplicate", (layout) => { layout.Bin_waylode_hook_1 = pe(0x8664); }],
+        ["wrong-arch", (layout) => { layout.Bin_waylode_hook = Buffer.from("MZ not a pe"); }],
       ];
       for (const [violation, change] of cases) {
         const result = check(await bundles({ [MSI]: msiLayout(change) }));
-        expect(result.violations, violation).toEqual([`${MSI}: ${violation}: gitpulse-hook`]);
+        expect(result.violations, violation).toEqual([`${MSI}: ${violation}: waylode-hook`]);
       }
     });
 
     it("finds NSIS binaries by their own file names and fails a duplicate there too", async () => {
       const layout = (extra: Extracted = {}): Extracted => ({ ...Object.fromEntries(BINS.map((bin) => [`${bin}.exe`, pe(0x8664)])), ...extra });
       expect(check(await bundles({ [NSIS]: layout() })).violations).toEqual([]);
-      expect(check(await bundles({ [NSIS]: layout({ "gitpulse-mcp_1.exe": pe(0x8664) }) })).violations).toEqual([`${NSIS}: duplicate: gitpulse-mcp`]);
-      const { "gitpulse-ptyd.exe": _gone, ...without } = layout();
-      expect(check(await bundles({ [NSIS]: without })).violations).toEqual([`${NSIS}: missing: gitpulse-ptyd`]);
+      expect(check(await bundles({ [NSIS]: layout({ "waylode-mcp_1.exe": pe(0x8664) }) })).violations).toEqual([`${NSIS}: duplicate: waylode-mcp`]);
+      const { "waylode-ptyd.exe": _gone, ...without } = layout();
+      expect(check(await bundles({ [NSIS]: without })).violations).toEqual([`${NSIS}: missing: waylode-ptyd`]);
     });
 
     it("exits through a thrown error, never a pass, when 7z is missing", async () => {
@@ -925,24 +925,24 @@ describe("bundle contents", () => {
       const leaky = await bundles({
         [MAC]: macTar(
           ...allMacBins(),
-          tarEntry("GitPulse.app/Contents/Resources/assets/main.js.map", Buffer.from("{}"), { mode: 0o644 }),
-          tarEntry("GitPulse.app/Contents/Resources/assets/MAIN.JS.MAP", Buffer.from("{}"), { mode: 0o644 }),
-          tarEntry("GitPulse.app/Contents/Resources/assets/link.js.map", Buffer.alloc(0), { type: "2", mode: 0o777 }),
-          paxEntry({ path: "GitPulse.app/Contents/Resources/leak.js.map" }, "decoy.txt", Buffer.from("{}"), 0o644),
-          tarEntry("GitPulse.app/Contents/Resources/assets/main.js", Buffer.from("console.log(1);\n//# sourceMappingURL=main.js.map\n"), { mode: 0o644 }),
-          tarEntry("GitPulse.app/Contents/Resources/assets/app.css", Buffer.from("body{}\n/*# sourceMappingURL=app.css.map */"), { mode: 0o644 }),
+          tarEntry("Waylode.app/Contents/Resources/assets/main.js.map", Buffer.from("{}"), { mode: 0o644 }),
+          tarEntry("Waylode.app/Contents/Resources/assets/MAIN.JS.MAP", Buffer.from("{}"), { mode: 0o644 }),
+          tarEntry("Waylode.app/Contents/Resources/assets/link.js.map", Buffer.alloc(0), { type: "2", mode: 0o777 }),
+          paxEntry({ path: "Waylode.app/Contents/Resources/leak.js.map" }, "decoy.txt", Buffer.from("{}"), 0o644),
+          tarEntry("Waylode.app/Contents/Resources/assets/main.js", Buffer.from("console.log(1);\n//# sourceMappingURL=main.js.map\n"), { mode: 0o644 }),
+          tarEntry("Waylode.app/Contents/Resources/assets/app.css", Buffer.from("body{}\n/*# sourceMappingURL=app.css.map */"), { mode: 0o644 }),
         ),
       });
       const result = check(leaky);
       expect(result.ok).toBe(false);
       expect(result.invalid).toBe(false);
       expect(result.violations).toEqual([
-        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/assets/main.js.map`,
-        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/assets/MAIN.JS.MAP`,
-        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/assets/link.js.map`,
-        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/leak.js.map`,
-        `${MAC}: sourcemap-ref: GitPulse.app/Contents/Resources/assets/main.js`,
-        `${MAC}: sourcemap-ref: GitPulse.app/Contents/Resources/assets/app.css`,
+        `${MAC}: sourcemap: Waylode.app/Contents/Resources/assets/main.js.map`,
+        `${MAC}: sourcemap: Waylode.app/Contents/Resources/assets/MAIN.JS.MAP`,
+        `${MAC}: sourcemap: Waylode.app/Contents/Resources/assets/link.js.map`,
+        `${MAC}: sourcemap: Waylode.app/Contents/Resources/leak.js.map`,
+        `${MAC}: sourcemap-ref: Waylode.app/Contents/Resources/assets/main.js`,
+        `${MAC}: sourcemap-ref: Waylode.app/Contents/Resources/assets/app.css`,
       ]);
     });
 
@@ -952,7 +952,7 @@ describe("bundle contents", () => {
       const result = check(await bundles({
         [DEB]: debOf("data.tar.gz", gzipSync(tarball(
           ...BINS.map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e))),
-          tarEntry("./usr/lib/gitpulse/leak.js.map", Buffer.from("{}"), { mode: 0o644 }),
+          tarEntry("./usr/lib/waylode/leak.js.map", Buffer.from("{}"), { mode: 0o644 }),
         ))),
         [NSIS]: {
           ...Object.fromEntries(BINS.map((bin) => [`${bin}.exe`, pe(0x8664)])),
@@ -960,16 +960,16 @@ describe("bundle contents", () => {
           "plugin/app.js": Buffer.from("export {};\n//# sourceMappingURL=app.js.map\n"),
         },
         [MSI]: {
-          ...Object.fromEntries(BINS.map((bin) => [bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)])),
+          ...Object.fromEntries(BINS.map((bin) => [bin === "waylode" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)])),
           "leak.js.map": Buffer.from("{}"),
           [wixMapId]: Buffer.from(JSON.stringify({ version: 3, sources: ["src/App.svelte"], mappings: "AAAA" })),
-          [wixBenignId]: Buffer.from(JSON.stringify({ name: "gitpulse", version: "1.99.0" })),
+          [wixBenignId]: Buffer.from(JSON.stringify({ name: "waylode", version: "1.99.0" })),
         },
       }));
       expect(result.ok).toBe(false);
       expect(result.invalid).toBe(false);
       expect(result.violations).toEqual([
-        `${DEB}: sourcemap: usr/lib/gitpulse/leak.js.map`,
+        `${DEB}: sourcemap: usr/lib/waylode/leak.js.map`,
         `${NSIS}: sourcemap-ref: plugin/app.js`,
         `${NSIS}: sourcemap: plugin/leak.js.map`,
         `${MSI}: sourcemap: ${wixMapId}`,
@@ -1004,7 +1004,7 @@ describe("bundle contents: adversarial bundles", () => {
     const msi = archive.endsWith(".msi");
     const machine = archive.includes("arm64") ? 0xaa64 : 0x8664;
     for (const bin of BINS) {
-      const id = msi ? (bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`;
+      const id = msi ? (bin === "waylode" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`;
       const dest = path.join(outDir, place(bin, id));
       mkdirSync(path.dirname(dest), { recursive: true });
       writeFileSync(dest, pe(machine));
@@ -1029,8 +1029,8 @@ describe("bundle contents: adversarial bundles", () => {
     // An extractor writes a regular file named under a symlinked directory
     // through the link, so the installed binary does not live in the app.
     it.each([
-      ["the macOS MacOS directory", "GitPulse.app/Contents/MacOS"],
-      ["the macOS Contents directory", "GitPulse.app/Contents"],
+      ["the macOS MacOS directory", "Waylode.app/Contents/MacOS"],
+      ["the macOS Contents directory", "Waylode.app/Contents"],
     ])("fails a bundle whose binaries sit under %s when it is a symlink", async (_label, link) => {
       const result = check(await bundles({ [MAC]: macTar(tarEntry(link, Buffer.alloc(0), { type: "2" }), ...allMacBins()) }));
       expect(result.ok).toBe(false);
@@ -1055,10 +1055,10 @@ describe("bundle contents: adversarial bundles", () => {
     it.each([
       ["NSIS", NSIS, "$PLUGINSDIR"],
       ["MSI", MSI, "somewhere/else"],
-    ])("fails %s when gitpulse-hook is found only inside a subdirectory", async (_label, asset, dir) => {
-      const result = await runWindows(windowsExtract((bin, id) => (bin === "gitpulse-hook" ? `${dir}/${id}` : id)));
+    ])("fails %s when waylode-hook is found only inside a subdirectory", async (_label, asset, dir) => {
+      const result = await runWindows(windowsExtract((bin, id) => (bin === "waylode-hook" ? `${dir}/${id}` : id)));
       expect(result.ok).toBe(false);
-      expect(result.violations.some((violation) => violation.startsWith(`${asset}:`) && violation.includes("gitpulse-hook"))).toBe(true);
+      expect(result.violations.some((violation) => violation.startsWith(`${asset}:`) && violation.includes("waylode-hook"))).toBe(true);
     });
   });
 
@@ -1079,7 +1079,7 @@ describe("bundle contents: adversarial bundles", () => {
     lying.writeUInt32BE(0x4000_0000, 20);
     lying.writeUInt32BE(0x8000, 36);
     lying.writeUInt32BE(0x4000_0000, 40);
-    const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulsed"), macBin("gitpulsed", lying)) }));
+    const result = check(await bundles({ [MAC]: macTar(...allMacBins("wayloded"), macBin("wayloded", lying)) }));
     expect(result.ok).toBe(false);
   });
 
@@ -1104,21 +1104,21 @@ describe("bundle contents: adversarial bundles", () => {
   describe("cases that hold", () => {
     it("HOLDS: a suffixed, prefixed or wrongly placed copy of a binary does not stand in for it", async () => {
       for (const entry of [
-        macBin("gitpulse-hook.bak"),
-        macBin("xgitpulse-hook"),
-        tarEntry("GitPulse.app/Contents/Resources/gitpulse-hook", universal()),
-        tarEntry("GitPulse.app//Contents/MacOS/gitpulse-hook", universal()),
+        macBin("waylode-hook.bak"),
+        macBin("xwaylode-hook"),
+        tarEntry("Waylode.app/Contents/Resources/waylode-hook", universal()),
+        tarEntry("Waylode.app//Contents/MacOS/waylode-hook", universal()),
       ]) {
-        const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), entry) }));
-        expect(result.violations).toEqual([`${MAC}: missing: gitpulse-hook`]);
+        const result = check(await bundles({ [MAC]: macTar(...allMacBins("waylode-hook"), entry) }));
+        expect(result.violations).toEqual([`${MAC}: missing: waylode-hook`]);
       }
     });
 
     it("HOLDS: a path with spaces and non-ASCII names, and a ustar prefix split, are read", async () => {
       const body = macTar(
-        ...allMacBins("gitpulse-hook"),
-        prefixedEntry("GitPulse.app/Contents", "MacOS/gitpulse-hook", universal()),
-        tarEntry("GitPulse.app/Contents/Resources/é file 日本.txt", Buffer.from("x"), { mode: 0o644 }),
+        ...allMacBins("waylode-hook"),
+        prefixedEntry("Waylode.app/Contents", "MacOS/waylode-hook", universal()),
+        tarEntry("Waylode.app/Contents/Resources/é file 日本.txt", Buffer.from("x"), { mode: 0o644 }),
       );
       expect(check(await bundles({ [MAC]: body })).violations).toEqual([]);
     });
@@ -1180,13 +1180,13 @@ describe.skipIf(process.platform === "win32")("app bundle on disk", () => {
   }
 
   function makeApp(mutate?: (appDir: string) => void, bins = BINS, machO: () => Buffer = thinMachO): string {
-    const parent = mkdtempSync(path.join(tmpdir(), "gitpulse-app-"));
+    const parent = mkdtempSync(path.join(tmpdir(), "waylode-app-"));
     tempDirs.push(parent);
-    const appDir = path.join(parent, "GitPulse.app");
+    const appDir = path.join(parent, "Waylode.app");
     mkdirSync(path.join(appDir, "Contents", "MacOS"), { recursive: true });
     mkdirSync(path.join(appDir, "Contents", "Resources", "plugin"), { recursive: true });
     writeFileSync(path.join(appDir, "Contents", "Info.plist"), "<plist/>");
-    writeFileSync(path.join(appDir, "Contents", "Resources", "plugin", "plugin.json"), '{"name":"gitpulse"}');
+    writeFileSync(path.join(appDir, "Contents", "Resources", "plugin", "plugin.json"), '{"name":"waylode"}');
     for (const bin of bins) {
       writeFileSync(path.join(appDir, "Contents", "MacOS", bin), machO(), { mode: 0o755 });
     }
@@ -1244,27 +1244,27 @@ describe.skipIf(process.platform === "win32")("app bundle on disk", () => {
 
     const broken = makeApp((appDir) => {
       rmSync(path.join(appDir, "Contents", "Info.plist"));
-      rmSync(path.join(appDir, "Contents", "MacOS", "gitpulse-hook"));
-      chmodSync(path.join(appDir, "Contents", "MacOS", "gitpulse-mcp"), 0o644);
-      writeFileSync(path.join(appDir, "Contents", "MacOS", "gitpulse-ptyd"), Buffer.alloc(0), { mode: 0o755 });
-      writeFileSync(path.join(appDir, "Contents", "MacOS", "gitpulsed"), elf(0x3e), { mode: 0o755 });
+      rmSync(path.join(appDir, "Contents", "MacOS", "waylode-hook"));
+      chmodSync(path.join(appDir, "Contents", "MacOS", "waylode-mcp"), 0o644);
+      writeFileSync(path.join(appDir, "Contents", "MacOS", "waylode-ptyd"), Buffer.alloc(0), { mode: 0o755 });
+      writeFileSync(path.join(appDir, "Contents", "MacOS", "wayloded"), elf(0x3e), { mode: 0o755 });
     });
     const brokenResult = inspectAppBundle({ appPath: broken, binaries: BINS });
     expect(brokenResult.ok).toBe(false);
     expect(brokenResult.invalid).toBe(false);
     expect(brokenResult.violations).toEqual([
       "missing: Contents/Info.plist",
-      "missing: gitpulse-hook",
-      "not-executable: gitpulse-mcp",
-      "empty: gitpulse-ptyd",
-      "wrong-arch: gitpulsed",
+      "missing: waylode-hook",
+      "not-executable: waylode-mcp",
+      "empty: waylode-ptyd",
+      "wrong-arch: wayloded",
     ]);
   });
 
   it("drives --app through the CLI with exit codes 0 (clean), 1 (sourcemap leak), and 2 (bad path or invalid flag combinations)", async () => {
     const cleanApp = makeApp();
     const ok = await execFileAsync(process.execPath, [scriptPath, "--app", cleanApp]);
-    expect(ok.stdout).toContain("OK: GitPulse.app holds every declared binary and no source maps");
+    expect(ok.stdout).toContain("OK: Waylode.app holds every declared binary and no source maps");
 
     const leakyApp = makeApp((appDir) => {
       writeFileSync(path.join(appDir, "Contents", "Resources", "leak.js.map"), "{}");

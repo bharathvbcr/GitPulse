@@ -54,6 +54,9 @@ mod platform {
     }
     pub(super) fn withdraw(_natives: &[String]) {}
     pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
+    pub(super) const RELIEF_CATEGORY: &str = "gitpulse-relief";
+    pub(super) const RELIEF_OFFER_CATEGORY: &str = "gitpulse-relief-offer";
+    pub(super) const RELIEF_ADVICE_CATEGORY: &str = "gitpulse-relief-advice";
 }
 
 pub(super) struct Coordinator {
@@ -71,7 +74,127 @@ pub(super) enum Event {
     /// is the person saying "not now", and stealing focus would contradict it.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Snooze(String),
+    /// The pressure-relief banner's Settings button or its body: open
+    /// Settings. Its "Resume now" never becomes an event; the delegate leaves
+    /// the supervisor's request file itself.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Relief,
 }
+
+/// Posts a pressure-relief banner (`desktop::pressure`) in its own category,
+/// whose "Resume now" and "Settings" buttons the delegate answers. `native`
+/// replaces the banner of the same identifier rather than stacking.
+///
+/// It obeys the person's notification preference like every other banner here:
+/// off means no banner (the status item and Health still show the pause), the
+/// sound setting decides the sound, and with "while GitPulse is in the
+/// background" off a hidden window gets none. A preference or permission that
+/// cannot be read is an error, not a banner.
+pub(crate) fn post_relief(
+    app: &tauri::AppHandle,
+    native: &str,
+    heading: &str,
+    body: &str,
+    banner: ReliefBanner,
+) -> Result<bool, String> {
+    let host = app.state::<WorkbenchState>().inner().clone();
+    let preferences = settings(&host).map_err(|error| {
+        format!(
+            "the notification preference could not be read: {}",
+            error.message
+        )
+    })?;
+    let window_visible = app.get_webview_window("main").is_some_and(|window| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true)
+    });
+    if !relief_banner_wanted(&preferences, window_visible) {
+        return Ok(false);
+    }
+    let authorization = platform::authorization(false).map_err(|error| error.message)?;
+    if !matches!(authorization.as_str(), "authorized" | "provisional") {
+        return Err(format!("macOS notification permission is {authorization}"));
+    }
+    platform::post(
+        native,
+        heading,
+        body,
+        preferences.sound,
+        match banner {
+            ReliefBanner::Paused => platform::RELIEF_CATEGORY,
+            ReliefBanner::Offer => platform::RELIEF_OFFER_CATEGORY,
+            ReliefBanner::Advice => platform::RELIEF_ADVICE_CATEGORY,
+        },
+    )
+    .map_err(|error| error.message)
+}
+
+/// Which buttons a relief banner carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReliefBanner {
+    /// "Resume now", "End it" and "Settings".
+    Paused,
+    /// "Pause it" and "Settings": a tree of an agent GitPulse did not launch.
+    Offer,
+    /// "Settings" only: advice about a tree it may not pause.
+    Advice,
+}
+
+/// The identifier prefixes of the relief banners that are about one tree
+/// (`<prefix>:<pid>:<start_us>`, `relief_status::banner_id`).
+pub(crate) const RELIEF_PAUSED_PREFIX: &str = "gitpulse.relief.paused";
+pub(crate) const RELIEF_OFFER_PREFIX: &str = "gitpulse.relief.offer";
+pub(crate) const RELIEF_ADVICE_PREFIX: &str = "gitpulse.relief.advice";
+
+/// The relief banners' buttons, by the identifier each is registered under.
+pub(super) const RELIEF_RESUME_ACTION: &str = "relief-resume";
+pub(super) const RELIEF_TERMINATE_ACTION: &str = "relief-terminate";
+pub(super) const RELIEF_PAUSE_ACTION: &str = "relief-pause";
+pub(super) const RELIEF_SETTINGS_ACTION: &str = "relief-settings";
+
+/// What a press on a relief banner asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReliefTap {
+    /// Resume everything.
+    Resume,
+    /// End the paused tree the banner names.
+    Terminate(crate::sysload::relief_status::TreeId),
+    /// Pause the offered tree the banner names.
+    Pause(crate::sysload::relief_status::TreeId),
+    /// Open Settings (the Settings button and a click on the body).
+    Settings,
+    /// A button whose banner does not name a tree: nothing to act on.
+    Ignore,
+}
+
+/// Routes a press on a relief banner. Each button acts only on the category
+/// it is registered with, and the tree comes only from the banner's own
+/// identifier, parsed by `relief_status::banner_target`: an identifier that
+/// does not name a plausible tree is [`ReliefTap::Ignore`], never a guess.
+pub(super) fn relief_tap(category: &str, action: &str, native: &str) -> ReliefTap {
+    use crate::sysload::relief_status::banner_target;
+    let target = |prefix: &str, make: fn(crate::sysload::relief_status::TreeId) -> ReliefTap| {
+        banner_target(native, prefix).map_or(ReliefTap::Ignore, make)
+    };
+    match (category, action) {
+        (platform::RELIEF_CATEGORY, RELIEF_RESUME_ACTION) => ReliefTap::Resume,
+        (platform::RELIEF_CATEGORY, RELIEF_TERMINATE_ACTION) => {
+            target(RELIEF_PAUSED_PREFIX, ReliefTap::Terminate)
+        }
+        (platform::RELIEF_OFFER_CATEGORY, RELIEF_PAUSE_ACTION) => {
+            target(RELIEF_OFFER_PREFIX, ReliefTap::Pause)
+        }
+        _ => ReliefTap::Settings,
+    }
+}
+
+/// Whether the saved notification preference lets a relief banner out.
+fn relief_banner_wanted(preferences: &Settings, window_visible: bool) -> bool {
+    preferences.enabled && (preferences.background || window_visible)
+}
+
+/// The identity a relief banner's Settings button is forwarded under when the
+/// banner was answered by a launch that only passes requests on.
+pub(crate) const RELIEF_SETTINGS_ID: &str = "gitpulse.relief.settings";
 
 /// How long the banner's Snooze defers a notice. The activity inbox's own
 /// Snooze sends the same number from `attentionWrite` in
@@ -82,7 +205,7 @@ pub(super) const SNOOZE_SECONDS: u32 = 3600;
 
 /// The heading of every activity banner. The same words go to Graft, so the
 /// phone shows what the Mac showed.
-pub(super) const ACTIVITY_HEADING: &str = "GitPulse activity";
+pub(super) const ACTIVITY_HEADING: &str = "Waylode activity";
 
 /// At most this many delivered banners are checked for withdrawal in one pass.
 /// Notification Center keeps a history of its own; the cap keeps a pass to a
@@ -435,7 +558,11 @@ fn enqueue_response(host: &WorkbenchState, native: String, snooze: bool) -> Resu
         .notifications
         .get()
         .ok_or("native notifications are not installed in this process")?;
-    let event = if snooze {
+    let event = if native == RELIEF_SETTINGS_ID {
+        // A relief banner's Settings, answered by another launch: it opens
+        // Settings, and there is nothing to claim or snooze in the store.
+        Event::Relief
+    } else if snooze {
         Event::Snooze(native)
     } else {
         Event::Activate(native)
@@ -462,6 +589,9 @@ impl ResponseTap {
             match self.0.try_recv().ok()? {
                 Event::Activate(native) => return Some((native, false)),
                 Event::Snooze(native) => return Some((native, true)),
+                // Passed on under a fixed identity, so the running app opens
+                // Settings (`enqueue_response`).
+                Event::Relief => return Some((RELIEF_SETTINGS_ID.to_owned(), false)),
                 Event::Wake => continue,
             }
         }
@@ -620,6 +750,16 @@ fn run(
                 let opening = app.clone();
                 if let Err(error) = app.run_on_main_thread(move || {
                     deliver_notification_activation(&opening, session);
+                }) {
+                    if let Ok(mut current) = status.lock() {
+                        current.error = Some(error.to_string());
+                    }
+                }
+            }
+            Ok(Event::Relief) => {
+                let opening = app.clone();
+                if let Err(error) = app.run_on_main_thread(move || {
+                    crate::desktop::handle_menu_event(&opening, "tray:settings");
                 }) {
                     if let Ok(mut current) = status.lock() {
                         current.error = Some(error.to_string());
@@ -976,6 +1116,87 @@ pub(super) fn native_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relief_button_acts_on_the_tree_its_banner_names_and_on_nothing_else() {
+        use crate::sysload::relief_status::TreeId;
+        let id = |pid, start_us, since_ms| TreeId {
+            pid,
+            start_us,
+            since_ms,
+        };
+        let paused =
+            crate::sysload::relief_status::banner_id(RELIEF_PAUSED_PREFIX, id(4242, 77, 5));
+        let offer = crate::sysload::relief_status::banner_id(RELIEF_OFFER_PREFIX, id(4243, 78, 6));
+        let tap = relief_tap;
+        assert_eq!(
+            tap(platform::RELIEF_CATEGORY, RELIEF_TERMINATE_ACTION, &paused),
+            ReliefTap::Terminate(id(4242, 77, 5)),
+            "the pause the banner was raised for travels with it"
+        );
+        assert_eq!(
+            tap(platform::RELIEF_CATEGORY, RELIEF_RESUME_ACTION, &paused),
+            ReliefTap::Resume
+        );
+        assert_eq!(
+            tap(platform::RELIEF_OFFER_CATEGORY, RELIEF_PAUSE_ACTION, &offer),
+            ReliefTap::Pause(id(4243, 78, 6))
+        );
+        // The body click and the Settings button open Settings, on every banner.
+        for category in [
+            platform::RELIEF_CATEGORY,
+            platform::RELIEF_OFFER_CATEGORY,
+            platform::RELIEF_ADVICE_CATEGORY,
+        ] {
+            assert_eq!(
+                tap(category, RELIEF_SETTINGS_ACTION, &paused),
+                ReliefTap::Settings
+            );
+            assert_eq!(
+                tap(
+                    category,
+                    "com.apple.UNNotificationDefaultActionIdentifier",
+                    &paused
+                ),
+                ReliefTap::Settings
+            );
+        }
+        // A button never acts across kinds: End it on an offer's identifier,
+        // Pause it on a paused tree's, or on an untrusted advice banner.
+        assert_eq!(
+            tap(platform::RELIEF_CATEGORY, RELIEF_TERMINATE_ACTION, &offer),
+            ReliefTap::Ignore
+        );
+        assert_eq!(
+            tap(
+                platform::RELIEF_OFFER_CATEGORY,
+                RELIEF_PAUSE_ACTION,
+                &paused
+            ),
+            ReliefTap::Ignore
+        );
+        let advice =
+            crate::sysload::relief_status::banner_id(RELIEF_ADVICE_PREFIX, id(4244, 79, 7));
+        assert_eq!(
+            tap(
+                platform::RELIEF_ADVICE_CATEGORY,
+                RELIEF_PAUSE_ACTION,
+                &advice
+            ),
+            ReliefTap::Settings,
+            "an untrusted repository's advice has no pause path"
+        );
+        // A banner that names no tree (the cap notice) ends nothing.
+        assert_eq!(
+            tap(
+                platform::RELIEF_CATEGORY,
+                RELIEF_TERMINATE_ACTION,
+                "gitpulse.relief.cap-resumed"
+            ),
+            ReliefTap::Ignore
+        );
+    }
+
     #[test]
     fn activation_is_a_queued_event_distinct_from_wake() {
         assert!(!matches!(Event::Wake, Event::Activate(_)));
@@ -1006,6 +1227,10 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Ok(Event::Activate(n)) if n == "open-me"));
         enqueue_response(&host, "later".into(), true).unwrap();
         assert!(matches!(receiver.try_recv(), Ok(Event::Snooze(n)) if n == "later"));
+        // A relief banner's Settings, answered by another launch, is not an
+        // activity claim to look up: it arrives as its own event.
+        enqueue_response(&host, RELIEF_SETTINGS_ID.into(), false).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Event::Relief)));
 
         enqueue_response(&host, "fills".into(), false).unwrap();
         let full = enqueue_response(&host, "overflows".into(), false).unwrap_err();
@@ -1013,6 +1238,24 @@ mod tests {
         drop(receiver);
         let stopped = enqueue_response(&host, "nobody".into(), false).unwrap_err();
         assert!(stopped.contains("stopped"), "{stopped}");
+    }
+    #[test]
+    fn a_relief_banner_obeys_the_saved_notification_preference() {
+        let prefs = |enabled, background| Settings {
+            enabled,
+            sound: true,
+            background,
+        };
+        assert!(
+            !relief_banner_wanted(&prefs(false, true), true),
+            "off is off"
+        );
+        assert!(relief_banner_wanted(&prefs(true, true), false));
+        assert!(relief_banner_wanted(&prefs(true, false), true));
+        assert!(
+            !relief_banner_wanted(&prefs(true, false), false),
+            "no banners while hidden when the person said so"
+        );
     }
     #[test]
     fn native_id_cannot_be_a_path_command_or_another_namespace() {
@@ -1642,8 +1885,12 @@ mod tests {
         use std::fmt::Write as _;
 
         const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        const LEGACY_PLUGIN_LOGO_SHA256: &str =
-            "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
+        const RETIRED_PLUGIN_LOGO_SHA256S: [&str; 2] = [
+            // Legacy Sep-14 pulse-only PNG
+            "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1",
+            // Legacy GitPulse G-ring PNG
+            "1cf0341b1cc7b556701b5bfb17c3ed02b2eba2e87863928b4de8e1cc7225fd3b",
+        ];
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let tauri_conf_raw = std::fs::read_to_string(manifest_dir.join("tauri.conf.json"))
@@ -1668,7 +1915,7 @@ mod tests {
             );
         }
         assert_eq!(
-            tauri_conf["bundle"]["resources"]["../plugins/gitpulse/"],
+            tauri_conf["bundle"]["resources"]["../plugins/waylode/"],
             json!("plugin/")
         );
 
@@ -1718,7 +1965,7 @@ mod tests {
         }
 
         let (logo_w, logo_h, bit_depth, color_type, logo_bytes) =
-            read_png_ihdr(&manifest_dir.join("../plugins/gitpulse/assets/logo.png"));
+            read_png_ihdr(&manifest_dir.join("../plugins/waylode/assets/logo.png"));
         assert_eq!((logo_w, logo_h), (256, 256));
         assert_eq!(bit_depth, 8, "plugin logo must be 8-bit");
         assert_eq!(color_type, 6, "plugin logo must be RGBA");
@@ -1727,15 +1974,15 @@ mod tests {
         for byte in Sha256::digest(&logo_bytes) {
             let _ = write!(digest, "{byte:02x}");
         }
-        assert_ne!(
-            digest, LEGACY_PLUGIN_LOGO_SHA256,
-            "plugins/gitpulse/assets/logo.png still matches legacy Sep-14 pulse-only PNG"
+        assert!(
+            !RETIRED_PLUGIN_LOGO_SHA256S.contains(&digest.as_str()),
+            "plugins/waylode/assets/logo.png still matches a retired legacy PNG ({digest})"
         );
     }
 
     #[test]
     fn session_host_routes_through_session_category_and_preserves_activity_heading() {
-        assert_eq!(ACTIVITY_HEADING, "GitPulse activity");
+        assert_eq!(ACTIVITY_HEADING, "Waylode activity");
         assert_eq!(platform::SESSION_CATEGORY, "gitpulse-session");
         assert_eq!(crate::alerts::NATIVE_PREFIX, "gitpulse.session.");
     }

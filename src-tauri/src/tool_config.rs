@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub const CONFIG_VERSION: u32 = 1;
-pub const TOOL_CONFIG_ENV: &str = "GITPULSE_TOOL_CONFIG";
+pub const TOOL_CONFIG_ENV: &str = "WAYLODE_TOOL_CONFIG";
+pub const LEGACY_TOOL_CONFIG_ENV: &str = "GITPULSE_TOOL_CONFIG";
 
 fn is_false(v: &bool) -> bool {
     !*v
@@ -682,6 +683,56 @@ fn is_default_idle_memory_mode(mode: &IdleMemoryMode) -> bool {
     *mode == IdleMemoryMode::default()
 }
 
+/// What the pressure-relief supervisor (`sysload::relief`, load-governor card
+/// 4) does when memory pressure bears down on agent trees. Stored as the
+/// top-level key `host_load_supervisor`, host-wide: a repository override is
+/// not offered, because the supervisor acts on every agent session on the
+/// host and a per-repository switch would leave the same memory pressure
+/// bearing down on the sessions that opted out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorMode {
+    /// Nothing is slowed or frozen, and what was is put back.
+    Off,
+    /// The decisions are computed and published (`relief.v1.json`), and no
+    /// signal or priority change is sent.
+    Advise,
+    /// Slow descendants of agent sessions under memory pressure, and freeze
+    /// the heaviest runaway subtree of a GitPulse-launched session when it
+    /// holds and worsens. An unreadable value is this: the default.
+    #[default]
+    #[serde(other)]
+    Act,
+}
+
+fn lenient_supervisor_mode<'de, D>(deserializer: D) -> Result<SupervisorMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable host_load_supervisor, keeping act: {error}"
+        );
+        SupervisorMode::Act
+    }))
+}
+
+/// An opt-in switch read leniently: anything but a real `true` is "no", and
+/// costs nothing else in the file (a bad value must neither opt anyone in nor
+/// discard the whole configuration).
+fn lenient_opt_in<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool() == Some(true))
+}
+
+fn is_default_supervisor_mode(mode: &SupervisorMode) -> bool {
+    *mode == SupervisorMode::default()
+}
+
 /// Whether builds take a slot (`sysload::lease`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1041,6 +1092,16 @@ pub struct HostLoadSettings {
     /// `host_load_idle`.
     #[serde(default)]
     pub idle: HostLoadIdle,
+    /// What the pressure-relief supervisor may do (`off`, `advise`, `act`).
+    /// Stored at the top level as `host_load_supervisor`, like `hook_mode`.
+    #[serde(default)]
+    pub supervisor: SupervisorMode,
+    /// Rung C. When a paused build is still paused at the 10-minute cap, end
+    /// it (SIGCONT, SIGTERM, then SIGKILL) instead of resuming it. Off by
+    /// default: ending a person's build is opt-in. Stored at the top level as
+    /// `host_load_supervisor_terminate`, like `supervisor`.
+    #[serde(default)]
+    pub supervisor_terminate: bool,
 }
 
 fn is_default_hook_mode(mode: &HostLoadHookMode) -> bool {
@@ -1061,6 +1122,8 @@ impl Default for HostLoadSettings {
             hook_mode: HostLoadHookMode::default(),
             leases: HostLoadLeases::default(),
             idle: HostLoadIdle::default(),
+            supervisor: SupervisorMode::default(),
+            supervisor_terminate: false,
         }
     }
 }
@@ -1679,6 +1742,23 @@ pub struct ToolConfig {
         skip_serializing_if = "HostLoadIdle::is_default"
     )]
     pub host_load_idle: HostLoadIdle,
+    /// What the pressure-relief supervisor does (`off`, `advise`, `act`). A
+    /// sibling key of the host-load block, not a field in it: that block is
+    /// mirrored field for field by the frontend.
+    #[serde(
+        default,
+        deserialize_with = "lenient_supervisor_mode",
+        skip_serializing_if = "is_default_supervisor_mode"
+    )]
+    pub host_load_supervisor: SupervisorMode,
+    /// Whether the supervisor ends a paused build at the 10-minute cap
+    /// instead of resuming it. A sibling key of `host_load_supervisor`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_opt_in",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub host_load_supervisor_terminate: bool,
     /// Periodic Manvi system steward settings (host-wide and per-repository).
     #[serde(
         default,
@@ -1721,6 +1801,8 @@ impl Default for ToolConfig {
             turn_checkpoints: TurnCheckpointSettings::default(),
             host_load_leases: HostLoadLeases::default(),
             host_load_idle: HostLoadIdle::default(),
+            host_load_supervisor: SupervisorMode::default(),
+            host_load_supervisor_terminate: false,
             manvi_steward: ManviStewardSettings::default(),
             idle_memory_mode: IdleMemoryMode::default(),
             unknown: serde_json::Map::new(),
@@ -1816,31 +1898,44 @@ impl Drop for FileLock {
     }
 }
 
-/// Where the platform keeps application support / config for GitPulse.
-pub fn default_config_dir() -> Option<PathBuf> {
+fn platform_config_dir(app_name: &str, linux_name: &str) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
+        let _ = linux_name;
         std::env::var_os("HOME").map(|home| {
             PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
-                .join("GitPulse")
+                .join(app_name)
         })
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join("GitPulse"))
+        let _ = linux_name;
+        std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join(app_name))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
+        let _ = app_name;
         std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|base| base.join("gitpulse"))
+            .map(|base| base.join(linux_name))
     }
 }
 
-/// Where the platform keeps GitPulse state that can be rebuilt at any time:
+/// Where the platform keeps application support / config for Waylode.
+pub fn default_config_dir() -> Option<PathBuf> {
+    platform_config_dir("Waylode", "waylode")
+}
+
+/// Where GitPulse kept its application support / config before the Waylode rename.
+pub fn legacy_config_dir() -> Option<PathBuf> {
+    platform_config_dir("GitPulse", "gitpulse")
+}
+
+/// Where the platform keeps Waylode state that can be rebuilt at any time:
 /// deleting it costs recomputation, never data. Derived from the per-user
 /// home like [`default_config_dir`], never `temp_dir()`, which agent hosts
 /// commonly make private per process.
@@ -1851,13 +1946,13 @@ pub fn default_cache_dir() -> Option<PathBuf> {
             PathBuf::from(home)
                 .join("Library")
                 .join("Caches")
-                .join("GitPulse")
+                .join("Waylode")
         })
     }
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("LOCALAPPDATA")
-            .map(|base| PathBuf::from(base).join("GitPulse").join("Cache"))
+            .map(|base| PathBuf::from(base).join("Waylode").join("Cache"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1865,16 +1960,225 @@ pub fn default_cache_dir() -> Option<PathBuf> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-            .map(|base| base.join("gitpulse"))
+            .map(|base| base.join("waylode"))
+    }
+}
+
+const MAX_PROFILE_DEPTH: usize = 32;
+const MAX_PROFILE_ENTRIES: usize = 200_000;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProfileMigrationOutcome {
+    Copied { files: usize },
+    NothingToMigrate,
+    TargetAlreadyExists,
+    BlockedByLiveProcess(String),
+}
+
+fn dir_has_entries(dir: &Path) -> Result<bool, String> {
+    let mut entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("cannot read {}: {err}", dir.display())),
+    };
+    Ok(entries
+        .next()
+        .transpose()
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .is_some())
+}
+
+fn check_legacy_locks(legacy_dir: &Path) -> Result<Option<String>, String> {
+    if let Some(owner) = crate::daemon_lock::running_named(legacy_dir, "instance.lock")? {
+        return Ok(Some(format!(
+            "legacy instance.lock held by pid {:?}",
+            owner.pid
+        )));
+    }
+    let daemon_dir = legacy_dir.join(crate::daemon_lock::LEGACY_DIR);
+    if let Some(owner) =
+        crate::daemon_lock::running_named(&daemon_dir, crate::daemon_lock::LEGACY_LOCK_FILE)?
+    {
+        return Ok(Some(format!(
+            "legacy {} held by pid {:?}",
+            crate::daemon_lock::LEGACY_LOCK_FILE,
+            owner.pid
+        )));
+    }
+    let pty_host_dir = legacy_dir.join("pty-host");
+    let entries = match fs::read_dir(&pty_host_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("cannot scan {}: {err}", pty_host_dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot scan {}: {e}", pty_host_dir.display()))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("ptyd-v") && name_str.ends_with(".lock") {
+            if let Some(owner) = crate::daemon_lock::running_named(&pty_host_dir, &name_str)? {
+                return Ok(Some(format!(
+                    "legacy {name_str} held by pid {:?}",
+                    owner.pid
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn is_transient_socket_or_lock(name: &std::ffi::OsStr) -> bool {
+    let text = name.to_string_lossy();
+    text.ends_with(".lock") || text.ends_with(".sock")
+}
+
+fn copy_profile_tree(
+    from: &Path,
+    to: &Path,
+    depth: usize,
+    files: &mut usize,
+) -> std::io::Result<()> {
+    if depth > MAX_PROFILE_DEPTH {
+        return Err(std::io::Error::other(
+            "profile directory is nested too deeply",
+        ));
+    }
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if is_transient_socket_or_lock(&name) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        let target = to.join(name);
+        if kind.is_dir() {
+            copy_profile_tree(&entry.path(), &target, depth + 1, files)?;
+        } else if kind.is_file() {
+            *files += 1;
+            if *files > MAX_PROFILE_ENTRIES {
+                return Err(std::io::Error::other(
+                    "profile directory has too many files",
+                ));
+            }
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Atomically and non-destructively copies `legacy_dir` (`GitPulse/` or
+/// `gitpulse/`) into `target_dir` (`Waylode/` or `waylode/`) via
+/// `<target>.migrating`, leaving `legacy_dir` intact for rollback.
+pub fn migrate_profile_in(
+    legacy_dir: &Path,
+    target_dir: &Path,
+) -> Result<ProfileMigrationOutcome, String> {
+    if legacy_dir == target_dir || !legacy_dir.is_dir() {
+        return Ok(ProfileMigrationOutcome::NothingToMigrate);
+    }
+    if dir_has_entries(target_dir)? {
+        return Ok(ProfileMigrationOutcome::TargetAlreadyExists);
+    }
+    if let Some(holder) = check_legacy_locks(legacy_dir)? {
+        return Ok(ProfileMigrationOutcome::BlockedByLiveProcess(holder));
+    }
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| format!("profile path {} has no parent", target_dir.display()))?;
+    let target_name = target_dir.file_name().ok_or_else(|| {
+        format!(
+            "profile path {} has no directory name",
+            target_dir.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let staging = parent.join(format!("{}.migrating", target_name.to_string_lossy()));
+    match fs::remove_dir_all(&staging) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("cannot clear {}: {err}", staging.display())),
+    }
+    let mut files = 0;
+    if let Err(err) = copy_profile_tree(legacy_dir, &staging, 0, &mut files) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!(
+            "cannot copy {} to {}: {err}",
+            legacy_dir.display(),
+            staging.display()
+        ));
+    }
+    if target_dir.exists() {
+        if let Err(err) = fs::remove_dir(target_dir) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(format!(
+                "cannot replace empty target {}: {err}",
+                target_dir.display()
+            ));
+        }
+    }
+    if let Err(err) = fs::rename(&staging, target_dir) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!(
+            "cannot rename {} to {}: {err}",
+            staging.display(),
+            target_dir.display()
+        ));
+    }
+    Ok(ProfileMigrationOutcome::Copied { files })
+}
+
+/// First-run profile migration on startup before locks or SQLite stores open.
+/// Failures are logged and never stop the app from starting.
+pub fn migrate_profile_dir() {
+    if crate::env_compat::var_os_compat(TOOL_CONFIG_ENV, LEGACY_TOOL_CONFIG_ENV).is_some() {
+        return;
+    }
+    let (Some(legacy), Some(target)) = (legacy_config_dir(), default_config_dir()) else {
+        return;
+    };
+    match migrate_profile_in(&legacy, &target) {
+        Ok(ProfileMigrationOutcome::Copied { files }) => {
+            log::info!(
+                target: "setup",
+                "migrated {files} profile files from {} to {}",
+                legacy.display(),
+                target.display()
+            );
+        }
+        Ok(ProfileMigrationOutcome::BlockedByLiveProcess(reason)) => {
+            log::warn!(
+                target: "setup",
+                "skipped profile migration from {} ({reason})",
+                legacy.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::warn!(
+                target: "setup",
+                "profile migration from {} failed: {error}",
+                legacy.display()
+            );
+        }
+    }
+}
+
+fn explicit_config_path(var_name: &str) -> Option<Result<PathBuf, String>> {
+    match std::env::var(var_name) {
+        Ok(explicit) if explicit.is_empty() => Some(Err(format!("{var_name} is set but empty"))),
+        Ok(explicit) => Some(Ok(PathBuf::from(explicit))),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => Some(Err(format!("{var_name} is not valid UTF-8: {err}"))),
     }
 }
 
 pub fn config_path() -> Result<PathBuf, String> {
-    if let Ok(explicit) = std::env::var(TOOL_CONFIG_ENV) {
-        if explicit.is_empty() {
-            return Err(format!("{TOOL_CONFIG_ENV} is set but empty"));
-        }
-        return Ok(PathBuf::from(explicit));
+    if let Some(result) = explicit_config_path(TOOL_CONFIG_ENV) {
+        return result;
+    }
+    if let Some(result) = explicit_config_path(LEGACY_TOOL_CONFIG_ENV) {
+        return result;
     }
     let dir = default_config_dir().ok_or_else(|| {
         "cannot resolve platform config directory (HOME / APPDATA / XDG_CONFIG_HOME unset)"
@@ -1974,10 +2278,10 @@ pub fn save_confirmed(
     let changes = new_executable_paths(&current, config);
     if !changes.is_empty() {
         let message = format!(
-            "GitPulse will run programs from these locations:\n\n{}\n\nOnly continue if you chose them.",
+            "Waylode will run programs from these locations:\n\n{}\n\nOnly continue if you chose them.",
             changes.join("\n")
         );
-        if !confirm("Change which programs GitPulse runs?", &message) {
+        if !confirm("Change which programs Waylode runs?", &message) {
             return Err("Tool locations were not changed: the change was not confirmed".into());
         }
     }
@@ -2427,6 +2731,8 @@ pub fn host_load_settings() -> HostLoadSettings {
                 profile: cfg.host_load_profile,
                 leases: cfg.host_load_leases,
                 idle: cfg.host_load_idle,
+                supervisor: cfg.host_load_supervisor,
+                supervisor_terminate: cfg.host_load_supervisor_terminate,
                 ..cfg.host_load
             }
         })
@@ -2458,6 +2764,34 @@ pub fn host_load_leases() -> HostLoadLeases {
 /// What GitPulse does about an idle session, or the defaults (advise).
 pub fn host_load_idle() -> HostLoadIdle {
     load().map(|cfg| cfg.host_load_idle).unwrap_or_default()
+}
+
+/// What the pressure-relief supervisor does, or the default (act).
+///
+/// An unreadable file is "act": the supervisor only ever answers sustained
+/// memory pressure, and a broken config must not be what quietly turns the
+/// last defence against a hung Mac off. Read by the sampler once per tick.
+pub fn host_load_supervisor() -> SupervisorMode {
+    load()
+        .map(|cfg| cfg.host_load_supervisor)
+        .unwrap_or_default()
+}
+
+/// Whether a freeze still standing at the 10-minute cap is ended instead of
+/// resumed. An unreadable file is "no": ending a person's build is opt-in, and
+/// a broken config must never be what opts them in.
+pub fn host_load_supervisor_terminate() -> bool {
+    load()
+        .map(|cfg| cfg.host_load_supervisor_terminate)
+        .unwrap_or(false)
+}
+
+/// Stores the supervisor's mode (`off`, `advise`, `act`).
+pub fn set_host_load_supervisor(mode: SupervisorMode) -> Result<(), String> {
+    update(|cfg| {
+        cfg.host_load_supervisor = mode;
+        Ok(())
+    })
 }
 
 /// The stored turn-checkpoint switch. Any failure to read it is "off": a
@@ -2499,6 +2833,8 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     cfg.host_load_profile = next.profile;
     cfg.host_load_leases = next.leases.clone();
     cfg.host_load_idle = next.idle.clone();
+    cfg.host_load_supervisor = next.supervisor;
+    cfg.host_load_supervisor_terminate = next.supervisor_terminate;
     cfg.host_load = next;
     save(&cfg)?;
     Ok(())
@@ -3970,6 +4306,111 @@ mod tests {
     }
 
     #[test]
+    fn the_host_load_settings_report_and_save_the_supervisor_mode() {
+        with_temp_config(|path| {
+            assert_eq!(host_load_settings().supervisor, SupervisorMode::Act);
+            // Over IPC the settings carry it under `supervisor`.
+            let wire = serde_json::to_value(host_load_settings()).unwrap();
+            assert_eq!(wire["supervisor"], "act");
+            set_host_load_settings(HostLoadSettings {
+                supervisor: SupervisorMode::Advise,
+                ..host_load_settings()
+            })
+            .unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_settings().supervisor, SupervisorMode::Advise);
+            assert_eq!(host_load_supervisor(), SupervisorMode::Advise);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load_supervisor"], "advise");
+            assert!(
+                stored["host_load"].get("supervisor").is_none(),
+                "never inside host_load, which an older build would discard whole"
+            );
+            // A save from a client that does not know the key sends the default.
+            let sent: HostLoadSettings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+            assert_eq!(sent.supervisor, SupervisorMode::Act);
+        });
+    }
+
+    #[test]
+    fn ending_a_paused_build_at_the_cap_is_opt_in_stored_beside_the_supervisor_and_round_trips() {
+        with_temp_config(|path| {
+            assert!(!host_load_supervisor_terminate(), "off by default");
+            assert!(!host_load_settings().supervisor_terminate);
+            let mut next = host_load_settings();
+            next.supervisor_terminate = true;
+            set_host_load_settings(next).unwrap();
+            invalidate_cache();
+            assert!(host_load_supervisor_terminate());
+            assert!(host_load_settings().supervisor_terminate);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load_supervisor_terminate"], true);
+            assert!(
+                stored["host_load"].get("supervisor_terminate").is_none(),
+                "never inside host_load, which an older build would discard whole"
+            );
+            // Turning it off omits the key again, and the mode is untouched.
+            let mut off = host_load_settings();
+            off.supervisor_terminate = false;
+            set_host_load_settings(off).unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored.get("host_load_supervisor_terminate").is_none());
+            assert_eq!(host_load_supervisor(), SupervisorMode::Act);
+            // A client that does not know the key sends false; an unreadable
+            // value never opts anyone in.
+            let sent: HostLoadSettings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+            assert!(!sent.supervisor_terminate);
+            fs::write(path, r#"{"host_load_supervisor_terminate": "yes"}"#).unwrap();
+            invalidate_cache();
+            assert!(!host_load_supervisor_terminate());
+        });
+    }
+
+    #[test]
+    fn the_supervisor_setting_defaults_to_act_omits_the_default_and_survives_bad_values() {
+        assert_eq!(SupervisorMode::default(), SupervisorMode::Act);
+        for (text, want) in [
+            (r#""off""#, SupervisorMode::Off),
+            (r#""advise""#, SupervisorMode::Advise),
+            (r#""act""#, SupervisorMode::Act),
+            (r#""enforce""#, SupervisorMode::Act),
+        ] {
+            assert_eq!(serde_json::from_str::<SupervisorMode>(text).unwrap(), want);
+        }
+        with_temp_config(|path| {
+            assert_eq!(host_load_supervisor(), SupervisorMode::Act);
+            for mode in [SupervisorMode::Off, SupervisorMode::Advise] {
+                set_host_load_supervisor(mode).unwrap();
+                invalidate_cache();
+                assert_eq!(host_load_supervisor(), mode);
+                let stored: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+                assert_eq!(stored["host_load_supervisor"], serde_json::json!(mode));
+            }
+            // Saving the host-load block keeps the sibling key.
+            set_host_load_settings(host_load_settings()).unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_supervisor(), SupervisorMode::Advise);
+            set_host_load_supervisor(SupervisorMode::Act).unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                stored.get("host_load_supervisor").is_none(),
+                "the default is not stored"
+            );
+            // A value this build cannot read is act, never off.
+            fs::write(path, r#"{"host_load_supervisor": 7}"#).unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_supervisor(), SupervisorMode::Act);
+        });
+    }
+
+    #[test]
     fn idle_memory_mode_defaults_to_balanced_falls_back_on_unknown_and_round_trips() {
         assert_eq!(IdleMemoryMode::default(), IdleMemoryMode::Balanced);
         assert_eq!(
@@ -4587,6 +5028,111 @@ mod model_setting_tests {
             set_manvi_steward_settings(ManviStewardSettings::default()).unwrap();
             assert_eq!(manvi_steward_settings().clean_retention_days, 3);
         });
+    }
+
+    #[test]
+    fn default_dirs_use_waylode_and_legacy_config_dir_uses_gitpulse() {
+        let cfg = default_config_dir().unwrap();
+        let legacy = legacy_config_dir().unwrap();
+        let cache = default_cache_dir().unwrap();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(cfg.ends_with("Waylode"), "{cfg:?}");
+            assert!(legacy.ends_with("GitPulse"), "{legacy:?}");
+            assert!(cache.to_string_lossy().contains("Waylode"), "{cache:?}");
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert!(cfg.ends_with("waylode"), "{cfg:?}");
+            assert!(legacy.ends_with("gitpulse"), "{legacy:?}");
+            assert!(cache.ends_with("waylode"), "{cache:?}");
+        }
+    }
+
+    #[test]
+    fn profile_migration_copies_atomically_skips_symlinks_locks_sockets_and_keeps_legacy() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("GitPulse");
+        let target = root.path().join("Waylode");
+        fs::create_dir_all(legacy.join("nested")).unwrap();
+        fs::write(legacy.join("tools.json"), "{\"version\":1}").unwrap();
+        fs::write(legacy.join("nested/workbench.sqlite"), "db-bytes").unwrap();
+        fs::write(legacy.join("instance.lock"), "123\n").unwrap();
+        fs::write(legacy.join("instance.sock"), "").unwrap();
+        fs::create_dir_all(legacy.join("gitpulsed")).unwrap();
+        fs::write(legacy.join("gitpulsed/gitpulsed.lock"), "456\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            let secret = root.path().join("secret.txt");
+            fs::write(&secret, "secret").unwrap();
+            std::os::unix::fs::symlink(&secret, legacy.join("link")).unwrap();
+        }
+
+        // Leftover .migrating directory is cleaned before copying.
+        let staging = root.path().join("Waylode.migrating");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("stale"), "partial").unwrap();
+
+        let outcome = migrate_profile_in(&legacy, &target).unwrap();
+        assert_eq!(outcome, ProfileMigrationOutcome::Copied { files: 2 });
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read_to_string(target.join("tools.json")).unwrap(),
+            "{\"version\":1}"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("nested/workbench.sqlite")).unwrap(),
+            "db-bytes"
+        );
+        assert!(!target.join("instance.lock").exists());
+        assert!(!target.join("instance.sock").exists());
+        assert!(!target.join("gitpulsed/gitpulsed.lock").exists());
+        #[cfg(unix)]
+        assert!(!target.join("link").exists());
+        // Legacy GitPulse/ remains intact for rollback.
+        assert!(legacy.join("tools.json").exists());
+
+        // Second run is idempotent and does not overwrite Waylode/.
+        fs::write(target.join("tools.json"), "{\"version\":1,\"live\":true}").unwrap();
+        assert_eq!(
+            migrate_profile_in(&legacy, &target).unwrap(),
+            ProfileMigrationOutcome::TargetAlreadyExists
+        );
+        assert!(fs::read_to_string(target.join("tools.json"))
+            .unwrap()
+            .contains("live"));
+    }
+
+    #[test]
+    fn profile_migration_refuses_when_legacy_locks_are_held() {
+        for (subdir, lock_file) in [
+            (None, "instance.lock"),
+            (Some("gitpulsed"), "gitpulsed.lock"),
+            (Some("pty-host"), "ptyd-v1.lock"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let legacy = root.path().join("GitPulse");
+            let target = root.path().join("Waylode");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("tools.json"), "{}").unwrap();
+            let lock_dir = match subdir {
+                Some(sub) => legacy.join(sub),
+                None => legacy.clone(),
+            };
+            let held = match crate::daemon_lock::acquire_named(&lock_dir, lock_file, "0.2.0") {
+                crate::daemon_lock::Acquire::Held(lock) => lock,
+                other => panic!("failed to acquire {lock_file}: {other:?}"),
+            };
+
+            let outcome = migrate_profile_in(&legacy, &target).unwrap();
+            assert!(
+                matches!(outcome, ProfileMigrationOutcome::BlockedByLiveProcess(_)),
+                "expected block for {lock_file}, got {outcome:?}"
+            );
+            assert!(!target.exists());
+            drop(held);
+        }
     }
 }
 

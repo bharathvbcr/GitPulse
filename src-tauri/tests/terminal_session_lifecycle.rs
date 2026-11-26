@@ -7,19 +7,19 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{
-    acknowledge_output, kill_session, session_context, spawn_session, spawn_session_in,
-    write_to_session, KillOrigin, TerminalSessions,
-};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{
+    acknowledge_output, kill_session, session_context, spawn_session, spawn_session_in,
+    write_to_session, KillOrigin, TerminalSessions,
+};
 
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("PTY test cleanup incomplete: {error}");
         }
     }
@@ -29,7 +29,7 @@ fn repo() -> tempfile::TempDir {
     // These tests are about session lifetime, not the production spawn rate.
     // Every test starts here, and the race below opens 128 sessions whose
     // repository validation would otherwise queue behind the rate in one gate.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -51,7 +51,7 @@ struct Harness {
 
 fn harness() -> Harness {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -131,7 +131,7 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), script]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     let job = read_pid(&pidfile, Duration::from_secs(5));
@@ -174,7 +174,7 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
         Some("/bin/bash".into()),
         Some(vec!["-i".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     write_to_session(
@@ -222,7 +222,7 @@ fn closing_stops_a_foreground_program_that_ignores_hangup() {
             "trap '' HUP; printf ready; while :; do sleep 1; done".into(),
         ]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     assert!(wait_for_output(&h.output, "ready", Duration::from_secs(10)));
@@ -259,7 +259,7 @@ fn quitting_closes_every_session_concurrently() {
                 format!("trap '' HUP; printf 'ready-{index};'; while :; do sleep 1; done"),
             ]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+            waylode_lib::terminal::OutputSink::events(h.app.handle()),
         )
         .unwrap();
     }
@@ -271,7 +271,7 @@ fn quitting_closes_every_session_concurrently() {
         ));
     }
     let started = Instant::now();
-    gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&h.state).unwrap();
     let took = started.elapsed();
     // Each close waits out the 2.5 s hangup grace: 30 s in sequence. Together
     // it is one grace, whatever the number of sessions.
@@ -299,7 +299,7 @@ fn a_session_starts_in_the_requested_directory_inside_the_repository() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "pwd -P; exit 0".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     h.exits.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -343,7 +343,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exit 0".into()]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+            waylode_lib::terminal::OutputSink::events(h.app.handle()),
         );
         assert!(
             result.is_err(),
@@ -361,7 +361,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exit 0".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle())
+        waylode_lib::terminal::OutputSink::events(h.app.handle())
     )
     .is_err());
     // A refusal consumed no capacity and started no process.
@@ -377,7 +377,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exit 0".into()]),
             None,
-            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+            waylode_lib::terminal::OutputSink::events(h.app.handle()),
         )
         .unwrap();
         assert_eq!(
@@ -403,7 +403,7 @@ fn context_names_the_foreground_program_and_follows_cd() {
         Some("/bin/sh".into()),
         Some(vec!["-i".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     // `sh -i` echoes the typed line, so the marker is split by quotes there
@@ -488,7 +488,7 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
                         Some("/bin/sh".into()),
                         Some(vec!["-i".into()]),
                         None,
-                        gitpulse_lib::terminal::OutputSink::events(&handle),
+                        waylode_lib::terminal::OutputSink::events(&handle),
                     )
                     .expect("capacity is never exhausted: THREADS is below the session cap");
                     let reader_state = state.clone();
@@ -522,7 +522,7 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
             });
         }
     });
-    gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&h.state).unwrap();
     // Every slot came back: the cap can be filled again from empty.
     let mut held = Vec::new();
     for _ in 0..h.state.session_limit() {
@@ -536,12 +536,12 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
                 Some("/bin/sh".into()),
                 Some(vec!["-c".into(), "sleep 30".into()]),
                 None,
-                gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+                waylode_lib::terminal::OutputSink::events(h.app.handle()),
             )
             .expect("a slot leaked during the race"),
         );
     }
-    gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&h.state).unwrap();
 }
 
 /// Sixteen closers on one session, plus a bystander session and a process in
@@ -564,7 +564,7 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
         Some("/bin/bash".into()),
         Some(vec!["-i".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     write_to_session(
@@ -584,7 +584,7 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "sleep 30".into()]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     let mut outsider = std::process::Command::new("sleep")
@@ -616,7 +616,7 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
         "a close reached a process outside the session"
     );
     assert!(
-        gitpulse_lib::terminal::list_sessions(&h.state)
+        waylode_lib::terminal::list_sessions(&h.state)
             .unwrap()
             .iter()
             .any(|listing| listing.id == bystander.id),
@@ -649,7 +649,7 @@ fn a_close_marks_the_session_ended_by_gitpulse_before_it_signals() {
         Some("/bin/bash".into()),
         Some(vec!["-c".into(), script]),
         None,
-        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+        waylode_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     assert!(wait_for_output(&h.output, "armed", Duration::from_secs(10)));
@@ -660,7 +660,7 @@ fn a_close_marks_the_session_ended_by_gitpulse_before_it_signals() {
             assert!(Instant::now() < deadline, "the hangup never arrived");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let ending = gitpulse_lib::terminal::list_sessions(&h.state)
+        let ending = waylode_lib::terminal::list_sessions(&h.state)
             .unwrap()
             .iter()
             .any(|listing| listing.id == session.id && listing.ending);

@@ -1144,7 +1144,7 @@ pub(crate) fn read_state_snapshot_at(path: Option<&Path>) -> HubStateRead {
         Ok(Some(file)) => file,
         Ok(None) => {
             return HubStateRead::Unavailable(
-                "GitPulse desktop app is not running (no active session-state snapshot)".into(),
+                "Waylode desktop app is not running (no active session-state snapshot)".into(),
             );
         }
         Err(error) => {
@@ -1198,7 +1198,7 @@ pub(crate) fn read_state_snapshot_at(path: Option<&Path>) -> HubStateRead {
             snapshot.writer_pid
         )),
         None => HubStateRead::Unavailable(format!(
-            "GitPulse desktop app pid {} is no longer running",
+            "Waylode desktop app pid {} is no longer running",
             snapshot.writer_pid
         )),
     }

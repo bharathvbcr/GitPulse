@@ -30,11 +30,11 @@
 // touches none of it. Ungated, all of it is dead code on Windows and fails
 // clippy's `-D warnings` there.
 #[cfg(unix)]
-use gitpulse_lib::procguard::LockedSpawn;
-#[cfg(unix)]
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use waylode_lib::procguard::LockedSpawn;
 
 #[cfg(unix)]
 const SAMPLES: usize = 200;
@@ -221,8 +221,8 @@ fn main() {
 /// larger than this one would otherwise be, and with nothing held.
 #[cfg(target_os = "macos")]
 fn background_band(resident: &[u8]) {
-    use gitpulse_lib::procguard;
     use std::os::unix::process::CommandExt;
+    use waylode_lib::procguard;
 
     std::hint::black_box(resident);
     let trivial_in = |cmd: &mut Command| {

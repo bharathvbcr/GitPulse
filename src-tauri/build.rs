@@ -91,9 +91,14 @@ fn compile_apple_intelligence() {
     // platform; without this, clippy's `unexpected_cfgs` fires on Linux.
     println!("cargo:rustc-check-cfg=cfg(apple_intelligence)");
     println!("cargo:rerun-if-changed=swift/AppleIntelligence.swift");
+    println!("cargo:rerun-if-env-changed=WAYLODE_DISABLE_APPLE_INTELLIGENCE");
     println!("cargo:rerun-if-env-changed=GITPULSE_DISABLE_APPLE_INTELLIGENCE");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    if std::env::var("WAYLODE_DISABLE_APPLE_INTELLIGENCE").as_deref() == Ok("1") {
+        println!("cargo:warning=Apple Intelligence bridge disabled by WAYLODE_DISABLE_APPLE_INTELLIGENCE=1");
         return;
     }
     if std::env::var("GITPULSE_DISABLE_APPLE_INTELLIGENCE").as_deref() == Ok("1") {

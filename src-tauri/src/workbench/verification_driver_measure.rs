@@ -112,7 +112,7 @@ fn profile_copy(real_config: &Path) -> PathBuf {
         let config = config.canonicalize().unwrap_or(config);
         assert!(
             !path.starts_with(&config),
-            "{} is inside the GitPulse config directory {}; measure a copy",
+            "{} is inside the Waylode config directory {}; measure a copy",
             path.display(),
             config.display()
         );

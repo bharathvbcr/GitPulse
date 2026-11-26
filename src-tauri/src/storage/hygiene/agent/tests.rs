@@ -1214,7 +1214,7 @@ fn a_real_child_holding_the_target_keeps_it_through_the_real_process_table() {
     let (_temp, root) = temp_root();
     let target = scratchpad(&root, OLD).join("target-x");
     cargo_target(&target, 30);
-    if !cfg!(unix) {
+    if !crate::sysload::procscan::SCAN_SUPPORTED {
         // No process table is read here, so whether a process holds the folder
         // cannot be answered: the reading says so, and the folder is kept as
         // one that could not be checked, never offered.
@@ -1238,12 +1238,23 @@ fn a_real_child_holding_the_target_keeps_it_through_the_real_process_table() {
         assert!(target.is_dir());
         return;
     }
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", "read line"])
-        .current_dir(&target)
-        .stdin(std::process::Stdio::piped())
-        .spawn_locked()
-        .unwrap();
+    // Any long-lived child whose working directory is the target: `sh` waits
+    // on its stdin; Windows has no `sh`, and `ping` (always on PATH) waits on
+    // its count. It is killed below either way.
+    let mut child = if cfg!(windows) {
+        let mut ping = std::process::Command::new("ping");
+        ping.args(["-n", "120", "127.0.0.1"])
+            .stdout(std::process::Stdio::null());
+        ping
+    } else {
+        let mut sh = std::process::Command::new("sh");
+        sh.args(["-c", "read line"]);
+        sh
+    }
+    .current_dir(&target)
+    .stdin(std::process::Stdio::piped())
+    .spawn_locked()
+    .unwrap();
     let pid = i32::try_from(child.id()).unwrap();
     let real_use = |dir: &Path| crate::sysload::procscan::dir_use(dir);
     let held = crate::test_support::env::wait_until(Duration::from_secs(20), || {

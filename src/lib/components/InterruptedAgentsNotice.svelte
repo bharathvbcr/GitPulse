@@ -122,7 +122,7 @@
         </span>
       {/if}
       {#if managedFailed}
-        <span class="text-textMuted" data-tone="unknown" data-testid="interrupted-managed-unread">GitPulse couldn't check whether managed agents were interrupted.</span>
+        <span class="text-textMuted" data-tone="unknown" data-testid="interrupted-managed-unread">Waylode couldn't check whether managed agents were interrupted.</span>
       {/if}
       {#if unreconciled}
         <span class="text-textMuted" data-tone="unknown" data-testid="interrupted-unreconciled-text">{LEDGER_UNRECONCILED_TEXT}</span>

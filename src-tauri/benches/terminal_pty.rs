@@ -39,16 +39,16 @@ mod common;
 mod imp {
     use super::common::fixture::{git, trust_repo};
     use super::common::{interleave, Case, Report, Sample};
-    use gitpulse_lib::terminal::{
-        acknowledge_output, kill_session, shutdown_sessions, spawn_session, write_to_session,
-        KillOrigin,
-    };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tauri::Listener;
+    use waylode_lib::terminal::{
+        acknowledge_output, kill_session, shutdown_sessions, spawn_session, write_to_session,
+        KillOrigin,
+    };
 
     const FLOOD_BYTES: u64 = 16 * 1024 * 1024;
     const KEYSTROKES: usize = 12;
@@ -76,10 +76,10 @@ mod imp {
     }
 
     pub fn main() {
-        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+        waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("terminal_pty");
         let app = tauri::test::mock_builder()
-            .build(gitpulse_lib::context())
+            .build(waylode_lib::context())
             .expect("mock app");
         let state = super::common::terminals();
         let seen = Arc::new(Seen::default());
@@ -129,7 +129,7 @@ mod imp {
                 Some(program.to_owned()),
                 Some(args.iter().map(|a| (*a).to_owned()).collect()),
                 None,
-                gitpulse_lib::terminal::OutputSink::events(app.handle()),
+                waylode_lib::terminal::OutputSink::events(app.handle()),
             )
             .unwrap_or_else(|error| panic!("spawn {program}: {error}", error = error.message()))
             .id

@@ -1,25 +1,25 @@
 [package]
-name = "gitpulse"
+name = "waylode"
 version = "0.2.0-beta.1"
 description = "High-performance native Git desktop client, code intelligence engine, and task workspace"
-authors = ["GitPulse Team"]
+authors = ["Waylode Team"]
 edition = "2021"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bharathvbcr/GitPulse"
 keywords = ["git", "git-client", "tauri", "devtools", "local-first"]
 categories = ["development-tools", "gui"]
-default-run = "gitpulse"
+default-run = "waylode"
 
 [lib]
-name = "gitpulse_lib"
+name = "waylode_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 # Declared explicitly, and the GUI first.
 #
-# `src/bin/*.rs` is auto-discovered by cargo, so adding `gitpulsed` gave the
+# `src/bin/*.rs` is auto-discovered by cargo, so adding `wayloded` gave the
 # package three binaries — and the Tauri bundler stopped picking the right one.
-# It bundled the 3 MB headless daemon as GitPulse.app's executable, which
+# It bundled the 3 MB headless daemon as Waylode.app's executable, which
 # launches, finds no repository named on its command line, and exits: an
 # installed app that opens nothing, from a build that reported success.
 #
@@ -27,28 +27,28 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # entries are what stop cargo's target list from being order-dependent in the
 # first place.
 [[bin]]
-name = "gitpulse"
+name = "waylode"
 path = "src/main.rs"
 
 [[bin]]
-name = "gitpulsed"
-path = "src/bin/gitpulsed.rs"
+name = "wayloded"
+path = "src/bin/wayloded.rs"
 
 [[bin]]
-name = "gitpulse-mcp"
-path = "src/bin/gitpulse-mcp.rs"
+name = "waylode-mcp"
+path = "src/bin/waylode-mcp.rs"
 
 # The hook executable a Claude Code / agent-plugin host spawns per hook event.
-# It is its own binary rather than a `gitpulse-mcp` subcommand because a hook is
+# It is its own binary rather than a `waylode-mcp` subcommand because a hook is
 # spawned on every matching tool call and must not pay for an MCP server's
 # startup: a hook that is slow is a hook users turn off.
 [[bin]]
-name = "gitpulse-hook"
-path = "src/bin/gitpulse-hook.rs"
+name = "waylode-hook"
+path = "src/bin/waylode-hook.rs"
 
 [[bin]]
-name = "gitpulse-ptyd"
-path = "src/bin/gitpulse-ptyd.rs"
+name = "waylode-ptyd"
+path = "src/bin/waylode-ptyd.rs"
 
 [dependencies]
 # `macos-private-api` is what makes the macOS glass appearance possible at all,

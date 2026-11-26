@@ -2,11 +2,11 @@
 //! Public API only, so the same file runs on main and on the lane for an A/B.
 mod common;
 
-use gitpulse_lib::engine::GitReader;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
+use waylode_lib::engine::GitReader;
+use waylode_lib::procguard::LockedSpawn;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = StdCommand::new("git")
@@ -26,7 +26,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn repo() -> (TempDir, String) {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().unwrap();
     git(dir.path(), &["init", "-q", "-b", "main"]);
     git(dir.path(), &["config", "user.email", "a@b.c"]);
@@ -55,7 +55,7 @@ fn pack(dir: &Path, rows: &[(&str, Vec<u8>)]) {
     std::fs::write(dir.join(".git").join("packed-refs"), bytes).unwrap();
 }
 
-fn names(path: &str) -> Result<Vec<String>, gitpulse_lib::ipc_error::CommandError> {
+fn names(path: &str) -> Result<Vec<String>, waylode_lib::ipc_error::CommandError> {
     GitReader::list_branches(path).map(|b| b.into_iter().map(|b| b.name).collect())
 }
 

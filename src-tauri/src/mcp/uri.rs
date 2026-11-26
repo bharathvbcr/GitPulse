@@ -21,7 +21,13 @@
 
 use std::fmt;
 
-pub const SCHEME: &str = "gitpulse://";
+pub const SCHEME: &str = "waylode://";
+
+/// Legacy scheme accepted by [`parse`] during the GitPulse -> Waylode transition.
+pub const LEGACY_SCHEME: &str = "gitpulse://";
+
+/// Compatibility alias for [`LEGACY_SCHEME`].
+pub const ALIAS_SCHEME: &str = LEGACY_SCHEME;
 
 /// What a well-formed `gitpulse://` URI addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +151,10 @@ fn from_uri_path(uri_path: &str) -> String {
 /// "exists as a repo" are different failures and a caller has to be able to say
 /// which one it hit.
 pub fn parse(uri: &str) -> Result<Target, UriError> {
-    let rest = uri.strip_prefix(SCHEME).ok_or(UriError::WrongScheme)?;
+    let rest = uri
+        .strip_prefix(SCHEME)
+        .or_else(|| uri.strip_prefix(LEGACY_SCHEME))
+        .ok_or(UriError::WrongScheme)?;
     let (facet, encoded_path) = match rest.split_once('/') {
         Some((facet, path)) => (facet, path),
         None => (rest, ""),
@@ -208,7 +217,7 @@ mod tests {
     #[test]
     fn a_posix_repo_uri_round_trips() {
         let uri = repo_uri("insights", "/Users/me/proj");
-        assert_eq!(uri, "gitpulse://insights/Users/me/proj");
+        assert_eq!(uri, "waylode://insights/Users/me/proj");
         assert_eq!(
             parse(&uri).unwrap(),
             Target::Repo {
@@ -223,7 +232,7 @@ mod tests {
         // `C:/proj` without the leading slash would parse as authority `C:`,
         // making the drive letter the facet and losing the path entirely.
         let uri = repo_uri("status", "C:\\Users\\me\\proj");
-        assert_eq!(uri, "gitpulse://status/C%3A/Users/me/proj");
+        assert_eq!(uri, "waylode://status/C%3A/Users/me/proj");
         assert_eq!(
             parse(&uri).unwrap(),
             Target::Repo {
@@ -293,6 +302,42 @@ mod tests {
             parse("gitpulse://insights/Users/me%00/etc"),
             Err(UriError::InteriorNul)
         );
+    }
+
+    #[test]
+    fn the_legacy_gitpulse_scheme_parses_to_the_same_target_through_the_same_checks() {
+        assert_eq!(
+            parse("waylode://server/manifest"),
+            parse("gitpulse://server/manifest")
+        );
+        assert_eq!(
+            parse("waylode://insights/Users/me/proj"),
+            parse("gitpulse://insights/Users/me/proj")
+        );
+        assert!(matches!(
+            parse("gitpulse://insights/Users/me/../etc"),
+            Err(UriError::Traversal(_))
+        ));
+        assert_eq!(
+            parse("gitpulse://insights/Users/me%00/etc"),
+            Err(UriError::InteriorNul)
+        );
+        assert_eq!(parse("gitpulse://"), Err(UriError::MissingFacet));
+        // Only the exact scheme is read as the legacy scheme.
+        assert_eq!(
+            parse("Waylode://server/manifest"),
+            Err(UriError::WrongScheme)
+        );
+        assert_eq!(
+            parse("GitPulse://server/manifest"),
+            Err(UriError::WrongScheme)
+        );
+        assert_eq!(
+            parse("waylodex://server/manifest"),
+            Err(UriError::WrongScheme)
+        );
+        // What this server mints always uses the primary waylode:// scheme.
+        assert!(repo_uri("insights", "/Users/me/proj").starts_with(SCHEME));
     }
 
     #[test]

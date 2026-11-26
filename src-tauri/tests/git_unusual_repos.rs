@@ -5,9 +5,9 @@
 
 mod common;
 use common::{run_git, trust_repo};
-use gitpulse_lib::engine::{remotes, GitReader};
-use gitpulse_lib::graph::{list_ref_decorations, LaneSolver, RefKind, RefScope};
 use std::path::Path;
+use waylode_lib::engine::{remotes, GitReader};
+use waylode_lib::graph::{list_ref_decorations, LaneSolver, RefKind, RefScope};
 
 fn repo() -> tempfile::TempDir {
     common::unmetered_spawns();

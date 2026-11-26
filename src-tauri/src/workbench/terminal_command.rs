@@ -808,7 +808,7 @@ pub fn resume(provider: &str, session_id: &str, checkout: &Path) -> Result<Vec<S
             Ok(vec!["--conversation".into(), sid.to_ascii_lowercase()])
         }
         _ => Err(format!(
-            "Provider {provider:?} does not support resuming conversations from GitPulse."
+            "Provider {provider:?} does not support resuming conversations from Waylode."
         )),
     }
 }
@@ -834,7 +834,7 @@ pub(crate) fn fork_resume_with(
     let provider = provider.trim();
     if provider != "claude" {
         return Err(format!(
-            "Provider {provider:?} does not support forking conversations from GitPulse."
+            "Provider {provider:?} does not support forking conversations from Waylode."
         ));
     }
     let source = source_session_id.trim();
@@ -1463,15 +1463,18 @@ fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), Workb
 /// The environment half of the launch table: what every PTY launch carries
 /// beside [`policy`]'s flags, by name, with `None` meaning "remove it".
 ///
-/// `GITPULSE_RUN_ID` is the task attempt's run id, and absent from every
-/// other terminal — removed rather than left alone, because a GitPulse that
-/// was itself started inside an attempt (a dev build run from an agent's
-/// terminal) would otherwise hand that outer run's id to every shell tab, and
-/// each would be counted as part of a run it has nothing to do with. Every
-/// descendant inherits the value, which is how the host-load scan attributes a
-/// child that launchd adopted to the run that started it.
-pub(crate) fn launch_env(run_id: Option<&str>) -> [(&'static str, Option<String>); 1] {
-    [(crate::sysload::RUN_ID_ENV, run_id.map(str::to_owned))]
+/// `WAYLODE_RUN_ID` / `GITPULSE_RUN_ID` carry the task attempt's run id, and
+/// are absent from every other terminal — removed rather than left alone,
+/// because a Waylode that was itself started inside an attempt (a dev build
+/// run from an agent's terminal) would otherwise hand that outer run's id to
+/// every shell tab, and each would be counted as part of a run it has nothing
+/// to do with. Every descendant inherits the value, which is how the host-load
+/// scan attributes a child that launchd adopted to the run that started it.
+pub(crate) fn launch_env(run_id: Option<&str>) -> [(&'static str, Option<String>); 2] {
+    [
+        (crate::sysload::RUN_ID_ENV, run_id.map(str::to_owned)),
+        (crate::sysload::LEGACY_RUN_ID_ENV, run_id.map(str::to_owned)),
+    ]
 }
 
 /// What a launched agent is told about finishing. How to work is not said
@@ -1480,10 +1483,10 @@ pub(crate) fn launch_env(run_id: Option<&str>) -> [(&'static str, Option<String>
 /// a terminal agent and a managed one are told the same thing. The guidance
 /// names no completion step because only this launch knows the mode; the
 /// brief's `Task: <id> (revision N)` line follows it. The tool is
-/// `gitpulse_complete_task` on the GitPulse MCP server, which changes only the
+/// `waylode_complete_task` on the Waylode MCP server, which changes only the
 /// status and records the summary. Manvi's managed lane states the same scope
 /// in `serve.managedTurn`.
-pub(crate) const COMPLETION: &str = "Carry out the saved task within the selected permission mode. When every acceptance criterion is met and your verification passed, mark the task done with the gitpulse_complete_task tool, using the id on the brief's Task: line and a short summary of what changed and how you verified it; if anything is unfinished or needs a person's judgement, use status review instead and say what remains.";
+pub(crate) const COMPLETION: &str = "Carry out the saved task within the selected permission mode. When every acceptance criterion is met and your verification passed, mark the task done with the waylode_complete_task tool, using the id on the brief's Task: line and a short summary of what changed and how you verified it; if anything is unfinished or needs a person's judgement, use status review instead and say what remains.";
 
 pub(super) fn arguments(
     provider: &str,
@@ -1553,7 +1556,7 @@ pub(super) fn arguments(
         skill("merge-prs"),
         skill("wrap-up"),
     );
-    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. In this GitPulse terminal, the {terminal} skill covers spawning and orchestrating child terminals or split file panes, the {load} skill covers checking host load before a heavy build or test and what a refusal for load means, and the {merge_train} skill covers verifying several finished branches together with one full gate run. When the user asks you to land work, the {commit_and_merge} skill commits and merges finished branches while keeping locked-in ones, the {merge_prs} skill merges pull requests, and the {wrap_up} skill winds agents down and lands everything; run those three only on the user's request. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
+    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, Waylode, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. In this Waylode terminal, the {terminal} skill covers spawning and orchestrating child terminals or split file panes, the {load} skill covers checking host load before a heavy build or test and what a refusal for load means, and the {merge_train} skill covers verifying several finished branches together with one full gate run. When the user asks you to land work, the {commit_and_merge} skill commits and merges finished branches while keeping locked-in ones, the {merge_prs} skill merges pull requests, and the {wrap_up} skill winds agents down and lands everything; run those three only on the user's request. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
     if args.iter().any(|a| a.len() > 16 * 1024 || a.contains('\0')) {
         return Err(error(
             "invalid_input",
@@ -1980,10 +1983,10 @@ mod tests {
                 "{provider}"
             );
             assert!(prompt.contains("DevMap and DevCouncil"), "{provider}");
-            assert!(!prompt.contains("gitpulse_complete_task"), "{provider}");
+            assert!(!prompt.contains("waylode_complete_task"), "{provider}");
             let edit = arguments(provider, "edit", false, "/c", &brief.path).unwrap();
             assert!(
-                edit.last().unwrap().contains("gitpulse_complete_task"),
+                edit.last().unwrap().contains("waylode_complete_task"),
                 "{provider}"
             );
         }
@@ -2536,7 +2539,7 @@ mod tests {
                     .pop()
                     .unwrap();
                 assert!(
-                    prompt.contains("gitpulse_complete_task"),
+                    prompt.contains("waylode_complete_task"),
                     "{provider}/{mode}"
                 );
                 assert!(prompt.contains("Task: line"), "{provider}/{mode}");
@@ -2551,13 +2554,13 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-            assert!(!inspect.contains("gitpulse_complete_task"), "{provider}");
+            assert!(!inspect.contains("waylode_complete_task"), "{provider}");
             assert!(inspect.contains("change the task's status"), "{provider}");
         }
     }
     /// Antigravity runs a plugin skill as a bare `/<name>`, so it is told the
     /// prefixed names its copies carry; the hosts that namespace by plugin are
-    /// told `gitpulse:<name>`. Naming one host's spelling to the other names a
+    /// told `waylode:<name>`. Naming one host's spelling to the other names a
     /// skill that agent cannot find.
     #[test]
     fn the_launch_prompt_names_skills_the_way_that_agent_runs_them() {
@@ -2569,9 +2572,9 @@ mod tests {
                 .pop()
                 .unwrap();
             let (want, other) = if provider == "agy" {
-                ("gitpulse-", "gitpulse:")
+                ("waylode-", "waylode:")
             } else {
-                ("gitpulse:", "gitpulse-")
+                ("waylode:", "waylode-")
             };
             for skill in [
                 "terminal",
@@ -3586,7 +3589,7 @@ mod hook_launch_tests {
     use serde_json::Value;
     use std::path::Path;
 
-    const HOOK: &str = "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook";
+    const HOOK: &str = "/Applications/Waylode.app/Contents/MacOS/waylode-hook";
 
     fn with_hook(notify: bool) -> LaunchOptions<'static> {
         LaunchOptions {

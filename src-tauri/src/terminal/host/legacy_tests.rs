@@ -320,6 +320,26 @@ fn the_current_protocols_own_socket_is_not_a_legacy_host() {
     assert_eq!(discover(fake.dir(), PRETEND).hosts.len(), 1);
 }
 
+/// A protocol-4 host never sends the `screen` notice channel (an agent's
+/// dialog read off the terminal), so its sessions would read "no prompt" while
+/// one was showing: not the protocol this build speaks. Left running across
+/// the update (quitting leaves the host up by default), it is another
+/// protocol's host to this app: listed through the frozen v4 dialect, reported,
+/// retired when idle, and never driven as if it were current.
+#[test]
+fn a_protocol_four_host_is_another_protocols_host_to_this_build() {
+    const { assert!(proto::PROTOCOL > 4, "this build must not speak protocol 4") };
+    let fake = Fake::v4(well_behaved());
+    let scan = discover(fake.dir(), proto::PROTOCOL);
+    assert_eq!(scan.hosts.len(), 1, "{:?}", scan.hosts);
+    assert_eq!(scan.hosts[0].protocol, 4);
+    assert!(
+        matches!(scan.hosts[0].status, LegacyStatus::Listed { .. }),
+        "{:?}",
+        scan.hosts[0].status
+    );
+}
+
 #[test]
 fn discovery_lists_every_other_host_and_says_when_it_stopped_looking() {
     let fake = Fake::v4(well_behaved());
@@ -583,203 +603,18 @@ fn an_unreadable_listing_is_a_protocol_error_and_spends_the_handle() {
     assert!(matches!(host.list(), Err(LegacyError::Broken)));
 }
 
-// ---- a real protocol-4 host ------------------------------------------------
+// ---- the real host of this build ------------------------------------------
+//
+// Two tests here ran this build's own `server::serve` as "a real protocol-4
+// host" while this build spoke protocol 4. Protocol 5 (the `screen` notice
+// channel) ended that: no v4 server is built from this tree any more. What a
+// v4 host sends stays pinned by the literal tests in `compat_v4_tests.rs`, and
+// listing, reading, stopping and the refusal while its own app is connected
+// are driven through the v4 fakes above
+// (`a_host_is_listed_killed_and_read_through_the_frozen_dialect`,
+// `another_app_holding_the_host_is_refused_not_reported_empty`).
 
-use crate::terminal::host::{proto, server};
-use std::os::unix::net::UnixStream as Stream;
-
-/// A real `server::serve` of this build (protocol 4) in a temp directory, with
-/// the sessions a test started on it, stopped when it drops.
-struct RealHost {
-    dir: tempfile::TempDir,
-    sessions: Vec<String>,
-    thread: Option<std::thread::JoinHandle<i32>>,
-}
-
-impl RealHost {
-    fn start() -> Self {
-        let dir = short_tempdir();
-        let config = server::ServeConfig {
-            dir: dir.path().to_path_buf(),
-            idle_exit: Duration::from_millis(300),
-        };
-        let thread = std::thread::spawn(move || {
-            server::serve_for_unit_test(config, crate::terminal::Engine::default())
-        });
-        let socket = dir.path().join(super::super::socket_name(proto::PROTOCOL));
-        assert!(
-            crate::test_support::wait_until(Duration::from_secs(10), || {
-                Stream::connect(&socket).is_ok()
-            }),
-            "the test host never listened"
-        );
-        Self {
-            dir,
-            sessions: Vec::new(),
-            thread: Some(thread),
-        }
-    }
-
-    /// An app of this build's own protocol, connected to the host.
-    fn app(&self) -> Stream {
-        let stream = Stream::connect(
-            self.dir
-                .path()
-                .join(super::super::socket_name(proto::PROTOCOL)),
-        )
-        .unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        stream
-    }
-
-    fn app_call(stream: &mut Stream, id: u64, request: proto::Request) -> Result<Value, String> {
-        proto::write_frame(stream, &proto::Envelope { id, request }, b"").unwrap();
-        loop {
-            let (header, _) = proto::read_frame(stream).unwrap().expect("the host closed");
-            if let proto::HostFrame::Reply { id: got, ok, error } = proto::decode(&header).unwrap()
-            {
-                assert_eq!(got, id);
-                return match error {
-                    Some(error) => Err(error),
-                    None => Ok(ok.unwrap_or(Value::Null)),
-                };
-            }
-        }
-    }
-
-    /// Starts `sh -c <script>` in `cwd` and leaves it running with no app
-    /// connected: the situation a protocol bump creates.
-    fn spawn(&mut self, id: &str, script: &str, cwd: &Path) {
-        let mut app = self.app();
-        Self::app_call(
-            &mut app,
-            1,
-            proto::Request::Hello {
-                protocol: proto::PROTOCOL,
-                build: crate::updates::CURRENT_VERSION.to_owned(),
-            },
-        )
-        .unwrap();
-        let request = crate::terminal::SpawnRequest {
-            session_id: id.to_owned(),
-            place: crate::terminal::Place::Task {
-                cwd: cwd.to_string_lossy().into_owned(),
-            },
-            rows: 24,
-            cols: 80,
-            program: Some("/bin/sh".into()),
-            args: Some(vec!["-c".into(), script.to_owned()]),
-            env: None,
-            run_id: None,
-            parent_session_id: None,
-            child_launcher: None,
-            child_title: None,
-            token_hash_hex: None,
-        };
-        Self::app_call(&mut app, 2, proto::Request::Spawn { request })
-            .expect("the test session started");
-        self.sessions.push(id.to_owned());
-        // Dropping `app` is the app going away; the session stays.
-    }
-}
-
-impl Drop for RealHost {
-    fn drop(&mut self) {
-        // Stop what is left, then let the host's idle timer end it.
-        if !self.sessions.is_empty() {
-            if let Ok(mut host) = LegacyHost::connect(self.dir.path(), 4) {
-                for session in std::mem::take(&mut self.sessions) {
-                    let _ = host.kill(&session);
-                }
-            }
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-#[test]
-fn a_real_v4_host_is_discovered_read_and_stopped_by_an_app_of_a_later_protocol() {
-    let work = crate::test_support::git_repo();
-    // The host refuses a working directory that resolves elsewhere.
-    let cwd = work.path().canonicalize().unwrap();
-    let mut host = RealHost::start();
-    host.spawn(
-        "term-77-1",
-        "echo legacy-output-marker; exec sleep 300",
-        &cwd,
-    );
-
-    let scan = discover(host.dir.path(), PRETEND);
-    assert_eq!(scan.hosts.len(), 1, "{scan:?}");
-    let LegacyStatus::Listed { info, sessions } = &scan.hosts[0].status else {
-        panic!("not listed: {:?}", scan.hosts[0]);
-    };
-    assert_eq!(info.protocol, 4);
-    assert_eq!(info.sessions, 1);
-    assert_eq!(info.pid, std::process::id(), "the in-process test host");
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].id, "term-77-1");
-    assert_eq!(sessions[0].program, "/bin/sh");
-    assert!(sessions[0].detached, "no app holds it");
-
-    let mut legacy = LegacyHost::connect(host.dir.path(), 4).unwrap();
-    // The saved output is read while the session lives, polled for because the
-    // host records it asynchronously.
-    let mut recorded = None;
-    let mut last = String::from("never read");
-    crate::test_support::wait_until(Duration::from_secs(15), || {
-        match legacy.transcript_tail("term-77-1", 4096, false).unwrap() {
-            crate::terminal::TranscriptRead::Found(tail) if tail.bytes > 0 => {
-                recorded = Some(tail);
-                true
-            }
-            other => {
-                last = format!("{other:?}");
-                false
-            }
-        }
-    });
-    let tail = recorded.unwrap_or_else(|| panic!("no output was recorded: {last}"));
-    assert!(tail.live);
-    use base64::Engine as _;
-    let text = base64::engine::general_purpose::STANDARD
-        .decode(&tail.data_b64)
-        .unwrap();
-    assert!(String::from_utf8_lossy(&text).contains("legacy-output-marker"));
-    let stranger = legacy.transcript_tail("term-1-1", 64, false).unwrap();
-    assert!(
-        matches!(stranger, crate::terminal::TranscriptRead::Missing),
-        "{stranger:?}"
-    );
-
-    legacy.kill("term-77-1").unwrap();
-    assert!(legacy.list().unwrap().is_empty(), "the session is gone");
-    // A v4 host's kill of a session that is already gone is not an error.
-    legacy.kill("term-77-1").unwrap();
-    host.sessions.clear();
-}
-
-#[test]
-fn a_real_v4_host_whose_own_app_is_still_connected_refuses_the_legacy_client() {
-    let host = RealHost::start();
-    let mut app = host.app();
-    RealHost::app_call(
-        &mut app,
-        1,
-        proto::Request::Hello {
-            protocol: proto::PROTOCOL,
-            build: crate::updates::CURRENT_VERSION.to_owned(),
-        },
-    )
-    .unwrap();
-    let status = inspect_with(host.dir.path(), 4, Duration::from_secs(5));
-    assert!(matches!(status, LegacyStatus::Refused { .. }), "{status:?}");
-    drop(app);
-}
+use crate::terminal::host::proto;
 
 /// Before: a host that exited with its last session read, on the next ask, as a
 /// host that "could not be listed", and a failure had no rule against reading

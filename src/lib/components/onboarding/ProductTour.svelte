@@ -114,7 +114,7 @@
           {:else}Ready when you are{/if}
         </h1>
         {#if step === "welcome"}
-          <p>Take a hands-on tour of GitPulse. Open a repository, try the workspace views, and find Tasks and Settings.</p>
+          <p>Take a hands-on tour of Waylode. Open a repository, try the workspace views, and find Tasks and Settings.</p>
           <p>The guide will move beside the controls as you explore. Every step is optional; resume later from Settings → Appearance → Guided walkthrough.</p>
         {:else if step === "repository"}
           <p>{target ? "Try the highlighted Open button to choose a repository, or clone one from the menu beside it. You can also use the button below." : "Use the button below to choose a repository. The Open button is not currently visible."} Review repository trust when asked.</p>
@@ -145,7 +145,7 @@
           <button class="gp-btn" onclick={leaveForTools}>Set up optional tools</button>
         {:else if step === "permissions"}
           <p>{repositoryAccessGuidance($hostPlatform.os)}</p>
-          <p class="text-xs">Repository trust is a separate GitPulse decision; it does not override denied folder access. Opening GitPulse at login is optional in Settings.</p>
+          <p class="text-xs">Repository trust is a separate Waylode decision; it does not override denied folder access. Opening Waylode at login is optional in Settings.</p>
           <button class="gp-btn" onclick={onSettings}>Open Settings</button>
           {#if settingsVisited}<p role="status" class="tour-success"><Check size={15} /> Settings opened. No permission grant is required to finish.</p>
           {:else}<p class="text-xs">Explore Settings, then close it to return to this step. The tour does not change permissions or credentials.</p>{/if}

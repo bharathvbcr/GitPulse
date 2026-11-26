@@ -1,4 +1,4 @@
-# GitPulse: adoption gaps, the collision-radar wedge, and cloud conflict warnings
+# Waylode: adoption gaps, the collision-radar wedge, and cloud conflict warnings
 
 Written 2026-11-22 from two audit passes (Sonnet agents) and a Fable strategy review. Labels:
 
@@ -9,13 +9,13 @@ Written 2026-11-22 from two audit passes (Sonnet agents) and a Fable strategy re
 The DevMap/DevCouncil half is in DevCouncil's `docs/launch/adoption-gaps.md`. The positioning and
 recording plan is [LAUNCH_PLAN.md](LAUNCH_PLAN.md).
 
-## Where GitPulse stands
+## Where Waylode stands
 
 - **Traction:** 18 GitHub stars (verified). Herdr, the closest launched comparison, reports ~25k
   stars and a $6M seed (vendor).
 - **Signing:** `v0.2.0-beta.1` is a macOS DMG, ad-hoc signed and not notarized.
   INSTALLATION.md:32-45 tells users to run `xattr -dr com.apple.quarantine` (verified).
-- **Setup:** the install path expects GitPulse, DevCouncil and Manvi, and a schema-parity check.
+- **Setup:** the install path expects Waylode, DevCouncil and Manvi, and a schema-parity check.
 - **Docs:** the README links 40 or more docs (verified).
 - **Strengths:**
   - Collision awareness at file, symbol (DevMap spans) and committed-work level (pairwise
@@ -35,7 +35,7 @@ read-only audit found it is mostly there (verified unless noted):
   - The app mailbox is an optional cache (insights/app_facets.rs:1-35).
   - The edit-time guard exists (hooks/mod.rs:1051, calling `collision_for_path` at :2798).
 - **What couples it to the app:**
-  1. `gitpulse_lib` links the forked Tauri, so a headless build compiles wry.
+  1. `waylode_lib` links the forked Tauri, so a headless build compiles wry.
   2. Symbol verdicts need a DevMap index at the worktree HEAD, and nothing refreshes it without the
      app, so verdicts fall to `FileLevel`.
   3. Claims see Claude Code's registry and hook writes only.
@@ -65,7 +65,7 @@ Order of work (card **ft-6727833f**):
 1. **One user, many machines** (laptop, VPS, SSH runners). Heartbeats gain HMAC symbol ids and the
    base SHA, so verdicts survive the trip.
 2. **A PR check** that comments when a PR touches symbols held by another open PR or a live agent
-   branch. Start as a GitHub Action that runs the standalone CLI, then an App. GitPulse card
+   branch. Start as a GitHub Action that runs the standalone CLI, then an App. Waylode card
    ft-52bd0659 covers posting verify results to GitHub and shares the integration.
 3. **Live team presence**, only after stage 2 shows demand.
 
@@ -93,7 +93,7 @@ cloud claim. What the git audit found (verified):
 | Gap | Card |
 |---|---|
 | Ad-hoc-signed DMG and the `xattr` instruction; no Homebrew cask | ft-2009bb7f (updated with a Gatekeeper acceptance criterion) |
-| gitpulse.vbcr.dev serves the author's portfolio HTML, so links do not unfurl as GitPulse | DevCouncil ft-07d78669 |
+| gitpulse.vbcr.dev serves the author's portfolio HTML, so links do not unfurl as Waylode | DevCouncil ft-07d78669 |
 | Concept load (lanes, claims, governor, ledger…) and three-product setup | ft-1943c402 (onboarding follow-ups) and the wedge card |
 | SSH runners and the mobile companion | ft-5b7e7fed (keep SSH; Fable advised pausing mobile until after launch) |
 
@@ -118,7 +118,7 @@ cloud claim. What the git audit found (verified):
 
 ## Marketing, from the second audit
 
-- **Headline:** "Herdr runs your agents. GitPulse knows what they're changing." Pair it with a 10 s
+- **Headline:** "Herdr runs your agents. Waylode knows what they're changing." Pair it with a 10 s
   recording of the radar warning before the second agent's edit lands.
 - **Release order:** ship the radar as a standalone install first, so the launch post needs no DMG.
   The desktop app is the upsell.

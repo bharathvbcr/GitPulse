@@ -9,14 +9,14 @@
 
 #![cfg(unix)]
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
-use gitpulse_lib::storage::{scan_storage, ReclaimConfidence, ReclaimSafety};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use waylode_lib::storage::{scan_storage, ReclaimConfidence, ReclaimSafety};
 
 static UNIQUE: AtomicUsize = AtomicUsize::new(0);
 
@@ -30,7 +30,7 @@ impl TempRepo {
         // The suite shares one process gate. Leaving the production rate on
         // makes a parallel run defer `git worktree` and report a complete
         // fixture as truncated — the gate's own tests cover that refusal.
-        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+        waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let guard = tempfile::tempdir().expect("tempdir");
         let root = guard.path().join("repo");
         fs::create_dir_all(&root).unwrap();
@@ -241,7 +241,7 @@ fn budget_attacks_report_truncation_honestly() {
 
 mod bare_and_worktrees {
     use super::*;
-    use gitpulse_lib::procguard::LockedSpawn;
+    use waylode_lib::procguard::LockedSpawn;
 
     /// A bare repository scans cleanly: no worktree sections, git internals
     /// still fully present.
@@ -566,7 +566,7 @@ fn agent_and_tool_caches_are_classified() {
         .iter()
         .find(|a| a.path == ".devcouncil")
         .expect(".devcouncil must be recognized as an artifact");
-    assert_eq!(devcouncil.kind, gitpulse_lib::storage::ArtifactKind::Cache);
+    assert_eq!(devcouncil.kind, waylode_lib::storage::ArtifactKind::Cache);
     assert_eq!(devcouncil.bytes, 60_000);
 
     let gitnexus = report
@@ -574,7 +574,7 @@ fn agent_and_tool_caches_are_classified() {
         .iter()
         .find(|a| a.path == ".gitnexus")
         .expect(".gitnexus must be recognized as an artifact");
-    assert_eq!(gitnexus.kind, gitpulse_lib::storage::ArtifactKind::Cache);
+    assert_eq!(gitnexus.kind, waylode_lib::storage::ArtifactKind::Cache);
     assert_eq!(gitnexus.bytes, 40_000);
 
     assert!(report.totals.cache_artifacts_bytes >= 100_000);
@@ -682,7 +682,7 @@ fn go_and_temp_and_log_caches_are_classified() {
     );
 
     for a in &report.artifacts {
-        assert_eq!(a.kind, gitpulse_lib::storage::ArtifactKind::Cache);
+        assert_eq!(a.kind, waylode_lib::storage::ArtifactKind::Cache);
     }
     assert!(report.totals.cache_artifacts_bytes >= 106_000);
 }

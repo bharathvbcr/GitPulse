@@ -14,6 +14,7 @@ import {
   parseArgs,
   remainingBudgetMs,
   webviewOptionsFor,
+  windowsLoggingDriver,
 } from "./e2e-driver-smoke.mjs";
 
 const TINY_PNG_BASE64 = Buffer.from([
@@ -79,11 +80,23 @@ describe("e2e-driver-smoke", () => {
   });
 
   it("resolves default binaries honoring CARGO_TARGET_DIR and rejects bad ports/timeouts", () => {
-    expect(defaultAppBinary("linux", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "gitpulse"));
-    expect(defaultAppBinary("win32", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "gitpulse.exe"));
+    expect(defaultAppBinary("linux", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "waylode"));
+    expect(defaultAppBinary("win32", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "waylode.exe"));
     expect(defaultSeedBinary("linux", { CARGO_TARGET_DIR: "/target" }, "/repo")).toBe(path.resolve("/target", "debug", "examples", "e2e_seed_trust"));
     expect(() => parseArgs(["--port", "0"])).toThrow(/1\.\.65535/);
     expect(() => parseArgs(["--timeout", "5"])).toThrow(/30 and 900/);
+  });
+
+  it("wraps Edge WebDriver so it logs verbosely to a file, passing every argument through", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "gp-e2e-wrap-"));
+    try {
+      const log = path.join(dir, "msedgedriver.log");
+      const wrapper = windowsLoggingDriver("C:\\drivers\\msedgedriver.exe", dir, log);
+      expect(wrapper).toBe(path.join(dir, "msedgedriver-logged.cmd"));
+      expect(readFileSync(wrapper, "utf8")).toBe(`@echo off\r\n"C:\\drivers\\msedgedriver.exe" %* --verbose "--log-path=${log}"\r\n`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("hands Edge WebDriver the WebView2 profile as tauri:options.webviewOptions", async () => {

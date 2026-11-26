@@ -165,7 +165,7 @@ export function isGitPulseLane(kind: string): boolean {
 export function agentKindLabel(kind: string): string {
   const trimmed = kind.trim();
   if (!trimmed) return "";
-  if (isGitPulseLane(trimmed)) return "GitPulse task";
+  if (isGitPulseLane(trimmed)) return "Waylode task";
   const provider = asAgentProvider(trimmed.toLowerCase());
   if (provider) return PROVIDER_LABELS[provider];
   return trimmed

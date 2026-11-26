@@ -3,31 +3,31 @@
   <head>
     <meta charset="UTF-8" />
     <script src="/theme-boot.js"></script>
-    <link rel="icon" type="image/svg+xml" href="/gitpulse-mark.svg" />
+    <link rel="icon" type="image/svg+xml" href="/waylode-mark.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark light" />
-    <meta name="application-name" content="GitPulse" />
+    <meta name="application-name" content="Waylode" />
     <meta
       name="description"
-      content="GitPulse is a fast, local-first Git desktop client, code intelligence suite, and task workspace built with Rust (Tauri 2) and Svelte 5. GPU-accelerated commit graph, 3-way merge conflict editor, test coverage viewer, and privacy-first local AI."
+      content="Waylode is a fast, local-first Git desktop client, code intelligence suite, and task workspace built with Rust (Tauri 2) and Svelte 5. GPU-accelerated commit graph, 3-way merge conflict editor, test coverage viewer, and privacy-first local AI."
     />
     <meta
       name="keywords"
-      content="GitPulse, Git client, Git GUI, Rust, Tauri 2, Svelte 5, local-first, code intelligence, DevMap, commit graph, merge conflict resolver, reflog, test coverage, secret scanner, developer tools, MCP server, zero telemetry"
+      content="Waylode, Git client, Git GUI, Rust, Tauri 2, Svelte 5, local-first, code intelligence, DevMap, commit graph, merge conflict resolver, reflog, test coverage, secret scanner, developer tools, MCP server, zero telemetry"
     />
     <meta name="author" content="Bharath Chandra Vaddaram" />
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="GitPulse" />
-    <meta property="og:title" content="GitPulse: Local-First Git Desktop Workspace & Code Intelligence" />
+    <meta property="og:site_name" content="Waylode" />
+    <meta property="og:title" content="Waylode: Local-First Git Desktop Workspace & Code Intelligence" />
     <meta
       property="og:description"
       content="Fast, local-first Git desktop client and code intelligence workspace built with Rust (Tauri 2) and Svelte 5. GPU commit graph, 3-way conflict resolver, 11 specialized sections, and zero cloud telemetry."
     />
     <meta property="og:url" content="https://gitpulse.vbcr.dev/" />
     <meta property="og:image" content="https://gitpulse.vbcr.dev/assets/screenshot-graph.png" />
-    <meta property="og:image:alt" content="GitPulse native desktop interface showing canvas commit graph and diff viewer" />
+    <meta property="og:image:alt" content="Waylode native desktop interface showing canvas commit graph and diff viewer" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="GitPulse: Local-First Git Desktop Workspace" />
+    <meta name="twitter:title" content="Waylode: Local-First Git Desktop Workspace" />
     <meta
       name="twitter:description"
       content="High-performance native Git desktop client and code intelligence suite built with Rust (Tauri 2) and Svelte 5. 100% on-device, private-by-design."
@@ -37,7 +37,7 @@
     {
       "@context": "https://schema.org",
       "@type": "SoftwareApplication",
-      "name": "GitPulse",
+      "name": "Waylode",
       "operatingSystem": "macOS, Linux, Windows",
       "applicationCategory": "DeveloperApplication",
       "description": "Fast, local-first Git desktop client, code intelligence suite, and task workspace built with Rust (Tauri 2) and Svelte 5.",
@@ -49,7 +49,7 @@
       }
     }
     </script>
-    <title>GitPulse: Local-First Git Desktop Workspace &amp; Code Intelligence</title>
+    <title>Waylode: Local-First Git Desktop Workspace &amp; Code Intelligence</title>
     <!-- Boot plate (DESIGN_LANGUAGE §8.4, §12). Critical CSS, inline on purpose:
          it paints before app.css and before any script runs, so a cold start is
          never an empty window. Its colors are the two surface tokens (--c-bg in
@@ -197,14 +197,14 @@
       <svg class="gp-boot-logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
         <defs>
           <linearGradient id="gp-boot-stroke" x1="3" y1="27" x2="29" y2="6" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#22d3ee" />
-            <stop offset="52%" stop-color="#58a6ff" />
-            <stop offset="100%" stop-color="#a371f7" />
+            <stop offset="0%" stop-color="#7dd3fc" />
+            <stop offset="52%" stop-color="#38bdf8" />
+            <stop offset="100%" stop-color="#3b82f6" />
           </linearGradient>
         </defs>
         <g transform="translate(3.04 3.04) scale(0.81)">
-          <path d="M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8" stroke="url(#gp-boot-stroke)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" />
-          <circle cx="24.04" cy="9.25" r="2.9" fill="url(#gp-boot-stroke)" />
+          <path d="M23.8 9.0A10.5 10.5 0 1 0 26.5 16.0H21.0L16.2 11.6L11.4 18.8" stroke="url(#gp-boot-stroke)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="23.8" cy="9.0" r="2.8" fill="url(#gp-boot-stroke)" />
         </g>
       </svg>
       <div class="gp-wake-shell">
@@ -247,14 +247,14 @@
     <div id="app"></div>
     <noscript>
       <main style="max-width: 36rem; margin: 4rem auto; padding: 0 1.5rem; font-family: system-ui, sans-serif; line-height: 1.5">
-        <h1>GitPulse</h1>
+        <h1>Waylode</h1>
         <p>
-          GitPulse is a local-first desktop app for Git, code, and tasks. Its interface is rendered
+          Waylode is a local-first desktop app for Git, code, and tasks. Its interface is rendered
           with JavaScript, so this page stays blank when scripting is disabled.
         </p>
         <p>
           Enable JavaScript for this window and reload. If you opened this file in a browser, note
-          that GitPulse runs as a native Tauri application: download it from the
+          that Waylode runs as a native Tauri application: download it from the
           <a href="https://github.com/bharathvbcr/GitPulse/releases/latest">releases page</a> or read
           the <a href="https://gitpulse.vbcr.dev/">project website</a>.
         </p>

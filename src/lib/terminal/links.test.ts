@@ -55,7 +55,7 @@ describe("isOpenableUrl", () => {
       "ftp://example.com/x",
       "ssh://example.com",
       "chrome://settings",
-      "x-gitpulse://open",
+      "x-waylode://open",
     ]) {
       expect(isOpenableUrl(url), url).toBe(false);
     }

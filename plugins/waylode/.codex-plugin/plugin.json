@@ -1,0 +1,19 @@
+{
+  "name": "waylode",
+  "version": "0.2.0-beta.1",
+  "description": "Waylode control plane for agents: worktrees, collisions, ledger, provenance, in-process code intelligence, and the task board. It never runs git push, and the skills that change the default branch or the remote act only after you approve their plan.",
+  "author": {
+    "name": "Waylode Team"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Waylode",
+    "shortDescription": "Inspect Git repositories through Waylode.",
+    "longDescription": "Waylode exposes repository, worktree, collision, ledger, provenance, and code-intelligence tools to Codex, plus the task-board write tools (add, import, complete, merge, delete). It never runs git push, and the skills that change the default branch or the remote act only after you approve their plan.",
+    "developerName": "Waylode Team",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Inspect this repository with Waylode before making changes."
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -88,6 +88,15 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 ### Changed
 
+- **GitPulse is becoming Waylode.** This first step changes the name where you
+  read it: the window title, the app's text, and the README and docs. Nothing
+  you rely on moves yet. The app bundle, its data folders, the command-line
+  tools (`gitpulse`, `gitpulse-mcp`, `gitpulse-hook`), the MCP tool names,
+  `gitpulse://` addresses, `GITPULSE_*` variables and the `gitpulse.*` git
+  config keys keep their names, so existing installs, agent setups and scripts
+  work unchanged. Those move in later releases, each with the old name kept
+  working. `node scripts/brand-rename.mjs` applies the rename, and its contract
+  test fails if the old name comes back in the app's text.
 - **GitPulse's branch cleanup keeps locked-in branches.** The dead-branch scan
   marks every branch under a `git config gitpulse.lockedBranch` value or under
   `archive/` as protected, a clean refuses to delete one, the Ops cleanup plan

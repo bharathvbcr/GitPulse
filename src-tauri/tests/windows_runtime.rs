@@ -15,13 +15,13 @@ fn main() {
     if nextest_list::answer_list("windows_runtime", true) {
         return;
     }
-    use gitpulse_lib::desktop::{install_menu, set_recent_menu, DesktopState};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     };
     use std::time::Duration;
     use tauri::{webview::PageLoadEvent, RunEvent, WebviewUrl, WindowEvent};
+    use waylode_lib::desktop::{install_menu, set_recent_menu, DesktopState};
 
     let version = wry::webview_version()
         .expect("Windows runtime test requires Microsoft Edge WebView2 Runtime");

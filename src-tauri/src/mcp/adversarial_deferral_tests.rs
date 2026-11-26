@@ -163,11 +163,11 @@ fn every_wrapped_tool_under_forced_deferral_meets_its_output_schema() {
     let repo = crate::test_support::git_repo();
     let path = repo.path().to_str().unwrap();
     for tool in [
-        "gitpulse_insights",
-        "gitpulse_collision_risk",
-        "gitpulse_merge_conflicts",
-        "gitpulse_active_changes",
-        "gitpulse_change_context",
+        "waylode_insights",
+        "waylode_collision_risk",
+        "waylode_merge_conflicts",
+        "waylode_active_changes",
+        "waylode_change_context",
     ] {
         let payload = deferred_answer(tool, path);
         let violations: Vec<String> = validate::validate(&payload, &schema_of(tool))
@@ -180,8 +180,8 @@ fn every_wrapped_tool_under_forced_deferral_meets_its_output_schema() {
 
 /// BREAK 5 (low, contract honesty): `deferred`/`retry_after_ms` is declared
 /// only on the collision facet. Insights' `worktrees`, `agents`, `changes`,
-/// `ledger` are `{type: object}`, and `gitpulse_active_changes` /
-/// `gitpulse_change_context` top levels do not declare it, yet all can emit it.
+/// `ledger` are `{type: object}`, and `waylode_active_changes` /
+/// `waylode_change_context` top levels do not declare it, yet all can emit it.
 /// Not a validation failure (schemas are open).
 #[test]
 fn every_emitted_deferred_field_is_declared_in_the_advertised_schema() {
@@ -189,10 +189,10 @@ fn every_emitted_deferred_field_is_declared_in_the_advertised_schema() {
     let path = repo.path().to_str().unwrap();
     let mut gaps = Vec::new();
     for tool in [
-        "gitpulse_insights",
-        "gitpulse_merge_conflicts",
-        "gitpulse_active_changes",
-        "gitpulse_change_context",
+        "waylode_insights",
+        "waylode_merge_conflicts",
+        "waylode_active_changes",
+        "waylode_change_context",
     ] {
         let payload = deferred_answer(tool, path);
         undeclared_deferral(&payload, &schema_of(tool), tool, &mut gaps);

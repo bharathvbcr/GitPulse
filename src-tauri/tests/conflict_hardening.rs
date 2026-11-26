@@ -3,7 +3,7 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
+use waylode_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
 
 #[test]
 fn diff3_preview_preserves_the_order_of_all_three_sides() {

@@ -9,12 +9,12 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use gitpulse_lib::insights::claims::{
+use waylode_lib::insights::claims::{
     append_claim, append_claims_repairing, read_store, ClaimSource, FileClaim, DEFAULT_CAP,
     DEFAULT_TTL_MS,
 };
 #[cfg(unix)]
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 
 const T0: u64 = 1_794_110_184_306;
 /// The store compacts at this many bytes per row of cap. Kept here, not

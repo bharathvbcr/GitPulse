@@ -1,4 +1,4 @@
-# GitPulse launch plan: video, slides, docs and screenshots
+# Waylode launch plan: video, slides, docs and screenshots
 
 Drafted 2026-11-17 against local `main` at `16eba11f3` (version `1.99.0`, the 2.0 beta). It was
 re-checked at `4c25d1d13` after the same-day merge train, which landed load leases, parking and the
@@ -24,22 +24,22 @@ the app against this list yet. The rehearsal in §10 is where each demo path get
 
 ### The one-liner
 
-> **GitPulse is the free, local-first command centre for agentic coding.** It runs Claude Code, Codex
+> **Waylode is the free, local-first command centre for agentic coding.** It runs Claude Code, Codex
 > and other agents side by side across all your repositories. Each agent gets its own worktree, a
 > policy guard and a code map, and the load scheduler keeps the laptop responsive. Every git tool
 > you need sits in the same window.
 
 ### The core idea: a workspace, not a chat window
 
-> **GitPulse is built for the agentic era. It gives the same information and the same tools to the
+> **Waylode is built for the agentic era. It gives the same information and the same tools to the
 > people and to the agents doing the work.** Most agent apps are organised around a chat transcript:
-> one agent, one conversation, and you scroll to find out what happened. GitPulse is organised around
+> one agent, one conversation, and you scroll to find out what happened. Waylode is organised around
 > the work itself: repositories, worktrees, tasks, sessions, code and machine load. It shows that state
 > to you in the UI, and to your agents through the same facts over MCP (65 tools).
 
 Show this as a two-column contrast, on slide 4 and in the 0:20–0:45 part of the video:
 
-| Chat-centred agent apps | GitPulse |
+| Chat-centred agent apps | Waylode |
 |---|---|
 | One transcript per agent; history is scroll-back | One live map of every repo, worktree, task and session |
 | The agent sees the code it opened | Agents query the code graph, collisions, tasks and load (`gitpulse_insights`, `devmap_*`) |
@@ -52,13 +52,13 @@ The comparison slide names the real strengths of each product, and an unfair lin
 
 ### Why it exists when Claude Code, T3 Code, VS Code and Cursor do
 
-Those tools are **agents, or editors that host agents**. GitPulse is the **layer above them**. It
+Those tools are **agents, or editors that host agents**. Waylode is the **layer above them**. It
 does not replace Claude Code or Codex; it launches them, watches them, guards them and lands their
 work. The pitch is about what happens when you run five agents across three repositories at once:
 
 1. **You lose the map.** Which agent is in which repo and worktree, and which one is waiting for you?
-   GitPulse shows every live session, including ones it did not launch, in one tree.
-2. **Agents collide.** Two agents edit the same file in different worktrees. GitPulse's collision radar
+   Waylode shows every live session, including ones it did not launch, in one tree.
+2. **Agents collide.** Two agents edit the same file in different worktrees. Waylode's collision radar
    and claims warn before the merge does, and agents can message each other through the peer inbox.
 3. **Agents do damage.** They run commands outside their checkout, commit secrets, or force a reset.
    Manvi's command gate, per-repository trust, the secret gate and pre-operation undo snapshots cover this.
@@ -86,7 +86,7 @@ product (§2, "Before publishing"), the deck says "we have not found another…"
 
 ### "Agentic era" framing
 
-Every tool before this assumed one person, one checkout and one terminal. GitPulse assumes many
+Every tool before this assumed one person, one checkout and one terminal. Waylode assumes many
 agents, many worktrees and many repositories, with a person supervising. That is the core message.
 
 ---
@@ -96,7 +96,7 @@ agents, many worktrees and many repositories, with a person supervising. That is
 This table needs verification before publishing. Legend: ✅ stated by the official source · ◐ partial
 (the limit is named) · ❌ the source says no · **?** not found in the pages read. A ? is **not** a no.
 
-| Capability | **GitPulse** | Claude Code | T3 Code | VS Code (Copilot) | Cursor | Conductor | Codex app |
+| Capability | **Waylode** | Claude Code | T3 Code | VS Code (Copilot) | Cursor | Conductor | Codex app |
 |---|---|---|---|---|---|---|---|
 | App runtime | **Rust core on the system webview (Tauri 2)** | ? (CLI; desktop app runtime not checked) | **Electron** ([T3 Code desktop guide](https://www.mintlify.com/pingdotgg/t3code/guides/desktop-app), [DeepWiki](https://deepwiki.com/pingdotgg/t3code/4-desktop-application)) | ? | ? | ? | ? |
 | Platforms | macOS tested; Windows and Linux built, testing pending | macOS, Windows, Linux | macOS, Win, Linux, mobile, web | ? | ? | macOS | macOS, Windows (Linux unclear) |
@@ -122,7 +122,7 @@ This table needs verification before publishing. Legend: ✅ stated by the offic
 
 These pages were read through a summarizing fetcher. Re-verify every ✅ before printing it.
 
-| Capability | **GitPulse** | Zed | Warp | GitKraken Desktop | Tower |
+| Capability | **Waylode** | Zed | Warp | GitKraken Desktop | Tower |
 |---|---|---|---|---|---|
 | Category | Agentic workspace + git client | Editor with agent panel | Agentic terminal | Git GUI + agent sessions | Git GUI |
 | App runtime | **Rust core on the system webview (Tauri 2), no bundled Chromium** | ? | ? | **Electron** ([GitKraken blog](https://gitkraken.com/blog/5-electron-apps)) | ? |
@@ -144,7 +144,7 @@ These pages were read through a summarizing fetcher. Re-verify every ✅ before 
 | Cloud / remote execution | Labs | ? | ✅ Oz cloud agents | ◐ remote environments | ? |
 
 **What this changes in the pitch:**
-- GitPulse is **not** the only app with agent guards (Zed, GitKraken), with worktree agents (Zed,
+- Waylode is **not** the only app with agent guards (Zed, GitKraken), with worktree agents (Zed,
   GitKraken, Cursor, VS Code, Claude Code) or with an MCP server (GitKraken).
 - The rows where **no researched product showed the capability** are cross-agent file collision
   warnings, agents filing follow-up tasks on a board, code-graph impact and affected tests, and
@@ -179,14 +179,14 @@ names a limit the product's own docs state, not an opinion.
 | GitKraken | Electron; collision checks cover branch and worktree names only, not files | help.gitkraken.com |
 | Tower | No agent launching, task board or guards found | git-tower.com features |
 
-GitPulse's own limits go on the same slide. It is tested on macOS only, there are no cloud agents
+Waylode's own limits go on the same slide. It is tested on macOS only, there are no cloud agents
 outside Labs, it is not an editor, and Antigravity sessions get no command guard.
 
 ### Where the others are genuinely stronger (say this on a slide; it builds trust)
 
 - **Zed** is a full editor with its own agent, edit prediction and real-time multiplayer.
 - **Warp** has managed cloud agents (Oz) and scheduled or triggered automation.
-- **GitKraken** has a mature git GUI, issue-tracker integration (Launchpad, Jira, Trello) and team/enterprise plans. GitPulse's answer is the Labs issue-tracker integrations (§5, coming soon); until they ship, this stays a GitKraken strength.
+- **GitKraken** has a mature git GUI, issue-tracker integration (Launchpad, Jira, Trello) and team/enterprise plans. Waylode's answer is the Labs issue-tracker integrations (§5, coming soon); until they ship, this stays a GitKraken strength.
 - **Tower** is a long-polished git client with a PR manager across four hosts.
 
 - **Claude Code / Codex** are the agents themselves. They have first-party depth, cloud sessions and
@@ -198,10 +198,10 @@ outside Labs, it is not an editor, and Antigravity sessions get no command guard
 
 ### Before publishing the table
 
-1. For each product, run a targeted search on the three rows where GitPulse claims to be unique:
+1. For each product, run a targeted search on the three rows where Waylode claims to be unique:
    collision warning, code-graph impact and load-aware scheduling. Fill every ? or leave it as ?.
 2. Before naming Conductor, re-check its status (Meta acquisition, cloud shutdown).
-4. Run the four "only GitPulse" rows (collision warnings, agents filing tasks, code-graph impact,
+4. Run the four "only Waylode" rows (collision warnings, agents filing tasks, code-graph impact,
    load-aware scheduling) as targeted searches against all ten products. Until then, the slide says
    "not found in any of the products we checked".
 5. Add the date "as of <date>" under the table.
@@ -228,7 +228,7 @@ Demo locations come from code. Each one gets confirmed during rehearsal.
 |---|---|---|
 | Six launchers: Shell, Claude, Codex, Manvi, Grok, Antigravity (`agy`), plus a Browser tab | Shipped | Dock → new session type |
 | Per-launcher default model, effort, advisor and commit model | Shipped (commit model on `main`) | Settings → Agents |
-| Live session detection, including sessions GitPulse did not launch (Claude, Codex, Antigravity, DevCouncil, Manvi) | Shipped | Agents view, `gitpulse_sessions` |
+| Live session detection, including sessions Waylode did not launch (Claude, Codex, Antigravity, DevCouncil, Manvi) | Shipped | Agents view, `gitpulse_sessions` |
 | **Agent tree**: parent and child sessions nested, collapsible, filterable | Shipped | Agents view (`AgentsView.svelte`) |
 | Worktree per agent: copy-on-write `node_modules`/`target`, `.worktreeinclude`, DevMap store seeded from the main checkout | Shipped (no seed-time figure until it is measured) | Work → Overview; `claude --worktree` |
 | **Agent-to-agent communication**: peer inbox, `agent_register` / `send` / `wait` / `peers`, worktree messages, Send to agent | Shipped | Agent inbox; two agents coordinating |
@@ -248,9 +248,9 @@ Demo locations come from code. Each one gets confirmed during rehearsal.
 | Command gate on every agent shell command (Allowed, Demoted, Granted, Widened, Degraded, Warned, Blocked, Unchecked) | Shipped | Don't say "5 verdicts"; the code has 8 statuses |
 | Scope fences: refuses writes into another checkout (`sed -i`, `tee`, `rm`, `mv` …) | Shipped | Good live demo |
 | Per-repository trust; only the desktop can grant it | Shipped | Trust prompt on first open |
-| Secret gate on commit and push (`dc-redact`) | Shipped for commits GitPulse makes | Don't claim it catches an agent's own `git commit` |
+| Secret gate on commit and push (`dc-redact`) | Shipped for commits Waylode makes | Don't claim it catches an agent's own `git commit` |
 | Pre-operation undo snapshots (`refs/gitpulse/ops/`) with CAS-checked restore | Shipped | History → HEAD moves |
-| Signal guard: agents cannot kill GitPulse | Shipped | Mention only |
+| Signal guard: agents cannot kill Waylode | Shipped | Mention only |
 | Limits to state honestly | n/a | Antigravity has no PreToolUse guards; Labs runner sessions run ungated |
 
 ### 3.4 DevCouncil and DevMap code intelligence
@@ -279,7 +279,7 @@ Demo locations come from code. Each one gets confirmed during rehearsal.
 **Why this board matters for agents.** Other agent apps keep work in threads, so a gap an agent notices
 mid-run lives in a transcript and is lost when the thread scrolls away. T3 Code, for example, organises
 threads in an inbox-style sidebar rather than a board (per a [Digg summary](https://digg.com/tech/14rflh3u)
-of a Theo post; confirm the original before quoting). GitPulse's board is a durable, shared work queue
+of a Theo post; confirm the original before quoting). Waylode's board is a durable, shared work queue
 that **agents write to as well as read from**:
 
 - **Gaps become cards, not lost lines.** An agent that spots out-of-scope work files it with
@@ -417,9 +417,9 @@ Recount every row on the release commit and update the table before publishing.
 
 **Decision (2026-11-17): no app-versus-app footprint comparison.** The benchmark was dropped before
 its counted runs. Say only the sourced architecture line: "A native Rust core on the system webview,
-with no bundled Chromium." The sources are `src-tauri/` and `tauri.conf.json` for GitPulse, and the
+with no bundled Chromium." The sources are `src-tauri/` and `tauri.conf.json` for Waylode, and the
 GitKraken blog and T3 Code desktop docs for their Electron builds. Publish no size, RAM or "N× lighter"
-figure, for GitPulse or for anyone else.
+figure, for Waylode or for anyone else.
 
 ---
 
@@ -451,7 +451,7 @@ These are roadmap slides only. Never present them as shipped.
 
 ---
 
-## 5. GitPulse Labs (future paid features)
+## 5. Waylode Labs (future paid features)
 
 **Superseded on 2026-11-23 by the Labs plan in the private Labs repository**, which is the canonical split. In
 summary:
@@ -514,14 +514,14 @@ You add the voice, then I re-time the cuts to the generated audio.
   - notification banners;
   - Claude/Codex account names.
 
-  Blur in the edit, or retake. Mute notifications except GitPulse's during takes.
-- **Capture:** `screencapture -v -V<seconds> -k -R<x,y,w,h>` on the GitPulse window only (not the whole
+  Blur in the edit, or retake. Mute notifications except Waylode's during takes.
+- **Capture:** `screencapture -v -V<seconds> -k -R<x,y,w,h>` on the Waylode window only (not the whole
   display), with clicks shown. I drive the app through computer use. Take one 20-second pilot clip of
   scene 3 for your approval before shooting the rest.
 - **One theme throughout** (Neural HUD or Midnight IDE), plus a light theme only in the customization scene.
 - **You click** every trust prompt, "Admit anyway" and the scene-9 quit and relaunch.
 
-**Agent tasks for the live scenes** (approved 2026-11-17). Each runs in a fresh worktree of GitPulse,
+**Agent tasks for the live scenes** (approved 2026-11-17). Each runs in a fresh worktree of Waylode,
 and the diffs stay there for you to keep or drop:
 
 | Agent | Task | Shows |
@@ -542,43 +542,43 @@ that depend on in-flight features with `[IF LANDED]`.
 | Time | On screen | Narration (TTS) |
 |---|---|---|
 | 0:00–0:06 | Repo tabs, Agents tree filling with live sessions | "Many agents. Many repositories. One person." |
-| 0:06–0:14 | Fast cut: scattered chat windows, then GitPulse's one live view | "Most agent tools give you a chat window. GitPulse gives you the whole workspace." |
+| 0:06–0:14 | Fast cut: scattered chat windows, then Waylode's one live view | "Most agent tools give you a chat window. Waylode gives you the whole workspace." |
 | 0:14–0:26 | Task card → Launch Claude → worktree created → Codex launched on a second card | "Write a task, pick an agent, launch. Each one gets its own worktree." |
 | 0:26–0:36 | Claude files a follow-up card; it appears in Backlog live | "When an agent finds more work, it files it on your board. Nothing gets lost." |
-| 0:36–0:46 | Collision warning between the two Claude sessions; peer message | "Two agents on one file? GitPulse warns you first, and they can message each other." |
+| 0:36–0:46 | Collision warning between the two Claude sessions; peer message | "Two agents on one file? Waylode warns you first, and they can message each other." |
 | 0:46–0:54 | Manvi gate blocks a write into another checkout | "Claude Code and Codex commands pass a policy gate before they run." |
 | 0:54–1:02 | Diff with blast radius → CI:local running affected tests | "DevMap shows what a change touches, and runs only the tests it affects." |
 | 1:02–1:09 | Montage: branch stack tree, conflict editor, terminal splits, themes | "Plus a full git client and a terminal built for power users." |
-| 1:09–1:15 | Logo, "Free · open source · runs on your Mac", URL | "GitPulse. Free, open source, built for the agentic era." |
+| 1:09–1:15 | Logo, "Free · open source · runs on your Mac", URL | "Waylode. Free, open source, built for the agentic era." |
 
 ### Long video: script and shot flow
 
 | # | Time | Scene | On screen | Voice-over (draft) | Depends on |
 |---|---|---|---|---|---|
-| 1 | 0:00–0:20 | Cold open | Pull back from one terminal to GitPulse with 5 agents live across 3 repo tabs; the Agents tree fills | "This is what coding looks like now: five agents, three repositories, one person. GitPulse is the place you run all of it." | Shipped |
-| 2 | 0:20–0:45 | The problem | Quick montage: scattered chat transcripts and terminals, two agents editing one file, Activity Monitor in the red; then cut to GitPulse's one live map | "Most agent tools give you a chat window per agent. But agents collide, wander outside their checkout and melt your laptop, and a transcript won't show you that. GitPulse shows the work itself, to you and to your agents." | n/a (b-roll) |
+| 1 | 0:00–0:20 | Cold open | Pull back from one terminal to Waylode with 5 agents live across 3 repo tabs; the Agents tree fills | "This is what coding looks like now: five agents, three repositories, one person. Waylode is the place you run all of it." | Shipped |
+| 2 | 0:20–0:45 | The problem | Quick montage: scattered chat transcripts and terminals, two agents editing one file, Activity Monitor in the red; then cut to Waylode's one live map | "Most agent tools give you a chat window per agent. But agents collide, wander outside their checkout and melt your laptop, and a transcript won't show you that. Waylode shows the work itself, to you and to your agents." | n/a (b-roll) |
 | 3 | 0:45–1:30 | One workspace | Repo tabs → worktree stack switcher → Fleet `⌘⇧F` → Work → Overview with blocked worktree first | "Every repository, every worktree, every agent, in one window. Fleet compares them all. Overview puts what's blocked first." | Shipped |
 | 4 | 1:30–2:30 | Task → agent | Tasks: quick add → Manvi refine → Launch: pick Claude, model and effort → new worktree created and seeded → second card launched with Codex | "Write the task, let Manvi tighten it, and launch. Each agent gets its own worktree, with build caches cloned and the code map already built." Measure the DevMap seed time at rehearsal; only quote a number you measured. | Shipped |
 | 4b | (inside 4, +20 s) | Agents fill the board | Mid-run, the Claude agent notices an unrelated bug, calls `gitpulse_add_task`, and the card appears in Backlog live; a duplicate attempt is refused until related cards are reviewed | "When an agent finds something outside its task, it doesn't bury it in a transcript. It files it on the board, so nothing gets lost." | Shipped |
-| 5 | 2:30–3:30 | Control plane | Agents tree with a parent and child; a session started outside GitPulse appears; collision warning as both agents touch one file; agent A messages agent B via the peer inbox; Follow agent split | "GitPulse sees your Claude Code, Codex and Antigravity sessions, even ones it didn't start. It warns before two of them collide, and lets them message each other instead of overwriting each other's work." | Shipped |
-| 6 | 3:30–4:15 | Guards | A Claude session tries to write into another checkout → blocked by the Manvi gate; trust prompt; a commit made **in GitPulse's composer** with a planted fake key → secret gate stops it; HEAD moves → undo snapshot restores | "Claude Code and Codex shell commands go through Manvi's gate before they run. GitPulse checks its own commits and pushes for secrets, and the git operations it allows an agent to run can be undone." | Shipped; rehearse the exact blocked command |
+| 5 | 2:30–3:30 | Control plane | Agents tree with a parent and child; a session started outside Waylode appears; collision warning as both agents touch one file; agent A messages agent B via the peer inbox; Follow agent split | "Waylode sees your Claude Code, Codex and Antigravity sessions, even ones it didn't start. It warns before two of them collide, and lets them message each other instead of overwriting each other's work." | Shipped |
+| 6 | 3:30–4:15 | Guards | A Claude session tries to write into another checkout → blocked by the Manvi gate; trust prompt; a commit made **in Waylode's composer** with a planted fake key → secret gate stops it; HEAD moves → undo snapshot restores | "Claude Code and Codex shell commands go through Manvi's gate before they run. Waylode checks its own commits and pushes for secrets, and the git operations it allows an agent to run can be undone." | Shipped; rehearse the exact blocked command |
 | 7 | 4:15–5:00 | DevMap | Code → Map subsystems; History → Diff → blast radius; Work → Remote → CI:local runs only affected tests | "DevMap knows your code. See the blast radius of a change, and run just the tests it touches, for you and for your agents." | Shipped |
 | 8 | 5:00–5:30 | Load scheduler | Kick off 4 agent builds → build slots queue them (queue place on each terminal pill) → Health shows slots and idle sessions → park an idle agent → host-load strip climbs | "Six parallel builds don't have to mean a frozen machine. The load scheduler gives heavy builds slots, queues the rest, and parks idle agents." | Leases and parking shipped; the strip is **in flight**. The governor's refusal only appears under real memory pressure, so show it only if it fires naturally |
-| 9 | 5:30–6:15 | Terminal | Nested splits → split group → quit GitPulse, reopen, sessions still running → browser pane on localhost → command blocks → copy last output | "A terminal for power users: splits, groups, and sessions that survive quitting the app." | Splits/persistence shipped; groups and copy **in flight** |
+| 9 | 5:30–6:15 | Terminal | Nested splits → split group → quit Waylode, reopen, sessions still running → browser pane on localhost → command blocks → copy last output | "A terminal for power users: splits, groups, and sessions that survive quitting the app." | Splits/persistence shipped; groups and copy **in flight** |
 | 10 | 6:15–7:00 | Git, fully | Graph with avatars → branch stack tree and restack → word diff and line staging → conflict editor → PR review and merge → Actions rerun | "And it's a complete git client: graph, stacks, diffs, conflicts, pull requests and Actions, all in the same place." | Shipped |
 | 11 | 7:00–7:20 | Insights montage | Pulse heatmap, Coverage gutter, Health verdict, Storage | "Pulse, coverage, health and storage, all computed on your machine." | Shipped |
 | 12 | 7:20–7:40 | Make it yours | Theme gallery, switching through 3 themes, wallpaper, palette `⌘K` modes | "Seventeen themes, your own wallpapers, a command palette for everything." | Shipped |
-| 13 | 7:40–8:05 | Free + Labs + next | Comparison table card; Labs preview card; roadmap card | "GitPulse is free and open source, and it runs on your machine." Then one Labs line, worded to match decision 2 in §11 (for example "In Labs: remote runners, device sync and a secrets vault"). | Slides |
-| 14 | 8:05–8:15 | Call to action | Logo, URL, GitHub | "Download GitPulse at gitpulse.vbcr.dev." | n/a |
+| 13 | 7:40–8:05 | Free + Labs + next | Comparison table card; Labs preview card; roadmap card | "Waylode is free and open source, and it runs on your machine." Then one Labs line, worded to match decision 2 in §11 (for example "In Labs: remote runners, device sync and a secrets vault"). | Slides |
+| 14 | 8:05–8:15 | Call to action | Logo, URL, GitHub | "Download Waylode at gitpulse.vbcr.dev." | n/a |
 
 ---
 
 ## 7. Slide deck (16 slides)
 
-1. **Title:** GitPulse, the command centre for agentic coding
+1. **Title:** Waylode, the command centre for agentic coding
 2. **The shift:** from one dev/one branch to many agents, many worktrees, many repos
 3. **Five problems:** lost map, collisions, damage, blind agents, melting laptop
-4. **A workspace, not a chat window:** the two-column contrast from §1, then the layer diagram (Claude/Codex/Grok/agy → GitPulse → git/GitHub/DevMap/Manvi), with "the same facts for people (UI) and agents (MCP)"
+4. **A workspace, not a chat window:** the two-column contrast from §1, then the layer diagram (Claude/Codex/Grok/agy → Waylode → git/GitHub/DevMap/Manvi), with "the same facts for people (UI) and agents (MCP)"
 5. **One workspace:** tabs, stacks, Fleet, Overview (screenshot)
 6. **A board agents write to:** launch from a card; an agent filing a gap for later; verified Done (screenshot plus the five bullets from §3.5)
 7. **Control plane:** agent tree, collision radar, agent-to-agent messaging (screenshot)
@@ -614,7 +614,7 @@ most of them.
 
 **Files to update.** Edit the tracked ones. Root `FEATURES.md`, `docs/PROMO.md` and `docs/MANVI.md` are
 gitignored, so changes there never ship.
-- `README.md`: new hero line (§1), "Why GitPulse" block, comparison link, new hero screenshot, refreshed 2.0 bullets
+- `README.md`: new hero line (§1), "Why Waylode" block, comparison link, new hero screenshot, refreshed 2.0 bullets
 - `docs/FEATURES.md`: restructure to §3's areas, with status columns removed for released items
 - New `docs/WHY_GITPULSE.md`: positioning plus the dated comparison table and sources
 - New `docs/AGENTS_GUIDE.md`, or extend `wiki/MCP and Agents.md`: launching, guards, agent-to-agent messaging, collision workflow
@@ -631,7 +631,7 @@ The page lives in the **Portfolio** repo (`~/Code/web/Portfolio`):
 - the catalog entry in `src/data/projectData.js` and route metadata in `src/lib/routes.js`
 - screenshots under `public/assets/` (PNG and WebP)
 
-Updating GitPulse does not publish the site.
+Updating Waylode does not publish the site.
 
 **What's wrong today:**
 - It pitches a git client ("A clearer view of your work") and has no agent story.
@@ -655,7 +655,7 @@ Updating GitPulse does not publish the site.
 10. **Footer:** MIT, the privacy statement (use the wording only after the telemetry audit in §3.13), changelog.
 
 **Process:** work in the Portfolio repo, in a session rooted there. Regenerate WebP from the new PNGs
-and check the page at phone width. Publish after the GitPulse docs PR lands, so the links resolve.
+and check the page at phone width. Publish after the Waylode docs PR lands, so the links resolve.
 
 ---
 
@@ -704,7 +704,7 @@ You said: commit and merge everything, then launch a live preview and record. Th
    Leases, parking and the resource profile have already landed.
 3. **Go green:** `bun run ci:local` and `bun run check`. Then `bun run mcp:install` and
    `bun run mcp:doctor` (all OK), and `bun run check:schema-parity`. Build the app with
-   `bun run tauri build` and install it, then relaunch GitPulse into it. Record from the installed
+   `bun run tauri build` and install it, then relaunch Waylode into it. Record from the installed
    build, not `tauri dev`, and write that build's commit into each video's notes. The app running on
    2026-11-17 dated from Nov 15, older than the binary on disk, so relaunching matters.
 4. **Push `main`.** It is 210 commits ahead of `origin/main`, and the README images load from GitHub's `main`.
@@ -714,13 +714,13 @@ You said: commit and merge everything, then launch a live preview and record. Th
 6. **Record:** a 20-second pilot of scene 3 first, for your approval. Then each scene as its own take,
    so any one can be re-shot. Edit the silent cuts with captions. You generate the TTS from the
    narration files, and I re-time the cuts to the audio.
-7. **Publish order:** GitPulse docs and screenshots PR → website (Portfolio repo) → deck → video → posts.
+7. **Publish order:** Waylode docs and screenshots PR → website (Portfolio repo) → deck → video → posts.
 
 ---
 
 ## 11. Open decisions for you
 
-1. **Labs tiers.** Decided: you charge only where GitPulse carries infrastructure cost (relay sync and
+1. **Labs tiers.** Decided: you charge only where Waylode carries infrastructure cost (relay sync and
    team, hosted runners, and a few non-local integrations). Local, user-owned and sign-in are free (§5).
    Still open: the Pro and Team prices.
 2. **Labs in this launch?** Recommendation: preview only. No release build enables `cloud-labs`, and

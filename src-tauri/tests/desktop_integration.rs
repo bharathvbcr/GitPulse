@@ -6,12 +6,12 @@
 //! silently points the whole app at another repository, so it is exercised
 //! here against real on-disk layouts rather than mocked paths.
 
-use gitpulse_lib::desktop::cmd_resolve_git_root;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::desktop::cmd_resolve_git_root;
+use waylode_lib::procguard::LockedSpawn;
 
 fn run_git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")

@@ -63,12 +63,12 @@ fn ledger_objects(value: &Value, path: String, out: &mut Map<String, Value>, rep
 fn dump_surfaces(repo: &str) -> Value {
     let mut out = Map::new();
     for tool in [
-        "gitpulse_insights",
-        "gitpulse_status",
-        "gitpulse_ledger_events",
-        "gitpulse_change_context",
-        "gitpulse_task_view",
-        "gitpulse_list_tasks",
+        "waylode_insights",
+        "waylode_status",
+        "waylode_ledger_events",
+        "waylode_change_context",
+        "waylode_task_view",
+        "waylode_list_tasks",
     ] {
         let doc = crate::mcp::handle_tool_call(tool, &json!({ "repo_path": repo }))
             .unwrap_or_else(|e| json!({ "ERR": e.replace(repo, "<repo>") }));

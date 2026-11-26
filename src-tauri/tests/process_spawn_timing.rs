@@ -10,10 +10,10 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::engine::process::capture_command;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::engine::process::capture_command;
+use waylode_lib::procguard::LockedSpawn;
 
 fn no_op_program() -> (&'static str, &'static [&'static str]) {
     if cfg!(windows) {

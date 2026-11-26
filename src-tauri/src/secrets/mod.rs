@@ -410,7 +410,7 @@ mod tests {
         ] {
             assert_eq!(
                 reason(refusal_message("kingfisher", deferral).message()),
-                "kingfisher was deferred: GitPulse was under load and started no new process in time",
+                "kingfisher was deferred: Waylode was under load and started no new process in time",
                 "{deferral:?} is a deferral, not a slot timeout or a scan timeout"
             );
         }

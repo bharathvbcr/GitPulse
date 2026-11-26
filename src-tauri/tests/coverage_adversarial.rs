@@ -3,9 +3,8 @@
 //! concurrent hammering. Complements the parser-level corpus in
 //! coverage_stress.rs by attacking what sits AROUND the parsers.
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
-use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 use std::fs;
 #[cfg(unix)]
 use std::fs::Permissions;
@@ -14,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 
 fn git_repo() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
@@ -36,9 +36,9 @@ fn write(dir: &Path, rel: &str, content: &str) {
 }
 
 fn artifact_row<'a>(
-    report: &'a gitpulse_lib::analyzer::coverage::CoverageReport,
+    report: &'a waylode_lib::analyzer::coverage::CoverageReport,
     suffix: &str,
-) -> &'a gitpulse_lib::analyzer::coverage::CoverageArtifact {
+) -> &'a waylode_lib::analyzer::coverage::CoverageArtifact {
     report
         .artifacts
         .iter()
@@ -347,7 +347,7 @@ fn detail_lookup_matches_case_insensitively() {
 #[test]
 fn concurrent_scans_and_details_agree() {
     // Agreement under contention, not the production spawn rate.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let repo = git_repo();
     write(repo.path(), "src/lib.rs", "fn a() {}\nfn b() {}\n");
     write(repo.path(), "src/app.ts", "export const x = 1;\n");

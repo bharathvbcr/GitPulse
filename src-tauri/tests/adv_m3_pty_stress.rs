@@ -7,30 +7,30 @@
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{
-    acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
-    set_background_sessions, spawn_session, write_to_session, KillOrigin, OutputSink,
-    TerminalSessions,
-};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{
+    acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
+    set_background_sessions, spawn_session, write_to_session, KillOrigin, OutputSink,
+    TerminalSessions,
+};
 
 mod common;
 
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("PTY stress test cleanup incomplete: {error}");
         }
     }
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -86,7 +86,7 @@ struct StressView {
 impl StressView {
     fn new(stall: Duration) -> Self {
         let app = tauri::test::mock_builder()
-            .build(gitpulse_lib::context())
+            .build(waylode_lib::context())
             .unwrap();
         let state = common::terminals();
         state.set_output_stall_timeout(stall);
@@ -322,7 +322,7 @@ fn hidden_tab_backpressure_sheds_buffer_without_terminating_process() {
 #[test]
 fn stress_concurrent_spawn_write_detach_kill_cycles() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -436,7 +436,7 @@ fn stress_concurrent_spawn_write_detach_kill_cycles() {
 #[test]
 fn hidden_tab_with_failing_sink_sheds_and_preserves_child() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -494,7 +494,7 @@ fn hidden_tab_with_failing_sink_sheds_and_preserves_child() {
 #[test]
 fn child_sigkilled_on_hidden_tab_exits_cleanly() {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());

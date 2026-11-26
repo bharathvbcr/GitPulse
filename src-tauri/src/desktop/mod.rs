@@ -4,16 +4,15 @@ pub mod confirm;
 pub mod editor;
 pub mod exit;
 pub mod hibernate;
-#[cfg(any(target_os = "macos", test))]
 pub mod identity_migration;
 #[cfg(target_os = "macos")]
 pub mod instance;
 #[cfg(target_os = "macos")]
 pub mod launch;
-#[cfg(any(target_os = "macos", test))]
 pub mod launch_agent;
 mod menu;
 pub mod popover;
+pub mod pressure;
 pub mod shell;
 pub mod state;
 #[cfg(target_os = "macos")]
@@ -87,7 +86,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
         match id {
             "show" => {
                 if let Err(error) = reveal_main(app) {
-                    log::error!(target: "desktop", "Could not reveal GitPulse: {error}");
+                    log::error!(target: "desktop", "Could not reveal Waylode: {error}");
                 }
                 return;
             }
@@ -493,7 +492,7 @@ pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, argv: &[String], c
         SecondLaunch::Open(path) => queue_and_emit_open(app, &launch_path(path, Path::new(cwd))),
         SecondLaunch::Reveal => {
             if let Err(error) = reveal_main(app) {
-                log::warn!(target: "desktop", "Could not reveal GitPulse for a second launch: {error}");
+                log::warn!(target: "desktop", "Could not reveal Waylode for a second launch: {error}");
             }
         }
         SecondLaunch::Ignore => {}
@@ -526,7 +525,7 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         }
         instance::Request::Reveal => {
             if let Err(error) = reveal_main(&handle) {
-                log::warn!(target: "desktop", "Could not reveal GitPulse for another launch: {error}");
+                log::warn!(target: "desktop", "Could not reveal Waylode for another launch: {error}");
             }
         }
         // Answered on its own connection by the gate attached to the mailbox;
@@ -548,11 +547,11 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
                     .hibernation
                     .push_pending(hibernate::PendingMainEvent::Browse { repo, url });
                 if let Err(error) = reveal_main(&handle) {
-                    log::warn!(target: "desktop", "Could not reveal GitPulse for a browser session: {error}");
+                    log::warn!(target: "desktop", "Could not reveal Waylode for a browser session: {error}");
                 }
             } else {
                 if let Err(error) = reveal_main(&handle) {
-                    log::warn!(target: "desktop", "Could not reveal GitPulse for a browser session: {error}");
+                    log::warn!(target: "desktop", "Could not reveal Waylode for a browser session: {error}");
                 }
                 let request = crate::browser::BrowseRequest { repo, url };
                 if let Err(error) = handle.emit(crate::browser::BROWSE_EVENT, request) {
@@ -641,7 +640,7 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
             // window). Snooze asked for nothing.
             if !snooze && (forwarded.is_err() || !main_was_live) {
                 if let Err(error) = reveal_main(&handle) {
-                    log::warn!(target: "desktop", "Could not reveal GitPulse for a banner: {error}");
+                    log::warn!(target: "desktop", "Could not reveal Waylode for a banner: {error}");
                 }
             }
         }
@@ -899,7 +898,7 @@ fn serve_kickoff_spawn<R: tauri::Runtime>(
                 let wake_handle = app.clone();
                 if let Err(error) = app.run_on_main_thread(move || {
                     if let Err(err) = reveal_main(&wake_handle) {
-                        log::warn!(target: "desktop", "Could not reveal GitPulse for agent kickoff: {err}");
+                        log::warn!(target: "desktop", "Could not reveal Waylode for agent kickoff: {err}");
                     }
                 }) {
                     log::warn!(target: "desktop", "Could not schedule wake for agent kickoff: {error}");
@@ -1272,6 +1271,12 @@ pub fn menu_state<R: Runtime>(app: &AppHandle<R>) -> MenuState {
 pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result<(), String> {
     next.validate()?;
     let previous = menu_state(app);
+    // The renderer does not know the host's pressure, so its state never
+    // carries it: keep what the native poller last set.
+    let next = MenuState {
+        pressure: previous.pressure,
+        ..next
+    };
     let rebuild_menu = previous
         .repositories
         .iter()
@@ -1297,6 +1302,30 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
         .map_err(|error| error.to_string())? = next.clone();
     hibernate::persist_boot_tray_hint(next.show_status_icon, next.hide_dock_when_closed);
     popover::publish(app, &next)
+}
+
+/// Records the host's pressure for the status item and redraws it when that
+/// changes what it shows. Main thread, like every tray update.
+pub fn set_host_pressure<R: Runtime>(
+    app: &AppHandle<R>,
+    pressure: pressure::HostPressure,
+) -> Result<(), String> {
+    let previous = menu_state(app);
+    if previous.pressure == pressure {
+        return Ok(());
+    }
+    let next = MenuState {
+        pressure,
+        ..previous.clone()
+    };
+    if tray::needs_apply(&previous, &next) {
+        tray::apply(app, &next)?;
+    }
+    *app.state::<DesktopState>()
+        .menu_state
+        .lock()
+        .map_err(|error| error.to_string())? = next;
+    Ok(())
 }
 
 /// Runs `update`, turning a panic into the error the caller is waiting for.

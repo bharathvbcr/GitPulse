@@ -191,7 +191,7 @@ fn catalogue() -> Vec<Spec<'static>> {
             id: "dcverify",
             label: "dcverify",
             need: ComponentNeed::HostResolved,
-            purpose: "Manvi's verification gate. GitPulse links the same library, so its own reads work without the binary.",
+            purpose: "Manvi's verification gate. Waylode links the same library, so its own reads work without the binary.",
             probe: Probe::VersionWithFallback(&[]),
             presets: &["analysis", "all"],
             managed: None,
@@ -213,7 +213,7 @@ fn catalogue() -> Vec<Spec<'static>> {
             id: "devcouncil",
             label: "DevCouncil host",
             need: ComponentNeed::Optional,
-            purpose: "The Go orchestrator. GitPulse talks to Manvi instead and never starts this.",
+            purpose: "The Go orchestrator. Waylode talks to Manvi instead and never starts this.",
             probe: Probe::VersionFlag,
             presets: &["all"],
             managed: None,
@@ -462,15 +462,15 @@ fn probe_located_with(
                 return base(true, Some(path.clone()), version, None);
             }
             Some(reported) if reported < required => format!(
-                "`{path}` opens workbench schema {reported}, and GitPulse's task board is schema {required}. Manvi runs this `{}` against the board and it refuses the profile: update it to one that opens schema {required}.",
+                "`{path}` opens workbench schema {reported}, and Waylode's task board is schema {required}. Manvi runs this `{}` against the board and it refuses the profile: update it to one that opens schema {required}.",
                 spec.id
             ),
             Some(reported) => format!(
-                "`{path}` opens workbench schema {reported}, newer than GitPulse's task board (schema {required}); Manvi running it would migrate the profile past what GitPulse reads. Install a `{}` that opens schema {required}, or update GitPulse.",
+                "`{path}` opens workbench schema {reported}, newer than Waylode's task board (schema {required}); Manvi running it would migrate the profile past what Waylode reads. Install a `{}` that opens schema {required}, or update Waylode.",
                 spec.id
             ),
             None => format!(
-                "`{path}` does not report the workbench schema it opens (`workbench_schema` in `{} --version`), so it predates the check for schema {required}, the one GitPulse's task board needs. Manvi runs it against the board: update it.",
+                "`{path}` does not report the workbench schema it opens (`workbench_schema` in `{} --version`), so it predates the check for schema {required}, the one Waylode's task board needs. Manvi runs it against the board: update it.",
                 spec.id
             ),
         };
@@ -1073,7 +1073,7 @@ mod tests {
             assert!(reason.contains(&says), "{payload}: {reason}");
             assert!(
                 reason.contains(&format!("schema {required}")) && reason.contains("update"),
-                "the reason names what GitPulse needs and what to do: {reason}"
+                "the reason names what Waylode needs and what to do: {reason}"
             );
             assert!(
                 reason.contains("/stale/bin/dcstore"),

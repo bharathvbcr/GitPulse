@@ -27,13 +27,13 @@
 mod common;
 
 use common::env as hermetic_env;
-use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use waylode_lib::procguard::LockedSpawn;
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 
 /// A throwaway home, a real git repository, and a directory outside it.
 struct World {
@@ -110,7 +110,7 @@ impl World {
         .to_string();
         let mut child = Command::new(HOOK)
             .arg("command-gate")
-            .env(gitpulse_lib::logging::LOG_DIR_ENV, &self.logs)
+            .env(waylode_lib::logging::LOG_DIR_ENV, &self.logs)
             .env("HOME", &self.home)
             .env("TMPDIR", self.home.join("tmp"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
@@ -250,10 +250,10 @@ fn with_manvi_dev_tool_call_is_admitted_silently_except_an_outside_project_root(
     let _home = hermetic_env::bind_env(&serial).set("HOME", &world.home);
     for trusted in [false, true] {
         if trusted {
-            gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+            waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
             let repo = world.repo.to_str().expect("utf8 repo");
-            let preview = gitpulse_lib::repository_trust::inspect(repo).expect("inspect");
-            gitpulse_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
+            let preview = waylode_lib::repository_trust::inspect(repo).expect("inspect");
+            waylode_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
         }
         for (name, command) in commands(&world) {
             let (code, out) = world.ask_with(&command, &manvi);

@@ -120,7 +120,7 @@ describe("formatFirebaseDiagnostics", () => {
   it("carries everything a reader needs to act on the beta's startup failure", () => {
     const text = formatFirebaseDiagnostics(input());
     expect(text).toContain("Generated: 2026-11-14T09:05:00.000Z");
-    expect(text).toContain("GitPulse: 1.99.0");
+    expect(text).toContain("Waylode: 1.99.0");
     expect(text).toContain("Repository: /Users/me/Code/scholarlm");
     expect(text).toContain("Firebase CLI: firebase — not usable");
     // The classified state and its next step, not just the raw message.
