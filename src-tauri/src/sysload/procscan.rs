@@ -4461,8 +4461,15 @@ mod os {
         ))
     }
 
+    /// The arguments of one process for a caller that must tell "not this
+    /// kind" from "could not tell" (the relief's tool-shell mark): a process
+    /// that is gone has no arguments to read and is `None`, as on macOS. Not
+    /// [`argv_of`], which answers a scan's gone process with an empty list: the
+    /// relief read that as "not a tool shell" on Linux.
     pub(crate) fn argv_sized(pid: i32) -> Option<Vec<String>> {
-        argv_of(pid, &mut Vec::new())
+        read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20)
+            .ok()
+            .map(|raw| super::split_cmdline(&raw))
     }
 
     pub(super) fn priority_facts(pid: i32) -> Option<super::PriorityFacts> {

@@ -254,11 +254,31 @@ fn a_stale_token_is_turned_away_before_the_probes_and_does_the_work_of_no_token(
             p.rows.iter().map(|r| r.summary.clone()).collect()
         };
         assert_eq!(summaries(&stale), summaries(&none));
+        // The page asks for HEAD's branch from two of its scoped threads (the
+        // decorations and the default branch). Those threads have their own
+        // (test) ref-cache tables, so the two asks share one child only when
+        // both are queued at the spawn gate together: one or two children, by
+        // the schedule, on either side (Linux CI ran one against two). Every
+        // other child is still compared exactly.
+        let head_ask = ["symbolic-ref", "--quiet", "HEAD"].map(String::from);
+        let split = |shapes: Vec<Vec<String>>| -> (Vec<Vec<String>>, usize) {
+            let (asks, rest): (Vec<_>, Vec<_>) = shapes
+                .into_iter()
+                .partition(|argv| argv.ends_with(&head_ask));
+            (rest, asks.len())
+        };
+        let (stale_rest, stale_asks) = split(spawn_shapes(with_token.path()));
+        let (none_rest, none_asks) = split(spawn_shapes(without.path()));
         assert_eq!(
-            spawn_shapes(with_token.path()),
-            spawn_shapes(without.path()),
+            stale_rest, none_rest,
             "a stale token spawns exactly what no token spawns"
         );
+        for (side, asks) in [("stale token", stale_asks), ("no token", none_asks)] {
+            assert!(
+                (1..=2).contains(&asks),
+                "{side}: HEAD's branch is asked by two threads, so one or two children, not {asks}"
+            );
+        }
     });
 }
 
