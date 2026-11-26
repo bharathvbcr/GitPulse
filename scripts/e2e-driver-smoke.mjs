@@ -954,20 +954,36 @@ async function runSmoke(opts) {
             const cbId = window.__TAURI_INTERNALS__.transformCallback((raw) => {
               const msg = raw && typeof raw === "object" && "message" in raw ? raw.message : raw;
               let text = "";
+              // Flow control counts bytes, not decoded characters.
+              let bytes = 0;
               if (msg instanceof ArrayBuffer) {
+                bytes = msg.byteLength;
                 text = decoder.decode(new Uint8Array(msg));
               } else if (ArrayBuffer.isView(msg)) {
+                bytes = msg.byteLength;
                 text = decoder.decode(new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength));
               } else if (Array.isArray(msg)) {
+                bytes = msg.length;
                 text = decoder.decode(Uint8Array.from(msg));
               } else if (typeof msg === "string") {
+                bytes = new TextEncoder().encode(msg).length;
                 text = msg;
               } else if (msg && typeof msg === "object" && typeof msg.data_b64 === "string") {
                 try { text = atob(msg.data_b64); } catch { text = msg.data_b64; }
+                bytes = text.length;
               }
               if (text) collected += text;
-              if (sessionId && text.length > 0) {
-                window.__TAURI_INTERNALS__.invoke("cmd_terminal_ack", { sessionId, bytes: text.length }).catch(() => {});
+              if (sessionId && bytes > 0) {
+                window.__TAURI_INTERNALS__.invoke("cmd_terminal_ack", { sessionId, bytes }).catch(() => {});
+              }
+              // This page stands in for the terminal (xterm.js in the app), so it
+              // answers what a terminal answers. Windows' ConPTY is created with
+              // PSEUDOCONSOLE_INHERIT_CURSOR: it asks for the cursor position
+              // (ESC [ 6 n) and reads no input until the reply arrives.
+              if (sessionId && text.includes("\\x1b[6n")) {
+                window.__TAURI_INTERNALS__
+                  .invoke("cmd_terminal_write", { sessionId, data: "\\x1b[1;1R", binary: false })
+                  .catch(() => {});
               }
             });
             const spawned = await window.__TAURI_INTERNALS__.invoke("cmd_terminal_spawn", {
@@ -998,9 +1014,24 @@ async function runSmoke(opts) {
               await new Promise((r) => setTimeout(r, 150));
             }
             const matched = collected.includes(marker);
-            await window.__TAURI_INTERNALS__.invoke("cmd_terminal_kill", { sessionId });
+            // Both outcomes are reported: a Close that fails must not hide
+            // whether the round trip itself worked, nor the other way round.
+            let closeError = null;
+            try {
+              await window.__TAURI_INTERNALS__.invoke("cmd_terminal_kill", { sessionId });
+            } catch (err) {
+              closeError = String(err);
+            }
             if (!matched) {
-              done({ ok: false, error: "PTY output did not contain marker " + marker + "; got " + collected.slice(-300) });
+              done({
+                ok: false,
+                error: "PTY output did not contain marker " + marker + "; got " + JSON.stringify(collected.slice(-300)) +
+                  (closeError ? "; Close then failed too: " + closeError : ""),
+              });
+              return;
+            }
+            if (closeError) {
+              done({ ok: false, error: "the round trip worked, but Close failed: " + closeError });
               return;
             }
             done({ ok: true, sessionId, bytes: collected.length });
