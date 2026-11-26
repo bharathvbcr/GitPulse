@@ -569,7 +569,7 @@ pub fn resolve_binary_uncached() -> Result<ResolvedDevmap, String> {
         ));
     }
     if crate::tool_config::is_disabled(crate::tool_install::ExternalTool::Devmap) {
-        return Err("devmap is disabled in GitPulse settings".into());
+        return Err("devmap is disabled in Waylode settings".into());
     }
     if let Some(saved) = crate::tool_config::saved_binary(crate::tool_install::ExternalTool::Devmap)
     {
@@ -1332,7 +1332,7 @@ fn bound_warning(warning: &str) -> String {
         cut -= 1;
     }
     format!(
-        "{}… [GitPulse shortened this warning: {cut} of {} bytes shown]",
+        "{}… [Waylode shortened this warning: {cut} of {} bytes shown]",
         &warning[..cut],
         warning.len()
     )
@@ -1463,7 +1463,7 @@ impl DoctorReport {
         let dropped = all.len() - (MAX_WARNINGS - 1);
         all.truncate(MAX_WARNINGS - 1);
         all.push(format!(
-            "[GitPulse is showing {} of {} warnings; {dropped} more were not rendered]",
+            "[Waylode is showing {} of {} warnings; {dropped} more were not rendered]",
             MAX_WARNINGS - 1,
             dropped + MAX_WARNINGS - 1
         ));
@@ -1941,7 +1941,7 @@ mod tests {
             let long = format!("{}{}", "…".repeat(MAX_WARNING_BYTES), "x".repeat(pad));
             let bounded = bound_warning(&long);
             assert!(
-                bounded.contains("GitPulse shortened this warning"),
+                bounded.contains("Waylode shortened this warning"),
                 "shortened silently at pad {pad}"
             );
             assert!(

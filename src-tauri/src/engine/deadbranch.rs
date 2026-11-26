@@ -50,16 +50,18 @@ pub const DEFAULT_PROTECTED_BRANCHES: &[&str] = &[
 pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &["wip/*", "draft/*", "*/draft", "*/wip"];
 
 /// Local git config key naming the branches a repository keeps whatever their
-/// state, one value per branch or pattern under `refs/heads/`. The landing
-/// skills (`gitpulse:commit-and-merge`) read the same key.
-pub const LOCKED_BRANCH_CONFIG_KEY: &str = "gitpulse.lockedBranch";
+/// state, one value per branch or pattern under `refs/heads/`. Both
+/// `waylode.lockedBranch` and legacy `gitpulse.lockedBranch` are dual-read
+/// indefinitely.
+pub const LOCKED_BRANCH_CONFIG_KEY: &str = "waylode.lockedBranch";
+pub const LEGACY_LOCKED_BRANCH_CONFIG_KEY: &str = "gitpulse.lockedBranch";
 
 /// Branch families that are locked-in in every repository.
 const ALWAYS_LOCKED_BRANCHES: &[&str] = &["archive"];
 
 /// Full refs of the repository's locked-in branches: every local branch under
-/// a `gitpulse.lockedBranch` value or under `archive/`, and the same names
-/// under each of `remotes`.
+/// `waylode.lockedBranch` or legacy `gitpulse.lockedBranch` or under `archive/`,
+/// and the same names under each of `remotes`.
 ///
 /// `git for-each-ref` expands the values, so they match exactly as the landing
 /// skills match them: a value with no wildcard matches that branch and every
@@ -72,8 +74,11 @@ pub(crate) fn locked_in_refs(
     repo: &Path,
     remotes: &[String],
 ) -> Result<HashSet<String>, CommandError> {
-    let config = git_captured(repo, &["config", "--get-all", LOCKED_BRANCH_CONFIG_KEY])?;
-    let configured = locked_values(&config)?;
+    let mut configured = Vec::new();
+    for key in [LOCKED_BRANCH_CONFIG_KEY, LEGACY_LOCKED_BRANCH_CONFIG_KEY] {
+        let config = git_captured(repo, &["config", "--get-all", key])?;
+        configured.extend(locked_values(&config)?);
+    }
     let values = ALWAYS_LOCKED_BRANCHES
         .iter()
         .map(|v| v.to_string())
@@ -320,7 +325,9 @@ pub fn age_severity(days: i64) -> &'static str {
 
 /// Directory every repository's backup directory lives under.
 fn backups_root() -> Result<PathBuf, CommandError> {
-    if let Ok(explicit) = std::env::var("GITPULSE_BACKUPS_DIR") {
+    if let Some(explicit) =
+        crate::env_compat::var_os_compat("WAYLODE_BACKUPS_DIR", "GITPULSE_BACKUPS_DIR")
+    {
         return Ok(PathBuf::from(explicit));
     }
     let home = std::env::var_os("HOME")
@@ -2486,14 +2493,45 @@ mod tests {
         assert_eq!(deletes, BRANCHES);
         // 16 plus the two `git config` reads that tell a partial clone once
         // for the whole scan (a merge there would make git fetch blobs), plus
-        // the locked-in read (`git config --get-all gitpulse.lockedBranch`
-        // and one `for-each-ref` for every pattern) once per clean. The
-        // per-branch terms above are exact and unchanged.
-        const CONSTANT: usize = 20;
+        // the dual-read locked-in checks (`waylode.lockedBranch` and
+        // `gitpulse.lockedBranch` + `for-each-ref`) once per scan and clean.
+        const CONSTANT: usize = 22;
         assert!(
             used.len() <= 2 * BRANCHES + CONSTANT,
             "{} spawns for {BRANCHES} branches: {used:#?}",
             used.len()
         );
+    }
+
+    #[test]
+    fn dual_reads_waylode_and_legacy_gitpulse_locked_branch_keys() {
+        let (_dir, repo) = seeded_repo();
+        for name in ["keep-new", "keep-legacy", "delete-me"] {
+            git_in(&repo, &["branch", name]);
+        }
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--add",
+                LOCKED_BRANCH_CONFIG_KEY,
+                "keep-new",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--add",
+                LEGACY_LOCKED_BRANCH_CONFIG_KEY,
+                "keep-legacy",
+            ],
+        );
+        let refs = locked_in_refs(&repo, &[]).unwrap();
+        assert!(refs.contains("refs/heads/keep-new"), "{refs:?}");
+        assert!(refs.contains("refs/heads/keep-legacy"), "{refs:?}");
+        assert!(!refs.contains("refs/heads/delete-me"), "{refs:?}");
     }
 }

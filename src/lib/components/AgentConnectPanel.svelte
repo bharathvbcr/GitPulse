@@ -112,7 +112,7 @@
   </div>
 
   <p class="text-textMuted text-micro leading-snug">
-    Lets Claude Code and Codex start GitPulse's MCP server. Links the bundled binaries into
+    Lets Claude Code and Codex start Waylode's MCP server. Links the bundled binaries into
     <span class="font-mono">~/.local/bin</span> and registers the server with each agent's own
     command. Previewed first; nothing is written until you confirm.
   </p>

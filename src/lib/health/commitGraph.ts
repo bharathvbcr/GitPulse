@@ -59,7 +59,7 @@ export function commitGraphHint(report: CommitGraphReport | null | undefined): C
     return {
       tone: "unchecked",
       title: "Commit-graph couldn't be checked",
-      detail: report.note?.trim() || "GitPulse couldn't read the commit-graph.",
+      detail: report.note?.trim() || "Waylode couldn't read the commit-graph.",
     };
   }
   return null;

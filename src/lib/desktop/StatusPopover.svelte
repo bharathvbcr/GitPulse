@@ -121,13 +121,13 @@
 <svelte:window onkeydown={handleKey} />
 
 <div class="status-shell" class:reduce-motion={card?.reduceMotion} data-testid="status-popover" data-material={material} data-tone={card?.tone ?? "neutral"}>
-  <section class="panel" aria-label="GitPulse status">
+  <section class="panel" aria-label="Waylode status">
     <header>
       <div class="mark" aria-hidden="true"><Logo size={24} variant="badge" /></div>
       <div class="identity">
         <button class="repository" onclick={() => choosing = !choosing} disabled={(snapshot?.repositories.length ?? 0) < 2}
-          aria-expanded={choosing} aria-label="Choose repository" title={snapshot?.activePath ?? "GitPulse"}>
-          <span>{card?.repository ?? "GitPulse"}</span>
+          aria-expanded={choosing} aria-label="Choose repository" title={snapshot?.activePath ?? "Waylode"}>
+          <span>{card?.repository ?? "Waylode"}</span>
           {#if snapshot && snapshot.repositories.length > 1}
             <ChevronDown size={13} class={choosing ? "expanded" : ""} />
           {/if}
@@ -411,10 +411,10 @@
       {/if}
     </div>
     <footer>
-      <button class="open-app" onclick={() => act("show")}>Open GitPulse <ArrowUpRight size={12} /></button>
+      <button class="open-app" onclick={() => act("show")}>Open Waylode <ArrowUpRight size={12} /></button>
       <div>
         <button class="gp-icon-btn" data-size="md" aria-label="Settings" title="Settings" onclick={() => act("settings")}><Settings2 size={14} /></button>
-        <button class="gp-icon-btn" data-size="md" aria-label="Quit GitPulse" title="Quit GitPulse" onclick={() => act("quit")}><Power size={14} /></button>
+        <button class="gp-icon-btn" data-size="md" aria-label="Quit Waylode" title="Quit Waylode" onclick={() => act("quit")}><Power size={14} /></button>
       </div>
     </footer>
   </section>

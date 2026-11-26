@@ -53,14 +53,15 @@
 
 use super::sensor::{Reading, Why};
 use super::winproc;
-use super::RUN_ID_ENV;
+use super::{LEGACY_RUN_ID_ENV, RUN_ID_ENV};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The environment variable every GitPulse PTY child carries.
+/// The environment variable every Waylode PTY child carries.
 pub(crate) const SESSION_ENV: &str = crate::alerts::bridge::SESSION_ENV;
+pub(crate) const LEGACY_SESSION_ENV: &str = crate::alerts::bridge::LEGACY_SESSION_ENV;
 
 /// Upper bound on the processes one scan reads; past it the table is a scan
 /// that could not finish, never a prefix judged as the whole.
@@ -626,8 +627,8 @@ impl LaunchKey {
             .or_else(|| self.session_id.as_ref().map(|id| format!("session:{id}")))
     }
 
-    /// Picks `GITPULSE_RUN_ID` and `GITPULSE_SESSION_ID` out of `NAME=value`
-    /// strings. An empty, oversized or non-printable value is ignored.
+    /// Picks `WAYLODE_RUN_ID` / `WAYLODE_SESSION_ID` (with `GITPULSE_*` fallback)
+    /// out of `NAME=value` strings. An empty, oversized or non-printable value is ignored.
     pub(crate) fn from_env<'a>(vars: impl IntoIterator<Item = &'a str>) -> Option<Self> {
         let clean = |v: &str| {
             (!v.is_empty()
@@ -635,20 +636,37 @@ impl LaunchKey {
                 && v.chars().all(|c| c.is_ascii_graphic()))
             .then(|| v.to_string())
         };
-        let mut key = Self::default();
+        let mut primary_run_id = None;
+        let mut legacy_run_id = None;
+        let mut primary_session_id = None;
+        let mut legacy_session_id = None;
         for var in vars {
             if let Some(v) = var
                 .strip_prefix(RUN_ID_ENV)
                 .and_then(|r| r.strip_prefix('='))
             {
-                key.run_id = clean(v);
+                primary_run_id = clean(v);
+            } else if let Some(v) = var
+                .strip_prefix(LEGACY_RUN_ID_ENV)
+                .and_then(|r| r.strip_prefix('='))
+            {
+                legacy_run_id = clean(v);
             } else if let Some(v) = var
                 .strip_prefix(SESSION_ENV)
                 .and_then(|r| r.strip_prefix('='))
             {
-                key.session_id = clean(v);
+                primary_session_id = clean(v);
+            } else if let Some(v) = var
+                .strip_prefix(LEGACY_SESSION_ENV)
+                .and_then(|r| r.strip_prefix('='))
+            {
+                legacy_session_id = clean(v);
             }
         }
+        let key = Self {
+            run_id: primary_run_id.or(legacy_run_id),
+            session_id: primary_session_id.or(legacy_session_id),
+        };
         (key.run_id.is_some() || key.session_id.is_some()).then_some(key)
     }
 }
@@ -973,6 +991,9 @@ pub struct Scanner {
     index: HashMap<i32, usize>,
     tree_of: Vec<Option<u32>>,
     session_of: Vec<Option<u32>>,
+    /// Each session's root, by the number `session_of` carries: the last
+    /// attribution's, for [`Scanner::relief_table`].
+    sessions_at: Vec<usize>,
     tree_names: Vec<String>,
     written_before: HashMap<(i32, u64), u64>,
     written_now: HashMap<(i32, u64), u64>,
@@ -991,6 +1012,7 @@ impl Scanner {
             index: HashMap::with_capacity(4096),
             tree_of: Vec::with_capacity(4096),
             session_of: Vec::with_capacity(4096),
+            sessions_at: Vec::new(),
             tree_names: Vec::new(),
             written_before: HashMap::with_capacity(4096),
             written_now: HashMap::with_capacity(4096),
@@ -1139,6 +1161,7 @@ impl Scanner {
                 resolved[i] = true;
             }
         }
+        self.sessions_at.clone_from(&sessions);
         sessions
     }
 
@@ -1660,7 +1683,7 @@ fn terminate_confirmed(
 /// Everything that made `pid` an orphan, checked again on the live process.
 fn still_orphaned(pid: i32, start_us: u64) -> Result<Orphan, String> {
     if pid <= 1 || start_us == 0 || i32::try_from(std::process::id()).ok() == Some(pid) {
-        return Err("that process is not one GitPulse will terminate".into());
+        return Err("that process is not one Waylode will terminate".into());
     }
     let f = probe_one(pid).ok_or("the process is no longer running; nothing was signalled")?;
     if f.start_us != start_us {
@@ -1675,10 +1698,10 @@ fn still_orphaned(pid: i32, start_us: u64) -> Result<Orphan, String> {
         return Err("the process belongs to another user; nothing was signalled".into());
     }
     if f.ident.memguard {
-        return Err("GitPulse never terminates memguard".into());
+        return Err("Waylode never terminates memguard".into());
     }
     if f.ident.launch.is_some() {
-        return Err("the process belongs to a GitPulse launch; the supervisor owns it".into());
+        return Err("the process belongs to a Waylode launch; the supervisor owns it".into());
     }
     if f.ident.kind.is_some() {
         return Err("the process is an agent session; nothing was signalled".into());
@@ -1732,6 +1755,37 @@ pub(crate) struct AgentThrottleCandidate {
     /// uses them to tell a child that inherited background priority from a
     /// process it throttled apart from one someone else backgrounded.
     pub ancestor_pids: Vec<i32>,
+}
+
+/// One process of an agent session as the pressure relief sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReliefProc {
+    pub pid: i32,
+    pub ppid: i32,
+    pub start_us: u64,
+    pub name: String,
+    /// `None` when the OS refused the reading: unknown, never zero.
+    pub footprint: Option<u64>,
+    /// Spared by the shared exemption list ([`Scanner::throttle_exempt`]).
+    pub exempt: bool,
+}
+
+/// One agent session: its root and every other process of its tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReliefSession {
+    pub root: ReliefProc,
+    pub kind: AgentKind,
+    /// Started by GitPulse (the root or an ancestor carries a launch id).
+    pub launched: bool,
+    pub terminal_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub members: Vec<ReliefProc>,
+}
+
+/// The agent sessions of one scan, for [`Scanner::relief_table`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReliefTable {
+    pub sessions: Vec<ReliefSession>,
 }
 
 /// Most ancestor working directories one candidate carries.
@@ -1789,44 +1843,7 @@ impl Scanner {
             let Some(session_kind) = root.ident.kind else {
                 continue;
             };
-            // Never throttle GitPulse's own Manvi worker trees.
-            if session_kind == AgentKind::Manvi {
-                continue;
-            }
-            if f.pid <= 1 || f.start_us == 0 || f.pid == me_pid || f.uid != me_uid {
-                continue;
-            }
-            if f.ident.memguard {
-                continue;
-            }
-            // Never throttle the session root itself (interactive CLI TUI or IDE
-            // host): keeping the root at normal priority preserves Ctrl+C / hook
-            // responsiveness and prevents XNU fork() inheritance of PRIO_DARWIN_BG
-            // onto newly spawned long-lived child helpers.
-            if f.pid == root.pid {
-                continue;
-            }
-            // An IDE-hosted root is the whole editor: beside its agent server
-            // it parents the integrated-terminal shells and everything the
-            // person types there. Only the agent server's own descendants are
-            // the agent's work.
-            if root.ident.ide_hosted
-                && !is_ide_agent_server(root)
-                && !self.descends_from_agent_server(i, root_i)
-            {
-                continue;
-            }
-            let lower_name = f.ident.name.to_ascii_lowercase();
-            if matches!(
-                lower_name.as_str(),
-                "gitpulse"
-                    | "gitpulsed"
-                    | "gitpulse-mcp"
-                    | "gitpulse-hook"
-                    | "manvi"
-                    | "ptyd"
-                    | "devmap"
-            ) {
+            if self.throttle_exempt(i, root_i, me_pid, me_uid) {
                 continue;
             }
             let own_cwd = self
@@ -1850,6 +1867,115 @@ impl Scanner {
             });
         }
         Ok(out)
+    }
+
+    /// Whether process `i`, in the session rooted at `root_i`, is never slowed
+    /// or frozen. The one exemption list: the steward's slowdown
+    /// ([`Scanner::collect_throttle_candidates`]) and the pressure relief
+    /// (`sysload::relief`, rung A and rung B) all ask it.
+    ///
+    /// Exempt are: any Manvi worker tree; a process this scan cannot name, or
+    /// that is another user's, this process, or pid 1 or below; `memguard`; the
+    /// session root itself (keeping it at normal priority preserves Ctrl+C and
+    /// hook responsiveness, and keeps XNU's `fork()` from handing
+    /// `PRIO_DARWIN_BG` to newly spawned long-lived helpers, and a stopped root
+    /// would be a hung agent); an IDE host's own processes beside its agent
+    /// server (the editor parents the integrated-terminal shells and everything
+    /// the person types there); and GitPulse's, Manvi's, ptyd's and devmap's own
+    /// binaries.
+    fn throttle_exempt(&self, i: usize, root_i: usize, me_pid: i32, me_uid: u32) -> bool {
+        let f = &self.facts[i];
+        let root = &self.facts[root_i];
+        if root.ident.kind == Some(AgentKind::Manvi) {
+            return true;
+        }
+        if f.pid <= 1 || f.start_us == 0 || f.pid == me_pid || f.uid != me_uid {
+            return true;
+        }
+        if f.ident.memguard || f.pid == root.pid {
+            return true;
+        }
+        if root.ident.ide_hosted
+            && !is_ide_agent_server(root)
+            && !self.descends_from_agent_server(i, root_i)
+        {
+            return true;
+        }
+        matches!(
+            f.ident.name.to_ascii_lowercase().as_str(),
+            "waylode"
+                | "wayloded"
+                | "waylode-mcp"
+                | "waylode-hook"
+                | "waylode-ptyd"
+                | "gitpulse"
+                | "gitpulsed"
+                | "gitpulse-mcp"
+                | "gitpulse-hook"
+                | "manvi"
+                | "ptyd"
+                | "devmap"
+        )
+    }
+
+    /// The sessions of the last [`Scanner::scan`] as the pressure relief reads
+    /// them: each session's root and every other member of its tree, with its
+    /// footprint and whether [`Scanner::throttle_exempt`] spares it. It reads
+    /// the state that scan left (no second read of the process table, no
+    /// per-process syscall), so it is meaningful only straight after a scan.
+    /// A Manvi worker tree is left out whole.
+    pub(crate) fn relief_table(&self, me_pid: i32) -> ReliefTable {
+        let me_uid = self.source.me_uid();
+        let proc_of = |i: usize, exempt: bool| {
+            let f = &self.facts[i];
+            ReliefProc {
+                pid: f.pid,
+                ppid: f.ppid,
+                start_us: f.start_us,
+                name: f.ident.name.clone(),
+                footprint: f.footprint.value(),
+                exempt,
+            }
+        };
+        let mut sessions: Vec<ReliefSession> = Vec::new();
+        let mut at_of: HashMap<u32, usize> = HashMap::new();
+        for (n, &root_i) in self.sessions_at.iter().enumerate() {
+            let root = &self.facts[root_i];
+            let Some(kind) = root.ident.kind else {
+                continue;
+            };
+            if kind == AgentKind::Manvi || root.uid != me_uid {
+                continue;
+            }
+            at_of.insert(n as u32, sessions.len());
+            sessions.push(ReliefSession {
+                root: proc_of(root_i, true),
+                kind,
+                launched: self.tree_of.get(root_i).copied().flatten().is_some(),
+                terminal_session_id: root
+                    .ident
+                    .launch
+                    .as_ref()
+                    .and_then(|k| k.session_id.clone()),
+                run_id: root.ident.launch.as_ref().and_then(|k| k.run_id.clone()),
+                members: Vec::new(),
+            });
+        }
+        for i in 0..self.facts.len() {
+            let Some(n) = self.session_of.get(i).copied().flatten() else {
+                continue;
+            };
+            let (Some(&at), Some(&root_i)) = (at_of.get(&n), self.sessions_at.get(n as usize))
+            else {
+                continue;
+            };
+            if i == root_i {
+                continue;
+            }
+            let exempt = self.throttle_exempt(i, root_i, me_pid, me_uid);
+            sessions[at].members.push(proc_of(i, exempt));
+        }
+        ReliefTable { sessions }
     }
 
     /// Working directories of `i`'s ancestors, nearest first, through the
@@ -1985,7 +2111,7 @@ fn linux_may_slow(current: i32, rlimit_nice: u64, privileged: bool) -> Result<bo
         return Ok(true);
     }
     Err(format!(
-        "Linux would not let GitPulse put its priority back (its RLIMIT_NICE is {rlimit_nice}, nice {current} needs {needed}), so it was left at normal priority"
+        "Linux would not let Waylode put its priority back (its RLIMIT_NICE is {rlimit_nice}, nice {current} needs {needed}), so it was left at normal priority"
     ))
 }
 
@@ -2006,6 +2132,90 @@ static LINUX_SLOWED_FROM: std::sync::Mutex<std::collections::BTreeMap<(i32, u64)
 #[cfg(target_os = "linux")]
 const MAX_LINUX_SLOWED: usize = 4096;
 
+/// What a priority change checks about a process: who it is, not what it
+/// uses. [`probe_one`] also reads the footprint, the I/O counters and a
+/// 1 MiB-bounded argument block, per process, for a decision that touches
+/// thousands.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PriorityFacts {
+    pub start_us: u64,
+    pub uid: u32,
+    pub memguard: bool,
+}
+
+/// Whether `pid` (still the process that started at `start_us`) reads back as
+/// in the background; `None` when that cannot be read (gone, recycled, not
+/// ours, or a platform that cannot say).
+pub(crate) fn is_background(pid: i32, start_us: u64) -> Option<bool> {
+    if pid <= 1 {
+        return None;
+    }
+    let facts = os::priority_facts(pid)?;
+    if facts.start_us != start_us {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        darwin_task_priority(pid)
+            .ok()
+            .map(|pri| pri <= DARWIN_MAXPRI_THROTTLE)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `__errno_location` is thread-local; `getpriority` takes plain integers.
+        let nice = unsafe {
+            *libc::__errno_location() = 0;
+            let nice = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
+            if nice == -1 && *libc::__errno_location() != 0 {
+                return None;
+            }
+            nice
+        };
+        Some(nice >= LINUX_SLOW_NICE)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = facts;
+        None
+    }
+}
+
+/// The arguments `pid` was started with, `None` when the OS will not say.
+pub(crate) fn argv_of_pid(pid: i32) -> Option<Vec<String>> {
+    os::argv_sized(pid)
+}
+
+/// Whether `pid` (still the process that started at `start_us`) is stopped by
+/// a signal now (`SSTOP` on macOS, state `T` on Linux). `Err` carries "no
+/// longer running" or "recycled" for a process that ended or is another one
+/// now, and any other reason it could not be read: a caller that is about to
+/// signal a process must not take an unreadable state for a running one.
+pub(crate) fn is_stopped(pid: i32, start_us: u64) -> Result<bool, String> {
+    if pid <= 1 {
+        return Err("refused to read the state of a reserved process".into());
+    }
+    let (started, stopped) = os::state(pid)?;
+    if started != start_us {
+        return Err("pid was recycled by a newer process".into());
+    }
+    Ok(stopped)
+}
+
+/// Every process as `(pid, ppid, start_us)`, at most `limit` of them, for a
+/// caller that walks descendants once (a shutdown that looks for what
+/// inherited a background priority). Empty when the platform cannot list.
+pub(crate) fn process_table(limit: usize) -> Vec<(i32, i32, u64)> {
+    let mut pids = Vec::new();
+    if os::list_pids(&mut pids).is_err() {
+        return Vec::new();
+    }
+    pids.into_iter()
+        .filter(|&pid| pid > 1)
+        .take(limit)
+        .filter_map(|pid| os::pid_ppid_start(pid).map(|(ppid, start_us)| (pid, ppid, start_us)))
+        .collect()
+}
+
 /// Places (`enable = true`) or restores (`enable = false`) a live current-user
 /// process in OS background scheduler / I/O throttle after re-verifying both
 /// `pid` and `start_us` against the live process table.
@@ -2021,7 +2231,7 @@ pub(crate) fn set_background_throttle(
     if pid <= 1 || start_us == 0 || i32::try_from(std::process::id()).ok() == Some(pid) {
         return Err("refused to change priority of reserved or current process".into());
     }
-    let Some(facts) = probe_one(pid) else {
+    let Some(facts) = os::priority_facts(pid) else {
         return Err("process is no longer running".into());
     };
     if facts.start_us != start_us {
@@ -2035,8 +2245,8 @@ pub(crate) fn set_background_throttle(
     if facts.uid != me {
         return Err("process belongs to another user".into());
     }
-    if facts.ident.memguard {
-        return Err("GitPulse never modifies memguard scheduling".into());
+    if facts.memguard {
+        return Err("Waylode never modifies memguard scheduling".into());
     }
 
     #[cfg(target_os = "macos")]
@@ -2122,7 +2332,7 @@ pub(crate) fn set_background_throttle(
             }
             if slowed.len() >= MAX_LINUX_SLOWED && !slowed.contains_key(&(pid, start_us)) {
                 return Err(
-                    "GitPulse already holds as many slowed processes as it can put back".into(),
+                    "Waylode already holds as many slowed processes as it can put back".into(),
                 );
             }
             set_nice(LINUX_SLOW_NICE)?;
@@ -2810,6 +3020,14 @@ pub(crate) fn cwd_of(pid: i32) -> Option<PathBuf> {
     os::cwd(pid)
 }
 
+/// A process's environment as `NAME=value` strings, when the OS will say.
+/// macOS shows no environment for Apple platform binaries (`/bin/sh`,
+/// `/usr/bin/git`): that reads as an empty list, so an environment marker is
+/// found only on the programs that carry one (`cargo`, `rustc`, `node`...).
+pub(crate) fn environment_of(pid: i32) -> Option<Vec<String>> {
+    os::environment(pid)
+}
+
 /// One process as something about to signal it would see it: what `pkill`,
 /// `pgrep` and `killall` match against, and whether GitPulse would call it
 /// its own.
@@ -3145,6 +3363,70 @@ mod os {
         Ok(())
     }
 
+    /// The `NAME=value` strings of `pid`'s environment from
+    /// `KERN_PROCARGS2`, `None` when the kernel refuses it. An Apple platform
+    /// binary reads back with an empty environment, which this cannot tell
+    /// from one that has none.
+    pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
+        sized_procargs(pid).map(|(_, _, env)| env)
+    }
+
+    /// The arguments of `pid`, `None` when the kernel refuses them.
+    pub(crate) fn argv_sized(pid: i32) -> Option<Vec<String>> {
+        sized_procargs(pid).map(|(_, argv, _)| argv)
+    }
+
+    /// The path `pid` was exec'd with.
+    fn exec_sized(pid: i32) -> Option<String> {
+        sized_procargs(pid).map(|(exec, _, _)| exec)
+    }
+
+    /// [`full_procargs`] in a buffer sized to what the kernel reports for this
+    /// process (the size query is exact: 9 220 bytes for a 9 220-byte block)
+    /// rather than `KERN_ARGMAX` (1 MiB). A block that grew past the slack
+    /// between the two calls reads as `None`, never as a cut one.
+    fn sized_procargs(pid: i32) -> Option<(String, Vec<String>, Vec<String>)> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut need = 0usize;
+        // SAFETY: a null buffer asks only for the size, written to `need`.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut need,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || need < 4 {
+            return None;
+        }
+        let mut buf = vec![0u8; need.saturating_add(512).min(argmax())];
+        full_procargs(pid, &mut buf)
+    }
+
+    /// What `setpriority` needs to know of a process, without the footprint,
+    /// the I/O counters or an argument block.
+    pub(super) fn priority_facts(pid: i32) -> Option<super::PriorityFacts> {
+        let basic = basic(pid)?;
+        if basic.zombie {
+            return None;
+        }
+        let me = uid();
+        let memguard = basic.name == "memguard"
+            || (basic.uid == me
+                && exec_sized(pid)
+                    .as_deref()
+                    .and_then(|e| std::path::Path::new(e).file_name())
+                    .is_some_and(|n| n == "memguard"));
+        Some(super::PriorityFacts {
+            start_us: basic.start_us,
+            uid: basic.uid,
+            memguard,
+        })
+    }
+
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
         use std::ffi::CStr;
         use std::os::unix::ffi::OsStrExt;
@@ -3247,6 +3529,27 @@ mod os {
         }
         // SAFETY: fully initialised, established above.
         Ok(unsafe { info.assume_init() })
+    }
+
+    /// `(start_us, stopped)` of `pid`, from `PROC_PIDTBSDINFO`'s status. A
+    /// process that ended (or is a zombie) is "no longer running"; one the OS
+    /// will not describe (another user's) is an error, never "running".
+    pub(super) fn state(pid: i32) -> Result<(u64, bool), String> {
+        match bsdinfo(pid) {
+            Ok(info) if info.pbi_status == libc::SZOMB => {
+                Err("process is no longer running".into())
+            }
+            Ok(info) => Ok((
+                info.pbi_start_tvsec
+                    .saturating_mul(1_000_000)
+                    .saturating_add(info.pbi_start_tvusec),
+                info.pbi_status == libc::SSTOP,
+            )),
+            Err(Some(libc::ESRCH)) => Err("process is no longer running".into()),
+            Err(errno) => Err(format!(
+                "the state of process {pid} could not be read (errno {errno:?})"
+            )),
+        }
     }
 
     fn c_name(raw: &[libc::c_char]) -> String {
@@ -3868,6 +4171,18 @@ mod os {
         Ok(())
     }
 
+    /// The `NAME=value` strings of `pid`'s environment, `None` when it cannot
+    /// be read (gone, or not this user's).
+    pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
+        let raw = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20).ok()?;
+        Some(
+            raw.split(|byte| *byte == 0)
+                .filter(|item| !item.is_empty())
+                .map(|item| String::from_utf8_lossy(item).into_owned())
+                .collect(),
+        )
+    }
+
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
         let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
         // A deleted directory reads back as "/old/path (deleted)", which is still
@@ -3921,6 +4236,8 @@ mod os {
         cpu_ticks: u64,
         start_ticks: u64,
         zombie: bool,
+        /// Stopped by a signal (`T`) or by a tracer (`t`).
+        stopped: bool,
         /// `PF_KTHREAD` is set: a kernel thread, not a user process.
         kernel_thread: bool,
     }
@@ -3936,6 +4253,7 @@ mod os {
         Some(Stat {
             name,
             zombie: fields.first() == Some(&"Z"),
+            stopped: matches!(fields.first(), Some(&"T") | Some(&"t")),
             kernel_thread: field(6).is_some_and(|flags| flags & super::PF_KTHREAD != 0),
             ppid: field(1).and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
             cpu_ticks: field(11)?.saturating_add(field(12)?),
@@ -4143,6 +4461,18 @@ mod os {
         ))
     }
 
+    pub(crate) fn argv_sized(pid: i32) -> Option<Vec<String>> {
+        argv_of(pid, &mut Vec::new())
+    }
+
+    pub(super) fn priority_facts(pid: i32) -> Option<super::PriorityFacts> {
+        probe_one(pid).map(|f| super::PriorityFacts {
+            start_us: f.start_us,
+            uid: f.uid,
+            memguard: f.ident.memguard,
+        })
+    }
+
     pub(crate) fn argv_of(pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
         match read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20) {
             Ok(raw) => Some(super::split_cmdline(&raw)),
@@ -4165,6 +4495,24 @@ mod os {
         let boot = boot_us();
         let start_us = boot.saturating_add(st.start_ticks.saturating_mul(1_000_000) / ticks);
         Some((st.ppid, start_us))
+    }
+
+    /// `(start_us, stopped)` of `pid`; an error says whether it ended or its
+    /// state could not be read.
+    pub(super) fn state(pid: i32) -> Result<(u64, bool), String> {
+        let Some(st) = stat(pid) else {
+            return Err(if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                format!("the state of process {pid} could not be read")
+            } else {
+                "process is no longer running".into()
+            });
+        };
+        if st.zombie {
+            return Err("process is no longer running".into());
+        }
+        let start_us = boot_us()
+            .saturating_add(st.start_ticks.saturating_mul(1_000_000) / clock_ticks().max(1));
+        Ok((start_us, st.stopped))
     }
 
     pub(super) struct OsSource {
@@ -4543,6 +4891,45 @@ mod os {
         remote_of(pid, |remote| remote.argv())
     }
 
+    /// The arguments of `pid`, `None` when they cannot be read. The PEB read
+    /// sizes itself, so this is [`argv_of`] with no caller buffer.
+    pub(crate) fn argv_sized(pid: i32) -> Option<Vec<String>> {
+        argv_of(pid, &mut Vec::new())
+    }
+
+    /// The environment of `pid` as `NAME=value` strings, read from its PEB;
+    /// `None` when it cannot be read.
+    pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
+        remote_of(pid, |remote| remote.env())
+    }
+
+    /// What the priority checks need of `pid`: its start and whose it is.
+    /// Windows has no background throttle here (`set_background_throttle`
+    /// refuses it as unsupported, `is_background` answers `None`); this lets
+    /// that refusal say so instead of reading as a process that has gone.
+    /// `None` when the process is gone or cannot be looked at.
+    pub(super) fn priority_facts(pid: i32) -> Option<super::PriorityFacts> {
+        let Look::Live(live) = look(pid) else {
+            return None;
+        };
+        Some(super::PriorityFacts {
+            start_us: live.start_us,
+            // `set_background_throttle` reads `u32::MAX` as this user off Unix.
+            uid: if live.owner == Owner::Ours {
+                u32::MAX
+            } else {
+                UID_OTHER
+            },
+            memguard: false,
+        })
+    }
+
+    /// Whether `pid` is stopped by a signal: Windows has no such state, and
+    /// an unreadable state must never pass for a running one.
+    pub(super) fn state(_pid: i32) -> Result<(u64, bool), String> {
+        Err("process state is not readable on this platform".into())
+    }
+
     /// [`argv_of`], bounded for a repository hint: at most `MAX_HINT_ARGS`
     /// arguments, each read as empty when over `MAX_HINT_ARG_BYTES`.
     fn hint_argv_of(pid: i32) -> Option<Vec<String>> {
@@ -4903,7 +5290,19 @@ mod os {
         None
     }
 
+    pub(crate) fn environment(_pid: i32) -> Option<Vec<String>> {
+        None
+    }
+
     pub(crate) fn argv_of(_pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
+        None
+    }
+
+    pub(crate) fn argv_sized(_pid: i32) -> Option<Vec<String>> {
+        None
+    }
+
+    pub(super) fn priority_facts(_pid: i32) -> Option<super::PriorityFacts> {
         None
     }
 
@@ -4913,6 +5312,10 @@ mod os {
 
     pub(super) fn pid_ppid_start(_pid: i32) -> Option<(i32, u64)> {
         None
+    }
+
+    pub(super) fn state(_pid: i32) -> Result<(u64, bool), String> {
+        Err("process state is not readable on this platform".into())
     }
 
     pub(crate) fn read_use(_pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
@@ -5899,7 +6302,7 @@ pub(crate) mod tests {
         })
         .expect_err("pid 1");
         assert!(
-            refused.contains("not one GitPulse will terminate"),
+            refused.contains("not one Waylode will terminate"),
             "{refused}"
         );
         assert!(!asked.get());
@@ -7063,6 +7466,16 @@ pub(crate) mod tests {
         ])
         .unwrap();
         assert_eq!(key.tree().as_deref(), Some("run:run-7"));
+        let waylode_wins = LaunchKey::from_env([
+            "GITPULSE_RUN_ID=old-run",
+            "WAYLODE_RUN_ID=new-run",
+            "GITPULSE_SESSION_ID=old-term",
+            "WAYLODE_SESSION_ID=new-term",
+        ])
+        .unwrap();
+        assert_eq!(waylode_wins.tree().as_deref(), Some("run:new-run"));
+        let waylode_session = LaunchKey::from_env(["WAYLODE_SESSION_ID=wterm-1"]).unwrap();
+        assert_eq!(waylode_session.tree().as_deref(), Some("session:wterm-1"));
         let session = LaunchKey::from_env(["GITPULSE_SESSION_ID=term-1-2"]).unwrap();
         assert_eq!(session.tree().as_deref(), Some("session:term-1-2"));
         let long = format!("GITPULSE_RUN_ID={}", "x".repeat(MAX_ID_CHARS + 1));

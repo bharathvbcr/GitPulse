@@ -767,8 +767,8 @@ export function runReleaseStage(options, run = runCommand) {
         // `/releases/tags/{tag}` never returns drafts, even while tag_name is
         // still this tag. Resume those by tag_name. After uploads GitHub may
         // rewrite tag_name to untagged-<hex>; those are the ones we POST as
-        // `GitPulse ${tag}` and can only match by that name.
-        if (candidate.name !== `GitPulse ${tag}` && candidate.tag_name !== tag) continue;
+        // `Waylode ${tag}` (or legacy `GitPulse ${tag}`) and can match by name.
+        if (candidate.name !== `Waylode ${tag}` && candidate.name !== `GitPulse ${tag}` && candidate.tag_name !== tag) continue;
         matches.push(candidate);
       }
       if (listed.length < 100) {
@@ -791,7 +791,7 @@ export function runReleaseStage(options, run = runCommand) {
     if (!release) {
       // Do not automatically retry a POST whose outcome is unknown. A rerun
       // reads the existing draft before deciding whether creation is necessary.
-      release = record(api("releases", "POST", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}`, draft: true, prerelease, body: "Draft — platform builds and verification are pending." }));
+      release = record(api("releases", "POST", { tag_name: tag, target_commitish: commit, name: `Waylode ${tag}`, draft: true, prerelease, body: "Draft — platform builds and verification are pending." }));
     } else {
       // Identity first. `/releases/tags/{tag}` can still return a published
       // release; wiping its installers would delete the last successful set.
@@ -827,7 +827,7 @@ export function runReleaseStage(options, run = runCommand) {
         ![commit, tagIdentity.object, tagIdentity.peeled].some(pin => pin === commitish.toLowerCase() || pin.startsWith(commitish.toLowerCase()));
       const untagged = typeof release.tag_name === "string" && /^untagged-[0-9a-f]+$/i.test(release.tag_name);
       if (untagged || shaMismatch) {
-        release = record(api(`releases/${release.id}`, "PATCH", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}` }));
+        release = record(api(`releases/${release.id}`, "PATCH", { tag_name: tag, target_commitish: commit, name: `Waylode ${tag}` }));
       }
     }
   } else {

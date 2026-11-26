@@ -552,23 +552,30 @@ export function assertTrayPulseIconUpdated(trayRs: string): void {
   }
   const pulseScope = collectPulseIconScope(prodCode);
 
-  // Legacy 6-point polyline vertices must be removed from pulse_icon code.
+  // Legacy 6-point polyline and retired G-ring constants must be removed from pulse_icon code.
   for (const legacyPoint of [
     "(5i32 * SUPER as i32, 19i32 * SUPER as i32)",
     "(15 * SUPER as i32, 9 * SUPER as i32)",
     "(21 * SUPER as i32, 28 * SUPER as i32)",
+    "24.04",
+    "9.25",
+    "22.6",
+    "20.2",
+    "16.8",
+    "14.4",
+    "11.8",
   ]) {
     if (pulseCode.includes(legacyPoint)) {
-      throw new Error(`pulse_icon still contains legacy polyline point ${legacyPoint}`);
+      throw new Error(`pulse_icon still contains retired geometry ${legacyPoint}`);
     }
   }
 
-  // Non-vacuous G-ring + heartbeat + node rasterization signal in pulse_icon (and its helpers/consts).
-  const gRingCodeRe =
-    /(?:\.|::)(?:cos|sin|sin_cos|atan2|sqrt|hypot|to_radians)\s*\(|\b(?:atan2|sin_cos|to_radians|TAU|PI|FRAC_PI_2|r_inner|inner_r|r_outer|outer_r)\b|\b(?:24\.04|9\.25|10\.5|26\.5|22\.6|20\.2|16\.8|14\.4|11\.8)\b|(?:^|[^a-zA-Z0-9])(?:arc|draw_arc)(?:[^a-zA-Z0-9]|$)/;
-  const gRingIdentifierRe =
-    /(?:^|[^a-zA-Z0-9])(?:g[-_ ]?ring|ring_arc|commit_node|heartbeat|crossbar)(?:[^a-zA-Z0-9]|$)/i;
-  if (!gRingCodeRe.test(pulseScope) && !gRingIdentifierRe.test(pulseScope)) {
-    throw new Error("tray.rs pulse_icon lacks G-ring + heartbeat code after comment stripping");
+  // Non-vacuous Concept 2 Way-Arc + lodestar node rasterization signal in pulse_icon.
+  const wayArcCodeRe =
+    /(?:\.|::)(?:cos|sin|sin_cos|atan2|sqrt|hypot|to_radians)\s*\(|\b(?:atan2|sin_cos|to_radians|TAU|PI|FRAC_PI_2)\b|\b(?:23\.8|9\.0|10\.5|26\.5|21\.0|16\.2|11\.6|11\.4|18\.8)\b/;
+  const wayArcIdentifierRe =
+    /(?:^|[^a-zA-Z0-9])(?:way[-_ ]?arc|way_crest|lodestar|ring_arc)(?:[^a-zA-Z0-9]|$)/i;
+  if (!wayArcCodeRe.test(pulseScope) && !wayArcIdentifierRe.test(pulseScope)) {
+    throw new Error("tray.rs pulse_icon lacks Concept 2 Way-Arc + lodestar code after comment stripping");
   }
 }

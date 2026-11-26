@@ -105,7 +105,7 @@ function libTestBinary() {
   for (const line of build.stdout.split("\n")) {
     if (!line.startsWith("{")) continue;
     const message = JSON.parse(line);
-    if (message.reason === "compiler-artifact" && message.profile?.test && message.target?.name === "gitpulse_lib" && message.executable) {
+    if (message.reason === "compiler-artifact" && message.profile?.test && message.target?.name === "waylode_lib" && message.executable) {
       return message.executable;
     }
   }

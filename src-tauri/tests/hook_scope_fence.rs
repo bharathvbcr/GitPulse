@@ -58,12 +58,12 @@ mod hermetic_env;
 #[path = "../src/test_support/plant_task.rs"]
 mod plant_task;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use waylode_lib::procguard::LockedSpawn;
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -93,7 +93,7 @@ fn ask(
         .arg(subcommand)
         .env("HOME", home)
         .env("GITPULSE_MANVI_BIN", manvi)
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs)
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -143,10 +143,10 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
     // same call in `hook_protocol_stress`, since this test is ignored without a
     // manvi binary). The trust read does not: it reads the filesystem. The hook
     // processes this test drives have gates of their own.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
-    let preview = gitpulse_lib::repository_trust::inspect(repo).expect("inspect");
-    gitpulse_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
-    let db = gitpulse_lib::tasks::store_path(repo);
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    let preview = waylode_lib::repository_trust::inspect(repo).expect("inspect");
+    waylode_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
+    let db = waylode_lib::tasks::store_path(repo);
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     plant_task::plant(
         &dc_store::Store::open(&db).expect("task store"),
@@ -154,7 +154,7 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
         "in_progress",
         r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}]}"#,
     );
-    gitpulse_lib::ledger::bindings::bind(repo, repo, "TASK-FENCE").expect("bind");
+    waylode_lib::ledger::bindings::bind(repo, repo, "TASK-FENCE").expect("bind");
 
     let bash = |command: &str| {
         serde_json::json!({
@@ -298,15 +298,15 @@ fn sibling_worktree_and_outside_reads_are_judged_end_to_end() {
     let main_repo = main_dir.to_str().expect("utf8 main");
     let wt_b_repo = wt_b_dir.to_str().expect("utf8 wt_b");
 
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
-    let main_preview = gitpulse_lib::repository_trust::inspect(main_repo).expect("inspect main");
-    gitpulse_lib::repository_trust::grant(main_repo, &main_preview.identity, true)
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    let main_preview = waylode_lib::repository_trust::inspect(main_repo).expect("inspect main");
+    waylode_lib::repository_trust::grant(main_repo, &main_preview.identity, true)
         .expect("trust main");
-    let wt_b_preview = gitpulse_lib::repository_trust::inspect(wt_b_repo).expect("inspect wt_b");
-    gitpulse_lib::repository_trust::grant(wt_b_repo, &wt_b_preview.identity, true)
+    let wt_b_preview = waylode_lib::repository_trust::inspect(wt_b_repo).expect("inspect wt_b");
+    waylode_lib::repository_trust::grant(wt_b_repo, &wt_b_preview.identity, true)
         .expect("trust wt_b");
 
-    let db = gitpulse_lib::tasks::store_path(main_repo);
+    let db = waylode_lib::tasks::store_path(main_repo);
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     let store = dc_store::Store::open(&db).expect("task store");
     plant_task::plant(
@@ -321,8 +321,8 @@ fn sibling_worktree_and_outside_reads_are_judged_end_to_end() {
         "in_progress",
         r#"{"planned_files":[{"path":"src/sibling.rs","allowed_change":"modify"}],"allowed_commands":["git *"]}"#,
     );
-    gitpulse_lib::ledger::bindings::bind(main_repo, main_repo, "TASK-MAIN").expect("bind main");
-    gitpulse_lib::ledger::bindings::bind(main_repo, wt_b_repo, "TASK-WTB").expect("bind wt_b");
+    waylode_lib::ledger::bindings::bind(main_repo, main_repo, "TASK-MAIN").expect("bind main");
+    waylode_lib::ledger::bindings::bind(main_repo, wt_b_repo, "TASK-WTB").expect("bind wt_b");
 
     let bash = |command: &str| {
         serde_json::json!({

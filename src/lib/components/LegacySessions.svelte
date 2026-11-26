@@ -88,10 +88,10 @@
 </script>
 
 {#if view.rows.length > 0 || view.problems.length > 0}
-  <div class="legacy" data-testid="legacy-sessions" role="group" aria-label="Sessions in the previous GitPulse version's terminal host">
+  <div class="legacy" data-testid="legacy-sessions" role="group" aria-label="Sessions in the previous Waylode version's terminal host">
     <div class="legacy-head" data-testid="legacy-sessions-head">
       <Archive size={14} aria-hidden="true" />
-      <span class="font-medium">Running in the previous GitPulse version's terminal host</span>
+      <span class="font-medium">Running in the previous Waylode version's terminal host</span>
       {#if loading}<span class="text-textMuted">Updating…</span>{/if}
     </div>
     {#each view.problems as problem (problem)}

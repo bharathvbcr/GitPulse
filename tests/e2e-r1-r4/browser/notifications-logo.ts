@@ -8,7 +8,7 @@ import NativeNotificationBridgeView from "../../../src/lib/components/NativeNoti
 import SessionNotificationBridge from "../../../src/lib/components/SessionNotificationBridge.svelte";
 import AttentionInbox from "../../../src/lib/components/AttentionInbox.svelte";
 
-const LOGO_TRUNK_FRAGMENT = "M24.04 9.25A10.5";
+const LOGO_TRUNK_FRAGMENT = "M23.8 9.0A10.5";
 
 const params = new URLSearchParams(location.search);
 const scenario = params.get("scenario") ?? "all";
@@ -164,7 +164,7 @@ function inspectLogoIn(container: Element | null) {
   const svgs = [...container.querySelectorAll("svg")];
   const logoSvgs = svgs.filter((svg) => {
     const html = svg.outerHTML;
-    return html.includes(LOGO_TRUNK_FRAGMENT) || svg.getAttribute("aria-label") === "GitPulse";
+    return html.includes(LOGO_TRUNK_FRAGMENT) || svg.getAttribute("aria-label") === "Waylode";
   });
   const rects = logoSvgs.map((svg) => {
     const r = svg.getBoundingClientRect();

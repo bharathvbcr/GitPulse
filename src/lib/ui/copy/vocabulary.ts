@@ -39,10 +39,10 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     note: 'Written "Manvi policy" in sentences.',
   },
   {
-    concept: "GitPulse's own gate",
+    concept: "Waylode's own gate",
     say: "checks",
     never: ["harness", "sidecar", "posture"],
-    note: 'Written "GitPulse\'s checks". The technical term stays in code.',
+    note: 'Written "Waylode\'s checks". The technical term stays in code.',
   },
   {
     concept: "One execution of a task",
@@ -238,7 +238,7 @@ export const BANNED_UI_TERMS: readonly BannedTerm[] = [
   {
     term: "harness",
     pattern: /(?<![\w./-])harness(?:es)?(?![\w/-]|\.\w)/i,
-    use: "checks (as in GitPulse's checks)",
+    use: "checks (as in Waylode's checks)",
     note: 'Banned only as a UI noun. The lint cannot read grammar: it skips path-shaped uses ("harness/foo.html", "/harness", "test-harness") but cannot tell a noun from a verb ("to harness the power") or a code-formatted name. Expect to review hits by hand.',
   },
   {

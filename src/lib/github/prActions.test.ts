@@ -65,7 +65,7 @@ describe("describePrAction", () => {
       { headBranch: "feat/search" },
     );
     expect(create.message).toContain("Open a draft pull request from feat/search into main?");
-    expect(create.message).toContain("GitPulse does not push");
+    expect(create.message).toContain("Waylode does not push");
     const review = describePrAction(
       { kind: "review", number: 7, verdict: "request_changes", body: "Please add tests" },
       "acme/gitpulse",

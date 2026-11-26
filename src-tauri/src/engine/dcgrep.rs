@@ -27,6 +27,7 @@ use crate::storage::repo_tuning::index_file::{
 use crate::tool_capability::BinaryProbeCache;
 use crate::tool_install::release::app_bin_dir_path;
 
+const WAYLODE_DCGREP_ENV: &str = "WAYLODE_DCGREP_BIN";
 const GITPULSE_DCGREP_ENV: &str = "GITPULSE_DCGREP_BIN";
 const MANVI_GREP_ENV: &str = "MANVI_GREP_BINARY";
 const DCGREP_BIN_NAME: &str = if cfg!(windows) {
@@ -276,11 +277,16 @@ fn locate_binary_with_policy(
         };
     }
 
-    if let Some(explicit) = env_var_nonempty(GITPULSE_DCGREP_ENV) {
+    if let Some(explicit) = crate::env_compat::var_compat(WAYLODE_DCGREP_ENV, GITPULSE_DCGREP_ENV) {
         let path = PathBuf::from(&explicit);
+        let active_env = if std::env::var_os(WAYLODE_DCGREP_ENV).is_some_and(|v| !v.is_empty()) {
+            WAYLODE_DCGREP_ENV
+        } else {
+            GITPULSE_DCGREP_ENV
+        };
         if fail_on_invalid_gitpulse_env && !is_executable_file(&path) {
             return Err(format!(
-                "{GITPULSE_DCGREP_ENV} points to a missing or non-executable binary: {}",
+                "{active_env} points to a missing or non-executable binary: {}",
                 path.display()
             )
             .into());
@@ -521,8 +527,14 @@ fn resolve_usable_binary_inner(
         HealthProbeOutcome::Cancelled => Ok(UsableBinary::Cancelled),
         HealthProbeOutcome::Unsupported => {
             if explicit_gitpulse_env {
+                let active_env =
+                    if std::env::var_os(WAYLODE_DCGREP_ENV).is_some_and(|v| !v.is_empty()) {
+                        WAYLODE_DCGREP_ENV
+                    } else {
+                        GITPULSE_DCGREP_ENV
+                    };
                 Err(format!(
-                    "{GITPULSE_DCGREP_ENV} points to an unusable or incompatible dcgrep binary: {bin}"
+                    "{active_env} points to an unusable or incompatible dcgrep binary: {bin}"
                 )
                 .into())
             } else {
@@ -1380,7 +1392,9 @@ mod tests {
         let missing = dir.path().join("no-such-dcgrep");
         let root_str = dir.path().to_string_lossy().into_owned();
         let serial = env_serial();
-        let _env = bind_env(&serial).set(GITPULSE_DCGREP_ENV, missing.as_os_str());
+        let _env = bind_env(&serial)
+            .remove(WAYLODE_DCGREP_ENV)
+            .set(GITPULSE_DCGREP_ENV, missing.as_os_str());
         invalidate_cache();
 
         assert_eq!(
@@ -1669,7 +1683,9 @@ mod tests {
         }
         let serial = env_serial();
         let _inv = InvalidateOnDrop;
-        let _env = bind_env(&serial).set(GITPULSE_DCGREP_ENV, bad_exe.as_os_str());
+        let _env = bind_env(&serial)
+            .remove(WAYLODE_DCGREP_ENV)
+            .set(GITPULSE_DCGREP_ENV, bad_exe.as_os_str());
         crate::tool_capability::invalidate_all();
 
         // Inventory locator shares GITPULSE_DCGREP_BIN precedence.
@@ -1894,6 +1910,7 @@ mod tests {
         // 1. Lowest tier: PATH (with HOME redirected so host app_bin_dir doesn't shadow PATH).
         {
             let _env = bind_env(&_serial)
+                .remove(WAYLODE_DCGREP_ENV)
                 .remove(GITPULSE_DCGREP_ENV)
                 .remove(MANVI_GREP_ENV)
                 .set("HOME", temp_home.path().as_os_str())
@@ -1923,6 +1940,7 @@ mod tests {
         // 3. MANVI_GREP_BINARY (bare name on PATH & explicit path) beats app_bin_dir and PATH.
         {
             let _env = bind_env(&_serial)
+                .remove(WAYLODE_DCGREP_ENV)
                 .remove(GITPULSE_DCGREP_ENV)
                 .set(MANVI_GREP_ENV, "my-custom-dcgrep")
                 .set("PATH", &joined_path)

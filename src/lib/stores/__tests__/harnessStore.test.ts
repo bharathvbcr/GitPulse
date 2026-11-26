@@ -389,8 +389,8 @@ describe("harness error retention", () => {
     await store.refresh();
 
     expect(get(store).harness?.available).toBe(false);
-    expect(get(store).harness?.error).toBe("Something went wrong inside GitPulse. Details are in Diagnostics.");
-    expect(get(store).error).toBe("Something went wrong inside GitPulse. Details are in Diagnostics.");
+    expect(get(store).harness?.error).toBe("Something went wrong inside Waylode. Details are in Diagnostics.");
+    expect(get(store).error).toBe("Something went wrong inside Waylode. Details are in Diagnostics.");
     expect(JSON.stringify(get(store))).not.toContain("reading 'invoke'");
   });
 });

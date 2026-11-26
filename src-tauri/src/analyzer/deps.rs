@@ -724,7 +724,7 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             &mut issues,
             "info",
             "cargo_crev_unconfigured",
-            "cargo-crev is installed but has no local identity, so reviews were not checked. GitPulse does not create one.".into(),
+            "cargo-crev is installed but has no local identity, so reviews were not checked. Waylode does not create one.".into(),
             None,
         );
     }

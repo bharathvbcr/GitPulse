@@ -95,7 +95,7 @@ pub(crate) fn validate_user_path(
         std::fs::symlink_metadata(given).map_err(|e| format!("{path} cannot be read: {e}"))?;
     if meta.file_type().is_symlink() {
         return Err(format!(
-            "{path} is a symlink; GitPulse does not follow symlinks"
+            "{path} is a symlink; Waylode does not follow symlinks"
         ));
     }
     if !meta.is_dir() {
@@ -177,7 +177,7 @@ struct Spend {
 fn size_of(root: &Path, spend: &mut Spend, cancel: &AtomicBool) -> Result<Reading, String> {
     let meta = std::fs::symlink_metadata(root).map_err(|e| format!("could not be read: {e}"))?;
     if meta.file_type().is_symlink() {
-        return Err("is a symlink; GitPulse does not follow symlinks".into());
+        return Err("is a symlink; Waylode does not follow symlinks".into());
     }
     if !meta.is_dir() {
         return Err("is not a directory".into());

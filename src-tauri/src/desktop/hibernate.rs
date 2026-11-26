@@ -640,7 +640,7 @@ pub fn build_main_window_with_visibility<R: Runtime>(
         WebviewWindowBuilder::from_config(app, &cfg)
     } else {
         let builder = WebviewWindowBuilder::new(app, "main", url)
-            .title("GitPulse")
+            .title("Waylode")
             .visible(false)
             .inner_size(1280.0, 850.0)
             .min_inner_size(f64::from(MIN_WINDOW_WIDTH), f64::from(MIN_WINDOW_HEIGHT))

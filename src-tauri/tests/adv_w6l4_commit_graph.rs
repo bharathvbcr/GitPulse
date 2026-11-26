@@ -5,10 +5,10 @@
 
 mod common;
 use common::{run_git, trust_repo};
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::storage::commit_graph::{inspect, CommitGraphState};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::storage::commit_graph::{inspect, CommitGraphState};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 

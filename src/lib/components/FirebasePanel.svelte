@@ -1027,7 +1027,7 @@
                 and moves production traffic on
                 <span class="font-mono">{selectedBackend}</span> in
                 <span class="font-mono">{selectedProjectId}</span> to it. App Hosting has no
-                rollback command, so GitPulse cannot undo this — reverting means deploying an
+                rollback command, so Waylode cannot undo this — reverting means deploying an
                 earlier commit. The commit must exist in the backend's connected GitHub
                 repository, which is not necessarily this checkout.
               </div>

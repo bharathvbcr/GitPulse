@@ -40,6 +40,7 @@ import { fileManagerName, osDisplayName, systemSettingsName } from "../platformC
  * entry's own spelling is the canonical output.
  */
 export const PROPER_NOUNS: readonly string[] = [
+  "Waylode",
   "GitPulse",
   "GitHub",
   "Manvi",

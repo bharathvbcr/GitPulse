@@ -10,9 +10,9 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gitpulse_lib::engine::git_reader::GitReader;
-use gitpulse_lib::engine::gix_status::porcelain_v1_z_for_test;
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::engine::git_reader::GitReader;
+use waylode_lib::engine::gix_status::porcelain_v1_z_for_test;
+use waylode_lib::procguard::LockedSpawn;
 
 /// One status row: `(path, old_path, index_letter, worktree_letter)`.
 type Row = (String, Option<String>, char, char);

@@ -1,7 +1,7 @@
 # Mavi: agent conversations
 
-Mavi is GitPulse's chat-first surface for coding agents. Every other agent
-GitPulse hosts is a terminal; Mavi runs Claude Code in its structured mode and
+Mavi is Waylode's chat-first surface for coding agents. Every other agent
+Waylode hosts is a terminal; Mavi runs Claude Code in its structured mode and
 renders what the agent does as a timeline, with permission requests answered in
 place and a live view of what each turn changed. It runs on this computer or on
 another machine over SSH.
@@ -48,7 +48,7 @@ Open **Mavi** in the header (⌥⌘4 on macOS, Ctrl+Shift+4 elsewhere).
   conversation id that still resumes it in a terminal.
 - **Changes** (right column): what the selected turn, or the whole thread,
   changed, file by file. See below.
-- **Resume**: quitting GitPulse ends every agent. A thread keeps the
+- **Resume**: quitting Waylode ends every agent. A thread keeps the
   conversation id, and **Resume** continues the conversation with
   `--resume`, and shows the earlier turns read from Claude Code's transcript (see
   below).
@@ -88,7 +88,7 @@ this repository, badges the files it touched ("Agent editing"), lists those
 first while it works, and warns before **Discard** on a file an agent is
 editing right now.
 
-## Mavi and the rest of GitPulse
+## Mavi and the rest of Waylode
 
 Mavi starts with the app (after the first paint), so these work before the
 Mavi view is ever opened.
@@ -96,7 +96,7 @@ Mavi view is ever opened.
 | Where | What it does |
 | --- | --- |
 | Header | The Mavi view tab carries an amber count of threads waiting for your answer, or a red dot for one that failed and that you have not looked at. |
-| Toasts | A thread that starts waiting for an answer, or fails, says so with **Open**, unless it is on screen in a focused window. Only changes seen while GitPulse runs are announced (a reload is quiet), a finished turn is not announced, and the same request is not repeated within a minute. |
+| Toasts | A thread that starts waiting for an answer, or fails, says so with **Open**, unless it is on screen in a focused window. Only changes seen while Waylode runs are announced (a reload is quiet), a finished turn is not announced, and the same request is not repeated within a minute. |
 | Command palette | **New Mavi thread**, **Ask about the open file in Mavi** (starts a thread with `@path`), and **Open Mavi thread: …** for up to 12 threads, most urgent first. |
 | Settings → Agents | A new thread starts with Claude Code's default permission mode and model from Settings. Bypass still needs its acknowledgement in the form. |
 | Worktrees | **Run in a new worktree** creates a sibling `<repo>.wt-<slug>` on a `mavi/<slug>` branch, the same way the dock's isolated-agent preset does. It is ticked for you when this repository already has a live thread, which the host would refuse. The form warns when an agent terminal already works in the checkout, since its edits would show as Other changes. |
@@ -137,7 +137,7 @@ Running idle, In a terminal tab, Not running), what it asks of you, and how
 many files the agent edited, with **Open** and, while it runs, **End**.
 
 They are rows of their own rather than plane rows: the plane's projection is
-built from processes GitPulse hosts in a terminal and from worktrees, and a
+built from processes Waylode hosts in a terminal and from worktrees, and a
 thread is neither. With Mavi threads present the window still says when the
 plane is still reading or could not read, but no longer says "No agent work".
 
@@ -154,7 +154,7 @@ record per turn (duration, cost, the turn-end summary) is not invented: those
 turns read "Earlier turn".
 
 - Read from `<config>/projects/<encoded cwd>/<id>.jsonl`, found by the same
-  locator GitPulse uses for terminal resumes, across every Claude Code config
+  locator Waylode uses for terminal resumes, across every Claude Code config
   directory it knows.
 - Bounded: the last 16 MiB of the file and the last 4,000 timeline lines; a
   cut is announced.

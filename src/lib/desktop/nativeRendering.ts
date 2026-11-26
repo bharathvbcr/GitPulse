@@ -158,7 +158,7 @@ export async function applyNativeRendering(
 ): Promise<NativeRenderingStatus> {
   let status: NativeRenderingStatus;
   try {
-    status = parseNativeRendering(await deps.apply(request)) ?? failureStatus(request, "The window sent back an answer GitPulse couldn't read.");
+    status = parseNativeRendering(await deps.apply(request)) ?? failureStatus(request, "The window sent back an answer Waylode couldn't read.");
   } catch (error) {
     status = failureStatus(request, error);
   }

@@ -23,6 +23,7 @@ import {
   valueOf,
   type StatusChip,
 } from "./hostLoad";
+import { NO_RELIEF_CHIP, type ReliefChipInput } from "./hostRelief";
 
 export type MetricSeverity = "normal" | "warn" | "critical";
 export type MetricKind = "cpu" | "gpu" | "memory" | "thermal" | "storage";
@@ -221,18 +222,22 @@ function storageSeverity(pulse: HostLoadPulse, free: number | null | undefined, 
 export function bottomBarMetrics(
   pulse: HostLoadPulse | null,
   detail: BottomBarDetail = "full",
+  relief: ReliefChipInput = NO_RELIEF_CHIP,
 ): BottomBarMetricsModel {
   if (!pulse) {
+    // No host-load reading yet, but a paused build (or a status that could not
+    // be read) is still what the bar must say.
+    const reliefChip = statusChip(null, relief);
     return {
-      visible: false,
-      alertChip: null,
+      visible: reliefChip !== null,
+      alertChip: reliefChip,
       items: [],
-      severity: "normal",
-      summaryLabel: "Host metrics unavailable",
+      severity: reliefChip === null ? "normal" : reliefChip.tone === "danger" ? "critical" : "warn",
+      summaryLabel: reliefChip ? reliefChip.text : "Host metrics unavailable",
     };
   }
 
-  const alertChip = statusChip(pulse);
+  const alertChip = statusChip(pulse, relief);
   const alertSeverity: MetricSeverity =
     alertChip === null ? "normal" : alertChip.tone === "danger" ? "critical" : "warn";
 

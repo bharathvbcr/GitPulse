@@ -57,7 +57,8 @@ const LOG_TRUNCATION_MARKER: &str = " … log entry truncated … ";
 ///
 /// Also the only way a binary outside [`LOGGED_BINARIES`] gets a file at all,
 /// which is what keeps a test run from writing into the real log directory.
-pub const LOG_DIR_ENV: &str = "GITPULSE_LOG_DIR";
+pub const LOG_DIR_ENV: &str = "WAYLODE_LOG_DIR";
+pub const LEGACY_LOG_DIR_ENV: &str = "GITPULSE_LOG_DIR";
 
 /// Size at which the live log rotates to `<stem>.log.1`. Two generations are
 /// kept, so the durable record is bounded at twice this on disk.
@@ -73,11 +74,11 @@ const GENERATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs
 /// test` binary would drop a log into the user's real log directory. Unknown
 /// stems fail closed and get no file; [`LOG_DIR_ENV`] opts anything in.
 const LOGGED_BINARIES: [&str; 5] = [
-    "gitpulse",
-    "gitpulsed",
-    "gitpulse-mcp",
-    "gitpulse-hook",
-    "gitpulse-ptyd",
+    "waylode",
+    "wayloded",
+    "waylode-mcp",
+    "waylode-hook",
+    "waylode-ptyd",
 ];
 
 /// Lines of panic backtrace kept.
@@ -736,7 +737,7 @@ fn parent_of(path: &Path) -> &Path {
 fn stem_of(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "gitpulse".to_string())
+        .unwrap_or_else(|| "waylode".to_string())
 }
 
 /// Delimits one process's lines from the ones already in the file.
@@ -764,13 +765,13 @@ fn default_log_dir() -> Option<PathBuf> {
             PathBuf::from(home)
                 .join("Library")
                 .join("Logs")
-                .join("GitPulse")
+                .join("Waylode")
         })
     }
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("LOCALAPPDATA")
-            .map(|base| PathBuf::from(base).join("GitPulse").join("logs"))
+            .map(|base| PathBuf::from(base).join("Waylode").join("logs"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -779,7 +780,7 @@ fn default_log_dir() -> Option<PathBuf> {
             .or_else(|| {
                 std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
             })
-            .map(|base| base.join("gitpulse"))
+            .map(|base| base.join("waylode"))
     }
 }
 
@@ -789,7 +790,7 @@ fn default_log_dir() -> Option<PathBuf> {
 /// mutating process-global environment state from a parallel test run.
 fn sink_target(stem: Option<&str>, explicit: Option<&Path>) -> Option<(PathBuf, String)> {
     match explicit {
-        Some(dir) => Some((dir.to_path_buf(), stem.unwrap_or("gitpulse").to_string())),
+        Some(dir) => Some((dir.to_path_buf(), stem.unwrap_or("waylode").to_string())),
         None => {
             let stem = stem.filter(|s| LOGGED_BINARIES.contains(s))?;
             Some((default_log_dir()?, stem.to_string()))
@@ -798,8 +799,8 @@ fn sink_target(stem: Option<&str>, explicit: Option<&Path>) -> Option<(PathBuf, 
 }
 
 fn durable_sink() -> Option<FileSink> {
-    let explicit = std::env::var_os(LOG_DIR_ENV).filter(|dir| !dir.is_empty());
-    let (dir, stem) = sink_target(exe_stem().as_deref(), explicit.as_ref().map(Path::new))?;
+    let explicit = crate::env_compat::var_os_compat(LOG_DIR_ENV, LEGACY_LOG_DIR_ENV);
+    let (dir, stem) = sink_target(exe_stem().as_deref(), explicit.as_deref().map(Path::new))?;
     if MARK_ON_FIRST_LINE.load(Ordering::Acquire) {
         Some(FileSink::open_marked_on_first_line(&dir, &stem))
     } else {
@@ -877,7 +878,7 @@ impl RingLogger {
         let output = self.stderr.get_or_init(|| {
             crate::output::BoundedOutput::new(
                 std::io::stderr(),
-                "gitpulse-stderr",
+                "waylode-stderr",
                 MAX_LOG_ENTRY_BYTES + 1,
                 std::time::Duration::from_millis(100),
             )
@@ -947,13 +948,13 @@ fn admits_origin(record: &Record) -> bool {
     record.level() <= Level::Info || record.module_path().is_none_or(is_first_party_module)
 }
 
-/// Every crate this repository builds is named `gitpulse*`: the library, the
-/// app, and the `gitpulsed`, `gitpulse-mcp` and `gitpulse-hook` binaries.
+/// Every crate this repository builds is named `waylode*` or `gitpulse*`:
+/// the library, the app, and the daemon/MCP/hook/ptyd binaries.
 fn is_first_party_module(module_path: &str) -> bool {
     module_path
         .split("::")
         .next()
-        .is_some_and(|root| root.starts_with("gitpulse"))
+        .is_some_and(|root| root.starts_with("waylode") || root.starts_with("gitpulse"))
 }
 
 fn configured_level() -> LevelFilter {
@@ -1402,7 +1403,7 @@ mod tests {
         };
         log(Level::Debug, Some("ignore::walk"), "whitelisting");
         log(Level::Trace, Some("globset"), "glob");
-        log(Level::Debug, Some("gitpulse_lib::hooks"), "ours");
+        log(Level::Debug, Some("waylode_lib::hooks"), "ours");
         log(Level::Debug, Some("gitpulse_hook"), "hook binary");
         log(Level::Debug, None, "hand built");
         log(Level::Info, Some("ignore::walk"), "info");
@@ -2292,7 +2293,7 @@ mod tests {
     fn only_shipped_binaries_get_a_log_directory_of_their_own() {
         // A test binary must never leave a file in the user's log directory,
         // which is exactly what naming the file after current_exe() invites.
-        assert_eq!(sink_target(Some("gitpulse_lib-2a0bc691"), None), None);
+        assert_eq!(sink_target(Some("waylode_lib-2a0bc691"), None), None);
         assert_eq!(sink_target(None, None), None);
         for shipped in LOGGED_BINARIES {
             let (dir, stem) = sink_target(Some(shipped), None)
@@ -2471,5 +2472,19 @@ mod tests {
         assert!(count("skipped=") >= 1, "{exported}");
         assert!(count("read_after_events=") >= 2, "{exported}");
         assert!(count("unavailable_not_recursive=") >= 1, "{exported}");
+    }
+
+    #[test]
+    fn waylode_log_dir_and_first_party_module_roots() {
+        let log_dir = default_log_dir().expect("default_log_dir resolves");
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert!(log_dir.to_string_lossy().contains("Waylode"), "{log_dir:?}");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert!(log_dir.ends_with("waylode"), "{log_dir:?}");
+
+        assert!(is_first_party_module("waylode_hook::cli"));
+        assert!(is_first_party_module("wayloded::catchup"));
+        assert!(is_first_party_module("waylode_lib::hooks"));
+        assert!(!is_first_party_module("globset::something"));
     }
 }

@@ -300,7 +300,7 @@
               </div>
               <p class="text-micro text-textMuted">
                 Current Manvi CLI has no grant-revocation command. A grant stops applying after it is consumed or expires.
-                GitPulse only reads the ledger at <code class="font-mono break-all">{grants.path}</code>.
+                Waylode only reads the ledger at <code class="font-mono break-all">{grants.path}</code>.
               </p>
             {/if}
           {/if}
@@ -357,7 +357,7 @@
               If this checkout is a repository whose activity history was recorded elsewhere (moved
               across devices, restored from a backup, or copied with the original gone), adopt that
               history to keep recording into it. You will be asked to confirm in a system dialog, and
-              GitPulse says why if the history cannot be adopted.
+              Waylode says why if the history cannot be adopted.
             </p>
             <div>
               <button

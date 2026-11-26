@@ -27,7 +27,7 @@ const report = (cases: [string, string][]) =>
     .map(([binary, name]) => `<testsuite name="${binary}"><testcase name="${name}" classname="${binary}" time="0.1"/></testsuite>`)
     .join("")}</testsuites>`;
 
-const SUITES = { gitpulse_lib: { "a::one": {}, "a::two": {}, "b::three": {} }, native: { native: {} } };
+const SUITES = { waylode_lib: { "a::one": {}, "a::two": {}, "b::three": {} }, native: { native: {} } };
 
 describe("expectedTests", () => {
   it("lists what a full run would execute and leaves out #[ignore]d tests", () => {
@@ -83,7 +83,7 @@ describe("compare", () => {
   });
 
   it("names a test two shards both ran", () => {
-    expect(compare(expected, [all, [all[0]]]).duplicated).toEqual(["gitpulse_lib a::one"]);
+    expect(compare(expected, [all, [all[0]]]).duplicated).toEqual(["waylode_lib a::one"]);
   });
 
   it("names a test that ran but was never listed", () => {
@@ -122,9 +122,9 @@ describe("main", () => {
   };
 
   const FULL: [string, string][][] = [
-    [["gitpulse_lib", "a::one"], ["native", "native"]],
-    [["gitpulse_lib", "a::two"]],
-    [["gitpulse_lib", "b::three"]],
+    [["waylode_lib", "a::one"], ["native", "native"]],
+    [["waylode_lib", "a::two"]],
+    [["waylode_lib", "b::three"]],
   ];
 
   it("passes when the shards cover the list exactly once", () => {

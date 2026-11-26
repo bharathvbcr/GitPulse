@@ -3,7 +3,7 @@
 mod common;
 
 use common::run_git;
-use gitpulse_lib::engine::git_reader::GitReader;
+use waylode_lib::engine::git_reader::GitReader;
 
 fn repo() -> tempfile::TempDir {
     common::unmetered_spawns();
@@ -17,9 +17,9 @@ fn repo() -> tempfile::TempDir {
 #[cfg(unix)]
 #[test]
 fn diff_links_as_git_objects_without_reading_their_targets() {
-    use gitpulse_lib::engine::git_cli::{git_text, git_with_stdin};
-    use gitpulse_lib::graph::ref_scope::RefScope;
     use std::os::unix::fs::symlink;
+    use waylode_lib::engine::git_cli::{git_text, git_with_stdin};
+    use waylode_lib::graph::ref_scope::RefScope;
     let dir = repo();
     let root = dir.path();
     let path = root.to_str().unwrap();
@@ -110,7 +110,7 @@ fn diff_links_as_git_objects_without_reading_their_targets() {
 #[cfg(unix)]
 #[test]
 fn synthetic_link_diffs_roundtrip_hostile_filenames_through_git_apply() {
-    use gitpulse_lib::engine::git_cli::git_with_stdin;
+    use waylode_lib::engine::git_cli::git_with_stdin;
     let dir = repo();
     for name in [
         "space name",
@@ -154,8 +154,8 @@ fn synthetic_diffs_refuse_lossy_text_instead_of_offering_a_corrupted_patch() {
 #[cfg(unix)]
 #[test]
 fn historical_reads_ignore_replaced_working_tree_directories() {
-    use gitpulse_lib::engine::git_cli::git_text;
-    use gitpulse_lib::graph::RefScope;
+    use waylode_lib::engine::git_cli::git_text;
+    use waylode_lib::graph::RefScope;
     let dir = repo();
     let root = dir.path();
     let path = root.to_str().unwrap();
@@ -251,7 +251,7 @@ fn language_candidates_preserve_literal_whitespace_and_deduplicate_conflict_stag
     assert_eq!(report.scanned_files, 1);
     assert_eq!(report.stats.iter().map(|s| s.code_lines).sum::<usize>(), 2);
     // One path in three unmerged index stages is still one filesystem file.
-    use gitpulse_lib::engine::git_cli::{git_text, git_with_stdin};
+    use waylode_lib::engine::git_cli::{git_text, git_with_stdin};
     let oid = git_text(root, &["rev-parse", ": source.rs"]).unwrap();
     let records = format!("0 {}\t source.rs\n100644 {} 1\t source.rs\n100644 {} 2\t source.rs\n100644 {} 3\t source.rs\n", "0".repeat(oid.trim().len()), oid.trim(), oid.trim(), oid.trim());
     git_with_stdin(root, &["update-index", "--index-info"], records.as_bytes()).unwrap();

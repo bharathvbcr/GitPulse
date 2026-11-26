@@ -8,8 +8,8 @@
 
 mod common;
 
-use gitpulse_lib::ledger::bindings::{bind, repository_address, resolve};
 use std::time::Duration;
+use waylode_lib::ledger::bindings::{bind, repository_address, resolve};
 
 /// Open file descriptors of this process (macOS and Linux both list them here).
 fn open_descriptors() -> usize {
@@ -38,7 +38,7 @@ fn settled(target: usize) -> usize {
 /// call used to leave one descriptor behind per concurrent open.
 #[test]
 fn resolving_and_consolidating_concurrently_leaves_no_descriptor_behind() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().expect("temp repository");
     let main = dir.path().canonicalize().expect("canonical repository");
     common::run_git(&main, &["init", "-q", "-b", "main"]);

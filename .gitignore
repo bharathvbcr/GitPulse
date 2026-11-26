@@ -219,8 +219,8 @@ opencode.json
 .claude*
 !/.claude-plugin/
 !/.claude-plugin/marketplace.json
-!/plugins/gitpulse/.claude-plugin/
-!/plugins/gitpulse/.claude-plugin/plugin.json
+!/plugins/waylode/.claude-plugin/
+!/plugins/waylode/.claude-plugin/plugin.json
 # The shared Claude Code settings (SessionStart hook for cloud sessions) must be
 # committed: cloud sessions read only what is in the repository.
 !/.claude/
@@ -418,4 +418,4 @@ blob-report/
 *.stackdump
 *.pdb
 
-/crates/gitpulse-worktree/target/
+/crates/waylode-worktree/target/

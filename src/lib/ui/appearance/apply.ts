@@ -55,6 +55,15 @@ import { DEFAULT_MONO_STACK, DEFAULT_UI_STACK, fontStack, normalizeFamily } from
 import { derivedPalette, measureFloor } from "./materialModel";
 import { RADIUS_SCALE_RANGE, validateTheme, type GitPulseTheme } from "./themeSchema";
 import { backdropCssValue, builtinBackdropUrl, isBackdropId, isBuiltinBackdrop, type BackdropId } from "./backdrops";
+import {
+  DEFAULT_BRAND_LOGO_PALETTE,
+  DEFAULT_BRAND_LOGO_STYLE,
+  brandGradientCss,
+  isBrandLogoPalette,
+  isBrandLogoStyle,
+  type BrandLogoPalette,
+  type BrandLogoStyle,
+} from "./brandLogo";
 import { readSavedThemes } from "./savedThemes";
 
 export type FieldLevel = "off" | "subtle" | "vivid";
@@ -106,6 +115,10 @@ export interface AppearancePrefs {
   readonly wallpaperMotion: boolean;
   /** The reader's theme shelf. `customTheme` is the applied one; these are the ones kept. */
   readonly savedThemes: readonly GitPulseTheme[];
+  /** Brand mark geometry rendered by `<Logo>`. */
+  readonly logoStyle: BrandLogoStyle;
+  /** Brand mark palette and `--brand-gradient` selection. */
+  readonly logoPalette: BrandLogoPalette;
 }
 
 export const FLOAT_BLUR_SHIPPED = 34;
@@ -132,6 +145,8 @@ export const APPEARANCE_DEFAULTS: AppearancePrefs = {
   wallpaperIntensity: 1,
   wallpaperMotion: false,
   savedThemes: [],
+  logoStyle: DEFAULT_BRAND_LOGO_STYLE,
+  logoPalette: DEFAULT_BRAND_LOGO_PALETTE,
 };
 
 /** Level -> fraction of the theme's shipped field gain. Never above shipped (§11). */
@@ -228,6 +243,10 @@ export function sanitizeAppearance(raw: Readonly<Record<string, unknown>>): Appe
     ),
     wallpaperMotion: raw.wallpaperMotion === true,
     savedThemes: readSavedThemes(raw.savedThemes),
+    logoStyle: isBrandLogoStyle(raw.logoStyle) ? raw.logoStyle : APPEARANCE_DEFAULTS.logoStyle,
+    logoPalette: isBrandLogoPalette(raw.logoPalette)
+      ? raw.logoPalette
+      : APPEARANCE_DEFAULTS.logoPalette,
   };
 }
 
@@ -366,6 +385,7 @@ export const MANAGED_VARS: readonly string[] = [
   "--mac-hue-gain",
   "--gp-backdrop",
   "--gp-backdrop-dim",
+  "--brand-gradient",
 ];
 
 export const MANAGED_ATTRIBUTES: readonly string[] = [
@@ -402,6 +422,10 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
   const notes: AppearanceNote[] = [];
   const { theme } = context;
   let accentOverride: string | null = null;
+
+  if (prefs.logoPalette !== DEFAULT_BRAND_LOGO_PALETTE) {
+    vars["--brand-gradient"] = brandGradientCss(prefs.logoPalette, theme);
+  }
 
   // Palette and accent.
   const customTheme = prefs.customTheme;

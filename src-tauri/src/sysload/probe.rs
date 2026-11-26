@@ -1731,7 +1731,7 @@ mod tests {
     fn the_sampler_thread_can_take_its_qos_and_activity() {
         std::thread::spawn(|| {
             set_user_initiated_qos().unwrap();
-            let activity = Activity::begin("GitPulse host-load sampler test").unwrap();
+            let activity = Activity::begin("Waylode host-load sampler test").unwrap();
             drop(activity);
         })
         .join()

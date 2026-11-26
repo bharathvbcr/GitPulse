@@ -1,8 +1,8 @@
-use gitpulse_lib::engine::{BranchInfo, GitReader};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
+use waylode_lib::engine::{BranchInfo, GitReader};
+use waylode_lib::procguard::LockedSpawn;
 
 fn run_git(dir: &Path, args: &[&str]) {
     let out = StdCommand::new("git")
@@ -26,7 +26,7 @@ fn init_repo() -> TempDir {
     // production spawn rate. Every test starts here and the suite shares one
     // process gate, so the stats walk otherwise waits on the rate instead of
     // measuring the code under test.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().expect("tempdir");
     run_git(dir.path(), &["init", "-q", "-b", "main"]);
     run_git(dir.path(), &["config", "user.email", "stress@gitpulse.dev"]);

@@ -16,6 +16,64 @@ const MAX_CANDIDATE_PIDS: usize = 64;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const MAX_FDS_PER_PID: usize = 4_096;
 
+/// Executable names of the agent CLIs a terminal can host. A port one of them
+/// (or something it started) listens on is the agent's own plumbing, such as
+/// agy's language server, and never a dev server the user is waiting for.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const AGENT_PROCESS_NAMES: [&str; 5] = ["agy", "claude", "codex", "grok", "manvi"];
+
+/// One process as the probe sees it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone)]
+struct ProcRow {
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+    name: String,
+}
+
+/// Shells an agent runs its commands through. What starts under one is the
+/// user's work (a dev server started with Claude's Bash tool), not the agent's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SHELL_PROCESS_NAMES: [&str; 10] = [
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "nu", "pwsh",
+];
+
+/// The pids in `rows` that belong to an agent CLI: the CLI itself, what it
+/// spawns directly and their descendants, and a reparented helper still in a
+/// process group the CLI leads. Ownership stops at a shell: an agent runs the
+/// user's commands through `sh -c`, and a non-interactive shell does no job
+/// control, so a dev server it starts sits in the agent's group yet is exactly
+/// the port the tab's radar exists to find.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn agent_owned_pids(rows: &[ProcRow]) -> std::collections::HashSet<i32> {
+    use std::collections::HashSet;
+    let named = |row: &ProcRow, names: &[&str]| {
+        names.iter().any(|name| row.name.eq_ignore_ascii_case(name))
+    };
+    let mut owned: HashSet<i32> = rows
+        .iter()
+        .filter(|r| named(r, &AGENT_PROCESS_NAMES))
+        .map(|r| r.pid)
+        .collect();
+    let leaders: HashSet<i32> = owned.clone();
+    loop {
+        let before = owned.len();
+        for row in rows {
+            if named(row, &SHELL_PROCESS_NAMES) {
+                continue;
+            }
+            let reparented_helper = row.ppid <= 1 && row.pgid > 1 && leaders.contains(&row.pgid);
+            if owned.contains(&row.ppid) || reparented_helper {
+                owned.insert(row.pid);
+            }
+        }
+        if owned.len() == before {
+            return owned;
+        }
+    }
+}
+
 /// Returns sorted, deduplicated TCP ports in `LISTEN` state bound to loopback
 /// (`127.0.0.0/8`, `::1`) or wildcard (`0.0.0.0`, `::`) owned by `root_pid` or
 /// its live session/descendant processes.
@@ -429,8 +487,30 @@ mod macos {
             return Vec::new();
         }
         let mut ports = BTreeSet::new();
-        for pid in collect_candidate_pids(root) {
-            inspect_pid_sockets(pid, &mut ports);
+        let candidates = collect_candidate_pids(root);
+        let rows: Vec<super::ProcRow> = candidates
+            .iter()
+            .filter_map(|&pid| {
+                let info = short_bsdinfo(pid)?;
+                let name: Vec<u8> = info
+                    .pbsi_comm
+                    .iter()
+                    .take_while(|c| **c != 0)
+                    .map(|c| *c as u8)
+                    .collect();
+                Some(super::ProcRow {
+                    pid,
+                    ppid: i32::try_from(info.pbsi_ppid).ok()?,
+                    pgid: i32::try_from(info.pbsi_pgid).ok()?,
+                    name: String::from_utf8_lossy(&name).into_owned(),
+                })
+            })
+            .collect();
+        let agent_owned = super::agent_owned_pids(&rows);
+        for pid in candidates {
+            if !agent_owned.contains(&pid) {
+                inspect_pid_sockets(pid, &mut ports);
+            }
         }
         ports.into_iter().collect()
     }
@@ -610,6 +690,26 @@ mod linux {
             return Vec::new();
         }
         let pids = collect_candidate_pids(root_pid);
+        let rows: Vec<super::ProcRow> = pids
+            .iter()
+            .filter_map(|&pid| {
+                let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let open = text.find('(')?;
+                let close = text.rfind(')')?;
+                let mut rest = text.get(close + 2..)?.split_whitespace().skip(1);
+                Some(super::ProcRow {
+                    pid: i32::try_from(pid).ok()?,
+                    ppid: rest.next()?.parse().ok()?,
+                    pgid: rest.next()?.parse().ok()?,
+                    name: text.get(open + 1..close)?.to_owned(),
+                })
+            })
+            .collect();
+        let agent_owned = super::agent_owned_pids(&rows);
+        let pids: Vec<u32> = pids
+            .into_iter()
+            .filter(|&pid| !i32::try_from(pid).is_ok_and(|p| agent_owned.contains(&p)))
+            .collect();
         let inodes = collect_socket_inodes(&pids);
         if inodes.is_empty() {
             return Vec::new();
@@ -634,6 +734,8 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::listening_loopback_ports_for_root_pid;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::procguard::LockedSpawn;
     // The tests that bind sockets run on macOS and Linux only.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::net::{TcpListener, UdpSocket};
@@ -683,6 +785,192 @@ mod tests {
             after_drop.contains(&any_port),
             "still-open port {any_port} must remain in {after_drop:?}"
         );
+    }
+
+    /// Not a test on its own: the child the next test starts (a hard link of
+    /// this test binary under another name) runs it to hold a listener open.
+    #[test]
+    #[ignore = "child-process helper, started by the test below"]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn port_probe_listener_helper() {
+        let Some(path) = std::env::var_os("GITPULSE_PORT_PROBE_HELPER_FILE") else {
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("helper listener");
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(&path, port.to_string()).expect("helper port file");
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        drop(listener);
+    }
+
+    /// Starts this test binary, linked under `program`, holding a listener.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn start_listener_named(program: &str) -> (std::process::Child, u16, tempfile::TempDir) {
+        let exe = std::env::current_exe().expect("test exe");
+        // Beside the test binary, so the hard link stays on its filesystem.
+        let dir = tempfile::tempdir_in(exe.parent().unwrap()).expect("link dir");
+        let linked = dir.path().join(program);
+        std::fs::hard_link(&exe, &linked).expect("hard link test binary");
+        let port_file = dir.path().join("port");
+        let child = std::process::Command::new(&linked)
+            .args([
+                "--exact",
+                "terminal::port_probe::tests::port_probe_listener_helper",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("GITPULSE_PORT_PROBE_HELPER_FILE", &port_file)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn_locked()
+            .expect("start listener child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let port = loop {
+            if let Some(port) = std::fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u16>().ok())
+            {
+                break port;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener child never reported its port"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        (child, port, dir)
+    }
+
+    /// The incident's shape: the tab's root is a shell, agy was typed into it,
+    /// and agy holds a listener of its own. Probed from the shell, as the tab
+    /// is, agy's port is not a dev server; a server the same shell started is.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn from_a_shell_root_agys_own_listener_is_not_a_dev_server_but_the_shells_server_is() {
+        let exe = std::env::current_exe().expect("test exe");
+        let dir = tempfile::tempdir_in(exe.parent().unwrap()).expect("link dir");
+        for name in ["agy", "devsrv"] {
+            std::fs::hard_link(&exe, dir.path().join(name)).expect("hard link test binary");
+        }
+        let helper = "--exact terminal::port_probe::tests::port_probe_listener_helper --ignored --test-threads=1";
+        // `; wait` keeps the shell as the parent of both, as a tab's shell is.
+        let script = format!(
+            "GITPULSE_PORT_PROBE_HELPER_FILE=\"$1/agy.port\" \"$1/agy\" {helper} >/dev/null 2>&1 & \
+             GITPULSE_PORT_PROBE_HELPER_FILE=\"$1/devsrv.port\" \"$1/devsrv\" {helper} >/dev/null 2>&1 & wait"
+        );
+        use std::os::unix::process::CommandExt;
+        // Its own process group, as a tab's shell has, so it and both
+        // listeners end together below.
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", &script, "sh"])
+            .arg(dir.path())
+            .process_group(0)
+            .spawn_locked()
+            .expect("start the tab's shell");
+        let port_of = |name: &str| {
+            std::fs::read_to_string(dir.path().join(format!("{name}.port")))
+                .ok()
+                .and_then(|text| text.trim().parse::<u16>().ok())
+        };
+        let ready = crate::test_support::wait_until(std::time::Duration::from_secs(90), || {
+            port_of("agy").is_some() && port_of("devsrv").is_some()
+        });
+        let (agy_port, server_port) = (port_of("agy"), port_of("devsrv"));
+        let seen = listening_loopback_ports_for_root_pid(shell.id());
+        let group = i32::try_from(shell.id()).unwrap();
+        // SAFETY: a signal to the process group this test created; it holds
+        // only the shell and the two listeners it started.
+        unsafe {
+            libc::kill(-group, libc::SIGTERM);
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(ready, "the listeners never reported their ports");
+        let (agy_port, server_port) = (agy_port.unwrap(), server_port.unwrap());
+        assert!(
+            seen.contains(&server_port),
+            "the shell's server {server_port} is a dev server: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&agy_port),
+            "agy's own port {agy_port} was offered as a dev server: {seen:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_listener_owned_by_an_agent_cli_is_not_a_dev_server_port() {
+        let (mut agent, agent_port, _agent_dir) = start_listener_named("agy");
+        let (mut server, server_port, _server_dir) = start_listener_named("devsrv");
+        let seen_agent = listening_loopback_ports_for_root_pid(agent.id());
+        let seen_server = listening_loopback_ports_for_root_pid(server.id());
+        let _ = agent.kill();
+        let _ = server.kill();
+        let _ = agent.wait();
+        let _ = server.wait();
+        assert_eq!(
+            seen_server,
+            vec![server_port],
+            "a dev server by any other name is still one"
+        );
+        assert!(
+            !seen_agent.contains(&agent_port),
+            "agy's own port {agent_port} was offered as a dev server: {seen_agent:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn agent_ownership_follows_name_descent_and_the_agents_process_group() {
+        let row = |pid, ppid, pgid, name: &str| super::ProcRow {
+            pid,
+            ppid,
+            pgid,
+            name: name.to_owned(),
+        };
+        let rows = [
+            row(10, 1, 10, "zsh"),
+            row(20, 10, 20, "agy"),
+            row(21, 20, 20, "language_server"),
+            // Reparented to launchd but still in agy's group.
+            row(22, 1, 20, "helper"),
+            row(23, 21, 23, "deeper"),
+            row(30, 10, 30, "node"),
+        ];
+        let owned = super::agent_owned_pids(&rows);
+        let mut owned: Vec<i32> = owned.into_iter().collect();
+        owned.sort_unstable();
+        assert_eq!(owned, vec![20, 21, 22, 23]);
+    }
+
+    /// What an agent runs through a shell is the user's work, not the agent's
+    /// plumbing: a dev server Claude starts with its Bash tool (`zsh -c "npm
+    /// run dev"`, in Claude's process group because a non-interactive shell
+    /// does no job control) is exactly what the tab's port radar exists to
+    /// find. Only what the agent spawns directly, or a reparented helper left
+    /// in its group, is the agent's own.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn what_an_agent_runs_through_a_shell_is_not_agent_owned() {
+        let row = |pid, ppid, pgid, name: &str| super::ProcRow {
+            pid,
+            ppid,
+            pgid,
+            name: name.to_owned(),
+        };
+        let rows = [
+            row(10, 1, 10, "zsh"),
+            row(20, 10, 20, "claude"),
+            row(21, 20, 20, "language_server"),
+            row(40, 20, 20, "zsh"),
+            row(41, 40, 20, "node"),
+            row(42, 41, 20, "esbuild"),
+            row(50, 20, 20, "bash"),
+            row(51, 50, 51, "vite"),
+        ];
+        let mut owned: Vec<i32> = super::agent_owned_pids(&rows).into_iter().collect();
+        owned.sort_unstable();
+        assert_eq!(owned, vec![20, 21]);
     }
 
     #[test]

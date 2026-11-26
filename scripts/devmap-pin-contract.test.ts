@@ -37,7 +37,7 @@ export function devmapPinProblems(ci: string): string[] {
   if (installing.length === 0) problems.push("no job installs devmap");
   // The worktree crate's cli_e2e tests drive the real CLI, so a job that runs them needs it too.
   for (const id of [...ci.matchAll(/\n {2}([a-z][a-z-]*):\n/g)].map((m) => m[1])) {
-    const runsWorktreeCrate = /cargo test --manifest-path crates\/gitpulse-worktree\/Cargo\.toml/.test(jobText(ci, id));
+    const runsWorktreeCrate = /cargo test --manifest-path crates\/waylode-worktree\/Cargo\.toml/.test(jobText(ci, id));
     if (runsWorktreeCrate && !installing.includes(id)) problems.push(`${id} runs the worktree crate's tests without installing devmap`);
   }
   for (const id of installing) {

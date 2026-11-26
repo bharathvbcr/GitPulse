@@ -37,10 +37,10 @@ including across a restart, and its dock reappears when you return to it.
 
 Hiding the dock or switching repositories preserves its shells. Closing a terminal
 tab terminates that session. Closing a repository tab closes its terminal sessions,
-and GitPulse asks first when there are any — **Close Other Tabs** and **Close Tabs
+and Waylode asks first when there are any — **Close Other Tabs** and **Close Tabs
 to the Right** count every repository they would discard.
 
-A Manvi session is the wrap around DevCouncil components (policy, agent hosting). GitPulse uses it here without requiring the rest of the DevCouncil suite.
+A Manvi session is the wrap around DevCouncil components (policy, agent hosting). Waylode uses it here without requiring the rest of the DevCouncil suite.
 
 Choose a session type in **New session type** (searchable), then press **+**. The
 command palette also names each one directly — *New Terminal Session*, *New Claude
@@ -115,20 +115,20 @@ transcript; **Rescan results** checks the artifacts after the run.
 See [coverage generation](COVERAGE.md) for details and verification.
 
 Saved tasks can also launch a dedicated terminal session from their run controls.
-GitPulse binds the launch to the saved brief, selected checkout and a single run
+Waylode binds the launch to the saved brief, selected checkout and a single run
 attempt. Reconnecting a tab keeps the same live process and its scrollback; ended attempts
 need an explicit new launch from task details. Process exit does not accept the
-task; the agent marks it Done or Review itself through the GitPulse MCP server.
+task; the agent marks it Done or Review itself through the Waylode MCP server.
 
 A task's agent gets the same notification flags as an agent tab (*Configure
-agent CLIs GitPulse launches* in the session notification settings), so one waiting on a permission prompt in a
+agent CLIs Waylode launches* in the session notification settings), so one waiting on a permission prompt in a
 hidden tab still raises an alert. The same notice also reaches the task's
 Agents pane, as `gitpulse-session-attention`: every agent notice is announced
 there within a second, whether or not a banner was shown (you were looking,
 banners are off, quiet hours), so the pane can say "Needs your permission"
 and what was asked.
 
-With the GitPulse plugin installed, Claude Code's hooks say more than its bell
+With the Waylode plugin installed, Claude Code's hooks say more than its bell
 can. `PermissionRequest` shows "Needs your permission · Bash: cargo test" on
 the board the moment the dialog opens — the `Notification` that raises the
 banner comes about six seconds later, and only if the dialog is still up, so a
@@ -168,7 +168,7 @@ task launch only passes what the installed build can be shown to support).
 Antigravity takes a model (a slug from `agy models`) and an effort level;
 Codex and Grok take a model only, because neither lists the effort values it
 accepts. A task attempt checks that the installed CLI advertises each control
-and the chosen effort level before starting. GitPulse checks that a model name
+and the chosen effort level before starting. Waylode checks that a model name
 is well-formed, not that it exists: the CLI reports one it cannot use, except
 Antigravity, which falls back to its default model with a warning. Managed
 sessions are not affected; Manvi starts those with the CLI's own model.
@@ -180,7 +180,7 @@ sign-in, so it is only run when you press the button) and offers that account's
 models; the answer is reused for ten minutes unless you press **Refresh
 models**, and a stored model the list does not contain is flagged. Claude Code
 publishes no model list — it has no command for one, and the API's list needs
-credentials GitPulse does not read — so the Claude row offers its built-in
+credentials Waylode does not read — so the Claude row offers its built-in
 aliases plus the models your `~/.claude/settings.json` names (`model`,
 `advisorModel`, `availableModels`). Codex has no model list, and `grok models`
 talks to a background process it may start, so neither is asked. A listing
@@ -188,7 +188,7 @@ that fails says why and keeps the last list it had.
 
 Claude Code is also given the attempt's id as
 its session id and the brief's private folder as a readable directory. An ended
-Claude Code attempt offers **Resume conversation**: GitPulse looks for the
+Claude Code attempt offers **Resume conversation**: Waylode looks for the
 transcript Claude Code saved for that session and, if it is there, opens a new
 Claude Code tab in the attempt's checkout with `claude --resume`, in the
 attempt's own permission mode. If there is no saved conversation (attempts
@@ -199,20 +199,20 @@ questions and approvals use the separate Manvi protocol. See
 verification limits.
 
 A plain Claude Code tab gets the same treatment. A fresh launch is given a
-session id GitPulse records; a tab that takes over a running session (after a
+session id Waylode records; a tab that takes over a running session (after a
 reload, or from Sessions) keeps the record already made for it and never makes
 a new one. When a signal from outside ends the session, the tab — and, for a
 burst of them, the incident's **Resume N** — offers **Resume** only if Claude
 Code saved a transcript for it. If it saved none, nothing is offered; if the
 transcript could not be checked, the tab says so instead of guessing. A Close
-from GitPulse, from the tab or from Sessions, never offers Resume, and neither
+from Waylode, from the tab or from Sessions, never offers Resume, and neither
 does the program ending on its own; a tab's view closing while the agent keeps
 running does not end its record. "Resume N" reports what each relaunch did:
 started, waiting for a free terminal slot, or failed.
 
 Not verified against the Claude Code CLI, and relied on only as stated: whether
 `/clear` or `/resume` inside a session moves it to another session id (the
-transcript GitPulse looks for would then be the old one), and whether a session
+transcript Waylode looks for would then be the old one), and whether a session
 killed before its first message ever has a transcript (if not, it is correctly
 not offered).
 
@@ -263,13 +263,13 @@ address — `localhost:5173`, a bare port such as `3000`, or a full
 - **Local addresses only.** Anything that is not `localhost`, `127.0.0.0/8` or
   `::1` is refused, including a remote frame inside a local page, and the
   session says which address it blocked.
-- **No access to GitPulse.** The page runs in its own webview with no route to
-  GitPulse's commands and its own non-persistent storage
+- **No access to Waylode.** The page runs in its own webview with no route to
+  Waylode's commands and its own non-persistent storage
   ([Security](SECURITY.md#browser-sessions-pages-with-no-route-to-gitpulse)).
 - **The page is a native view over the tab.** It follows the tab's area as the
   dock moves or resizes and with the interface size, and it is hidden while the
   tab is not on screen (another tab, Console, a hidden dock or repository) and
-  while a menu, dialog or toast of GitPulse's is drawn over it — a native view
+  while a menu, dialog or toast of Waylode's is drawn over it — a native view
   would otherwise cover them. Overlays portaled to the page body (every menu,
   dialog and toast) are detected at any size; any other overlay is found by
   hit-testing a grid at most 64px apart (a ninth of the page on a larger
@@ -280,7 +280,7 @@ address — `localhost:5173`, a bare port such as `3000`, or a full
   browser). **↗** in the address bar opens the current address in your system
   browser.
 - **Agents can open one.** An agent calls the `gitpulse_browser_open` MCP tool
-  with a trusted repository and a local address; GitPulse comes to the front,
+  with a trusted repository and a local address; Waylode comes to the front,
   opens that repository and its dock, and shows the page — reusing, and
   reloading, a session already on that address, so an agent that edits and
   asks again shows the change. Requests from several agents wait their turn,
@@ -304,7 +304,7 @@ restart the session before entering more input.
 
 On Unix (`#[cfg(unix)]`), PTY sessions live in `gitpulse-ptyd`, survive a quit or a crash,
 and a quit with sessions running asks whether to leave them or stop them. **Settings →
-Agents → Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`,
+Agents → Keep managed agent runs running when Waylode quits** (`keep_terminals_running`,
 on by default) governs the detached `manvi serve --listen` process that hosts managed
 Codex and Claude runs. A session taken over by a new view — after a reload, a crash, or
 from Sessions — is first shown its newest 512 KiB of output, kept whether or not anything
@@ -347,7 +347,7 @@ browser only when its scheme is `http` or `https`; every other scheme —
 underlined, not hoverable and not openable. A file reference opens in the code
 viewer only when it resolves inside the session's repository; an absolute path
 elsewhere on disk, or one that climbs out with `..`, is not a link either.
-Terminal output is untrusted text, so a span GitPulse will not open is never
+Terminal output is untrusted text, so a span Waylode will not open is never
 decorated as though it would.
 
 `path:line:column` opens the file in the code viewer and lands on that line,
@@ -361,9 +361,9 @@ against the escape sequence's target rather than its display text.
 
 ## Checking how the wheel is read
 
-GitPulse decides per gesture whether the input is a mouse-wheel notch (it glides)
+Waylode decides per gesture whether the input is a mouse-wheel notch (it glides)
 or a trackpad (it does not). To see what your mouse or trackpad sends and what
-GitPulse took it for:
+Waylode took it for:
 
 1. In the app's Web Inspector console run
    `localStorage.setItem("gitpulse.debug.wheel", "1")`, then open a new terminal
@@ -425,7 +425,7 @@ rendering (`data-renderer="dom"`). If a held hidden context is lost, the hold si
 without consuming the session's active recovery budget.
 
 On device pixel ratio (DPR) changes (e.g. dragging a window between Retina and non-Retina
-displays), GitPulse invokes `clearAtlas()` to regenerate crisp glyphs and avoid atlas
+displays), Waylode invokes `clearAtlas()` to regenerate crisp glyphs and avoid atlas
 corruption. When drawing without WebGL acceleration, the terminal footer displays an
 unobtrusive indicator.
 
@@ -441,7 +441,7 @@ sequences (`CSI ? 2026 h` to begin, `CSI ? 2026 l` to end) to batch redraws into
 visual frames. If a stream ends or pauses mid-block, xterm can freeze the output buffer
 until the next write arrives (xterm.js #6071).
 
-GitPulse intercepts stream writes via `syncFrames.ts` and `eraseGuard.ts` to ensure
+Waylode intercepts stream writes via `syncFrames.ts` and `eraseGuard.ts` to ensure
 every write chunk delivered to xterm concludes outside an open DEC 2026 block, appending
 an un-sync escape code if necessary. Continuous synchronized frames paint smoothly at
 native display rates without frame buffer stalls.

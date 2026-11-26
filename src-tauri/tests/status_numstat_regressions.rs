@@ -1,6 +1,6 @@
-use gitpulse_lib::engine::GitReader;
 use std::fs;
 use tempfile::TempDir;
+use waylode_lib::engine::GitReader;
 
 mod common;
 use common::run_git;
@@ -38,7 +38,7 @@ impl TestRepo {
     }
 }
 
-fn staged_rename_entry(repo: &TestRepo) -> gitpulse_lib::engine::FileStatus {
+fn staged_rename_entry(repo: &TestRepo) -> waylode_lib::engine::FileStatus {
     let statuses = GitReader::get_status(&repo.path_str()).expect("get_status");
     assert_eq!(statuses.len(), 1, "exactly one status entry: {statuses:?}");
     statuses.into_iter().next().unwrap()

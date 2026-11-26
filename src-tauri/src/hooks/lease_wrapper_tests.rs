@@ -97,12 +97,12 @@ fn it_runs_as_cargo_or_go_or_as_the_lease_subcommand_and_as_nothing_else() {
         Some(("go".into(), os(&["test", "./..."])))
     );
     assert_eq!(
-        invocation(&os(&["gitpulse-hook", "lease", "--", "cargo", "test"])),
+        invocation(&os(&["waylode-hook", "lease", "--", "cargo", "test"])),
         Some(("cargo".into(), os(&["test"])))
     );
     assert_eq!(
         invocation(&os(&[
-            "gitpulse-hook",
+            "waylode-hook",
             "lease",
             "/Users/x/.cargo/bin/cargo",
             "check"
@@ -111,11 +111,11 @@ fn it_runs_as_cargo_or_go_or_as_the_lease_subcommand_and_as_nothing_else() {
         "a program by path is named by its last segment"
     );
     for not_a_wrapper in [
-        os(&["gitpulse-hook"]),
-        os(&["gitpulse-hook", "command-gate"]),
-        os(&["gitpulse-hook", "lease"]),
-        os(&["gitpulse-hook", "lease", "--"]),
-        os(&["gitpulse-hook", "--version"]),
+        os(&["waylode-hook"]),
+        os(&["waylode-hook", "command-gate"]),
+        os(&["waylode-hook", "lease"]),
+        os(&["waylode-hook", "lease", "--"]),
+        os(&["waylode-hook", "--version"]),
         os(&[]),
     ] {
         assert_eq!(invocation(&not_a_wrapper), None, "{not_a_wrapper:?}");
@@ -134,7 +134,7 @@ fn the_real_program_is_found_past_the_wrappers_own_link_and_never_the_wrapper() 
     for d in [&lease_bin, &real_bin, &other_bin] {
         std::fs::create_dir(d).unwrap();
     }
-    let hook = root.join("gitpulse-hook");
+    let hook = root.join("waylode-hook");
     std::fs::write(&hook, "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     symlink(&hook, lease_bin.join("cargo")).unwrap();
@@ -167,6 +167,7 @@ fn the_build_starts_with_its_slot_held_marked_and_its_jobs_split() {
     let env = exec_env(
         base.clone(),
         &[
+            ("WAYLODE_LEASE_HELD", "2".into()),
             ("GITPULSE_LEASE_HELD", "2".into()),
             ("CARGO_INCREMENTAL", "0".into()),
         ],
@@ -177,6 +178,7 @@ fn the_build_starts_with_its_slot_held_marked_and_its_jobs_split() {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.to_string_lossy().into_owned())
     };
+    assert_eq!(get("WAYLODE_LEASE_HELD").as_deref(), Some("2"));
     assert_eq!(get("GITPULSE_LEASE_HELD").as_deref(), Some("2"));
     assert_eq!(
         get("CARGO_INCREMENTAL").as_deref(),
@@ -348,7 +350,7 @@ fn a_build_is_labelled_by_its_program_and_verb_and_nothing_it_could_inject() {
 fn session_brief_writes_lease_path_to_claude_env_file() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("config");
-    let hook = temp.path().join("gitpulse-hook");
+    let hook = temp.path().join("waylode-hook");
     crate::test_support::fake_lease_hook(&hook);
     let env_file = temp.path().join("env");
     std::fs::write(&env_file, "export KEEP=1\n").unwrap();
@@ -416,7 +418,7 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
 
 fn routed(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let config = temp.path().join("config");
-    let hook = temp.path().join("gitpulse-hook");
+    let hook = temp.path().join("waylode-hook");
     crate::test_support::fake_lease_hook(&hook);
     lease::ensure_links(&config, &hook).unwrap();
     (config, temp.path().join("env"))
@@ -481,7 +483,7 @@ fn a_dangling_link_is_not_a_link() {
     let (config, env_file) = routed(&temp);
     let bin = lease::bin_dir(&config);
     assert_eq!(lease::links_problem(&bin, None), None);
-    std::fs::remove_file(temp.path().join("gitpulse-hook")).unwrap();
+    std::fs::remove_file(temp.path().join("waylode-hook")).unwrap();
     // The links are still there, and point at nothing.
     assert!(bin.join("cargo").symlink_metadata().is_ok());
     let problem = lease::links_problem(&bin, None).unwrap();
@@ -507,11 +509,11 @@ fn links_that_point_at_another_binary_are_not_this_gitpulses() {
     std::fs::write(&other, "y").unwrap();
     let bin = lease::bin_dir(&config);
     assert_eq!(
-        lease::links_problem(&bin, Some(&temp.path().join("gitpulse-hook"))),
+        lease::links_problem(&bin, Some(&temp.path().join("waylode-hook"))),
         None
     );
     let problem = lease::links_problem(&bin, Some(&other)).unwrap();
-    assert!(problem.contains("not at this GitPulse"), "{problem}");
+    assert!(problem.contains("not at this Waylode"), "{problem}");
 }
 
 #[test]

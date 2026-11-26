@@ -61,11 +61,11 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::graph::{
+use std::collections::{HashMap, HashSet};
+use waylode_lib::graph::{
     mainline_chain_ids, simplify_history, LaneSolver, MainlineHint, RawCommitNode, VisualCommitRow,
     MAINLINE_COLOR, MAINLINE_COLUMN, MAX_REWRITTEN_PARENTS,
 };
-use std::collections::{HashMap, HashSet};
 
 const LCG_MUL: u64 = 6364136223846793005;
 const LCG_INC: u64 = 1442695040888963407;

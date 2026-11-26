@@ -78,7 +78,7 @@ fn why_unreadable(why: Why) -> String {
         Why::Unsupported => "this platform cannot say".into(),
         Why::Failed => "reading it failed".into(),
         Why::Disabled => "host-load measurement is switched off".into(),
-        Why::Older => "it came from an older GitPulse that did not measure it".into(),
+        Why::Older => "it came from an older Waylode that did not measure it".into(),
     }
 }
 
@@ -144,7 +144,7 @@ pub fn waiting_from_standing(
 ) -> Waiting {
     if !matches!(kind, AgentKind::Claude | AgentKind::Antigravity) {
         return Waiting::Unknown(format!(
-            "{} reports no waiting state to GitPulse",
+            "{} reports no waiting state to Waylode",
             kind.name()
         ));
     }
@@ -165,14 +165,14 @@ pub fn park_blocker(
     cwd: Option<&str>,
 ) -> Option<String> {
     if terminal_session.is_none() {
-        return Some("GitPulse did not launch it, so it will not close it".into());
+        return Some("Waylode did not launch it, so it will not close it".into());
     }
     let provider = match kind {
         AgentKind::Claude => "claude",
         AgentKind::Antigravity => "agy",
         _ => {
             return Some(format!(
-                "{} sessions cannot be resumed from GitPulse",
+                "{} sessions cannot be resumed from Waylode",
                 kind.name()
             ))
         }
@@ -220,7 +220,7 @@ pub fn tab_blocker(
             "that terminal was launched as {launched}, not as {expected}, so closing it would close more than the agent"
         )),
         None => Some(
-            "that terminal was not launched as this agent (it is a shell tab, or GitPulse could not read how it was launched), so closing it would close more than the agent".into(),
+            "that terminal was not launched as this agent (it is a shell tab, or Waylode could not read how it was launched), so closing it would close more than the agent".into(),
         ),
     }
 }
@@ -291,7 +291,7 @@ pub fn build(
                 )
             } else {
                 Waiting::Unknown(
-                    "GitPulse does not hold its terminal, so it cannot tell how long it has waited"
+                    "Waylode does not hold its terminal, so it cannot tell how long it has waited"
                         .into(),
                 )
             };
@@ -415,7 +415,7 @@ pub fn park_when_idle_for(
     ready(&seen)?;
     let where_ = seen.cwd.as_deref().unwrap_or("an unknown folder");
     let body = format!(
-        "Park this {} session in {where_}?\n\nIts terminal closes and its memory is freed. Its conversation is kept, and GitPulse offers to reopen it with its conversation resumed.",
+        "Park this {} session in {where_}?\n\nIts terminal closes and its memory is freed. Its conversation is kept, and Waylode offers to reopen it with its conversation resumed.",
         seen.kind.name()
     );
     if !confirm("Park idle agent session", &body) {
@@ -609,7 +609,7 @@ pub fn park_session(
                 if marked {
                     "It is offered for reopening with its conversation resumed."
                 } else {
-                    "It was closed, but GitPulse has no record of the tab to offer it back from: resume it by hand."
+                    "It was closed, but Waylode has no record of the tab to offer it back from: resume it by hand."
                 },
                 match &close_error {
                     Some(why) => format!(

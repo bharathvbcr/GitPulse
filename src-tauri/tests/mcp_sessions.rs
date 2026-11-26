@@ -9,14 +9,6 @@
 mod common;
 
 #[cfg(unix)]
-use gitpulse_lib::alerts::{
-    default_state_snapshot_path, read_state_snapshot, start as start_alerts, try_offer, Host,
-    HubStateRead, Notice, Origin,
-};
-use gitpulse_lib::procguard::LockedSpawn;
-#[cfg(unix)]
-use gitpulse_lib::repository_trust;
-#[cfg(unix)]
 use serde_json::{json, Value};
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
@@ -32,6 +24,14 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use waylode_lib::alerts::{
+    default_state_snapshot_path, read_state_snapshot, start as start_alerts, try_offer, Host,
+    HubStateRead, Notice, Origin,
+};
+use waylode_lib::procguard::LockedSpawn;
+#[cfg(unix)]
+use waylode_lib::repository_trust;
 
 const ROLE_ENV: &str = "GITPULSE_FAKE_AGENT_ROLE";
 const MCP_BIN_ENV: &str = "GITPULSE_MCP_BIN";
@@ -244,7 +244,7 @@ fn spawn_caller_mcp_agent(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env(ROLE_ENV, "caller")
-        .env(MCP_BIN_ENV, env!("CARGO_BIN_EXE_gitpulse-mcp"))
+        .env(MCP_BIN_ENV, env!("CARGO_BIN_EXE_waylode-mcp"))
         .env(LOG_DIR_ENV, log_dir)
         .env("GITPULSE_RUN_ID", run_id)
         .env("GITPULSE_SESSION_ID", term_session_id)
@@ -548,8 +548,8 @@ fn gitpulse_sessions_identifies_caller_sources_states_bounds_and_spawns_no_git()
         provider_session_id: None,
     });
     assert!(
-        !matches!(offer1, gitpulse_lib::alerts::Offer::NotRunning)
-            && !matches!(offer2, gitpulse_lib::alerts::Offer::NotRunning),
+        !matches!(offer1, waylode_lib::alerts::Offer::NotRunning)
+            && !matches!(offer2, waylode_lib::alerts::Offer::NotRunning),
         "alerts worker must accept test notices: {offer1:?}, {offer2:?}"
     );
 

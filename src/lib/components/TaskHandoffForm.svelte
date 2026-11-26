@@ -437,7 +437,7 @@
         data-active={settings.kind === "managed"}
         aria-pressed={settings.kind === "managed"}
         disabled={locked || !supportsManaged(settings.provider)}
-        title={supportsManaged(settings.provider) ? "GitPulse supervises the run and shows its requests here." : `${PROVIDER_LABELS[settings.provider]} supports terminal handoffs only.`}
+        title={supportsManaged(settings.provider) ? "Waylode supervises the run and shows its requests here." : `${PROVIDER_LABELS[settings.provider]} supports terminal handoffs only.`}
         onclick={() => choose({ kind: "managed" })}
       >Managed</button>
     </div>
@@ -485,9 +485,9 @@
     </span>
   </label>
   {#if !candidates.length}
-    <p class="meta">GitPulse has no open checkout for {repositoryName}. Choose the folder this agent should work in.</p>
+    <p class="meta">Waylode has no open checkout for {repositoryName}. Choose the folder this agent should work in.</p>
   {:else if candidates[0].source === "derived"}
-    <p class="meta">Suggested from this repository's git directory. Open the repository in GitPulse to confirm it.</p>
+    <p class="meta">Suggested from this repository's git directory. Open the repository in Waylode to confirm it.</p>
   {/if}
 
   <label class="ack">
@@ -504,7 +504,7 @@
   {:else if holder.kind === "unknown"}
     <p class="meta" role="status" data-testid="checkout-holder-unknown">Couldn't tell whether an agent already works in this checkout ({holder.reason}), so this run uses its own worktree. Running in the checkout itself is disabled until that is known.</p>
   {:else if useWorktree}
-    <p class="meta">GitPulse creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the run is refused.</p>
+    <p class="meta">Waylode creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the run is refused.</p>
   {/if}
 
   <label>Permission mode

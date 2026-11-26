@@ -1,14 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 /// Usage text for `--help` / `-h`. Without this the flag falls through to
-/// `gitpulse_lib::run()`, whose single-instance handoff raises the running
+/// `waylode_lib::run()`, whose single-instance handoff raises the running
 /// app's window. `--cleaner-due` is deliberately omitted: it is launchd
 /// plumbing, not something a person types.
-const USAGE: &str = "gitpulse: the GitPulse desktop app.\n\
+const USAGE: &str = "waylode: the Waylode desktop app.\n\
 \n\
 Run it with no arguments to open the app; it takes none for normal use.\n\
-The command-line tools are separate binaries: `gitpulse-mcp` (tools, describe,\n\
-call, read) queries and drives GitPulse from a shell, and `gitpulse-hook` is the\n\
+The command-line tools are separate binaries: `waylode-mcp` (tools, describe,\n\
+call, read) queries and drives Waylode from a shell, and `waylode-hook` is the\n\
 hook executable agent hosts invoke.\n";
 
 /// Arguments that are answered before the app starts: `--help` and `-h`, as
@@ -34,7 +34,7 @@ fn main() {
     // share. First, ahead of the headless cleanup branch below, which spawns
     // git too and never reaches `run()`. Opting in spawns nothing, so
     // `--help` below can still answer without ever starting the app.
-    gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
+    waylode_lib::engine::process::run_process_with_shared_spawn_budget();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if let Some((text, code)) = early_exit(&args) {
         write_usage(&mut std::io::stdout().lock(), &text);
@@ -47,23 +47,23 @@ fn main() {
         // launchd runs this every 60 s and it usually finds nothing due. A
         // wake that logs nothing leaves the app's log as it was; a raised
         // limit is routine, and only one that fell short is worth a line.
-        gitpulse_lib::logging::init_for_headless_tick();
-        let _signals = gitpulse_lib::procguard::install_signal_handlers();
-        let limits = gitpulse_lib::limits::raise_open_file_limit();
+        waylode_lib::logging::init_for_headless_tick();
+        let _signals = waylode_lib::procguard::install_signal_handlers();
+        let limits = waylode_lib::limits::raise_open_file_limit();
         if !limits.is_sufficient() {
             log::warn!("{}", limits.describe());
         }
-        let outcome = gitpulse_lib::storage::hygiene::global::run_due_headless();
+        let outcome = waylode_lib::storage::hygiene::global::run_due_headless();
         if let Err(error) = &outcome {
             log::error!("Background cleanup: {error}", error = error.message());
         }
-        gitpulse_lib::procguard::exit(if outcome.is_ok() { 0 } else { 1 });
+        waylode_lib::procguard::exit(if outcome.is_ok() { 0 } else { 1 });
     }
-    gitpulse_lib::run();
+    waylode_lib::run();
     // The window closing is a normal return, but a `kill` or a logout is not:
     // exiting through `procguard` is what stops that return from overtaking a
     // shutdown sweep that is still killing this session's git subprocesses.
-    gitpulse_lib::procguard::exit(0);
+    waylode_lib::procguard::exit(0);
 }
 
 #[cfg(test)]
@@ -101,8 +101,8 @@ mod tests {
         for flag in ["--help", "-h"] {
             let (text, code) = early_exit(&args(&[flag])).expect("help is handled early");
             assert_eq!(code, 0, "{flag}");
-            assert!(text.contains("gitpulse-mcp"), "{flag}: {text}");
-            assert!(text.contains("gitpulse-hook"), "{flag}: {text}");
+            assert!(text.contains("waylode-mcp"), "{flag}: {text}");
+            assert!(text.contains("waylode-hook"), "{flag}: {text}");
         }
     }
 
@@ -177,11 +177,11 @@ mod tests {
     fn usage_text_is_plain_ascii_lines_naming_real_tools() {
         assert!(USAGE.is_ascii());
         assert!(USAGE.ends_with('\n'));
-        for name in ["gitpulse-mcp", "gitpulse-hook"] {
+        for name in ["waylode-mcp", "waylode-hook"] {
             assert!(USAGE.contains(name), "{name}");
         }
-        // Every one-shot command the text names is in gitpulse-mcp's CLI_COMMANDS.
-        let mcp = include_str!("bin/gitpulse-mcp.rs");
+        // Every one-shot command the text names is in waylode-mcp's CLI_COMMANDS.
+        let mcp = include_str!("bin/waylode-mcp.rs");
         assert!(mcp
             .contains(r#"const CLI_COMMANDS: [&str; 4] = ["tools", "describe", "call", "read"];"#));
         for command in ["tools", "describe", "call", "read"] {

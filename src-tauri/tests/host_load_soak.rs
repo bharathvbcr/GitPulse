@@ -18,11 +18,11 @@
 
 mod common;
 
-use gitpulse_lib::sysload::{start, SamplerOptions};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use waylode_lib::sysload::{start, SamplerOptions};
 
-const CADENCE: Duration = Duration::from_millis(gitpulse_lib::sysload::CADENCE_MS);
+const CADENCE: Duration = Duration::from_millis(waylode_lib::sysload::CADENCE_MS);
 
 fn soak_secs() -> u64 {
     std::env::var("GITPULSE_HOST_LOAD_SOAK_SECS")

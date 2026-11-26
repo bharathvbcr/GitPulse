@@ -15,6 +15,8 @@
   import MarkdownBody from "../MarkdownBody.svelte";
   import MaviToolGroup from "./MaviToolGroup.svelte";
   import MaviApproval from "./MaviApproval.svelte";
+  import MaviQuestion from "./MaviQuestion.svelte";
+  import { ASK_TOOL, encodeAnswers, parseQuestions } from "../../mavi/questions";
   import { toRows } from "../../mavi/rows";
   import { allTurnTotals } from "../../mavi/changes";
   import type { ThreadState, TurnEndItem } from "../../mavi/types";
@@ -165,12 +167,22 @@
           </div>
         {:else if row.kind === "approval"}
           <div class="mavi-row">
-            <MaviApproval
-              tool={row.tool}
-              {root}
-              onAnswer={(decision, message) => onAnswer(row.tool.approval!.requestId, decision, message)}
-            />
+            {#if row.tool.name === ASK_TOOL && parseQuestions(row.tool.input)}
+              <MaviQuestion
+                tool={row.tool}
+                onSubmit={(answers) => onAnswer(row.tool.approval!.requestId, "allow", encodeAnswers(answers))}
+                onDecline={() => onAnswer(row.tool.approval!.requestId, "deny")}
+              />
+            {:else}
+              <MaviApproval
+                tool={row.tool}
+                {root}
+                onAnswer={(decision, message) => onAnswer(row.tool.approval!.requestId, decision, message)}
+              />
+            {/if}
           </div>
+        {:else if row.kind === "question"}
+          <div class="mavi-row"><MaviQuestion tool={row.tool} /></div>
         {:else if row.item.kind === "user"}
           <div class="mavi-row mavi-user-row">
             <div class="mavi-user text-sm text-textPrimary whitespace-pre-wrap select-text">{row.item.text}</div>

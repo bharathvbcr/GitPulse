@@ -11,16 +11,16 @@
 //! phase was built: 886 transcripts, 0 unreadable lines, 193 events attributed
 //! to one repository, and a second pass that added nothing.
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
 
-use gitpulse_lib::{ingest, ledger};
 use std::process::Command;
+use waylode_lib::{ingest, ledger};
 
 #[test]
 fn catch_up_attributes_real_history() {
     // `ingest` and `ledger` reach the library's git gate in this process.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let repo = temp_dir.path().to_str().expect("repo path").to_string();
 

@@ -78,7 +78,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   },
   { id: "agent-live-runs", section: "agents", label: "Agents running at once", keywords: "concurrent parallel simultaneous many multiple agents sessions tasks attempts at once limit capacity managed manvi worktree" },
   { id: "terminal-sessions", section: "agents", label: "Terminal sessions open at once", keywords: "terminal sessions shells tabs pty open at once concurrent parallel many limit capacity maximum console agent tabs task terminals" },
-  { id: "keep-terminals", section: "agents", label: "Keep managed agent runs running when GitPulse quits", keywords: "terminal host ptyd keep running survive quit crash restart detach reattach background sessions agents persist outlive managed manvi codex claude runs adopt" },
+  { id: "keep-terminals", section: "agents", label: "Keep managed agent runs running when Waylode quits", keywords: "terminal host ptyd keep running survive quit crash restart detach reattach background sessions agents persist outlive managed manvi codex claude runs adopt" },
   { id: "agent-shell-reads", section: "agents", label: "Allow agents to read repository shell outputs", keywords: "terminal shell output read inspect mcp agent logs errors stdout scrollback user shells opt in" },
   { id: "agent-setting-sources", section: "agents", label: "Claude Code settings files", keywords: "claude settings sources setting-sources project local user settings.json settings.local.json hooks allow list permissions repository trust power advanced" },
   { id: "agent-models", section: "agents", label: "Agent models", keywords: "model models claude antigravity agy codex grok opus sonnet haiku fable opusplan gemini effort reasoning thinking fallback advisor routing --model --effort --fallback-model advisorModel" },
@@ -103,6 +103,18 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     label: "My themes",
     keywords:
       "my themes saved library save current look delete remove theme import export file json custom share gitpulse-theme load palette colors base contrast",
+  },
+  {
+    id: "appearance.logoStyle",
+    section: "appearance",
+    label: "Logo mark",
+    keywords: "logo mark style icon badge way-arc folded-ribbon lode-compass brand",
+  },
+  {
+    id: "appearance.logoPalette",
+    section: "appearance",
+    label: "Logo palette",
+    keywords: "logo palette brand gradient cobalt lodestar oxblood gilded swatch",
   },
   {
     id: "accent",

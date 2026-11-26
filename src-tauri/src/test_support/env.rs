@@ -51,7 +51,7 @@
 //!
 //! # Why this file is included twice
 //!
-//! `gitpulsed` is a separate bin crate and cannot see `gitpulse_lib`'s
+//! `gitpulsed` is a separate bin crate and cannot see `waylode_lib`'s
 //! `#[cfg(test)]` items, but it overrides `GITPULSE_TRANSCRIPT_ROOT` the same
 //! way and leaks it the same way. It includes this file with `#[path]` — the
 //! idiom `tests/common/process_trust.rs` already uses across two integration
@@ -448,7 +448,7 @@ pub(crate) mod hermetic {
     /// A prefix rather than a list so a name added to production tomorrow is
     /// covered today; the `env_names_read_by_production` contract test in
     /// `tests/hermetic_contract.rs` pins the names that are *not* covered.
-    const SCRUBBED_PREFIXES: &[&str] = &["GITPULSE_", "MANVI_", "LAPPI_", "PORTLESS_"];
+    const SCRUBBED_PREFIXES: &[&str] = &["WAYLODE_", "GITPULSE_", "MANVI_", "LAPPI_", "PORTLESS_"];
 
     /// Opt-in test drivers a developer exports on purpose (`GITPULSE_TEST_NPM=1`,
     /// `GITPULSE_LIVE_AI=1`, a benchmark's repository): they only ever switch a
@@ -457,6 +457,14 @@ pub(crate) mod hermetic {
     /// markers are `GITPULSE_TEST_*` and are kept by the first entry. Each entry
     /// is a prefix and says why it is kept.
     const KEPT_PREFIXES: &[(&str, &str)] = &[
+        (
+            "WAYLODE_TEST_",
+            "opt-in suite switches and test-only probes",
+        ),
+        (
+            "WAYLODE_DEVMAP_BIN",
+            "the devmap build under test (`cli_e2e` zero-copy tests); read by the test itself",
+        ),
         (
             "GITPULSE_TEST_",
             "opt-in suite switches and the hermetic markers",
@@ -863,7 +871,7 @@ mod relaxed_tests {
 /// counters, and the guard built on it.
 ///
 /// A suite that writes 549.8 GiB in 90 minutes (a `.diag` disk-writes report for
-/// a `gitpulse_lib` test binary, 101 MB/s) is burning SSD endurance the machine
+/// a `waylode_lib` test binary, 101 MB/s) is burning SSD endurance the machine
 /// does not get back, and nothing in a passing run says so. Wall-clock limits
 /// do not catch it: the process is busy, not hung. So the process is held to a
 /// byte budget instead:

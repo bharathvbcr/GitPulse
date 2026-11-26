@@ -148,7 +148,7 @@
           <div class="min-w-0 flex-1">
             {ai.detail || "No local model server answered."}
             <p class="mt-1.5 text-textMuted">
-              GitPulse talks to a model server on this machine only: the transport refuses
+              Waylode talks to a model server on this machine only: the transport refuses
               any address that is not loopback, so a diff cannot reach one through a
               mistyped setting. Only choosing Claude in Manvi's model sends a diff
               elsewhere: to the Claude API, through Manvi.

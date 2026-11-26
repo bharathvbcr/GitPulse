@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
- * Windows `cargo test --lib` builds `gitpulse_lib-*.exe`. tauri-winres links
+ * Windows `cargo test --lib` builds `waylode_lib-*.exe`. tauri-winres links
  * its resource only as `rustc-link-arg-bins`, and `rustc-link-arg-tests` only
  * covers `tests/*.rs`, so the lib harness died at load with
  * STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) — no test name, nothing checked.

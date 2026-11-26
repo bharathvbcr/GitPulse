@@ -6,20 +6,20 @@
 //! be destructive, so the refusals matter as much as the happy paths — and the
 //! module had no integration test at all, only inline unit tests.
 
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
 
-use gitpulse_lib::ops::{
-    branch_cleanup_plan, prepare_release, review_outgoing_commits, validate_release_tag,
-};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use waylode_lib::ops::{
+    branch_cleanup_plan, prepare_release, review_outgoing_commits, validate_release_tag,
+};
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
     // `ops` reaches the library's git gate in this process.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     Command::new("git")
         .args(args)
         .current_dir(dir)

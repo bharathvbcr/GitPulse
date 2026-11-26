@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use common::fixture::{build_chain, git, git_process_profile, trust_repo};
 use common::{percentile, Report, Row};
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 
 const BRANCHES: usize = 20;
 /// Rounds run in all; the first `DISCARD` are not reported.
@@ -126,7 +126,7 @@ fn call(
                 .to_string(),
         ),
     };
-    let payload = tauri::async_runtime::block_on(gitpulse_lib::commands::cmd_get_commit_graph(
+    let payload = tauri::async_runtime::block_on(waylode_lib::commands::cmd_get_commit_graph(
         path.to_string(),
         window,
         None,
@@ -271,13 +271,13 @@ fn arm_stats(label: &str, obs: &[Obs]) -> String {
 /// default branch, hidden-ref census), joined, on a path nothing has read.
 fn run_probes(path: &str) {
     std::thread::scope(|scope| {
-        let head = scope.spawn(|| gitpulse_lib::engine::git_reader::GitReader::head_id(path));
+        let head = scope.spawn(|| waylode_lib::engine::git_reader::GitReader::head_id(path));
         let refs = scope.spawn(|| {
-            gitpulse_lib::graph::list_ref_decorations(path, gitpulse_lib::graph::RefScope::Named)
+            waylode_lib::graph::list_ref_decorations(path, waylode_lib::graph::RefScope::Named)
         });
         let default =
-            scope.spawn(|| gitpulse_lib::engine::git_reader::GitReader::default_branch_name(path));
-        let hidden = scope.spawn(|| gitpulse_lib::graph::probe_hidden_history(path));
+            scope.spawn(|| waylode_lib::engine::git_reader::GitReader::default_branch_name(path));
+        let hidden = scope.spawn(|| waylode_lib::graph::probe_hidden_history(path));
         head.join().expect("head").expect("head ok");
         refs.join().expect("refs").expect("refs ok");
         default.join().expect("default").expect("default ok");
@@ -287,13 +287,13 @@ fn run_probes(path: &str) {
 
 /// The history walk alone for a window, on a path nothing has read.
 fn run_walk(path: &str, window: usize) {
-    let rows = gitpulse_lib::engine::git_reader::GitReader::read_commit_history_paged(
+    let rows = waylode_lib::engine::git_reader::GitReader::read_commit_history_paged(
         path,
         0,
         window + 1,
         None,
         None,
-        gitpulse_lib::graph::RefScope::Named,
+        waylode_lib::graph::RefScope::Named,
     )
     .expect("walk");
     assert_eq!(rows.len(), window + 1);
@@ -344,7 +344,7 @@ fn stage_breakdown(source: &Path, scratch: &Path, window: usize, rounds: usize, 
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("graph_hit_path");
     let smoke = report.opts.smoke;
     // `--breakdown-only` skips the paired arms and prints only where a cold

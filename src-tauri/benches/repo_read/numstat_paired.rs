@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use gitpulse_lib::engine::git_reader::GitReader;
+use waylode_lib::engine::git_reader::GitReader;
 
 use super::{git_bytes, ChildCpu};
 use crate::common::fixture::{build_repo, count_git_processes, dirty_files, Spec};
@@ -152,7 +152,7 @@ pub fn run(report: &mut Report, root: &Path, rounds: usize) {
          discarded, n={rounds}; ms are wall and child CPU (user+system, getrusage \
          RUSAGE_CHILDREN deltas)"
     ));
-    let churn = |rows: &[gitpulse_lib::engine::git_reader::FileStatus]| {
+    let churn = |rows: &[waylode_lib::engine::git_reader::FileStatus]| {
         rows.iter()
             .map(|row| (row.additions + row.deletions) as u64)
             .sum::<u64>()

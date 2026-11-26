@@ -1,0 +1,224 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Edit|MultiEdit|NotebookEdit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook collision-guard",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook command-gate",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify permission_request",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify tool_finished",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "waylode-hook peer-inbox",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify tool_finished",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify prompt_submitted",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "waylode-hook peer-inbox",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify turn_finished",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "waylode-hook deliver",
+            "timeout": 1800,
+            "asyncRewake": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify error",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook session-brief",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "waylode-hook peer-inbox",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/waylode-worktree.sh\" waylode-hook worktree-create",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/waylode-worktree.sh\" waylode-hook worktree-remove",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify session_ended",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify permission_prompt",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify idle_prompt",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "agent_needs_input",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify agent_needs_input",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "agent_completed",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify agent_completed",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "elicitation_dialog",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify elicitation_dialog",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "elicitation_url_dialog",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify elicitation_url_dialog",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,4 +1,4 @@
-//! `gitpulse_turn_checkpoints` as an agent meets it: advertised read-only, its
+//! `waylode_turn_checkpoints` as an agent meets it: advertised read-only, its
 //! answers match the declared schema, a list and a patch reach the wire, and
 //! a read that could not run says so instead of answering with an empty list.
 
@@ -9,7 +9,7 @@ use crate::test_support::{git_in, git_repo, write};
 fn schema() -> Value {
     tools()
         .into_iter()
-        .find(|t| t["name"] == "gitpulse_turn_checkpoints")
+        .find(|t| t["name"] == "waylode_turn_checkpoints")
         .expect("advertised")["outputSchema"]
         .clone()
 }
@@ -44,7 +44,7 @@ fn take(path: &str, now_ms: u64) -> tc::CaptureResult {
 fn it_is_advertised_read_only() {
     let tool = tools()
         .into_iter()
-        .find(|t| t["name"] == "gitpulse_turn_checkpoints")
+        .find(|t| t["name"] == "waylode_turn_checkpoints")
         .expect("advertised");
     assert_eq!(tool["annotations"]["readOnlyHint"], true);
     assert_eq!(tool["annotations"]["destructiveHint"], false);
@@ -63,7 +63,7 @@ fn a_list_and_a_patch_reach_the_wire() {
     assert_eq!(first.outcome, tc::CaptureOutcome::Captured, "{first:?}");
 
     let listed =
-        handle_tool_call("gitpulse_turn_checkpoints", &json!({ "repo_path": path })).expect("call");
+        handle_tool_call("waylode_turn_checkpoints", &json!({ "repo_path": path })).expect("call");
     conforms(&listed);
     assert_eq!(listed["ok"], true, "{listed}");
     assert_eq!(listed["total"], 1);
@@ -76,7 +76,7 @@ fn a_list_and_a_patch_reach_the_wire() {
 
     let id = entry["id"].as_str().unwrap();
     let patch = handle_tool_call(
-        "gitpulse_turn_checkpoints",
+        "waylode_turn_checkpoints",
         &json!({ "repo_path": path, "id": id }),
     )
     .expect("call");
@@ -86,7 +86,7 @@ fn a_list_and_a_patch_reach_the_wire() {
     assert_eq!(patch["diff"]["truncated"], false);
 
     let limited = handle_tool_call(
-        "gitpulse_turn_checkpoints",
+        "waylode_turn_checkpoints",
         &json!({ "repo_path": path, "limit": 1 }),
     )
     .expect("call");
@@ -98,7 +98,7 @@ fn a_read_that_could_not_run_is_not_an_empty_list() {
     let repo = git_repo();
     let path = repo.path().to_str().unwrap().to_string();
     let unknown = handle_tool_call(
-        "gitpulse_turn_checkpoints",
+        "waylode_turn_checkpoints",
         &json!({ "repo_path": path, "id": "123" }),
     )
     .expect("call");
@@ -107,7 +107,7 @@ fn a_read_that_could_not_run_is_not_an_empty_list() {
     assert!(!unknown["error"].as_str().unwrap().is_empty());
 
     let orphan = handle_tool_call(
-        "gitpulse_turn_checkpoints",
+        "waylode_turn_checkpoints",
         &json!({ "repo_path": path, "against": "123" }),
     )
     .expect("call");
@@ -115,7 +115,7 @@ fn a_read_that_could_not_run_is_not_an_empty_list() {
 
     let dir = tempfile::tempdir().unwrap();
     let not_a_repo = handle_tool_call(
-        "gitpulse_turn_checkpoints",
+        "waylode_turn_checkpoints",
         &json!({ "repo_path": dir.path().to_str().unwrap() }),
     )
     .expect("call");
@@ -123,7 +123,7 @@ fn a_read_that_could_not_run_is_not_an_empty_list() {
     assert_eq!(not_a_repo["ok"], false);
 
     let empty =
-        handle_tool_call("gitpulse_turn_checkpoints", &json!({ "repo_path": path })).expect("call");
+        handle_tool_call("waylode_turn_checkpoints", &json!({ "repo_path": path })).expect("call");
     assert_eq!(empty["ok"], true);
     assert_eq!(empty["total"], 0);
 }
@@ -139,7 +139,7 @@ fn the_arguments_are_bounded_at_the_wire() {
         json!({ "repo_path": path, "unknown": true }),
     ] {
         assert!(
-            validate_arguments("gitpulse_turn_checkpoints", &bad).is_err(),
+            validate_arguments("waylode_turn_checkpoints", &bad).is_err(),
             "{bad}"
         );
     }

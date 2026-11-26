@@ -238,7 +238,7 @@
     <EmptyState
       icon={ShieldCheck}
       title="No terminal sessions ended from outside"
-      hint="Incidents are kept in memory, so this covers the time since GitPulse started."
+      hint="Incidents are kept in memory, so this covers the time since Waylode started."
       compact
     />
   {/if}

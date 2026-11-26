@@ -1,6 +1,6 @@
 # Policy and AI
 
-Mutating Git (commit, push, rebase, branch delete, worktree prune, …) is evaluated by the **Manvi** wrap of DevCouncil policy when it is running. GitPulse talks to `manvi serve` over stdio (NDJSON). Code intelligence uses DevCouncil's `devmap` module directly and is not the same sidecar.
+Mutating Git (commit, push, rebase, branch delete, worktree prune, …) is evaluated by the **Manvi** wrap of DevCouncil policy when it is running. Waylode talks to `manvi serve` over stdio (NDJSON). Code intelligence uses DevCouncil's `devmap` module directly and is not the same sidecar.
 
 ```mermaid
 flowchart TD
@@ -19,7 +19,7 @@ flowchart TD
 
 ## Verdict ladder
 
-The harness decides one of three actions (`allow`, `warn`, `deny`). GitPulse then renders every decision as one of **eight statuses**, evaluated in a fixed order (`contracts/verdict.schema.json`, `$defs/classification`). An `allow` alone does not mean the rules passed.
+The harness decides one of three actions (`allow`, `warn`, `deny`). Waylode then renders every decision as one of **eight statuses**, evaluated in a fixed order (`contracts/verdict.schema.json`, `$defs/classification`). An `allow` alone does not mean the rules passed.
 
 | Status | Meaning |
 | --- | --- |
@@ -38,9 +38,9 @@ Asymmetric degradation: a wedged sidecar fails closed in the sense that the UI d
 
 ## Local AI
 
-Completions (commit messages, commit explanations, branch names, health/coverage suggestions) go through Manvi's `work.assist.complete`, which runs on whatever Manvi is set to (`manvi use`): a local OpenAI-compatible server (Ollama, LM Studio, llama.cpp, vLLM; loopback only) or the Claude API in cloud mode. A failed call is an error, never a quiet fall back. Only when Manvi is not installed, lacks the op, or has no mode chosen (its unset default is cloud, which GitPulse does not follow until you choose it in the Manvi pane) does GitPulse's own **loopback** client answer, asking before it sends to a server it found, with a warning naming why. Remote URLs are rejected on that path.
+Completions (commit messages, commit explanations, branch names, health/coverage suggestions) go through Manvi's `work.assist.complete`, which runs on whatever Manvi is set to (`manvi use`): a local OpenAI-compatible server (Ollama, LM Studio, llama.cpp, vLLM; loopback only) or the Claude API in cloud mode. A failed call is an error, never a quiet fall back. Only when Manvi is not installed, lacks the op, or has no mode chosen (its unset default is cloud, which Waylode does not follow until you choose it in the Manvi pane) does Waylode's own **loopback** client answer, asking before it sends to a server it found, with a warning naming why. Remote URLs are rejected on that path.
 
-Commit messages are classified in the app directly from the staged patch into a structured brief (type, scope, subject). When no loopback model is active, supported Macs can use on-device Apple Intelligence to phrase the subject from the classified brief (without sending the raw patch). If Apple Intelligence is unavailable or the subject fails validation, GitPulse falls back to the deterministic patch-based draft. See [[Security]].
+Commit messages are classified in the app directly from the staged patch into a structured brief (type, scope, subject). When no loopback model is active, supported Macs can use on-device Apple Intelligence to phrase the subject from the classified brief (without sending the raw patch). If Apple Intelligence is unavailable or the subject fails validation, Waylode falls back to the deterministic patch-based draft. See [[Security]].
 
 ```mermaid
 flowchart LR
@@ -74,7 +74,7 @@ providers' permissions. Managed runs (Codex and Claude Code) use a separate Manv
 
 Task title/description suggestions use the profile Manvi provider/model, are bound
 to saved revisions, respect field locks and require selected acceptance. When
-`~/.anthropic-accounts` is present (Manvi's `anthropic-account` registry), GitPulse
+`~/.anthropic-accounts` is present (Manvi's `anthropic-account` registry), Waylode
 launches `manvi serve` via `anthropic-account exec --no-fallback --repo $HOME -- manvi`,
 never reading or storing an Anthropic API key itself, and shows `Cloud · <model>`
 on the status-bar pill. See

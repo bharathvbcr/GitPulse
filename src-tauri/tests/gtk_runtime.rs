@@ -14,7 +14,6 @@ fn main() {
     if nextest_list::answer_list("gtk_runtime", true) {
         return;
     }
-    use gitpulse_lib::desktop::{install_menu, set_recent_menu, DesktopState};
     use gtk::glib::variant::ToVariant;
     use gtk::prelude::GtkWindowExt;
     use std::sync::{
@@ -23,6 +22,7 @@ fn main() {
     };
     use std::time::Duration;
     use tauri::{webview::PageLoadEvent, RunEvent, WebviewUrl, WindowEvent};
+    use waylode_lib::desktop::{install_menu, set_recent_menu, DesktopState};
 
     // Exercise both directions, empty input, UTF-8, exhaustion and oversized
     // skips in the iterator affected by RUSTSEC-2024-0429. Run in release mode

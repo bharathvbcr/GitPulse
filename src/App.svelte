@@ -520,7 +520,7 @@
       const omitted = agents.length > 5 ? `\n…and ${agents.length - 5} more` : "";
       const quit = await askConfirm({
         title: agents.length === 1 ? "Quit While an Agent Is Running?" : `Quit While ${agents.length} Agents Are Running?`,
-        message: `${listed}${omitted}\nQuitting GitPulse ends ${agents.length === 1 ? "this agent" : "these agents"} and whatever ${agents.length === 1 ? "it is" : "they are"} in the middle of.${maviAgents.some((a) => a.resumable) ? "\nMavi threads can be resumed after you reopen GitPulse." : ""}`,
+        message: `${listed}${omitted}\nQuitting Waylode ends ${agents.length === 1 ? "this agent" : "these agents"} and whatever ${agents.length === 1 ? "it is" : "they are"} in the middle of.${maviAgents.some((a) => a.resumable) ? "\nMavi threads can be resumed after you reopen Waylode." : ""}`,
         confirmLabel: agents.length === 1 ? "Quit and End Agent" : "Quit and End Agents",
         cancelLabel: "Keep Working",
         destructive: true,
@@ -541,7 +541,7 @@
       const pending = editorFileSaveQueue.pending;
       const waitForSaves = await askConfirm({
         title: "Finish Saving Before Quit?",
-        message: `${pending} editor ${pending === 1 ? "save is" : "saves are"} still in progress. GitPulse can wait for accepted writes before quitting.`,
+        message: `${pending} editor ${pending === 1 ? "save is" : "saves are"} still in progress. Waylode can wait for accepted writes before quitting.`,
         confirmLabel: "Wait and Quit",
         cancelLabel: "Keep Editing",
       });
@@ -591,7 +591,7 @@
       exitApproved = false;
       cancelNativeExitRequest();
       diagnostics.error("desktop:exit", error);
-      toastStore.error(`Couldn't quit GitPulse. ${formatError(error)}`);
+      toastStore.error(`Couldn't quit Waylode. ${formatError(error)}`);
     }
   }
 
@@ -1407,7 +1407,7 @@
         <Logo size={68} variant="badge" animated />
 
         <div>
-          <h1 class="text-lg font-semibold text-textPrimary">Welcome to GitPulse</h1>
+          <h1 class="text-lg font-semibold text-textPrimary">Welcome to Waylode</h1>
           <p class="text-xs text-textMuted mt-1">High-performance, native Git client built with Rust & Svelte</p>
         </div>
 
@@ -1530,8 +1530,8 @@
         <div class="text-xs font-semibold text-textPrimary mb-1">Optional tools</div>
         <p class="text-meta text-textMuted leading-relaxed mb-2">
           Set up the code map (Code → Map) and
-          Manvi (policy) when you want them — GitPulse works without either.
-          Connect Claude Code or Codex to GitPulse's MCP server too.
+          Manvi (policy) when you want them — Waylode works without either.
+          Connect Claude Code or Codex to Waylode's MCP server too.
         </p>
         <div class="flex items-center gap-2">
           <button

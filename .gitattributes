@@ -18,6 +18,9 @@
 *.png binary
 *.jpg binary
 *.jpeg binary
+# Raw PTY output replayed byte for byte (CR, LF and escapes as the terminal
+# sent them); normalizing its line endings would change what a test replays.
+*.ptylog binary
 *.gif binary
 *.ico binary
 *.icns binary

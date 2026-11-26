@@ -679,8 +679,8 @@ describe("SVG viewBox synthesis, strict XML root/case handling, and extended san
     expect(resolveSvgPreviewShortcut({ key: "0", ctrlKey: false, metaKey: true, altKey: false })).toBeNull();
 
     // Terminal SVG candidate resolution parity with HTML
-    expect(resolveTerminalSvgCandidate("public/gitpulse-mark.svg", "/repo")).toEqual({
-      path: "public/gitpulse-mark.svg",
+    expect(resolveTerminalSvgCandidate("public/waylode-mark.svg", "/repo")).toEqual({
+      path: "public/waylode-mark.svg",
       line: null,
       column: null,
       fallbackPath: undefined,

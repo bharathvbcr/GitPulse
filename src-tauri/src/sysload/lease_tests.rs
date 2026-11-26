@@ -201,12 +201,18 @@ fn a_launched_session_is_pointed_at_the_links_only_when_they_exist_and_leases_ar
     };
     // No links yet: nothing is added, and a stale marker is removed.
     let none = launch_env(Some(config), Some(OsStr::new("/bin")), true);
-    assert_eq!(none, [("GITPULSE_LEASE_BIN", None)]);
-    let hook = temp.path().join("gitpulse-hook");
+    assert_eq!(
+        none,
+        [("WAYLODE_LEASE_BIN", None), ("GITPULSE_LEASE_BIN", None)]
+    );
+    let hook = temp.path().join("waylode-hook");
     crate::test_support::fake_lease_hook(&hook);
     ensure_links(config, &hook).unwrap();
     let env = launch_env(Some(config), Some(OsStr::new("/bin")), true);
-    assert_eq!(names(&env), ["PATH", "GITPULSE_LEASE_BIN"]);
+    assert_eq!(
+        names(&env),
+        ["PATH", "WAYLODE_LEASE_BIN", "GITPULSE_LEASE_BIN"]
+    );
     let path = env[0].1.clone().unwrap();
     assert_eq!(
         std::env::split_paths(&path).next().unwrap(),
@@ -215,9 +221,12 @@ fn a_launched_session_is_pointed_at_the_links_only_when_they_exist_and_leases_ar
     // Switched off, or no config directory: nothing is promised.
     assert_eq!(
         launch_env(Some(config), None, false),
-        [("GITPULSE_LEASE_BIN", None)]
+        [("WAYLODE_LEASE_BIN", None), ("GITPULSE_LEASE_BIN", None)]
     );
-    assert_eq!(launch_env(None, None, true), [("GITPULSE_LEASE_BIN", None)]);
+    assert_eq!(
+        launch_env(None, None, true),
+        [("WAYLODE_LEASE_BIN", None), ("GITPULSE_LEASE_BIN", None)]
+    );
 }
 
 #[cfg(unix)]
@@ -526,6 +535,12 @@ fn only_an_identity_that_names_lease_is_a_lease_wrapper() {
         identity_serves_lease(&crate::hooks::identity()),
         Ok(()),
         "this build's own --version answer passes"
+    );
+    assert_eq!(
+        identity_serves_lease(
+            "waylode-hook 1.2.3\nsubcommands: collision-guard, command-gate, lease\n"
+        ),
+        Ok(())
     );
     assert_eq!(
         identity_serves_lease(

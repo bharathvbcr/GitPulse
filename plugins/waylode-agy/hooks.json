@@ -1,0 +1,67 @@
+{
+  "waylode": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook notify tool_finished",
+            "timeout": 5,
+            "env": {
+              "WAYLODE_HOST": "antigravity"
+            }
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "waylode-hook session-brief",
+        "timeout": 10,
+        "env": {
+          "WAYLODE_HOST": "antigravity"
+        }
+      },
+      {
+        "type": "command",
+        "command": "waylode-hook peer-inbox",
+        "timeout": 5,
+        "env": {
+          "WAYLODE_HOST": "antigravity"
+        }
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "waylode-hook peer-inbox",
+        "timeout": 5,
+        "env": {
+          "WAYLODE_HOST": "antigravity"
+        }
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "waylode-hook peer-inbox",
+        "timeout": 5,
+        "env": {
+          "WAYLODE_HOST": "antigravity"
+        }
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "waylode-hook stop-or-notify",
+        "timeout": 5,
+        "env": {
+          "WAYLODE_HOST": "antigravity"
+        }
+      }
+    ]
+  }
+}

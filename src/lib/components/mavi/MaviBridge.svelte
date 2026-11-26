@@ -12,7 +12,8 @@
    */
   import { onMount, untrack } from "svelte";
   import { maviStore } from "../../mavi/store.svelte";
-  import { maviNotices } from "../../mavi/notify";
+  import { childTabNotice, maviNotices } from "../../mavi/notify";
+  import { childTabs } from "../../mavi/childTabs.svelte";
   import { showMaviThread } from "../../mavi/navigate";
   import type { ThreadStatus } from "../../mavi/threads";
   import { toastStore } from "../../stores/toastStore";
@@ -48,6 +49,18 @@
       agentEvents.dispatchTouchedFile({ id: `mavi:${record.key}`, repo_path: record.target.root, path, artifact: false });
     }),
   );
+
+  // A terminal tab the agent started that needs the person, finished or ended:
+  // a card in its thread (MaviChildTabs) and, off screen, a toast.
+  onMount(() => {
+    void childTabs.start().catch(() => {});
+    return childTabs.onChange(({ threadKey, card, announce }) => {
+      if (!announce || onScreen(threadKey)) return;
+      const record = maviStore.record(threadKey);
+      if (!record) return;
+      toastStore.warning(childTabNotice(card, record.title), { label: "Open", onClick: () => void showMaviThread(threadKey) });
+    });
+  });
 
   function onScreen(key: string): boolean {
     return (

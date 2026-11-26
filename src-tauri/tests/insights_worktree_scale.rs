@@ -3,13 +3,13 @@
 
 mod common;
 
-use gitpulse_lib::insights;
-use gitpulse_lib::ledger;
-use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use waylode_lib::insights;
+use waylode_lib::ledger;
+use waylode_lib::procguard::LockedSpawn;
 
 const LINKED_BRANCH_WORKTREES: usize = 35;
 const LINKED_DETACHED_WORKTREES: usize = 6;
@@ -18,13 +18,13 @@ const MAIN_DIRTY_FILES: usize = 300;
 const OVERLAPPING_FILES: usize = 40;
 
 fn mcp_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_gitpulse-mcp")
+    env!("CARGO_BIN_EXE_waylode-mcp")
 }
 
 fn persist_trust(repo: &Path) {
     let path = repo.to_str().expect("repo path");
-    let preview = gitpulse_lib::repository_trust::inspect(path).expect("inspect repo");
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, true).expect("grant trust");
+    let preview = waylode_lib::repository_trust::inspect(path).expect("inspect repo");
+    waylode_lib::repository_trust::grant(path, &preview.identity, true).expect("grant trust");
 }
 
 struct ScaleFarm {
@@ -236,7 +236,7 @@ fn forty_two_worktrees_scan_completely_without_truncation_and_fail_closed_when_b
         (insights_code, insights_err.as_str()),
         (
             3,
-            "gitpulse-mcp call: the answer is incomplete (codeintel.available); read its error fields before relying on it\n"
+            "waylode-mcp call: the answer is incomplete (codeintel.available); read its error fields before relying on it\n"
         ),
         "the absent index must be the only incomplete part\npayload={insights_json}"
     );

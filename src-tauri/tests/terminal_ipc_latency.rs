@@ -15,12 +15,6 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::commands::{cmd_terminal_resize, cmd_terminal_write};
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{
-    acknowledge_output, hold_master, kill_session, list_sessions, spawn_session, KillOrigin,
-    TerminalSessions, GEOMETRY_QUEUE_CAPACITY, INPUT_QUEUE_CAPACITY,
-};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,6 +22,12 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tauri::{Listener, Manager};
+use waylode_lib::commands::{cmd_terminal_resize, cmd_terminal_write};
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{
+    acknowledge_output, hold_master, kill_session, list_sessions, spawn_session, KillOrigin,
+    TerminalSessions, GEOMETRY_QUEUE_CAPACITY, INPUT_QUEUE_CAPACITY,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -50,14 +50,14 @@ fn prompt() -> Duration {
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("PTY test cleanup incomplete: {error}");
         }
     }
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -231,7 +231,7 @@ fn after_ready(output: &Mutex<HashMap<String, Vec<u8>>>, id: &str) -> Option<Vec
 fn mock_app(state: &TerminalSessions) -> tauri::App<tauri::test::MockRuntime> {
     tauri::test::mock_builder()
         .manage(state.clone())
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap()
 }
 
@@ -287,7 +287,7 @@ fn start(
         Some("/bin/sh".into()),
         args,
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     assert!(
@@ -625,7 +625,7 @@ fn writes_queued_or_in_flight_when_a_session_ends_are_answered_as_gone() {
             Ending::Kill => {
                 kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
             }
-            Ending::Shutdown => gitpulse_lib::terminal::shutdown_sessions(&state).unwrap(),
+            Ending::Shutdown => waylode_lib::terminal::shutdown_sessions(&state).unwrap(),
             Ending::SelfExit => {}
         }
         let closed_in = closing.elapsed();
@@ -646,7 +646,7 @@ fn writes_queued_or_in_flight_when_a_session_ends_are_answered_as_gone() {
         for (n, result) in &seen {
             if let Err(message) = result {
                 assert!(
-                    gitpulse_lib::terminal::reads_as_session_gone(message),
+                    waylode_lib::terminal::reads_as_session_gone(message),
                     "{ending:?}: write {n} was answered {message:?}, which the frontend \
                      reads as a dropped chunk of a live session, not a session that ended"
                 );
@@ -1151,13 +1151,13 @@ fn attach_and_detach_while_writes_are_queued_keep_every_byte_in_order() {
         let (state, id, handle) = (&state, &id, &handle);
         scope.spawn(move || {
             for round in 0..30u16 {
-                let _ = gitpulse_lib::terminal::detach_session(state, id).unwrap();
-                gitpulse_lib::terminal::attach_session(
+                let _ = waylode_lib::terminal::detach_session(state, id).unwrap();
+                waylode_lib::terminal::attach_session(
                     state,
                     id,
                     20 + round,
                     80,
-                    gitpulse_lib::terminal::OutputSink::events(handle),
+                    waylode_lib::terminal::OutputSink::events(handle),
                 )
                 .unwrap();
                 std::thread::sleep(Duration::from_millis(20));
@@ -1245,7 +1245,7 @@ fn a_resize_storm_leaves_the_pty_at_the_last_size_requested() {
         let _ = tauri::async_runtime::block_on(call);
     }
     assert_eq!(
-        gitpulse_lib::terminal::pty_size(&state, &id).unwrap(),
+        waylode_lib::terminal::pty_size(&state, &id).unwrap(),
         *sizes.last().unwrap(),
         "the PTY was left at a size other than the last one asked for"
     );
@@ -1257,7 +1257,7 @@ fn a_resize_storm_leaves_the_pty_at_the_last_size_requested() {
 /// and what is refused is refused at once.
 #[test]
 fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() {
-    use gitpulse_lib::commands::cmd_terminal_context;
+    use waylode_lib::commands::cmd_terminal_context;
 
     async fn cmd_terminal_kill(
         _handle: tauri::AppHandle<tauri::test::MockRuntime>,
@@ -1265,7 +1265,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
         session_id: String,
     ) -> Result<(), String> {
         let kill_id = session_id.clone();
-        gitpulse_lib::terminal::control_async(&state, "terminal_kill", move |state| {
+        waylode_lib::terminal::control_async(&state, "terminal_kill", move |state| {
             kill_session(state, &kill_id, KillOrigin::Unspecified).map(|_| ())
         })
         .await
@@ -1287,7 +1287,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
     let running = Arc::new(AtomicUsize::new(0));
     let hold = || {
         let (gate, running) = (gate.clone(), running.clone());
-        Box::pin(gitpulse_lib::terminal::control_async(
+        Box::pin(waylode_lib::terminal::control_async(
             &state,
             "test_hold",
             move |_| {
@@ -1301,7 +1301,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
             },
         ))
     };
-    let threads_wide = gitpulse_lib::terminal::MAX_PTY_SESSIONS;
+    let threads_wide = waylode_lib::terminal::MAX_PTY_SESSIONS;
     let mut held = Vec::new();
     for _ in 0..threads_wide {
         let mut call = hold();
@@ -1366,7 +1366,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
     for message in &refusals {
         assert!(message.contains("queue is full"), "{message}");
         assert!(
-            !gitpulse_lib::terminal::reads_as_session_gone(message),
+            !waylode_lib::terminal::reads_as_session_gone(message),
             "{message}"
         );
     }
@@ -1415,7 +1415,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
 /// descriptor.
 #[test]
 fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
-    let sessions = gitpulse_lib::terminal::MAX_PTY_SESSIONS;
+    let sessions = waylode_lib::terminal::MAX_PTY_SESSIONS;
     let _serial = serial();
     let state = common::terminals();
     let app = mock_app(&state);
@@ -1487,7 +1487,7 @@ fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
     assert_eq!(state.lane_threads(), 1);
 
     let closing = Instant::now();
-    gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
+    waylode_lib::terminal::shutdown_sessions(&state).unwrap();
     let closed_in = closing.elapsed();
     println!("shutdown of {sessions} sessions took {closed_in:?}");
     assert!(

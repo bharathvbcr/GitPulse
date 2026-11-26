@@ -60,6 +60,18 @@ describe("validateTheme: accepted themes", () => {
     expect(result.ignoredKeys).toEqual([]);
   });
 
+  it("dual-accepts legacy gitpulse-theme/1 and canonical waylode-theme/1 on import while exporting waylode-theme/1", () => {
+    const legacy = validateTheme({ ...MINIMAL, schema: "gitpulse-theme/1" });
+    expect(legacy.ok).toBe(true);
+    if (!legacy.ok) return;
+    expect(legacy.theme.schema).toBe("waylode-theme/1");
+
+    const current = validateTheme({ ...MINIMAL, schema: "waylode-theme/1" });
+    expect(current.ok).toBe(true);
+    if (!current.ok) return;
+    expect(current.theme.schema).toBe("waylode-theme/1");
+  });
+
   it("accepts every field, lowercases hex, expands nothing, strips font quotes", () => {
     const result = validateTheme(FULL);
     expect(result.ok).toBe(true);

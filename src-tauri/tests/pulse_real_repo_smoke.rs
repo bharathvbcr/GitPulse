@@ -14,13 +14,13 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::engine::GitReader;
+use waylode_lib::engine::GitReader;
 
 fn repo_from_env() -> String {
     // A real repository is read at real scale, not at the production spawn
     // rate this process would otherwise run under (it links the library
     // without `cfg(test)`).
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     std::env::var("GITPULSE_PULSE_REPO").expect("set GITPULSE_PULSE_REPO to a repository path")
 }
 

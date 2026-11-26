@@ -43,18 +43,18 @@ describe("KeepTerminalsSetting", () => {
           managed: {
             requested: true,
             hosted: true,
-            detail: "Managed agent runs are kept running when GitPulse quits, and the next launch picks them up.",
+            detail: "Managed agent runs are kept running when Waylode quits, and the next launch picks them up.",
           },
         },
       },
     });
 
-    expect(body).toContain("Keep managed agent runs running when GitPulse quits");
+    expect(body).toContain("Keep managed agent runs running when Waylode quits");
     expect(body).toContain('aria-checked="true"');
     expect(body).toContain('data-testid="keep-terminals-note"');
     expect(body).toContain("held by the terminal host (survive quit and crash)");
     expect(body).toContain('data-testid="keep-managed-status"');
-    expect(body).toContain("Managed agent runs are kept running when GitPulse quits");
+    expect(body).toContain("Managed agent runs are kept running when Waylode quits");
     expect(body).not.toContain('data-testid="keep-terminals-trouble"');
     expect(body).not.toContain('data-testid="keep-terminals-backend-error"');
   });
@@ -76,14 +76,14 @@ describe("KeepTerminalsSetting", () => {
           managed: {
             requested: false,
             hosted: false,
-            detail: "Managed agent runs end when GitPulse quits.",
+            detail: "Managed agent runs end when Waylode quits.",
           },
         },
       },
     });
 
     expect(body).toContain('aria-checked="false"');
-    expect(body).toContain("Managed agent runs end when GitPulse quits.");
+    expect(body).toContain("Managed agent runs end when Waylode quits.");
 
     const optOut = withKeepTerminalsRunning({ permission: { claude: "edit" } }, false);
     expect(optOut).toEqual({ permission: { claude: "edit" }, keep_terminals_running: false });

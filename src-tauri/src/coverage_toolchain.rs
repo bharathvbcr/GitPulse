@@ -245,7 +245,7 @@ mod tests {
         );
         assert!(
             GCOVR_PACKAGES.contains(&GCOVR_MODULE),
-            "the module GitPulse runs must be one it is allowed to install"
+            "the module Waylode runs must be one it is allowed to install"
         );
     }
 }

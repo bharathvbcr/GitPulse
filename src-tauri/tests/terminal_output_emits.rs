@@ -14,14 +14,14 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{
-    acknowledge_output, spawn_session, write_to_session, TerminalSessions, OUTPUT_CHUNK_BYTES,
-};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
+use waylode_lib::procguard::LockedSpawn;
+use waylode_lib::terminal::{
+    acknowledge_output, spawn_session, write_to_session, TerminalSessions, OUTPUT_CHUNK_BYTES,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -34,14 +34,14 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        if let Err(error) = gitpulse_lib::terminal::shutdown_sessions(&self.0) {
+        if let Err(error) = waylode_lib::terminal::shutdown_sessions(&self.0) {
             eprintln!("PTY test cleanup incomplete: {error}");
         }
     }
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -147,7 +147,7 @@ fn spawn(
         Some("/bin/sh".into()),
         Some(args),
         None,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+        waylode_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap()
     .id
@@ -155,7 +155,7 @@ fn spawn(
 
 fn run_tui(sessions: usize, frames: usize, writes: usize) -> (Vec<Tally>, Duration) {
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -276,7 +276,7 @@ fn a_one_megabyte_burst_is_byte_exact_in_few_events_with_exact_credit() {
     let _serial = serial();
     const TOTAL: usize = 1024 * 1024;
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -326,10 +326,10 @@ fn a_one_megabyte_burst_is_byte_exact_in_few_events_with_exact_credit() {
         acknowledge_output(&state, &id, 1).is_err(),
         "credit accounting drifted from what was emitted"
     );
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &id,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 }
@@ -356,7 +356,7 @@ fn received(tallies: &Tallies, id: &str) -> usize {
 fn output_that_stops_after_looking_like_a_stream_is_still_delivered() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -377,10 +377,10 @@ fn output_that_stops_after_looking_like_a_stream_is_still_delivered() {
         "700 bytes followed by silence never arrived: {} did",
         received(&tallies, &id)
     );
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &id,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 
@@ -398,10 +398,10 @@ fn output_that_stops_after_looking_like_a_stream_is_still_delivered() {
         wait_for(Duration::from_secs(10), || received(&tallies, &id) >= 2),
         "a two-byte prompt never arrived"
     );
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &id,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 }
@@ -412,7 +412,7 @@ fn output_that_stops_after_looking_like_a_stream_is_still_delivered() {
 fn output_gathered_when_the_process_exits_is_delivered_before_the_exit() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -463,7 +463,7 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
     let _serial = serial();
     const WINDOW: usize = 512 * 1024;
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -550,10 +550,10 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
             .any(|w| w == b"RESUMED-OK")
     });
     assert!(resumed, "delivery never resumed after the view repaid");
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &id,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 }
@@ -565,7 +565,7 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
 fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -585,7 +585,7 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     // The flow-control window: credit the host can have sent and the view not
     // yet acknowledged. It is all that can still be on its way at the detach.
     const WINDOW: usize = 512 * 1024;
-    assert!(gitpulse_lib::terminal::detach_session(&state, &id).unwrap());
+    assert!(waylode_lib::terminal::detach_session(&state, &id).unwrap());
     // Counted once the host has applied the detach: until then the view is
     // still attached and acknowledging, and what the host sends it is not late.
     let at_detach = received(&tallies, &id);
@@ -593,7 +593,7 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     // sending would deliver megabytes in this time, not one window.
     std::thread::sleep(Duration::from_millis(700));
     assert!(
-        gitpulse_lib::terminal::list_sessions(&state)
+        waylode_lib::terminal::list_sessions(&state)
             .unwrap()
             .iter()
             .any(|s| s.id == id && s.detached),
@@ -607,7 +607,7 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     // A fixed 300 ms wait for that read a still-landing backlog as output
     // sent after the detach (85 KB on a loaded Linux runner).
     let (viewer, sink) = Viewer::new(&state, true);
-    gitpulse_lib::terminal::attach_session(&state, &id, 24, 80, sink).unwrap();
+    waylode_lib::terminal::attach_session(&state, &id, 24, 80, sink).unwrap();
     viewer.bind(&id);
     let late = received(&tallies, &id) - at_detach;
     assert!(
@@ -619,10 +619,10 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
         wait_for(Duration::from_secs(20), || viewer.bytes() > 512 * 1024),
         "a reattached session never streamed again"
     );
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &id,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 }
@@ -698,7 +698,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
     const KEYS: usize = 60;
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -744,10 +744,10 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let beside = echo_latencies(&state, &arrivals, &quiet, KEYS);
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &flood,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 
@@ -815,16 +815,16 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
         "an echo inside a flood took {:?}",
         within[within.len() - 1]
     );
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &own,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &quiet,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 }
@@ -838,7 +838,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
 fn characters_and_escape_sequences_split_across_events_arrive_byte_exact() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -931,10 +931,10 @@ fn characters_and_escape_sequences_split_across_events_arrive_byte_exact() {
         acknowledge_output(&state, &id, 1).is_err(),
         "credit accounting drifted from what was emitted"
     );
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &id,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 }
@@ -947,7 +947,7 @@ fn characters_and_escape_sequences_split_across_events_arrive_byte_exact() {
 fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -1057,10 +1057,10 @@ fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
         *largest.lock().unwrap()
     );
     assert!(*largest.lock().unwrap() <= OUTPUT_CHUNK_BYTES);
-    gitpulse_lib::terminal::kill_session(
+    waylode_lib::terminal::kill_session(
         &state,
         &id,
-        gitpulse_lib::terminal::KillOrigin::Unspecified,
+        waylode_lib::terminal::KillOrigin::Unspecified,
     )
     .unwrap();
 }
@@ -1074,9 +1074,9 @@ fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
 // then one end marker before the exit event. These tests are that view.
 // ---------------------------------------------------------------------------
 
-use gitpulse_lib::terminal::{OutputSink, END_OF_OUTPUT};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tauri::ipc::{Channel, InvokeResponseBody};
+use waylode_lib::terminal::{OutputSink, END_OF_OUTPUT};
 
 /// What one channel was sent.
 #[derive(Default)]
@@ -1208,7 +1208,7 @@ fn a_views_channel_gets_raw_bytes_in_order_then_one_end_marker_before_the_exit()
     let _serial = serial();
     const TOTAL: usize = 2 * 1024 * 1024;
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -1307,7 +1307,7 @@ fn a_views_channel_gets_raw_bytes_in_order_then_one_end_marker_before_the_exit()
 fn attaching_a_view_moves_the_output_to_its_channel() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -1326,10 +1326,10 @@ fn attaching_a_view_moves_the_output_to_its_channel() {
         wait_for(Duration::from_secs(10), || first.bytes() >= 4),
         "the first view never saw its echo"
     );
-    assert!(gitpulse_lib::terminal::detach_session(&state, &id).unwrap());
+    assert!(waylode_lib::terminal::detach_session(&state, &id).unwrap());
     let before = first.bytes();
     let (second, second_sink) = Viewer::new(&state, true);
-    gitpulse_lib::terminal::attach_session(&state, &id, 24, 80, second_sink).unwrap();
+    waylode_lib::terminal::attach_session(&state, &id, 24, 80, second_sink).unwrap();
     second.bind(&id);
     write_to_session(&state, &id, "pong").unwrap();
     assert!(
@@ -1352,7 +1352,7 @@ fn attaching_a_view_moves_the_output_to_its_channel() {
 fn a_hidden_sessions_output_is_batched_at_least_ten_times_harder_and_still_whole() {
     let _serial = serial();
     let app = tauri::test::mock_builder()
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .unwrap();
     let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
@@ -1377,7 +1377,7 @@ fn a_hidden_sessions_output_is_batched_at_least_ten_times_harder_and_still_whole
     seen.bind(&visible_id);
     let hidden_id = spawn_for(&app, &state, &dir, script, hidden_sink);
     hidden.bind(&hidden_id);
-    gitpulse_lib::terminal::set_background_sessions(&state, std::slice::from_ref(&hidden_id));
+    waylode_lib::terminal::set_background_sessions(&state, std::slice::from_ref(&hidden_id));
     let total = 150 * 2048;
     assert!(
         wait_for(Duration::from_secs(30), || seen.bytes() >= total

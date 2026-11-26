@@ -4,7 +4,7 @@
 
 ## 1. Open and trust a repository
 
-Install GitPulse and Git, launch the app, and use the Open control to choose a
+Install Waylode and Git, launch the app, and use the Open control to choose a
 repository. Read **Trust and Open** before approving it: repository hooks,
 helpers, and project tools can run under your account. Trust is not an OS
 sandbox or a guarantee about the repository's contents.
@@ -68,20 +68,20 @@ loaded-page filtering, multi-selection, archive, and run boundaries.
 ## 5. Run your first two agents
 
 This path starts two agents on two tasks in one repository, each in its own
-worktree, and shows you what GitPulse reports while they work. It needs a
+worktree, and shows you what Waylode reports while they work. It needs a
 repository you have trusted and at least one agent CLI installed (Claude Code,
 Codex, Antigravity or Manvi). Agents run under their own permissions, so read the
-[agents guide](AGENTS_GUIDE.md) first if you are unsure what GitPulse does and does
+[agents guide](AGENTS_GUIDE.md) first if you are unsure what Waylode does and does
 not guard.
 
 1. **Connect the agent.** Open **Settings → Agents → Connect your agent** and apply
    the plan (see step 6 for what it does). Without it, agents still launch, but they
-   cannot call GitPulse's MCP tools or the hooks that guard them.
+   cannot call Waylode's MCP tools or the hooks that guard them.
 2. **Write two tasks.** In **Work → Tasks**, use Quick add to create two small,
    independent tasks. Give each an acceptance criterion; the agent's brief includes it.
 3. **Launch the first.** Choose **Send to agent** on the first card. Pick the agent,
    the working checkout and the permission mode, and tick **Run in a new worktree**.
-   Optionally set the model, effort and advisor for this launch. GitPulse creates
+   Optionally set the model, effort and advisor for this launch. Waylode creates
    `.gitpulse/worktrees/<task>-<id>` on a new `gitpulse/<task>-<id>` branch and opens
    a terminal for the attempt in the dock.
 4. **Launch the second** the same way, with a different agent if you have one. The
@@ -101,7 +101,7 @@ not guard.
 
 ## 6. Add optional capabilities when you need them
 
-GitPulse works without any of these. The code-map views (Health, Suspects, diff
+Waylode works without any of these. The code-map views (Health, Suspects, diff
 impact and palette symbol search) stay open without DevMap and say what is
 missing, with a **Set up code map** or **Build index** button in place; the
 Manvi card and status pill do the same for Manvi.
@@ -113,7 +113,7 @@ Manvi card and status pill do the same for Manvi.
   the plan first and changes nothing until you apply it; anything already set
   up differently is left alone and reported, with the commands to switch it.
   **Copy setup prompt** gives your agent the same steps to carry out instead,
-  plus the optional Claude Code plugin that adds GitPulse's hooks and skills.
+  plus the optional Claude Code plugin that adds Waylode's hooks and skills.
   The plugin also provides the `gitpulse` server, so use it or the direct
   registration, not both; Connect skips the Claude Code registration when the
   plugin is enabled. No source checkout or Rust toolchain is needed.

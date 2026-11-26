@@ -8,15 +8,15 @@
 #![cfg(unix)]
 
 mod common;
-use gitpulse_lib::procguard::LockedSpawn;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
 fn daemon(profile: &std::path::Path, repo: &std::path::Path, logs: &std::path::Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
+    Command::new(env!("CARGO_BIN_EXE_wayloded"))
         .args(["--interval", "3600"])
         .arg(repo)
-        .env("GITPULSE_LOG_DIR", logs)
+        .env("WAYLODE_LOG_DIR", logs)
         .env("HOME", profile)
         .env("XDG_CONFIG_HOME", profile)
         .env("APPDATA", profile)
@@ -24,7 +24,7 @@ fn daemon(profile: &std::path::Path, repo: &std::path::Path, logs: &std::path::P
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn_locked()
-        .expect("spawn gitpulsed")
+        .expect("spawn wayloded")
 }
 
 fn wait_exit(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {
@@ -49,11 +49,11 @@ fn a_second_daemon_for_one_profile_is_refused_and_a_later_one_is_admitted() {
     // The first is admitted once the lock names it.
     // `default_config_dir`, as the daemon computes it from this scratch HOME.
     let config = if cfg!(target_os = "macos") {
-        dir.join("Library/Application Support/GitPulse/gitpulsed")
+        dir.join("Library/Application Support/Waylode/wayloded")
     } else {
-        dir.join("gitpulse/gitpulsed")
+        dir.join("waylode/wayloded")
     };
-    let status = || gitpulse_lib::daemon_lock::running(&config);
+    let status = || waylode_lib::daemon_lock::running(&config);
     let deadline = Instant::now() + Duration::from_secs(20);
     let owner = loop {
         if let Ok(Some(owner)) = status() {

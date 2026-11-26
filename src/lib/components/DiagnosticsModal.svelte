@@ -492,7 +492,7 @@
           {/if}
           {#each degradedSubsystems as degraded (degraded.subsystem)}
             <p class="text-meta text-warn wrap-break-word">
-              {degraded.subsystem} hit an internal error{degraded.panics > 1 ? ` ${degraded.panics} times` : ""} and {degraded.stopped ? "has stopped; restart GitPulse to bring it back" : "is retrying"}: {degraded.reason}
+              {degraded.subsystem} hit an internal error{degraded.panics > 1 ? ` ${degraded.panics} times` : ""} and {degraded.stopped ? "has stopped; restart Waylode to bring it back" : "is retrying"}: {degraded.reason}
             </p>
           {/each}
           {#if persistedLog?.degraded}

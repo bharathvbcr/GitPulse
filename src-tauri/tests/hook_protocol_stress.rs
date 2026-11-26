@@ -22,13 +22,13 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 const SUBCOMMANDS: [&str; 3] = ["collision-guard", "command-gate", "session-brief"];
 
 /// Generous on purpose. The hook's own ceiling is 5s and the host's is 10s;
@@ -52,7 +52,7 @@ fn ask(subcommand: &str, payload: &[u8], env: &[(&str, &Path)]) -> Answer {
     let mut command = Command::new(HOOK);
     command
         .arg(subcommand)
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -300,8 +300,8 @@ fn persistent_grant_child() {
     let Ok(repo) = std::env::var(GRANT_CHILD_ENV) else {
         return;
     };
-    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
-    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("persist");
+    let preview = waylode_lib::repository_trust::inspect(&repo).expect("inspect");
+    waylode_lib::repository_trust::grant(&repo, &preview.identity, true).expect("persist");
 }
 
 /// Sixty-four agent Bash calls at once against an initialised ledger the app
@@ -318,10 +318,10 @@ fn persistent_grant_child() {
 #[cfg(unix)]
 #[test]
 fn sixty_four_concurrent_hooks_read_a_live_ledger() {
-    use gitpulse_lib::ledger::{self, ActorKind, Draft, Outcome};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use waylode_lib::ledger::{self, ActorKind, Draft, Outcome};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let repo_buf = dir.path().canonicalize().expect("canonical repo");
@@ -353,9 +353,9 @@ fn sixty_four_concurrent_hooks_read_a_live_ledger() {
     // list` (one metered spawn, seen with the gate instrumented). The trust
     // read does not: it reads the filesystem. The hook processes this test
     // drives have gates of their own.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
-    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
-    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, false).expect("trust");
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    let preview = waylode_lib::repository_trust::inspect(&repo).expect("inspect");
+    waylode_lib::repository_trust::grant(&repo, &preview.identity, false).expect("trust");
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).expect("mkdir home");
     let granted = Command::new(std::env::current_exe().expect("test binary"))
@@ -571,7 +571,7 @@ fn the_identity_flag_cannot_be_reached_by_a_hook_payload() {
     assert_eq!(answer.code, Some(0));
     let text = String::from_utf8(answer.stdout).expect("utf-8");
     assert!(
-        text.starts_with("gitpulse-hook "),
+        text.starts_with("waylode-hook "),
         "identity did not lead with the binary name: {text:?}"
     );
     assert!(

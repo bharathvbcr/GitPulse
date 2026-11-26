@@ -62,10 +62,10 @@ const SCENARIOS: &[&str] = &[
 
 #[cfg(target_os = "macos")]
 fn parent() {
-    use gitpulse_lib::procguard::LockedSpawn;
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    use waylode_lib::procguard::LockedSpawn;
 
     // Drained while the child runs: a child that fills a pipe would otherwise
     // block on it and be reported as a hang.
@@ -144,13 +144,13 @@ mod child {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use gitpulse_lib::desktop::{
-        self, cmd_set_exit_guard_ready, exit, terminate, webcrash, DesktopState,
-        EXIT_REQUESTED_EVENT,
-    };
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send, sel};
     use tauri::{AppHandle, Listener, Manager, RunEvent, WebviewUrl, Wry};
+    use waylode_lib::desktop::{
+        self, cmd_set_exit_guard_ready, exit, terminate, webcrash, DesktopState,
+        EXIT_REQUESTED_EVENT,
+    };
 
     #[derive(Default)]
     struct Probe {
@@ -189,12 +189,12 @@ mod child {
             std::thread::sleep(Duration::from_secs(35));
             fail("main-thread deadline expired");
         });
-        let mut context = gitpulse_lib::context();
+        let mut context = waylode_lib::context();
         context.config_mut().identifier = "com.gitpulse.tests.quit-guard".into();
         context.config_mut().app.windows.clear();
         let mut app = tauri::Builder::default()
             .manage(DesktopState::default())
-            .manage(gitpulse_lib::terminal::TerminalSessions::from_settings())
+            .manage(waylode_lib::terminal::TerminalSessions::from_settings())
             .on_web_content_process_terminate(webcrash::on_terminated)
             // A page of its own: a debug build points `WebviewUrl::App` at the
             // dev server, which a test cannot assume is running.

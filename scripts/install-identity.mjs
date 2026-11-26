@@ -135,7 +135,7 @@ export function fileDigest(file) {
 }
 
 /**
- * Where the record lives: beside GitPulse's other per-user state, not beside
+ * Where the record lives: beside Waylode's other per-user state, not beside
  * the binary. `~/.cargo/bin` belongs to cargo, and a file dropped in it would
  * outlive an uninstall.
  *
@@ -145,11 +145,33 @@ export function recordPath() {
   const home = os.homedir();
   const dir =
     process.platform === "darwin"
-      ? path.join(home, "Library", "Application Support", "GitPulse")
+      ? path.join(home, "Library", "Application Support", "Waylode")
       : process.platform === "win32"
-        ? path.join(process.env.APPDATA ?? path.join(home, "AppData", "Roaming"), "GitPulse")
-        : path.join(process.env.XDG_CONFIG_HOME ?? path.join(home, ".config"), "GitPulse");
+        ? path.join(process.env.APPDATA ?? path.join(home, "AppData", "Roaming"), "Waylode")
+        : path.join(process.env.XDG_CONFIG_HOME ?? path.join(home, ".config"), "waylode");
   return path.join(dir, "mcp-install-v1.json");
+}
+
+/**
+ * Legacy GitPulse install record path(s), checked by {@link readInstallRecord}
+ * when `recordPath()` is absent.
+ *
+ * @returns {string[]}
+ */
+export function legacyRecordPaths() {
+  const home = os.homedir();
+  if (process.platform === "darwin") {
+    return [path.join(home, "Library", "Application Support", "GitPulse", "mcp-install-v1.json")];
+  }
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA ?? path.join(home, "AppData", "Roaming");
+    return [path.join(appData, "GitPulse", "mcp-install-v1.json")];
+  }
+  const xdg = process.env.XDG_CONFIG_HOME ?? path.join(home, ".config");
+  return [
+    path.join(xdg, "GitPulse", "mcp-install-v1.json"),
+    path.join(xdg, "gitpulse", "mcp-install-v1.json"),
+  ];
 }
 
 /**
@@ -165,20 +187,29 @@ export function recordPath() {
 /**
  * The recorded install, or `null` when there is not a usable one.
  *
- * A record from a future version, a truncated file, or one missing a field all
- * read as absent. None of them is an `ok`: absent means the doctor says it
- * could not verify, which is the honest report and the one that names the fix.
+ * Reads `recordPath()` first, falling back to legacy `GitPulse/mcp-install-v1.json`
+ * only when the primary file does not exist (`ENOENT`). A record from a future
+ * version, a truncated file, or one missing a field all read as absent.
  *
  * @returns {InstallRecord | null}
  */
 export function readInstallRecord() {
   /** @type {unknown} */
   let parsed;
-  try {
-    parsed = JSON.parse(readFileSync(recordPath(), "utf8"));
-  } catch {
-    return null;
+  let loaded = false;
+  for (const candidate of [recordPath(), ...legacyRecordPaths()]) {
+    try {
+      parsed = JSON.parse(readFileSync(candidate, "utf8"));
+      loaded = true;
+      break;
+    } catch (err) {
+      if (/** @type {NodeJS.ErrnoException} */ (err)?.code === "ENOENT") {
+        continue;
+      }
+      return null;
+    }
   }
+  if (!loaded) return null;
   if (typeof parsed !== "object" || parsed === null) return null;
   const record = /** @type {Partial<InstallRecord>} */ (parsed);
   if (record.version !== RECORD_VERSION) return null;

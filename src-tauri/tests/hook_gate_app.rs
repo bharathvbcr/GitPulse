@@ -17,15 +17,15 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::desktop::instance::{claim, Claim};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+use waylode_lib::desktop::instance::{claim, Claim};
+use waylode_lib::procguard::LockedSpawn;
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 
 /// Logs the parent pid of every start, then answers as Manvi does: a force
 /// push is denied, anything else is a demoted allow.
@@ -59,7 +59,7 @@ fn hook(home: &Path, manvi: &Path, payload: &str) -> serde_json::Value {
     let logs = tempfile::tempdir().expect("hook log dir");
     let mut child = Command::new(HOOK)
         .arg("command-gate")
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .env("HOME", home)
         .env("GITPULSE_MANVI_BIN", manvi)
         .stdin(Stdio::piped())
@@ -126,12 +126,12 @@ fn hooks_ask_the_app_and_fall_back_to_their_own_manvi() {
     let without_benign = hook(&home_path, &manvi, &benign);
 
     // With the app: none do.
-    let profile = home_path.join("Library/Application Support/GitPulse");
+    let profile = home_path.join("Library/Application Support/Waylode");
     let owner = match claim(&profile, Duration::from_millis(300)) {
         Claim::Primary(owner) => owner,
         _ => panic!("expected to own the profile"),
     };
-    owner.attach_gate(Arc::new(gitpulse_lib::hooks::serve_gate));
+    owner.attach_gate(Arc::new(waylode_lib::hooks::serve_gate));
     std::fs::write(&log, "").unwrap();
     for _ in 0..12 {
         let answer = hook(&home_path, &manvi, &force);

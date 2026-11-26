@@ -107,11 +107,11 @@ fn integration_tests_resolve_state_under_the_per_process_root() {
     for (what, path) in [
         (
             "default_config_dir",
-            gitpulse_lib::tool_config::default_config_dir(),
+            waylode_lib::tool_config::default_config_dir(),
         ),
         (
             "default_cache_dir",
-            gitpulse_lib::tool_config::default_cache_dir(),
+            waylode_lib::tool_config::default_cache_dir(),
         ),
     ] {
         let path = path.unwrap_or_else(|| panic!("{what} did not resolve"));
@@ -593,7 +593,7 @@ fn every_scoped_name_a_test_reads_survives_the_constructor_or_is_set_for_a_child
 /// survive and the session variables do not.
 #[test]
 fn an_exported_opt_in_driver_reaches_the_test_process_and_a_session_variable_does_not() {
-    use gitpulse_lib::procguard::LockedSpawn;
+    use waylode_lib::procguard::LockedSpawn;
     let kept = [
         "GITPULSE_MANVI_BIN",
         "GITPULSE_DEVMAP_BIN",
@@ -820,8 +820,8 @@ fn the_wall_clock_matcher_sees_single_line_and_wrapped_limits_only() {
 /// global git config is the file at `global`, and returns how many entries
 /// `HEAD`'s reflog holds afterwards.
 fn reflog_entries_after_commits(global: &Path, epoch: u64, count: usize) -> usize {
-    use gitpulse_lib::procguard::LockedSpawn;
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    use waylode_lib::procguard::LockedSpawn;
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::TempDir::new().unwrap();
     let date = format!("{epoch} +0000");
     let git = |args: &[&str]| {

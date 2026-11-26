@@ -67,7 +67,7 @@ pub fn parse_base_url(base_url: &str) -> Result<Endpoint, String> {
         Some(("http", rest)) => rest,
         Some(("https", _)) => {
             return Err(
-                "https is refused: GitPulse only talks to a model server on this machine, \
+                "https is refused: Waylode only talks to a model server on this machine, \
                  where there is no remote identity to verify"
                     .into(),
             )
@@ -120,7 +120,7 @@ pub fn parse_base_url(base_url: &str) -> Result<Endpoint, String> {
             .unwrap_or(false);
     if !is_loopback {
         return Err(format!(
-            "'{}' is not a loopback address; GitPulse's AI features only ever address a model \
+            "'{}' is not a loopback address; Waylode's AI features only ever address a model \
              server running on this machine",
             host
         ));
@@ -183,7 +183,7 @@ fn all_loopback(addrs: &[SocketAddr]) -> Result<(), String> {
     match offender {
         None => Ok(()),
         Some(addr) => Err(format!(
-            "refusing non-loopback address {addr}: GitPulse's AI features only ever address \
+            "refusing non-loopback address {addr}: Waylode's AI features only ever address \
              a model server running on this machine"
         )),
     }

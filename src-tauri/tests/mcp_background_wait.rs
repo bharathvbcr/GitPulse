@@ -6,11 +6,11 @@
 
 mod common;
 
-use gitpulse_lib::ipc_error::CommandError;
 use std::time::{Duration, Instant};
+use waylode_lib::ipc_error::CommandError;
 
-use gitpulse_lib::engine::git_cli::git_global;
-use gitpulse_lib::engine::process::{
+use waylode_lib::engine::git_cli::git_global;
+use waylode_lib::engine::process::{
     current_admission_name, run_process_as_background, run_process_awaiting_background_budget,
 };
 

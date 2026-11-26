@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Names this program to Graft's allow list. Matches `[a-z0-9][a-z0-9._-]{0,31}`.
 const SOURCE: &str = "gitpulse";
 /// What the phone shows as the posting application.
-const APP: &str = "GitPulse";
+const APP: &str = "Waylode";
 /// Environment override for the socket path.
 const SOCKET_ENV: &str = "GRAFT_NOTIFY_SOCKET";
 /// Under the user's home directory when the override is absent.

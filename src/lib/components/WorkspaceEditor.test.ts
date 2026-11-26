@@ -15,7 +15,7 @@ describe("WorkspaceEditor", () => {
     expect(source).toContain("addableOpenTabs");
     expect(source).toContain("registerRepository");
     expect(source).toContain("withRepositoryId");
-    expect(source).toContain("Open in GitPulse");
+    expect(source).toContain("Open in Waylode");
     expect(source).toContain("Add all open");
     expect(source).toContain("addOpenPaths");
     expect(source).toContain("draft.repository_ids = withRepositoryId");

@@ -1,0 +1,49 @@
+{
+  "waylode": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "waylode-hook --host=agy session-brief",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "waylode-hook --host=agy peer-inbox",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "waylode-hook --host=agy notify tool_finished",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "waylode-hook --host=agy peer-inbox",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "waylode-hook --host=agy peer-inbox",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "waylode-hook --host=agy stop-or-notify",
+        "timeout": 5
+      }
+    ]
+  }
+}

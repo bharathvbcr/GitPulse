@@ -26,9 +26,9 @@ use std::time::Instant;
 
 use common::fixture::{git, trust_repo};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
+use waylode_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 #[cfg(unix)]
-use gitpulse_lib::analyzer::deps::{DepsScanner, ScanOptions};
+use waylode_lib::analyzer::deps::{DepsScanner, ScanOptions};
 
 const HIT_FILES: usize = 2_000;
 const HIT_LINES: usize = 100;

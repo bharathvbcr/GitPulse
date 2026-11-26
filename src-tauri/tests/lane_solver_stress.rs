@@ -12,9 +12,9 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::graph::{LaneSolver, RawCommitNode, VisualCommitRow};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use waylode_lib::graph::{LaneSolver, RawCommitNode, VisualCommitRow};
 
 fn make_commit(id: String, parents: Vec<String>) -> RawCommitNode {
     RawCommitNode {

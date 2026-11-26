@@ -635,7 +635,7 @@ fn the_wording_says_the_next_ordinary_git_status_writes_the_cache() {
         "{}",
         offer.reason
     );
-    assert!(offer.reason.contains("GitPulse's own"), "{}", offer.reason);
+    assert!(offer.reason.contains("Waylode's own"), "{}", offer.reason);
 }
 
 #[test]

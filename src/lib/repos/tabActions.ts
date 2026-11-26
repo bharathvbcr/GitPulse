@@ -731,7 +731,7 @@ export function createTabActions(deps: TabActionsDeps) {
       if (!session) return;
       const approved = await askConfirmFn({
         title: "Revoke repository trust?",
-        message: `${session.path}\n\nThis closes the tab and blocks new GitPulse operations. Trust was granted to the repository, so this revokes it for every worktree of it, not only this checkout: any other tab open on the same repository stays open but stops working until it is trusted again. Already-running terminals and agent tasks retain their permissions; stop them separately if needed.`,
+        message: `${session.path}\n\nThis closes the tab and blocks new Waylode operations. Trust was granted to the repository, so this revokes it for every worktree of it, not only this checkout: any other tab open on the same repository stays open but stops working until it is trusted again. Already-running terminals and agent tasks retain their permissions; stop them separately if needed.`,
         confirmLabel: "Revoke Trust",
         destructive: true,
       });

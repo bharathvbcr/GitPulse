@@ -29,7 +29,7 @@ fn record_events(repo: &str, count: usize) {
 }
 
 fn tool_page(repo: &str) -> Value {
-    crate::mcp::handle_tool_call("gitpulse_ledger_events", &json!({ "repo_path": repo }))
+    crate::mcp::handle_tool_call("waylode_ledger_events", &json!({ "repo_path": repo }))
         .expect("ledger events")
 }
 
@@ -115,7 +115,7 @@ fn change_context_names_the_as_of_of_the_ledger_it_read() {
     let as_of = tool_page(&repo)["as_of"].clone();
 
     let context =
-        crate::mcp::handle_tool_call("gitpulse_change_context", &json!({ "repo_path": repo }))
+        crate::mcp::handle_tool_call("waylode_change_context", &json!({ "repo_path": repo }))
             .expect("change context");
 
     assert_eq!(context["ledger_freshness"]["as_of"], as_of, "{context}");
@@ -127,9 +127,9 @@ fn every_mcp_ledger_surface_serialises_the_honest_view() {
     let (_dir, repo) = trusted_repo();
     record_events(&repo, 1);
 
-    let insights = crate::mcp::handle_tool_call("gitpulse_insights", &json!({ "repo_path": repo }))
+    let insights = crate::mcp::handle_tool_call("waylode_insights", &json!({ "repo_path": repo }))
         .expect("insights");
-    let status = crate::mcp::handle_tool_call("gitpulse_status", &json!({ "repo_path": repo }))
+    let status = crate::mcp::handle_tool_call("waylode_status", &json!({ "repo_path": repo }))
         .expect("status");
     let page = tool_page(&repo);
     let resource = repo_facet("ledger", &repo).expect("ledger resource");
@@ -137,11 +137,11 @@ fn every_mcp_ledger_surface_serialises_the_honest_view() {
     let status_resource = repo_facet("status", &repo).expect("status resource");
 
     for (name, ledger) in [
-        ("gitpulse_insights", &insights["ledger"]),
+        ("waylode_insights", &insights["ledger"]),
         ("insights resource", &insights_resource["ledger"]),
-        ("gitpulse_status", &status["ledger"]),
+        ("waylode_status", &status["ledger"]),
         ("status resource", &status_resource["ledger"]),
-        ("gitpulse_ledger_events", &page),
+        ("waylode_ledger_events", &page),
         ("ledger resource", &resource),
     ] {
         assert_eq!(ledger["recording"], false, "{name}: {ledger}");

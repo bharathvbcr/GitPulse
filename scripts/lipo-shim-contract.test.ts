@@ -33,11 +33,11 @@ const tauriRunner = readFileSync(join(REPO_ROOT, "scripts/tauri.mjs"), "utf8");
 const declaredBinaries = [...cargoToml.matchAll(/^\[\[bin\]\]\s*\nname\s*=\s*"([^"]+)"/gm)].map(
   (match) => match[1],
 );
-const MAIN_BINARY = "gitpulse";
+const MAIN_BINARY = "waylode";
 
 /** A stand-in for the real lipo that records its arguments and touches -output. */
 function withRecorder<T>(run: (dir: string, env: NodeJS.ProcessEnv) => T): T {
-  const dir = mkdtempSync(join(tmpdir(), "gitpulse-lipo-"));
+  const dir = mkdtempSync(join(tmpdir(), "waylode-lipo-"));
   try {
     const recorder = join(dir, "recorder");
     writeFileSync(
@@ -56,7 +56,7 @@ function withRecorder<T>(run: (dir: string, env: NodeJS.ProcessEnv) => T): T {
     for (const arch of ["aarch64-apple-darwin", "x86_64-apple-darwin", "universal-apple-darwin"]) {
       mkdirSync(join(dir, arch, "release"), { recursive: true });
     }
-    return run(dir, { RECORD: join(dir, "log"), GITPULSE_REAL_LIPO: recorder });
+    return run(dir, { RECORD: join(dir, "log"), WAYLODE_REAL_LIPO: recorder });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

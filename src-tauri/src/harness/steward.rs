@@ -23,8 +23,13 @@
 //!    writer `(pid, start_us)` and `expires_at_ms`) that `hooks::load_gate`
 //!    enforces even when agents bypass advisory rules, and by placing active
 //!    agent child/worker processes into OS background scheduler/I/O throttle
-//!    (`sysload::procscan::set_background_throttle`), revoking immediately when
-//!    critical pressure clears, a repository opts out, or GitPulse exits.
+//!    (through `sysload::relief::steward_throttle`, which is the one owner of
+//!    every priority change: the pressure relief's own slowing is never undone
+//!    from here, and this one is never undone by the relief), revoking
+//!    immediately when critical pressure clears, a repository opts out, or
+//!    GitPulse exits. The relief (`sysload::relief`) slows and freezes on the
+//!    sampler's tick with no Manvi, so this slowdown adds the lease and the
+//!    directive text, not the only slowing.
 //! 4. **Reclaim leftover Cargo targets, agent scratchpads, and shared caches
 //!    when storage or resources are critical** by building a pre-verified idle
 //!    candidate inventory (including idle linked-worktree Cargo targets and,
@@ -37,7 +42,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -1060,7 +1065,7 @@ fn worker_loop(rt: &Arc<StewardRuntime>) {
     // them before anything else (whatever the settings now say).
     if let Some(dir) = crate::tool_config::default_config_dir() {
         let restored = restore_throttle_journal(&dir, |pid, start_us| {
-            crate::sysload::procscan::set_background_throttle(pid, start_us, false)
+            crate::sysload::relief::steward_throttle(pid, start_us, false)
         });
         if restored > 0 {
             log::info!(target: "steward", "restored {restored} agent processes a previous GitPulse left throttled");
@@ -1196,7 +1201,7 @@ fn release_all_live_throttles(rt: &StewardRuntime) {
         return;
     }
     for (pid, (start_us, _)) in throttled {
-        let _ = crate::sysload::procscan::set_background_throttle(pid, start_us, false);
+        let _ = crate::sysload::relief::steward_throttle(pid, start_us, false);
     }
     if let Some(dir) = &dir {
         let _ = write_throttle_journal(dir, &BTreeMap::new());
@@ -1236,7 +1241,7 @@ fn bump_settings_and_reconcile_live_throttles(
         return;
     };
     for (pid, start_us) in to_restore {
-        let _ = crate::sysload::procscan::set_background_throttle(pid, start_us, false);
+        let _ = crate::sysload::relief::steward_throttle(pid, start_us, false);
     }
     if let Some(dir) = crate::tool_config::default_config_dir() {
         let _ = write_throttle_journal(&dir, &remaining);
@@ -1401,29 +1406,7 @@ pub(crate) fn write_active_throttle(
 fn write_private_steward_file(config_dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     let dir = config_dir.join(STEWARD_SUBDIR);
     crate::hooks::advisory_once::private_dir(&dir)?;
-    let tmp = dir.join(format!(
-        ".{name}.tmp.{}.{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let target = dir.join(name);
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW).mode(0o600);
-    }
-    let mut file = opts.open(&tmp).map_err(|e| e.to_string())?;
-    if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err.to_string());
-    }
-    drop(file);
-    fs::rename(&tmp, &target).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        e.to_string()
-    })
+    crate::hooks::advisory_once::write_private_atomic(&dir, name, bytes)
 }
 
 /// The processes this GitPulse put (or let inherit) into background priority,
@@ -2038,7 +2021,7 @@ impl StewardDeps for LiveDeps<'_> {
     }
 
     fn set_process_throttle(&self, pid: i32, start_us: u64, enable: bool) -> Result<bool, String> {
-        crate::sysload::procscan::set_background_throttle(pid, start_us, enable)
+        crate::sysload::relief::steward_throttle(pid, start_us, enable)
     }
 
     fn write_active_lease(&self, dir: &Path, record: &ActiveThrottleRecord) -> Result<(), String> {
@@ -5107,6 +5090,63 @@ mod tests {
         assert!(acted.warnings.iter().any(|w| w.contains("cached Manvi")));
     }
 
+    /// The premise of the pressure relief (`sysload::relief`), pinned: with
+    /// Manvi unconfigured, or its probe deferred before it ever answered, a
+    /// severe memory-bound tick throttles nothing here. The slowing and
+    /// freezing under that pressure is the relief's, which runs on the
+    /// sampler's tick and asks neither.
+    #[test]
+    fn the_steward_alone_throttles_nothing_without_manvi_which_is_why_the_relief_does_not_ask_it() {
+        let candidate = AgentThrottleCandidate {
+            pid: 4200,
+            start_us: 77,
+            name: "rustc".into(),
+            session_pid: 4000,
+            session_kind: AgentKind::Claude,
+            session_cwd: Some("/trusted/a".into()),
+            is_session_root: false,
+            lineage_cwds: Vec::new(),
+            ancestor_pids: Vec::new(),
+        };
+        let severe = || {
+            make_load(
+                SensorState::Fresh,
+                Tier::Severe,
+                Some(Binding::MemoryPressure),
+                false,
+            )
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = StewardRuntime::default();
+        let mut deps = base_deps(tmp.path());
+        deps.candidates = vec![candidate.clone()];
+        deps.load = severe();
+        deps.manvi = ManviProbe::Answered(Box::new(ManviStatus {
+            state: "not_chosen".into(),
+            ..ManviStatus::default()
+        }));
+        let unconfigured = evaluate_tick_with(&rt, "critical_wake", None, &deps);
+        assert_eq!(unconfigured.outcome, "manvi_unconfigured");
+        assert_eq!(unconfigured.throttled_processes, 0);
+        assert!(
+            deps.throttle_ops.borrow().iter().all(|(_, enable)| !enable),
+            "nothing was slowed: {:?}",
+            deps.throttle_ops.borrow()
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = StewardRuntime::default();
+        let mut deps = base_deps(tmp.path());
+        deps.candidates = vec![candidate];
+        deps.load = severe();
+        deps.manvi = ManviProbe::Deferred("shed under pressure".into());
+        let deferred = evaluate_tick_with(&rt, "critical_wake", None, &deps);
+        assert_eq!(deferred.outcome, "manvi_deferred");
+        assert_eq!(deferred.throttled_processes, 0);
+        assert!(deps.throttle_ops.borrow().is_empty());
+    }
+
     #[test]
     fn healthy_tick_makes_no_model_call_and_dedupes_worktrees_by_common_dir_and_skips_empty_repos()
     {
@@ -6461,7 +6501,7 @@ mod tests {
         let sec_item = sec_dir.join("item");
         let sec_legacy = sec_dir.join("item-legacy");
         let sec_script = format!(
-            "#!/bin/sh\npick() {{\n  case \"$1\" in\n    com.gitpulse.desktop*) item='{legacy}' ;;\n    *) item='{item}' ;;\n  esac\n}}\ncase \"$1\" in\n  -i)\n    read -r line\n    key=${{line##* -w }}\n    svc=${{line#* -s }}; svc=${{svc%% *}}\n    pick \"$svc\"\n    printf '%s' \"$key\" > \"$item\"\n    exit 0 ;;\n  find-generic-password)\n    pick \"$3\"\n    [ -f \"$item\" ] || exit 44\n    cat \"$item\"; echo; exit 0 ;;\n  delete-generic-password)\n    pick \"$3\"\n    rm -f \"$item\"; exit 0 ;;\nesac\nexit 2\n",
+            "#!/bin/sh\npick() {{\n  case \"$1\" in\n    dev.vbcr.gitpulse*|com.gitpulse.desktop*) item='{legacy}' ;;\n    *) item='{item}' ;;\n  esac\n}}\ncase \"$1\" in\n  -i)\n    read -r line\n    key=${{line##* -w }}\n    svc=${{line#* -s }}; svc=${{svc%% *}}\n    pick \"$svc\"\n    printf '%s' \"$key\" > \"$item\"\n    exit 0 ;;\n  find-generic-password)\n    pick \"$3\"\n    [ -f \"$item\" ] || exit 44\n    cat \"$item\"; echo; exit 0 ;;\n  delete-generic-password)\n    pick \"$3\"\n    rm -f \"$item\"; exit 0 ;;\nesac\nexit 2\n",
             item = sec_item.display(),
             legacy = sec_legacy.display(),
         );

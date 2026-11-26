@@ -12,7 +12,9 @@
  */
 import { formatHex, parseHex } from "../color/oklch";
 
-export const THEME_SCHEMA_ID = "gitpulse-theme/1";
+export const THEME_SCHEMA_ID = "waylode-theme/1";
+export const LEGACY_THEME_SCHEMA_ID = "gitpulse-theme/1";
+export const ACCEPTED_THEME_SCHEMA_IDS = [THEME_SCHEMA_ID, LEGACY_THEME_SCHEMA_ID] as const;
 
 /** Longest accepted `name` or font family. */
 export const MAX_NAME_LENGTH = 64;
@@ -298,7 +300,8 @@ export function validateTheme(input: unknown): ThemeValidation {
   const root = reader.keysOf(input, "", TOP_LEVEL_KEYS);
   if (!root) return { ok: false, errors: reader.errors };
 
-  if (reader.own(root, "schema") !== THEME_SCHEMA_ID) {
+  const schemaInput = reader.own(root, "schema");
+  if (schemaInput !== THEME_SCHEMA_ID && schemaInput !== LEGACY_THEME_SCHEMA_ID) {
     reader.error("schema", `must be "${THEME_SCHEMA_ID}"`);
   }
   const nameInput = reader.required(root, "name", "name");

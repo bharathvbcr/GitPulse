@@ -1,7 +1,7 @@
 # Cloud, SSH and Remote Control sessions
 
-What a Claude Code session can use of GitPulse when it is not running on your
-Mac. Short version: DevMap yes (if installed), GitPulse Insights no.
+What a Claude Code session can use of Waylode when it is not running on your
+Mac. Short version: DevMap yes (if installed), Waylode Insights no.
 
 Platform facts below are cited to the Claude Code documentation as read on
 2026-11-23 (`cloud-environments`, `settings`, `hooks`, `claude-code-on-the-web`
@@ -49,7 +49,7 @@ those and the agent will find it on PATH
   - Runs `devmap build --manifest` (bounded to 120 s).
   - Compares the installed build's stamp with the pin in the repo's own `ci.yml`
     and tells the agent when it is NOT at the pin, is the stale release, or has
-    no stamp. When devmap is missing it says DevMap and GitPulse tools are
+    no stamp. When devmap is missing it says DevMap and Waylode tools are
     unavailable and to use source inspection.
 - `.devcontainer/setup.sh` calls the same installer (`--strict`).
 

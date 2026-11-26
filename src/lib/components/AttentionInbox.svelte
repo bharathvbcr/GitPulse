@@ -126,7 +126,7 @@
                something happened, and failing the page would hide everything else. Nothing to open, since what
                it targets is not known either. -->
           <article class="gp-card unreadable" class:unread={item.read_at === null} class:dismissed={item.dismissed_at !== null} data-notice-unreadable={item.kind}>
-            <div class="summary"><strong>{item.title}</strong><span>Kind “{item.kind}” · {formatRelativeTime(item.created_at)} · update GitPulse to read it</span></div>
+            <div class="summary"><strong>{item.title}</strong><span>Kind “{item.kind}” · {formatRelativeTime(item.created_at)} · update Waylode to read it</span></div>
             {@render dismissControl(item)}
           </article>
         {:else}

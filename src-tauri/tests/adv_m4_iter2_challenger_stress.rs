@@ -10,10 +10,10 @@
 
 mod common;
 
-use gitpulse_lib::engine::agent_bus::{list_inbox_threads, post_thread_message};
-use gitpulse_lib::mcp::{process_request, Era, JsonRpcRequest, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use waylode_lib::engine::agent_bus::{list_inbox_threads, post_thread_message};
+use waylode_lib::mcp::{process_request, Era, JsonRpcRequest, PROTOCOL_VERSION};
 
 fn create_test_repo() -> TempDir {
     common::unmetered_spawns();
@@ -82,7 +82,7 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         let key_rocket = format!("t-rocket-{}", offset);
         post_thread_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-challenger",
             None,
             Some(&key_rocket),
@@ -101,7 +101,7 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         let key_crab = format!("t-crab-{}", offset);
         post_thread_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-challenger",
             None,
             Some(&key_crab),
@@ -120,7 +120,7 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         let key_family = format!("t-family-{}", offset);
         post_thread_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-challenger",
             None,
             Some(&key_family),
@@ -139,7 +139,7 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         let key_cjk = format!("t-cjk-{}", offset);
         post_thread_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-challenger",
             None,
             Some(&key_cjk),
@@ -158,7 +158,7 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         let key_eur = format!("t-eur-{}", offset);
         post_thread_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-challenger",
             None,
             Some(&key_eur),
@@ -177,7 +177,7 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         let key_combining = format!("t-combining-{}", offset);
         post_thread_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-challenger",
             None,
             Some(&key_combining),
@@ -196,7 +196,7 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         let key_zwj = format!("t-zwj-{}", offset);
         post_thread_message(
             repo_path,
-            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+            waylode_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-challenger",
             None,
             Some(&key_zwj),
@@ -242,7 +242,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     // 1. Post validation: 0-byte and whitespace-only strings are rejected by post_thread_message
     let err_empty = post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-0",
         None,
         Some("thread-empty"),
@@ -255,7 +255,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
 
     let err_ws = post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-ws",
         None,
         Some("thread-whitespace"),
@@ -269,7 +269,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     // 2. 1-byte ASCII string
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("thread-1byte"),
@@ -282,7 +282,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     // 3. 1-char 4-byte emoji string
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-emoji1",
         None,
         Some("thread-1emoji"),
@@ -296,7 +296,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     let text_57_ascii = "A".repeat(57);
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-57a",
         None,
         Some("thread-57-ascii"),
@@ -312,7 +312,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     assert_eq!(text_57_cjk.len(), 171);
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-57cjk",
         None,
         Some("thread-57-cjk"),
@@ -326,7 +326,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     let text_60_ascii = "B".repeat(60);
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-60a",
         None,
         Some("thread-60-ascii"),
@@ -342,7 +342,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     assert_eq!(text_60_cjk.len(), 180);
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-60cjk",
         None,
         Some("thread-60-cjk"),
@@ -356,7 +356,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     let text_61_ascii = "C".repeat(61);
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-61a",
         None,
         Some("thread-61-ascii"),
@@ -372,7 +372,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     assert_eq!(text_61_cjk.len(), 183);
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-61cjk",
         None,
         Some("thread-61-cjk"),
@@ -388,7 +388,7 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
     assert_eq!(text_61_emoji.len(), 244);
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-61emoji",
         None,
         Some("thread-61-emoji"),
@@ -598,7 +598,7 @@ fn test_adversarial_malformed_json_and_exotic_scripts() {
         "{ \"title\": \"Incomplete json string 🚀🦀中文éΩЖ and tail exceeding sixty chars";
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-malformed",
         None,
         Some("t-malformed-json"),
@@ -612,7 +612,7 @@ fn test_adversarial_malformed_json_and_exotic_scripts() {
     let bidi_text = "مرحبا بالعالم 🚀 שלום עולם 🦀 Hebrew and Arabic mixed with English tail exceeding sixty chars";
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-bidi",
         None,
         Some("t-bidi"),
@@ -626,7 +626,7 @@ fn test_adversarial_malformed_json_and_exotic_scripts() {
     let math_text = "𝕬𝕭𝕮𝕯 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890";
     post_thread_message(
         repo_path,
-        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        waylode_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-math",
         None,
         Some("t-math"),

@@ -103,7 +103,7 @@ pub const OP_ASSIST_COMPLETE: &str = "work.assist.complete";
 const ASSIST_MAX_SYSTEM_BYTES: usize = 32_768;
 const ASSIST_MAX_USER_BYTES: usize = 2_097_152;
 /// What the user reads when Manvi predates the op.
-pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to run GitPulse's AI features through it.";
+pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to run Waylode's AI features through it.";
 
 /// Manvi's `work.assist.complete` code for a credential the provider refused
 /// (Anthropic: HTTP 401, a wrong, revoked or disabled key). Read as data, never
@@ -111,7 +111,7 @@ pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.compl
 pub const MANVI_PROVIDER_AUTH: &str = "E_PROVIDER_AUTH";
 
 /// What the user reads when the provider refused the key Manvi sent.
-pub const REJECTED_KEY_MESSAGE: &str = "Anthropic rejected the API key Manvi used: it is wrong, revoked or disabled. Replace the Claude key in GitPulse settings, or fix the account in ~/.anthropic-accounts when you use one.";
+pub const REJECTED_KEY_MESSAGE: &str = "Anthropic rejected the API key Manvi used: it is wrong, revoked or disabled. Replace the Claude key in Waylode settings, or fix the account in ~/.anthropic-accounts when you use one.";
 
 /// A failed `work.assist.complete` call: the worker's code and message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1811,7 +1811,7 @@ fn run_advisory_with_empty_retry(
         if !generation.text.is_empty() {
             if retry {
                 prior_warnings.push(format!(
-                    "The first model completion contained no visible {answer_name}; GitPulse retried once."
+                    "The first model completion contained no visible {answer_name}; Waylode retried once."
                 ));
             }
             prior_warnings.append(&mut generation.warnings);
@@ -1826,12 +1826,12 @@ fn run_advisory_with_empty_retry(
     }
     if ended_in_reasoning {
         return Err(format!(
-            "{REPLY_ENDED_IN_REASONING} GitPulse retried once for the {answer_name}."
+            "{REPLY_ENDED_IN_REASONING} Waylode retried once for the {answer_name}."
         )
         .into());
     }
     Err(format!(
-        "The model returned an empty {answer_name} twice; GitPulse stopped after one bounded retry."
+        "The model returned an empty {answer_name} twice; Waylode stopped after one bounded retry."
     )
     .into())
 }

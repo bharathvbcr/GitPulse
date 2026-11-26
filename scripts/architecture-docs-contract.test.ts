@@ -109,7 +109,7 @@ describe("architecture documentation contract", () => {
     expect(commands).toContain("tauri::async_runtime::spawn_blocking");
   });
 
-  it("states DevCouncil as modules, Manvi as the wrap, and GitPulse as a selecting host", () => {
+  it("states DevCouncil as modules, Manvi as the wrap, and Waylode as a selecting host", () => {
     const moduleIntegration = readFileSync(
       new URL("../docs/MODULE_INTEGRATION.md", import.meta.url),
       "utf8",
@@ -123,8 +123,8 @@ describe("architecture documentation contract", () => {
         "components and modules",
       );
       expect(source, `${name} must say Manvi wraps them`).toMatch(/Manvi[\s\S]{0,80}wrap/i);
-      expect(source, `${name} must say GitPulse uses Manvi`).toMatch(
-        /GitPulse[\s*]*uses[\s*]*Manvi/i,
+      expect(source, `${name} must say Waylode uses Manvi`).toMatch(
+        /Waylode[\s*]*uses[\s*]*Manvi/i,
       );
     }
   });

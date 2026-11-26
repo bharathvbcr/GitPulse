@@ -51,8 +51,8 @@ mod common;
 
 use common::fixture::{build_repo, count_git_processes, Spec};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::mcp::{self, Era, JsonRpcRequest};
 use serde_json::{json, Value};
+use waylode_lib::mcp::{self, Era, JsonRpcRequest};
 
 /// Rounds for the cheap protocol rows and for the git-spawning rows.
 const PROTOCOL_ROUNDS: usize = 200;
@@ -94,7 +94,7 @@ fn call(method: &str, params: &Value) -> (Value, usize) {
 /// and the failing facet otherwise.
 struct BenchSnapshotHost;
 
-impl gitpulse_lib::alerts::Host for BenchSnapshotHost {
+impl waylode_lib::alerts::Host for BenchSnapshotHost {
     fn submit(&self, _: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
         Ok(true)
     }
@@ -104,7 +104,7 @@ impl gitpulse_lib::alerts::Host for BenchSnapshotHost {
     }
 
     fn state_snapshot_path(&self) -> Option<std::path::PathBuf> {
-        gitpulse_lib::alerts::default_state_snapshot_path()
+        waylode_lib::alerts::default_state_snapshot_path()
     }
 }
 
@@ -142,7 +142,7 @@ fn protocol_case(name: &'static str, method: &'static str, params: Value) -> Cas
 fn main() {
     // First statement: the production spawn gate (192-spawn burst, then 8/s)
     // would otherwise be what the git-spawning rows time.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
 
     let mut report = Report::new("mcp_protocol");
     let protocol_rounds = report.opts.samples(PROTOCOL_ROUNDS);
@@ -242,11 +242,11 @@ fn main() {
 
     // Start the alerts worker on the hermetic config root so `gitpulse_sessions`
     // sees a live `app_state` facet (`ok: true`) rather than failing the gate.
-    gitpulse_lib::alerts::start(std::sync::Arc::new(BenchSnapshotHost));
+    waylode_lib::alerts::start(std::sync::Arc::new(BenchSnapshotHost));
     assert!(
         common::env::wait_until(std::time::Duration::from_secs(2), || matches!(
-            gitpulse_lib::alerts::read_state_snapshot(),
-            gitpulse_lib::alerts::HubStateRead::Ok(_)
+            waylode_lib::alerts::read_state_snapshot(),
+            waylode_lib::alerts::HubStateRead::Ok(_)
         )),
         "alerts snapshot not created inside bench hermetic HOME",
     );

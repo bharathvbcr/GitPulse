@@ -6,9 +6,9 @@
 //! asserts the repository is genuinely back to a clean, idle state — not just
 //! that the command exited zero.
 
-use gitpulse_lib::engine::repo_op::{self, OperationAction, OperationKind};
-use gitpulse_lib::ipc_error::CommandError;
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::engine::repo_op::{self, OperationAction, OperationKind};
+use waylode_lib::ipc_error::CommandError;
+use waylode_lib::procguard::LockedSpawn;
 
 /// Drives a recovery verb with a judge that records the argv and approves it.
 ///
@@ -473,7 +473,7 @@ fn acting_on_an_idle_repository_is_refused_rather_than_run() {
 /// said "rebase or merge" for every state — and did not see this one at all.
 #[test]
 fn restack_refuses_on_a_parked_cherry_pick_and_names_it() {
-    use gitpulse_lib::engine::GitWriter;
+    use waylode_lib::engine::GitWriter;
 
     let repo = TestRepo::with_diverged_branches();
     run_git_allow_failure(repo.path(), &["cherry-pick", "side"]);

@@ -1,6 +1,6 @@
 # Security
 
-GitPulse is a **local-first, zero-telemetry** desktop app. It has no GitPulse backend and no analytics.
+Waylode is a **local-first, zero-telemetry** desktop app. It has no Waylode backend and no analytics.
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them. Policy and agent hosting go through Manvi; code intelligence uses selected DevCouncil modules.
 
@@ -18,9 +18,9 @@ flowchart TD
 
 **No remote phoning home.** Network-capable features follow user actions or opt-in settings, including scheduled release checks, automatic task suggestions, and the default-on GitHub alert scan. The webview does not load CDN scripts or trackers.
 
-**GitHub credentials.** GitPulse never requests, reads, stores, or transmits GitHub tokens. PR / Actions / Dependabot / code scanning features delegate to the `gh` CLI you already authenticated. Dependabot and code scanning alerts are fetched when a repository opens (Settings → Analysis; on by default). Critical and high findings warn; a check that did not run is not an all-clear.
+**GitHub credentials.** Waylode never requests, reads, stores, or transmits GitHub tokens. PR / Actions / Dependabot / code scanning features delegate to the `gh` CLI you already authenticated. Dependabot and code scanning alerts are fetched when a repository opens (Settings → Analysis; on by default). Critical and high findings warn; a check that did not run is not an all-clear.
 
-**Local AI transport.** Built-in local completions and model probes reject remote base URLs; GitPulse's own AI features go through Manvi's `work.assist.complete`, which follows Manvi's own `manvi use` setting (a local server, or the Claude API in cloud mode once someone chose it; the loopback client, with its consent dialog, is the fallback when Manvi is missing, too old, or has no mode chosen, since Manvi's unset default is cloud). Profile Manvi task suggestions and explicitly launched agents use their configured provider and run settings; the loopback restriction does not apply to those separate execution paths.
+**Local AI transport.** Built-in local completions and model probes reject remote base URLs; Waylode's own AI features go through Manvi's `work.assist.complete`, which follows Manvi's own `manvi use` setting (a local server, or the Claude API in cloud mode once someone chose it; the loopback client, with its consent dialog, is the fallback when Manvi is missing, too old, or has no mode chosen, since Manvi's unset default is cloud). Profile Manvi task suggestions and explicitly launched agents use their configured provider and run settings; the loopback restriction does not apply to those separate execution paths.
 
 **Terminal sessions.** Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit agent launchers and task handoffs start dedicated PTY sessions under the provider's permissions. Worktrees are not OS sandboxes. Remediation actions (`cmd_manvi_run_action`) use a command allowlist and require confirmation. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 
@@ -30,13 +30,13 @@ flowchart TD
 
 **Policy fail-closed.** A missing MANVI harness yields **unchecked**, not **allowed**. A check that could not run must never look like a check that passed. See [[Policy and AI]].
 
-**Redacted secret scanning.** Insights → Health scans for secrets in-process with GitPulse's own scanner; Kingfisher is an optional second opinion, run only on an explicit Rescan when it is installed, with `--redact` and no validation. Findings keep rule, repo-relative path, line, confidence, Git location and a per-scan grouping ordinal; secret values, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted. Scanner stdout is unlogged, and a partial, truncated or failed scan is never shown as clean.
+**Redacted secret scanning.** Insights → Health scans for secrets in-process with Waylode's own scanner; Kingfisher is an optional second opinion, run only on an explicit Rescan when it is installed, with `--redact` and no validation. Findings keep rule, repo-relative path, line, confidence, Git location and a per-scan grouping ordinal; secret values, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted. Scanner stdout is unlogged, and a partial, truncated or failed scan is never shown as clean.
 
 **Dead-branch cleanup authorization & backups.** Destructive deletions generate explicit git commands requiring authorization before execution; durable restorable tip backups are written to disk and recorded in the ledger prior to any branch removal.
 
 **Lifecycle hooks require repository trust.** Worktree lifecycle hooks declared in `.gitpulse/hooks.toml` are strictly gated on repository trust; untrusted checkouts refuse execution.
 
-**Linux signal guard protects processes.** On Linux, the signal guard models Linux inspection tools (`pkill`, `pgrep`, `killall`, `pidof`), checking `/proc/<pid>/status` UIDs with real `kill(2)` permission rules and prompting on unmodelled options to protect GitPulse and agent sessions from accidental termination.
+**Linux signal guard protects processes.** On Linux, the signal guard models Linux inspection tools (`pkill`, `pgrep`, `killall`, `pidof`), checking `/proc/<pid>/status` UIDs with real `kill(2)` permission rules and prompting on unmodelled options to protect Waylode and agent sessions from accidental termination.
 
 **Durable hook notify drop records.** When hook notifications miss their deadline, timed records are appended to `<socket>.drops` beside the socket with single-owner rotation to `.prev`, best-effort `0600` permissions, and 7-day expiration.
 

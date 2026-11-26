@@ -121,7 +121,7 @@
       data-variant="primary"
       data-size="sm"
       aria-label={`Run in ${PROVIDER_LABELS[launcher]}`}
-      title="Runs in GitPulse’s terminal with this repository as the working directory"
+      title="Runs in Waylode’s terminal with this repository as the working directory"
       disabled={!repoPath || launching}
       onclick={() => void runAgent(launcher)}
     >

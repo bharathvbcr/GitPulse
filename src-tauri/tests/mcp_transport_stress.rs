@@ -20,20 +20,20 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::procguard::LockedSpawn;
 
 fn mcp_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_gitpulse-mcp")
+    env!("CARGO_BIN_EXE_waylode-mcp")
 }
 
 fn modern_meta() -> Value {
     json!({
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": { "name": "gitpulse-stress", "version": "0" },
+        "io.modelcontextprotocol/clientInfo": { "name": "waylode-stress", "version": "0" },
         "io.modelcontextprotocol/clientCapabilities": {}
     })
 }
@@ -613,7 +613,7 @@ fn an_oversized_result_is_reported_and_the_session_survives() {
 /// A trusted repository whose ledger holds about 2 MB of rows, so a page of it
 /// is far past a pipe buffer.
 fn repository_with_a_heavy_ledger() -> (tempfile::TempDir, String) {
-    use gitpulse_lib::ledger::{self, ActorKind, Draft, Outcome};
+    use waylode_lib::ledger::{self, ActorKind, Draft, Outcome};
     let dir = tempfile::tempdir().expect("tempdir");
     let canonical = dir.path().canonicalize().expect("canonical repo");
     let repo = canonical.to_str().expect("utf8").to_string();
@@ -625,8 +625,8 @@ fn repository_with_a_heavy_ledger() -> (tempfile::TempDir, String) {
         .status_locked()
         .expect("spawn git");
     assert!(status.success(), "git init");
-    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
-    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
+    let preview = waylode_lib::repository_trust::inspect(&repo).expect("inspect");
+    waylode_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
     for n in 0..320 {
         let id = ledger::record(Draft {
             repo_path: repo.clone(),
@@ -703,8 +703,8 @@ fn a_task_with_logs_near_the_cap_is_returned_over_stdio_not_refused_as_too_large
         .status_locked()
         .expect("spawn git");
     assert!(init.success(), "git init");
-    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
-    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
+    let preview = waylode_lib::repository_trust::inspect(&repo).expect("inspect");
+    waylode_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
 
     let logs = "ab\n".repeat(40_000);
     assert!(logs.len() > 100_000 && logs.len() < 256 * 1024);
@@ -985,11 +985,11 @@ fn stdout_carries_one_message_per_line_and_nothing_else() {
         ("tools/list", json!({})),
         (
             "resources/read",
-            json!({ "uri": "gitpulse://server/manifest" }),
+            json!({ "uri": "waylode://server/manifest" }),
         ),
         (
             "tools/call",
-            json!({ "name": "gitpulse_insights", "arguments": { "repo_path": "/tmp" } }),
+            json!({ "name": "waylode_insights", "arguments": { "repo_path": "/tmp" } }),
         ),
     ]
     .into_iter()

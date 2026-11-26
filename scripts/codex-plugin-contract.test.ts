@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { appVersion } from "./app-version.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN = path.join(ROOT, "plugins", "gitpulse");
+const PLUGIN = path.join(ROOT, "plugins", "waylode");
 
 function readJson(file: string): Record<string, unknown> {
   return JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
@@ -34,9 +34,9 @@ describe("native Codex plugin package", () => {
     const mcp = readJson(path.join(PLUGIN, ".mcp.json"));
     expect(mcp).toEqual({
       mcpServers: {
-        gitpulse: {
+        waylode: {
           type: "stdio",
-          command: "gitpulse-mcp",
+          command: "waylode-mcp",
         },
       },
     });
@@ -49,13 +49,13 @@ describe("native Codex plugin package", () => {
 });
 
 describe("Codex marketplace and app-bundle discovery", () => {
-  it("publishes GitPulse as an installable repo plugin", () => {
+  it("publishes Waylode as an installable repo plugin", () => {
     const marketplace = readJson(path.join(ROOT, ".agents", "plugins", "marketplace.json"));
     const plugins = marketplace.plugins as Array<Record<string, unknown>>;
-    const entry = plugins.find((candidate) => candidate.name === "gitpulse");
+    const entry = plugins.find((candidate) => candidate.name === "waylode");
     expect(entry).toMatchObject({
-      name: "gitpulse",
-      source: { source: "local", path: "./plugins/gitpulse" },
+      name: "waylode",
+      source: { source: "local", path: "./plugins/waylode" },
       policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
       category: "Developer Tools",
     });
@@ -65,7 +65,7 @@ describe("Codex marketplace and app-bundle discovery", () => {
     const tauri = readJson(path.join(ROOT, "src-tauri", "tauri.conf.json"));
     const bundle = tauri.bundle as Record<string, unknown>;
     expect(bundle.resources).toMatchObject({
-      "../plugins/gitpulse/": "plugin/",
+      "../plugins/waylode/": "plugin/",
     });
   });
 });

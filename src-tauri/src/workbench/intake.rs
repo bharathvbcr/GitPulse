@@ -43,7 +43,7 @@ pub(crate) fn default_profile_path() -> Result<PathBuf, WorkbenchError> {
         .ok_or_else(|| {
             WorkbenchError::new(
                 "store_error",
-                "Cannot resolve the GitPulse profile directory.",
+                "Cannot resolve the Waylode profile directory.",
             )
         })
 }
@@ -1695,7 +1695,7 @@ pub(crate) fn list_tasks(
         return Ok(json!({
             "ok": true, "repository": null, "returned": 0, "total": 0, "has_more": false,
             "next_cursor": null, "tasks": [],
-            "note": "This repository is not on the GitPulse board yet: no task has been filed under it. That is not the same as a repository whose tasks are all done.",
+            "note": "This repository is not on the Waylode board yet: no task has been filed under it. That is not the same as a repository whose tasks are all done.",
         }));
     };
     let mut input = json!({
@@ -2153,7 +2153,7 @@ fn board_repository(store: &Store, repo_path: &str) -> Result<Value, WorkbenchEr
     find(store, &local.identity)?.ok_or_else(|| {
         WorkbenchError::new(
             "not_found",
-            "This repository is not on the GitPulse board yet; no task has been filed under it.",
+            "This repository is not on the Waylode board yet; no task has been filed under it.",
         )
     })
 }

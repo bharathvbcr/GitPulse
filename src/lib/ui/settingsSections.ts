@@ -57,7 +57,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "analysis",
     label: "Analysis",
-    summary: "Work GitPulse may run against the repository itself.",
+    summary: "Work Waylode may run against the repository itself.",
   },
   {
     id: "agents",
@@ -74,7 +74,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "updates",
     label: "Updates",
-    summary: "Whether GitPulse checks its own repository for releases.",
+    summary: "Whether Waylode checks its own repository for releases.",
   },
 ];
 

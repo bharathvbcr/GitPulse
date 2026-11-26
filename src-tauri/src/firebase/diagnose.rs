@@ -431,7 +431,7 @@ pub fn classify_failure(message: &str, project_id: Option<&str>) -> FirebaseFail
             format!(
                 "It could not create its debug log (firebase-debug.log) in the folder it was \
                  started from. This is a local file-system problem, not a Google Cloud \
-                 permission. GitPulse points the log at {} — check that folder is writable.",
+                 permission. Waylode points the log at {} — check that folder is writable.",
                 firebase_log_dir().display()
             ),
         );
@@ -465,7 +465,7 @@ pub fn classify_failure(message: &str, project_id: Option<&str>) -> FirebaseFail
             "The Firebase CLI could not find Node".into(),
             "The `firebase` script runs on Node, which a windowed launch could not find. If Node \
              is installed under nvm, fnm or volta, set GITPULSE_FIREBASE_BIN to the absolute path \
-             of `firebase` and relaunch GitPulse."
+             of `firebase` and relaunch Waylode."
                 .into(),
         );
     }
@@ -480,9 +480,9 @@ pub fn classify_failure(message: &str, project_id: Option<&str>) -> FirebaseFail
     ) {
         return failure(
             FirebaseFailureKind::CliMissing,
-            "The Firebase CLI is not installed where GitPulse can run it".into(),
+            "The Firebase CLI is not installed where Waylode can run it".into(),
             "Install it with `npm install -g firebase-tools`, or set GITPULSE_FIREBASE_BIN to its \
-             absolute path, then relaunch GitPulse."
+             absolute path, then relaunch Waylode."
                 .into(),
         );
     }
@@ -645,7 +645,7 @@ pub fn classify_failure(message: &str, project_id: Option<&str>) -> FirebaseFail
 
     failure(
         FirebaseFailureKind::Unknown,
-        "The Firebase CLI reported an error GitPulse does not recognise".into(),
+        "The Firebase CLI reported an error Waylode does not recognise".into(),
         "Copy the diagnostics below — they include the CLI's own output.".into(),
     )
 }
@@ -953,11 +953,11 @@ Error: Unable to obtain permissions for firebase-debug.log
             .expect("every firebase child must carry FIREBASE_DEBUG_PATH");
         assert!(
             debug_path.starts_with(firebase_log_dir()) && debug_path != firebase_log_dir(),
-            "each run gets a directory of its own under GitPulse's: {debug_path:?}"
+            "each run gets a directory of its own under Waylode's: {debug_path:?}"
         );
         assert!(
             debug_path.is_absolute() && debug_path != Path::new("/"),
-            "the debug log must go to a directory GitPulse owns: {debug_path:?}"
+            "the debug log must go to a directory Waylode owns: {debug_path:?}"
         );
         let second = FirebaseSpawn::new(
             "firebase".into(),

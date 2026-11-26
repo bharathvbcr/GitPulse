@@ -416,7 +416,7 @@ export function importVsCodeThemeObject(
   );
 
   const candidate = {
-    schema: "gitpulse-theme/1",
+    schema: "waylode-theme/1",
     name: sanitizeThemeName(parsed.name, hints.fallbackName ?? "Imported VS Code Theme"),
     appearance,
     colors: {

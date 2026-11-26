@@ -13,14 +13,14 @@ mod common;
 #[path = "common/process_trust.rs"]
 mod process_trust;
 
-use gitpulse_lib::hooks::{HOST_TIMEOUT_MARGIN, TOTAL_BUDGET};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use waylode_lib::hooks::{HOST_TIMEOUT_MARGIN, TOTAL_BUDGET};
+use waylode_lib::procguard::LockedSpawn;
 
-const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
+const HOOK: &str = env!("CARGO_BIN_EXE_waylode-hook");
 
 /// How late the host delivers the payload. Past the point where two full
 /// `BUDGET` waits (5 s each) would end at the host's 10 s timeout.
@@ -84,7 +84,7 @@ fn a_stalled_child_is_reaped_and_the_total_stays_under_the_host_timeout() {
         .arg("session-brief")
         .env("PATH", &path)
         .envs(process_trust::profile_env(home.path()))
-        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
+        .env(waylode_lib::logging::LOG_DIR_ENV, logs.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

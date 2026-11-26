@@ -442,7 +442,7 @@ ${renderRow(codeRow, ROW_B_Y)}
 
   <line x1="${PAD}" y1="${FOOTER_RULE_Y}" x2="${CARD_WIDTH - PAD}" y2="${FOOTER_RULE_Y}" stroke="${COLOR.border}" stroke-width="1" />
   <text x="${PAD}" y="${FOOTER_TEXT_Y}" class="gp-foot">${xmlText(
-    `A metric whose scan did not run shows ${EM_DASH}, never 0. Measured offline by GitPulse; no repository data leaves this machine.`,
+    `A metric whose scan did not run shows ${EM_DASH}, never 0. Measured offline by Waylode; no repository data leaves this machine.`,
   )}</text>
 </svg>`;
 }

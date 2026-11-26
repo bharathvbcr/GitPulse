@@ -90,17 +90,17 @@
 
 <div>
   <SettingToggle
-    label="Keep managed agent runs running when GitPulse quits"
+    label="Keep managed agent runs running when Waylode quits"
     disabled={busy}
     checked={chosen}
     onchange={(next) => void choose(next)}
   />
   <p class="text-textMuted text-micro leading-snug mt-1" data-testid="keep-terminals-note">
-    Terminal sessions run in a separate host process (<code>gitpulse-ptyd</code>), so quitting GitPulse — or GitPulse crashing — does
+    Terminal sessions run in a separate host process (<code>gitpulse-ptyd</code>), so quitting Waylode — or Waylode crashing — does
     not end them. The next launch lists them, replays buffered output, and reconciles any that finished; quitting asks whether
     to stop them or leave them running.
     {#if backend}
-      Terminals now: {runningInHost ? "held by the terminal host (survive quit and crash)" : "held in-process (end when GitPulse quits)"}.
+      Terminals now: {runningInHost ? "held by the terminal host (survive quit and crash)" : "held in-process (end when Waylode quits)"}.
     {/if}
   </p>
   {#if backend?.managed}

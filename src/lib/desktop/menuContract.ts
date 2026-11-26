@@ -484,7 +484,7 @@ export function fallbackMenuState(state: MenuState): MenuState {
     trayTitle: null,
     trayDetails: [],
     traySummary: { id: "open", text: "Open a repository…" },
-    trayDetail: "GitPulse",
+    trayDetail: "Waylode",
     // Startup knows of no agent. Unlike the two preferences above, a count from
     // a payload that could not be repaired is not one to trust.
     agentsWaiting: 0,
@@ -493,7 +493,7 @@ export function fallbackMenuState(state: MenuState): MenuState {
     agentsRunning: 0,
     agentsInformational: 0,
     status: {
-      repository: "GitPulse",
+      repository: "Waylode",
       branch: "",
       changed: null,
       staged: null,

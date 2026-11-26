@@ -651,7 +651,7 @@
       const answers = await checkTranscripts([sourceSessionId]);
       const answer = answers.get(sourceSessionId) ?? {
         state: "unknown" as const,
-        reason: "GitPulse did not get an answer for it.",
+        reason: "Waylode did not get an answer for it.",
       };
       const checked = resolveTranscriptAnswer(hostedClaude, sourceSessionId, "claude", answer);
       if (!checked.offer) {
@@ -885,8 +885,8 @@
       <Checkbox label="Share build caches (reflink / clonefile)" checked={cowCaches} onchange={(next) => (cowCaches = next)} />
       <Checkbox label="Seed the code map index (copy-on-write clone, then built here)" checked={seedDevmap} onchange={(next) => (seedDevmap = next)} />
       <Checkbox
-        label="Link to the main code map instead of copying it (GitPulse only)"
-        description="Only GitPulse reads the link; the code map tool that agents run does not, and builds a full index beside it."
+        label="Link to the main code map instead of copying it (Waylode only)"
+        description="Only Waylode reads the link; the code map tool that agents run does not, and builds a full index beside it."
         checked={zeroCopyDevmap}
         onchange={(next) => (zeroCopyDevmap = next)}
       />
@@ -1103,7 +1103,7 @@
                   class="gp-chip shrink-0"
                   data-tone="accent"
                   data-kind="count"
-                  title="{isGitPulseLane(kind) ? 'GitPulse task worktree' : `Agent worktree (${agentKindLabel(kind)})`}{isGitPulseLane(kind) ? ' — no agent is running in it' : ''}{slug ? `: ${slug}` : ''}"
+                  title="{isGitPulseLane(kind) ? 'Waylode task worktree' : `Agent worktree (${agentKindLabel(kind)})`}{isGitPulseLane(kind) ? ' — no agent is running in it' : ''}{slug ? `: ${slug}` : ''}"
                 >{agentKindLabel(kind)}</span>
               {/if}
             {/if}

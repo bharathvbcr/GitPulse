@@ -2219,7 +2219,7 @@ impl ReclaimSizing {
             Self::MayShare => (
                 logical,
                 ReclaimConfidence::Estimated,
-                "Logical size, an upper bound: GitPulse makes reflink clones on this platform and nothing reads how much of this is shared with one.".to_string(),
+                "Logical size, an upper bound: Waylode makes reflink clones on this platform and nothing reads how much of this is shared with one.".to_string(),
             ),
             #[cfg(not(target_os = "linux"))]
             Self::Logical => (

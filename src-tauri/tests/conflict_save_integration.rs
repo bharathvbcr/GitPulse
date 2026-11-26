@@ -1,14 +1,14 @@
-use gitpulse_lib::diff::{
+use waylode_lib::diff::{
     conflict_session::{self, ConflictFileChoice, ConflictSaveRequest, ConflictSnapshot},
     ConflictResolutionChoice,
 };
-use gitpulse_lib::engine::git_cli::{git, git_with_stdin};
-use gitpulse_lib::ipc_error::CommandError;
+use waylode_lib::engine::git_cli::{git, git_with_stdin};
+use waylode_lib::ipc_error::CommandError;
 // Only the macOS extended-attribute test spawns.
-#[cfg(target_os = "macos")]
-use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use tempfile::TempDir;
+#[cfg(target_os = "macos")]
+use waylode_lib::procguard::LockedSpawn;
 mod common;
 use common::run_git;
 
@@ -19,7 +19,7 @@ fn fixture_with_format(format: &str) -> TempDir {
     // These tests are about conflict-save behaviour, not the production spawn
     // rate. Every test starts here and the suite shares one process gate, so
     // a parallel run otherwise spends the burst and defers git mid-save.
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().unwrap();
     let path = dir.path();
     run_git(
@@ -97,7 +97,7 @@ fn restarting_an_identical_merge_invalidates_the_old_operation() {
 
 #[test]
 fn operation_continue_rejects_markers_staged_by_an_external_editor() {
-    use gitpulse_lib::engine::repo_op::{run_action_with, OperationAction};
+    use waylode_lib::engine::repo_op::{run_action_with, OperationAction};
     let dir = fixture();
     run_git(dir.path(), &["config", "user.email", "test@example.com"]);
     run_git(dir.path(), &["config", "user.name", "Test"]);

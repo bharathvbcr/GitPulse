@@ -120,7 +120,7 @@ fn main_checkout(selected: &Path) -> Result<PathBuf, WorkbenchError> {
     let common = resolve_git_common_dir(selected).map_err(|e| refused(e.into_message()))?;
     if common.file_name().and_then(|n| n.to_str()) != Some(".git") {
         return Err(refused(
-            "This repository has no main checkout beside its Git directory (it is bare or uses a separate Git directory), so GitPulse cannot place an agent worktree. Choose an existing checkout instead.",
+            "This repository has no main checkout beside its Git directory (it is bare or uses a separate Git directory), so Waylode cannot place an agent worktree. Choose an existing checkout instead.",
         ));
     }
     common
@@ -229,7 +229,7 @@ fn provision_with(
     let exclude = crate::devmap::init::ensure_dir_excluded(&root, EXCLUDED, EXCLUDE_MARKER);
     if !exclude.is_clean() {
         return Err(refused(format!(
-            "GitPulse could not keep {EXCLUDED}/ out of git status, so it will not create an agent worktree there: {exclude:?}"
+            "Waylode could not keep {EXCLUDED}/ out of git status, so it will not create an agent worktree there: {exclude:?}"
         )));
     }
     let argv = crate::engine::worktree::add_worktree_argv(&path_text, Some(&branch), None, false);
@@ -353,7 +353,7 @@ fn provision_with(
                     })
                     .unwrap_or_default();
                 return Err(refused(format!(
-                    "GitPulse could not record which branch the new worktree was cut from, so the agent was not started: {error}.{cleanup}", error = error.message()
+                    "Waylode could not record which branch the new worktree was cut from, so the agent was not started: {error}.{cleanup}", error = error.message()
                 )));
             }
         }
@@ -397,7 +397,7 @@ pub fn plan_fork_target(
     let exclude = crate::devmap::init::ensure_dir_excluded(&main, EXCLUDED, EXCLUDE_MARKER);
     if !exclude.is_clean() {
         return Err(CommandError::plain(format!(
-            "GitPulse could not keep {EXCLUDED}/ out of git status, so it will not create a forked worktree there: {exclude:?}"
+            "Waylode could not keep {EXCLUDED}/ out of git status, so it will not create a forked worktree there: {exclude:?}"
         )));
     }
     let container = gitpulse_lane_container(&main);

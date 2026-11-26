@@ -129,15 +129,15 @@ describe("ci:local mirrors the workflows it stands in for", () => {
     expect(cargo.some((line) => line.startsWith("cargo fmt"))).toBe(true);
     expect(cargo.some((line) => line.startsWith("cargo clippy"))).toBe(true);
     expect(cargo.some((line) => line.includes("llvm-cov"))).toBe(true);
-    const manifests = ["src-tauri/Cargo.toml", "crates/gitpulse-worktree/Cargo.toml"];
+    const manifests = ["src-tauri/Cargo.toml", "crates/waylode-worktree/Cargo.toml"];
     for (const line of cargo) {
       expect(manifests.some((manifest) => line.includes(manifest))).toBe(true);
     }
   });
 
-  it("builds and tests crates/gitpulse-worktree, which is not a src-tauri workspace member", () => {
+  it("builds and tests crates/waylode-worktree, which is not a src-tauri workspace member", () => {
     // Before these gates nothing in CI or ci:local built the zero-copy build cache.
-    const manifest = "crates/gitpulse-worktree/Cargo.toml";
+    const manifest = "crates/waylode-worktree/Cargo.toml";
     const crate = GATES.filter((gate) => gate.program === "cargo")
       .map(commandLine)
       .filter((line) => line.includes(manifest));
@@ -1086,7 +1086,7 @@ describe("a shared directory is not deleted while anything may be using it", () 
   });
 
   it("refuses when a process runs an executable from inside it", () => {
-    const outcomes = runShared(() => ` 99 ${build()}/debug/deps/gitpulse_lib-abc --nocapture\n`);
+    const outcomes = runShared(() => ` 99 ${build()}/debug/deps/waylode_lib-abc --nocapture\n`);
     expect(existsSync(build())).toBe(true);
     expect(firstCleanup(outcomes).status).toBe("refused");
   });
@@ -1309,7 +1309,7 @@ describe("the live-process check matches every spelling of the path, on path bou
 
   // macOS-only: `/private` is the prefix macOS puts on /tmp, /var and /etc.
   it.skipIf(process.platform !== "darwin")("sees the /private spelling of the same path", () => {
-    expect(withListing(` 77 ${alias()}/debug/deps/gitpulse_lib --nocapture\n`).status).toBe("refused");
+    expect(withListing(` 77 ${alias()}/debug/deps/waylode_lib --nocapture\n`).status).toBe("refused");
   });
 
   it("sees the path inside --target-dir=...", () => {

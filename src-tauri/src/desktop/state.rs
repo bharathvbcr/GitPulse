@@ -72,7 +72,7 @@ pub struct StatusCard {
 impl Default for StatusCard {
     fn default() -> Self {
         Self {
-            repository: "GitPulse".into(),
+            repository: "Waylode".into(),
             branch: String::new(),
             changed: None,
             staged: None,
@@ -128,6 +128,12 @@ pub struct MenuState {
     pub agents_running: u32,
     #[serde(default)]
     pub agents_informational: u32,
+    /// Host memory pressure and the relief supervisor's pauses, fed by the
+    /// native poller (`pressure`), never by the renderer: the web view may be
+    /// the casualty. Skipped on the wire in both directions, and carried over
+    /// from the previous state when the renderer sends a new one.
+    #[serde(skip)]
+    pub pressure: super::pressure::HostPressure,
     pub status: StatusCard,
 }
 
@@ -177,6 +183,7 @@ impl Default for MenuState {
             agent_requests_hidden: 0,
             agents_running: 0,
             agents_informational: 0,
+            pressure: super::pressure::HostPressure::default(),
             status: StatusCard::default(),
         }
     }

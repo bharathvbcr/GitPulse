@@ -126,7 +126,7 @@
 
 <section aria-label="Global build cleaner" class="@container space-y-4 text-xs">
   <div class="flex flex-wrap justify-between gap-3">
-    <div><h3 class="flex items-center gap-2 font-semibold text-sm text-textPrimary"><ShieldCheck size={16} /> Global build cleaner</h3><p class="mt-1 text-textMuted">Maintain repositories beneath your chosen roots, including repositories that are closed in GitPulse. This policy is the scheduler's own: it keeps its own retention because a sweep runs without this window, and a repository's override in Storage does not change it.</p></div>
+    <div><h3 class="flex items-center gap-2 font-semibold text-sm text-textPrimary"><ShieldCheck size={16} /> Global build cleaner</h3><p class="mt-1 text-textMuted">Maintain repositories beneath your chosen roots, including repositories that are closed in Waylode. This policy is the scheduler's own: it keeps its own retention because a sweep runs without this window, and a repository's override in Storage does not change it.</p></div>
     <button class="gp-btn" data-size="sm" onclick={refresh}><RefreshCw size={12} />Refresh status</button>
   </div>
   {#if error}<p role="alert" class="gp-notice" data-tone="danger">{error}</p>{/if}
@@ -150,8 +150,8 @@
     <div class="gp-card p-3 space-y-2">
       <label class="flex items-center gap-2"><Checkbox ariaLabel="Enable scheduled cleanup" checked={draft.enabled} disabled={!cleaner.supported} onchange={(next) => { if (draft) { draft.enabled = next; edited(); } }} /><Clock size={13} />Automatically remove eligible output on schedule</label>
       <label>Repeat every <select aria-label="Cleanup interval" class="gp-select mx-1" bind:value={draft.interval_hours} onchange={() => { if (draft) draft.next_run_at = 0; edited(); }}><option value={24}>day</option><option value={168}>week</option><option value={720}>30 days</option></select></label>
-      <label class="flex items-center gap-2"><Checkbox ariaLabel="Run cleanup when GitPulse is closed" checked={draft.run_when_closed} disabled={!cleaner.background_supported} onchange={(next) => { if (draft) { draft.run_when_closed = next; edited(); } }} />Also run when GitPulse is closed</label>
-      <p class="text-textMuted">{closedAppSchedulingReason($hostPlatform.os, cleaner.background_supported)} Otherwise, schedules run while GitPulse is open, including in the background. A missed run is attempted once after restart or wake. Scheduling is off until you save it here.</p>
+      <label class="flex items-center gap-2"><Checkbox ariaLabel="Run cleanup when Waylode is closed" checked={draft.run_when_closed} disabled={!cleaner.background_supported} onchange={(next) => { if (draft) { draft.run_when_closed = next; edited(); } }} />Also run when Waylode is closed</label>
+      <p class="text-textMuted">{closedAppSchedulingReason($hostPlatform.os, cleaner.background_supported)} Otherwise, schedules run while Waylode is open, including in the background. A missed run is attempted once after restart or wake. Scheduling is off until you save it here.</p>
       <p class="text-textMuted">Next scheduled run: {cleaner.config.enabled ? new Date(cleaner.config.next_run_at * 1000).toLocaleString() : "Off"}</p>
     </div>
     {#if scopes && budget}
@@ -207,7 +207,7 @@
         {/if}
         {#if inventory.long_lived?.length}
           <div class="space-y-1" data-testid="long-lived">
-            <strong>Long-lived data · not cleaned by GitPulse</strong>
+            <strong>Long-lived data · not cleaned by Waylode</strong>
             <p class="text-textMuted">Where space is held by data this cleaner never touches. Listed so a full disk has an explanation; manage it with the tool that owns it.</p>
             {#each inventory.long_lived as item (item.path)}<p class="py-1"><span class="text-textMuted">{item.label}</span> <span class="font-mono break-all">{item.path}</span><span class="block text-textMuted" data-testid="long-lived-size">{item.error ? item.error :item.bytes === undefined || item.bytes === null ? "size unknown" : `${item.at_least ? "at least " : ""}${humanBytes(item.bytes)}`}</span></p>{/each}
           </div>

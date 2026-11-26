@@ -81,7 +81,7 @@ describe("GlobalCleaner reclaim scopes and clone budget", () => {
   });
   it("lists long-lived data as not cleaned by GitPulse, with no remove control, and lets the person add directories", () => {
     expect(source).toContain('data-testid="long-lived"');
-    expect(source).toContain("not cleaned by GitPulse");
+    expect(source).toContain("not cleaned by Waylode");
     expect(source).toContain("at least ");
     expect(source).toContain("long_lived_paths: paths(longLivedText)");
     const section = source.slice(source.indexOf('data-testid="long-lived"'), source.indexOf("These are current logical sizes."));

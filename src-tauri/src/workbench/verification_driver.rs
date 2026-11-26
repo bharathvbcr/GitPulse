@@ -867,7 +867,7 @@ pub(crate) fn judge_candidate_with(
     let deadline = backend.now() + WAIT_LIMIT;
     loop {
         if backend.cancelled() {
-            return Err("Verification stopped because GitPulse closed.".into());
+            return Err("Verification stopped because Waylode closed.".into());
         }
         match backend.memo().latest(store, task_id) {
             Err(why) => return Err(why),

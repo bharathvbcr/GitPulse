@@ -269,7 +269,7 @@ describe("freshnessBadge", () => {
   it("only says no agent's command matches when that is the basis", () => {
     const hand = freshnessBadge(fresh({ session_basis: "no_ingested_session_command" }));
     expect(hand.detail).toContain("no ingested agent session's git command matches");
-    expect(hand.detail).toContain("GitPulse does not ingest");
+    expect(hand.detail).toContain("Waylode does not ingest");
     const unknown = freshnessBadge(fresh({ session_basis: "scan_capped" }));
     expect(unknown.detail).toContain("couldn't be determined (scan capped)");
     expect(unknown.detail).not.toContain("no ingested agent session's git command matches");

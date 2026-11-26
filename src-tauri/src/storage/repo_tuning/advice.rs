@@ -153,7 +153,7 @@ const SPLIT_INDEX_EVIDENCE: &str = "On git 2.54 (Apple Git-157), `feature.manyFi
      in config or carried as the index's own extension, including a delta past \
      `splitIndex.maxPercentChange`, was run for several add, commit and status rounds at 5,000 \
      and 30,000 files and did not reproduce it. `feature.manyFiles` includes the untracked cache \
-     and which of its parts breaks the split index was not isolated, so GitPulse refuses the \
+     and which of its parts breaks the split index was not isolated, so Waylode refuses the \
      untracked cache over a split index instead of inferring it is safe";
 
 /// The reason the untracked cache (or `feature.manyFiles`, which includes it)
@@ -224,7 +224,7 @@ fn untracked_cache_offer(report: &RepoTuningReport, env: GitEnv) -> Option<Tunin
             "{entries} tracked files (offered from {UNTRACKED_CACHE_MIN_TRACKED_FILES}): an \
              ordinary `git status` measured about a quarter faster at 20,000 files once git has \
              written the untracked cache into the index, which your next ordinary git status \
-             does. It does not speed `git status -u` (all untracked files), which GitPulse's own \
+             does. It does not speed `git status -u` (all untracked files), which Waylode's own \
              status reads use: no change was measured there."
         ),
     ))
@@ -248,7 +248,7 @@ fn fsmonitor_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOffer
         format!(
             "{entries} tracked files (offered from {FSMONITOR_MIN_TRACKED_FILES}): git status \
              measured 20 to 45 percent faster at this size, and slower below about 10,000. \
-             GitPulse bypasses core.fsmonitor on its own reads; on macOS, external Apple Git \
+             Waylode bypasses core.fsmonitor on its own reads; on macOS, external Apple Git \
              (/usr/bin/git) callers can still spawn a deadlocking daemon."
         ),
     ))
@@ -309,7 +309,7 @@ pub fn warnings(report: &RepoTuningReport) -> Vec<String> {
     let mut out = Vec::new();
     if report.is_true("core.splitindex") {
         out.push(
-            "core.splitIndex is on, so GitPulse will not turn the untracked cache on here (it \
+            "core.splitIndex is on, so Waylode will not turn the untracked cache on here (it \
              breaks git's own add-then-commit when combined with feature.manyFiles, which \
              includes it)."
                 .to_string(),
@@ -317,19 +317,19 @@ pub fn warnings(report: &RepoTuningReport) -> Vec<String> {
     }
     if report.index.split_index == Some(true) && !report.is_true("core.splitindex") {
         out.push(
-            "This worktree's index is a split index, so GitPulse will not turn the untracked \
+            "This worktree's index is a split index, so Waylode will not turn the untracked \
              cache on here."
                 .to_string(),
         );
     }
     if let Some(blocker) = report.family.split_index_blocker() {
         out.push(format!(
-            "GitPulse will not turn the untracked cache on: {blocker}."
+            "Waylode will not turn the untracked cache on: {blocker}."
         ));
     }
     if untracked_cache_on(report) {
         out.push(
-            "The untracked cache is already on; GitPulse will not turn core.splitIndex on \
+            "The untracked cache is already on; Waylode will not turn core.splitIndex on \
              beside it."
                 .to_string(),
         );
@@ -339,7 +339,7 @@ pub fn warnings(report: &RepoTuningReport) -> Vec<String> {
             out.push(
                 "core.fsmonitor=true slows git status on repositories under 10,000 tracked \
                  files, disables macOS idle poll skipping, and risks Apple Git \
-                 fsmonitor--daemon IPC deadlocks for external /usr/bin/git tools (GitPulse \
+                 fsmonitor--daemon IPC deadlocks for external /usr/bin/git tools (Waylode \
                  bypasses it on its own reads; unset it with `git config --local --unset \
                  core.fsmonitor`)."
                     .to_string(),
@@ -348,7 +348,7 @@ pub fn warnings(report: &RepoTuningReport) -> Vec<String> {
             out.push(
                 "core.fsmonitor=true risks Apple Git fsmonitor--daemon IPC deadlocks under \
                  FSEvents pressure when external /usr/bin/git callers share the repository \
-                 (GitPulse disables core.fsmonitor on its own reads)."
+                 (Waylode disables core.fsmonitor on its own reads)."
                     .to_string(),
             );
         }
@@ -505,7 +505,7 @@ fn step_for(change: TuningChange, report: &RepoTuningReport) -> TuningStep {
             notes: vec![
                 "Nothing changes at the click. The untracked cache is added to the index the \
                  next time git rewrites it, and your next ordinary `git status` in this \
-                 repository does that. GitPulse's own reads cannot: they run with \
+                 repository does that. Waylode's own reads cannot: they run with \
                  GIT_OPTIONAL_LOCKS=0, which never lets status write the index. Until then \
                  nothing is faster."
                     .to_string(),
@@ -531,8 +531,8 @@ fn step_for(change: TuningChange, report: &RepoTuningReport) -> TuningStep {
             ),
             notes: vec![
                 "The first git command in this repository after this starts a long-lived \
-                 `git fsmonitor--daemon`. GitPulse does not own, supervise or stop it, and it \
-                 keeps running after GitPulse quits. Stop it with `git fsmonitor--daemon stop`."
+                 `git fsmonitor--daemon`. Waylode does not own, supervise or stop it, and it \
+                 keeps running after Waylode quits. Stop it with `git fsmonitor--daemon stop`."
                     .to_string(),
             ],
             skipped: None,
@@ -594,7 +594,7 @@ fn step_for(change: TuningChange, report: &RepoTuningReport) -> TuningStep {
                      other concurrent maintenance runs out, and a run that finds it held skips \
                      its task. The page says `git gc` \"does not take the lock in the same way\" \
                      and should not be combined with maintenance. The page does not say whether \
-                     ordinary reads wait on the lock, so GitPulse does not claim they are \
+                     ordinary reads wait on the lock, so Waylode does not claim they are \
                      unaffected while a task runs."
                         .to_string(),
                 ],

@@ -690,7 +690,7 @@ thread_local! {
 }
 
 const LINK_LIMITATION: &str =
-    "This conflict involves a symbolic link, which GitPulse cannot write into a Windows working tree. Choose a side that is not a link, or resolve and stage the link externally.";
+    "This conflict involves a symbolic link, which Waylode cannot write into a Windows working tree. Choose a side that is not a link, or resolve and stage the link externally.";
 
 /// The regular-file mode Git would record for a merge of the two sides: the
 /// side that changed it from the base wins, and ours wins when both changed it
@@ -942,9 +942,9 @@ pub fn save_with_gate(
     }
     let repo = validate_repo(repo_path)?;
     let mutex = repo_mutation_lock(&repo);
-    let _guard = mutex.lock().map_err(|_| {
-        "A previous repository mutation panicked; restart GitPulse before resolving"
-    })?;
+    let _guard = mutex
+        .lock()
+        .map_err(|_| "A previous repository mutation panicked; restart Waylode before resolving")?;
     let mut transaction = IndexTransaction::begin(&repo)?;
     let (current, source) = snapshot_inner(&repo, &request.file_path)?;
     if current.revision != request.revision {

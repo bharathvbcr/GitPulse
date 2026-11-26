@@ -1,7 +1,7 @@
-use gitpulse_lib::procguard::LockedSpawn;
+use waylode_lib::procguard::LockedSpawn;
 mod common;
-use gitpulse_lib::storage::{scan_storage, ReclaimSafety};
 use std::{fs, process::Command};
+use waylode_lib::storage::{scan_storage, ReclaimSafety};
 
 #[test]
 fn untracked_environments_agent_state_and_scratch_are_not_safe_cleanup() {

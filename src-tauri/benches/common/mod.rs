@@ -350,7 +350,7 @@ pub fn require_no_failed_facets(what: &str, payload: &Value) -> u64 {
 fn host_snapshot() -> Value {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        use gitpulse_lib::sysload::{OsSensor, Sensor};
+        use waylode_lib::sysload::{OsSensor, Sensor};
         let dir = std::env::temp_dir();
         let sample = OsSensor::new(&dir).sample();
         serde_json::to_value(sample).unwrap_or(Value::Null)
@@ -378,7 +378,7 @@ pub fn runner_class() -> String {
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
-    use gitpulse_lib::procguard::LockedSpawn;
+    use waylode_lib::procguard::LockedSpawn;
     let out = std::process::Command::new("git")
         .args(args)
         .output_locked()
@@ -552,7 +552,7 @@ impl Report {
 /// A session registry for benchmarks. On Unix every bench gets its own
 /// short-path host directory so `sun_path` stays under the OS limit and the
 /// binary is resolved via `GITPULSE_PTYD` / `bundled_binary`.
-pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
+pub fn terminals() -> waylode_lib::terminal::TerminalSessions {
     #[cfg(unix)]
     {
         static HOST_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
@@ -567,8 +567,8 @@ pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
         let id = NEXT_HOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = root.path().join(format!("h{id}"));
         std::fs::create_dir_all(&dir).expect("bench host dir");
-        gitpulse_lib::terminal::TerminalSessions::with_host(
-            gitpulse_lib::terminal::host::client::HostConfig {
+        waylode_lib::terminal::TerminalSessions::with_host(
+            waylode_lib::terminal::host::client::HostConfig {
                 binary: None,
                 idle_exit: Some(Duration::from_secs(3)),
                 log_dir: Some(dir.join("logs")),
@@ -578,6 +578,6 @@ pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
     }
     #[cfg(not(unix))]
     {
-        gitpulse_lib::terminal::TerminalSessions::default()
+        waylode_lib::terminal::TerminalSessions::default()
     }
 }

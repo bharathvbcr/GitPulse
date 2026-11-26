@@ -723,7 +723,7 @@
                   <div data-setting="status-icon" hidden={!shown("status-icon")}>
                     <SettingToggle
                       label={statusIconSettingLabel($hostPlatform.os)}
-                      description="Show repository status while GitPulse is in the background. Closing the window hides it; use Quit to exit."
+                      description="Show repository status while Waylode is in the background. Closing the window hides it; use Quit to exit."
                       ariaLabel={`Show ${statusIconLocationName($hostPlatform.os)} status icon`}
                       checked={$interfaceStore.showStatusIcon}
                       onchange={(next) => interfaceStore.setShowStatusIcon(next)}
@@ -735,7 +735,7 @@
                     <div data-setting="hide-dock" hidden={!shown("hide-dock")}>
                       <SettingToggle
                         label="Hide Dock icon while closed"
-                        description="Keep GitPulse in the menu bar only after you close the window. Opening GitPulse from the status panel restores the Dock."
+                        description="Keep Waylode in the menu bar only after you close the window. Opening Waylode from the status panel restores the Dock."
                         ariaLabel="Hide Dock icon while the main window is closed"
                         checked={$interfaceStore.hideDockWhenClosed}
                         disabled={!$interfaceStore.showStatusIcon}
@@ -756,8 +756,8 @@
                   <div data-setting="launch-at-login" hidden={!shown("launch-at-login")}>
                     <SettingToggle
                       label="Open at login"
-                      description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
-                      ariaLabel="Open GitPulse at login"
+                      description={`Start Waylode when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
+                      ariaLabel="Open Waylode at login"
                       checked={launchAtLogin.state === "on"}
                       disabled={launchRow.disabled}
                       onchange={(next) => void setLaunchAtLogin(next)}
@@ -985,7 +985,7 @@
                   <div data-setting="github-avatars" hidden={!shown("github-avatars")}>
                     <SettingToggle
                       label="Show GitHub profile pictures"
-                      description="On by default. When a repository has a GitHub remote, GitPulse asks GitHub through the GitHub CLI which account each commit email belongs to, and loads profile pictures from avatars.githubusercontent.com. Commits made with a GitHub noreply address load their picture directly from there. Off shows initials only and makes no requests."
+                      description="On by default. When a repository has a GitHub remote, Waylode asks GitHub through the GitHub CLI which account each commit email belongs to, and loads profile pictures from avatars.githubusercontent.com. Commits made with a GitHub noreply address load their picture directly from there. Off shows initials only and makes no requests."
                       ariaLabel="Show GitHub profile pictures for commit authors"
                       checked={$interfaceStore.showGithubAvatars}
                       onchange={(next) => interfaceStore.setShowGithubAvatars(next)}
@@ -1062,7 +1062,7 @@
                     />
                     <p class="text-textMuted text-micro mt-1.5">
                       Columns a literal tab advances to, in the diff, the file viewer,
-                      blame and the conflict editor. Display only — GitPulse never
+                      blame and the conflict editor. Display only — Waylode never
                       rewrites the bytes in the file.
                     </p>
                   </div>
@@ -1091,7 +1091,7 @@
                   <div data-setting="auto-github-alerts" hidden={!shown("auto-github-alerts")}>
                     <SettingToggle
                       label="Check GitHub alerts on launch"
-                      description="On by default. When a repository opens, GitPulse uses the GitHub CLI, its credentials, and the network to fetch Dependabot and code scanning alerts. Critical and high findings raise a warning. A check that did not run is listed in Health, never toasted as an all-clear."
+                      description="On by default. When a repository opens, Waylode uses the GitHub CLI, its credentials, and the network to fetch Dependabot and code scanning alerts. Critical and high findings raise a warning. A check that did not run is listed in Health, never toasted as an all-clear."
                       ariaLabel="Automatically check GitHub Dependabot and code scanning alerts when a repository opens"
                       checked={$interfaceStore.autoScanGithubAlerts}
                       onchange={(next) => interfaceStore.setAutoScanGithubAlerts(next)}
@@ -1268,7 +1268,7 @@
                   <h3 class="gp-label">MCP plugin</h3>
                   <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                     <p class="text-textMuted text-micro mb-2">
-                      Claude Code, Codex and Cursor connect through the GitPulse plugin package, which
+                      Claude Code, Codex and Cursor connect through the Waylode plugin package, which
                       ships a manifest for each. The one read and copied below is the Codex manifest
                       (<code class="font-mono">.codex-plugin/plugin.json</code> +
                       <code class="font-mono">.mcp.json</code>); all of them speak MCP 2026-07-28. The
@@ -1441,8 +1441,8 @@
                   <div data-setting="update-check" hidden={!shown("update-check")}>
                     <SettingToggle
                       label="Check for new releases"
-                      description="Off by default. When on, GitPulse contacts its own public repository at most once a day to compare release tags. It never downloads or installs anything."
-                      ariaLabel="Automatically check for new GitPulse releases"
+                      description="Off by default. When on, Waylode contacts its own public repository at most once a day to compare release tags. It never downloads or installs anything."
+                      ariaLabel="Automatically check for new Waylode releases"
                       checked={$interfaceStore.checkForUpdates}
                       onchange={(next) => interfaceStore.setCheckForUpdates(next)}
                     />

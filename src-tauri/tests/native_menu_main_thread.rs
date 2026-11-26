@@ -26,12 +26,12 @@ mod hermetic_env;
 #[path = "common/nextest_list.rs"]
 mod nextest_list;
 
-use gitpulse_lib::desktop::actions::SECTION_MENUS;
-use gitpulse_lib::desktop::{
+use tauri::menu::MenuItemKind;
+use waylode_lib::desktop::actions::SECTION_MENUS;
+use waylode_lib::desktop::{
     install_menu, menu_state, recent_menu_entries, set_menu_state, set_recent_menu, DesktopState,
     MenuState, RECENT_MENU_LIMIT,
 };
-use tauri::menu::MenuItemKind;
 
 fn collect_items(items: Vec<MenuItemKind<tauri::test::MockRuntime>>) -> Vec<String> {
     let mut ids = Vec::new();
@@ -135,7 +135,7 @@ fn check_additions(app: &tauri::App<tauri::test::MockRuntime>, failures: &mut Ve
 fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
     tauri::test::mock_builder()
         .manage(DesktopState::default())
-        .build(gitpulse_lib::context())
+        .build(waylode_lib::context())
         .expect("mock app builds")
 }
 
@@ -240,13 +240,13 @@ fn main() {
         ..Default::default()
     };
     selected.repositories = vec![
-        gitpulse_lib::desktop::state::MenuRepository {
+        waylode_lib::desktop::state::MenuRepository {
             path: "/r/one/repo".into(),
             label: "one/repo".into(),
             active: true,
             ..Default::default()
         },
-        gitpulse_lib::desktop::state::MenuRepository {
+        waylode_lib::desktop::state::MenuRepository {
             path: "/r/two/repo".into(),
             label: "two/repo".into(),
             active: false,
@@ -270,7 +270,7 @@ fn main() {
         "section:history:diff".into(),
         "terminal-dock".into(),
     ];
-    selected.labels = vec![gitpulse_lib::desktop::state::MenuLabel {
+    selected.labels = vec![waylode_lib::desktop::state::MenuLabel {
         id: "terminal-dock".into(),
         text: "Hide Terminal".into(),
     }];
@@ -330,7 +330,7 @@ fn main() {
     selected.enabled.retain(|id| id != "fetch");
     selected
         .labels
-        .push(gitpulse_lib::desktop::state::MenuLabel {
+        .push(waylode_lib::desktop::state::MenuLabel {
             id: "fetch".into(),
             text: "Fetching…".into(),
         });
@@ -373,7 +373,7 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
     };
     state
         .repositories
-        .push(gitpulse_lib::desktop::state::MenuRepository {
+        .push(waylode_lib::desktop::state::MenuRepository {
             path: "/r/with:colon/repo".into(),
             label: "repo".into(),
             active: true,
@@ -381,7 +381,7 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
         });
     state
         .agent_requests
-        .push(gitpulse_lib::desktop::state::MenuAgentRequest {
+        .push(waylode_lib::desktop::state::MenuAgentRequest {
             id: "term:colon-1".into(),
             source: "terminal".into(),
             provider: "claude".into(),
@@ -399,14 +399,14 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
     let observed = Arc::clone(&events);
     // Any target: menu events are broadcast while there is no "main", and
     // sent to "main" once revealing has built it.
-    let listener = app.listen_any(gitpulse_lib::desktop::MENU_EVENT, move |event| {
+    let listener = app.listen_any(waylode_lib::desktop::MENU_EVENT, move |event| {
         observed
             .lock()
             .unwrap()
             .push(serde_json::from_str::<serde_json::Value>(event.payload()).unwrap());
     });
     for id in ids {
-        gitpulse_lib::desktop::handle_menu_event(app.handle(), id);
+        waylode_lib::desktop::handle_menu_event(app.handle(), id);
     }
     let mut expected: Vec<_> = ids
         .iter()
@@ -416,13 +416,13 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
             })
         })
         .collect();
-    gitpulse_lib::desktop::handle_menu_event(app.handle(), "activate-repo:/r/with:colon/repo");
+    waylode_lib::desktop::handle_menu_event(app.handle(), "activate-repo:/r/with:colon/repo");
     expected.push(serde_json::json!({"id":"activate-repo", "path":"/r/with:colon/repo", "repo_path":"/r/with:colon/repo"}));
     // A status-menu action other than the in-menu ones reveals "main". This
     // app has no main window yet, so revealing builds one, and the event
     // waits in the hibernation queue until that page says it is ready, as
     // the real page does on mount (`cmd_main_ready`).
-    gitpulse_lib::desktop::handle_menu_event(app.handle(), "tray:focus-agent:term:colon-1");
+    waylode_lib::desktop::handle_menu_event(app.handle(), "tray:focus-agent:term:colon-1");
     let desktop = app.state::<DesktopState>();
     let hibernation = &desktop.hibernation;
     assert!(
@@ -434,7 +434,7 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
         1,
         "the event waits for the page that was just built"
     );
-    gitpulse_lib::desktop::hibernate::main_ready(app.handle());
+    waylode_lib::desktop::hibernate::main_ready(app.handle());
     assert_eq!(
         hibernation.pending_len(),
         0,
@@ -445,8 +445,8 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
     state.enabled.retain(|id| id != "stage-all");
     state.agent_requests.clear();
     set_menu_state(app.handle(), state).unwrap();
-    gitpulse_lib::desktop::handle_menu_event(app.handle(), "stage-all");
-    gitpulse_lib::desktop::handle_menu_event(app.handle(), "tray:focus-agent:term:colon-1");
+    waylode_lib::desktop::handle_menu_event(app.handle(), "stage-all");
+    waylode_lib::desktop::handle_menu_event(app.handle(), "tray:focus-agent:term:colon-1");
     assert_eq!(
         *events.lock().unwrap(),
         expected,
@@ -465,7 +465,7 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
 fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
     // The old text-heavy left-click menu is replaced by the popover. A minimal
     // right-click menu remains an independent escape path if its webview fails.
-    let menu = gitpulse_lib::desktop::build_tray_menu(app.handle(), &MenuState::default()).unwrap();
+    let menu = waylode_lib::desktop::build_tray_menu(app.handle(), &MenuState::default()).unwrap();
     let items = menu.items().unwrap();
     assert_eq!(items.len(), 3);
     for (item, id) in items
@@ -481,7 +481,7 @@ fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
     busy.tray_summary.id = "section:work:overview".into();
     busy.status.primary_label = "Review changes".into();
     busy.validate().unwrap();
-    let ids: Vec<String> = gitpulse_lib::desktop::build_tray_menu(app.handle(), &busy)
+    let ids: Vec<String> = waylode_lib::desktop::build_tray_menu(app.handle(), &busy)
         .unwrap()
         .items()
         .unwrap()
@@ -506,7 +506,7 @@ fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
         agents_waiting: 2,
         agents_running: 1,
         agent_requests: vec![
-            gitpulse_lib::desktop::state::MenuAgentRequest {
+            waylode_lib::desktop::state::MenuAgentRequest {
                 id: "req-1".into(),
                 source: "terminal".into(),
                 provider: "claude".into(),
@@ -518,7 +518,7 @@ fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
                 detail: None,
                 at_ms: None,
             },
-            gitpulse_lib::desktop::state::MenuAgentRequest {
+            waylode_lib::desktop::state::MenuAgentRequest {
                 id: "req-2".into(),
                 source: "managed".into(),
                 provider: "agy".into(),
@@ -534,7 +534,7 @@ fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
         ..Default::default()
     };
     waiting_agents.validate().unwrap();
-    let built = gitpulse_lib::desktop::build_tray_menu(app.handle(), &waiting_agents).unwrap();
+    let built = waylode_lib::desktop::build_tray_menu(app.handle(), &waiting_agents).unwrap();
     let items = built.items().unwrap();
     let waiting_ids: Vec<String> = items
         .iter()
@@ -575,7 +575,7 @@ fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
         ..Default::default()
     };
     let no_double_sep =
-        gitpulse_lib::desktop::build_tray_menu(app.handle(), &agents_disabled).unwrap();
+        waylode_lib::desktop::build_tray_menu(app.handle(), &agents_disabled).unwrap();
     let no_double_items = no_double_sep.items().unwrap();
     assert_eq!(no_double_items.len(), 3);
     for (item, id) in no_double_items

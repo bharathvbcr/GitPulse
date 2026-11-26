@@ -11,8 +11,8 @@ fn held_healthy_install_reports_no_plugin_error() {
     let exe = std::env::current_exe().unwrap();
     let serial = crate::harness::sidecar::test_serial();
     let _env = crate::test_support::env::bind_env(&serial)
-        .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
-        .set("GITPULSE_HOOK_PATH", exe.to_str().unwrap());
+        .set("WAYLODE_MCP_PATH", exe.to_str().unwrap())
+        .set("WAYLODE_HOOK_PATH", exe.to_str().unwrap());
     let info = mcp_info();
     assert!(info.plugin_found, "{}", info.plugin_error);
     assert_eq!(info.plugin_error, "");
@@ -28,8 +28,8 @@ fn held_missing_hook_binary_is_not_a_plugin_error() {
     let exe = std::env::current_exe().unwrap();
     let serial = crate::harness::sidecar::test_serial();
     let _env = crate::test_support::env::bind_env(&serial)
-        .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
-        .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+        .set("WAYLODE_MCP_PATH", exe.to_str().unwrap())
+        .set("WAYLODE_HOOK_PATH", "/no/such/waylode-hook");
     let info = mcp_info();
     assert_eq!(info.plugin_error, "");
     assert!(info.hooks_config_json.is_empty());
@@ -50,13 +50,13 @@ fn break_optional_hooks_file_absent_is_reported_as_error() {
     fs::write(root.path().join(".codex-plugin/plugin.json"), "{}").unwrap();
     fs::write(
         root.path().join(".mcp.json"),
-        r#"{"mcpServers":{"gitpulse":{"command":"gitpulse-mcp"}}}"#,
+        r#"{"mcpServers":{"waylode":{"command":"waylode-mcp"}}}"#,
     )
     .unwrap();
     let _env = crate::test_support::env::bind_env(&serial)
-        .set("GITPULSE_PLUGIN_ROOT", root.path().to_str().unwrap())
-        .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
-        .set("GITPULSE_HOOK_PATH", exe.to_str().unwrap());
+        .set("WAYLODE_PLUGIN_ROOT", root.path().to_str().unwrap())
+        .set("WAYLODE_MCP_PATH", exe.to_str().unwrap())
+        .set("WAYLODE_HOOK_PATH", exe.to_str().unwrap());
     let info = mcp_info();
     assert!(info.plugin_found);
     assert_eq!(

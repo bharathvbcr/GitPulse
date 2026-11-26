@@ -172,7 +172,7 @@ fn the_whole_run_ends_a_margin_before_the_host_timeout() {
     };
 
     let injected = crate::workbench::claude_hook::settings_hooks(std::path::Path::new(
-        "/opt/gitpulse/gitpulse-hook",
+        "/opt/waylode/waylode-hook",
     ))
     .unwrap();
     let entries = notify_timeouts(&injected);
@@ -191,7 +191,7 @@ fn the_whole_run_ends_a_margin_before_the_host_timeout() {
         .any(|(a, t)| a == "session_ended" && *t <= 1.0));
 
     let manifest: Value =
-        serde_json::from_str(include_str!("../../../plugins/gitpulse/hooks/hooks.json")).unwrap();
+        serde_json::from_str(include_str!("../../../plugins/waylode/hooks/hooks.json")).unwrap();
     let shipped = notify_timeouts(&manifest["hooks"]);
     assert!(
         shipped.len() >= 10,

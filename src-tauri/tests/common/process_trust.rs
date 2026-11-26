@@ -1,7 +1,7 @@
 //! Real persistent fixture approvals, isolated from the developer's profile.
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
+use waylode_lib::procguard::LockedSpawn;
 
 /// The variables every platform reads GitPulse's profile from, pointed into
 /// `home`. A process that should see an [`approve`]d repository needs all of
@@ -33,14 +33,12 @@ pub fn approve(repo: &Path, home: &Path) {
 #[ignore = "fixture helper invoked explicitly in an isolated subprocess"]
 fn approve_subprocess_fixture() {
     let repo = std::env::var("GITPULSE_TEST_GRANT_REPO").expect("fixture repository");
-    let view = gitpulse_lib::repository_trust::inspect(&repo).unwrap();
-    gitpulse_lib::repository_trust::grant(&repo, &view.identity, true).unwrap();
+    let view = waylode_lib::repository_trust::inspect(&repo).unwrap();
+    waylode_lib::repository_trust::grant(&repo, &view.identity, true).unwrap();
     // The fixture must end up covering the repository, not just the checkout
     // it named: worktrees added by a test are otherwise refused.
     assert_eq!(
-        gitpulse_lib::repository_trust::inspect(&repo)
-            .unwrap()
-            .scope,
-        gitpulse_lib::repository_trust::TrustScope::Repository
+        waylode_lib::repository_trust::inspect(&repo).unwrap().scope,
+        waylode_lib::repository_trust::TrustScope::Repository
     );
 }

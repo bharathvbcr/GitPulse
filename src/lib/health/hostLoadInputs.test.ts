@@ -107,7 +107,7 @@ describe("the input rows", () => {
     expect(new Set(INPUT_SPECS.map((spec) => spec.settingId)).size).toBe(INPUT_SPECS.length);
     expect(MODE_LABELS).toEqual({
       off: "Off",
-      shed: "Slow GitPulse's background work",
+      shed: "Slow Waylode's background work",
       refuse: "Also refuse agent launches",
     });
     expect(specOf("battery").canRefuse).toBe(false);

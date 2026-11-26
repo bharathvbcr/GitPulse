@@ -98,7 +98,7 @@ function sessionNote(f: ProvenanceFreshness): string {
     case "no_ingested_session_command":
       // Not "no agent was involved": a session this machine does not ingest
       // (another Claude config directory, another tool) leaves no command row.
-      return "; no ingested agent session's git command matches it (sessions GitPulse does not ingest are not seen)";
+      return "; no ingested agent session's git command matches it (sessions Waylode does not ingest are not seen)";
     default:
       return `; which session made it couldn't be determined (${basis.replace(/_/g, " ")})`;
   }

@@ -136,7 +136,7 @@ pub fn build_native_menu<R: Runtime>(
 ) -> tauri::Result<Menu<R>> {
     let pkg = app.package_info();
     let about = AboutMetadata {
-        name: Some(pkg.name.clone()),
+        name: Some("Waylode".into()),
         version: Some(pkg.version.to_string()),
         copyright: app.config().bundle.copyright.clone(),
         authors: app.config().bundle.publisher.clone().map(|p| vec![p]),
@@ -476,7 +476,7 @@ pub fn build_native_menu<R: Runtime>(
         &[
             #[cfg(not(target_os = "macos"))]
             &PredefinedMenuItem::about(app, None, Some(about.clone()))?,
-            &item(app, actions::DOCUMENTATION, "GitPulse Help", None)?,
+            &item(app, actions::DOCUMENTATION, "Waylode Help", None)?,
             &item(
                 app,
                 actions::SHORTCUTS,
@@ -497,7 +497,7 @@ pub fn build_native_menu<R: Runtime>(
     #[cfg(target_os = "macos")]
     let app_menu = Submenu::with_items(
         app,
-        pkg.name.clone(),
+        "Waylode",
         true,
         &[
             &PredefinedMenuItem::about(app, None, Some(about))?,

@@ -1,8 +1,8 @@
-# Install and update GitPulse
+# Install and update Waylode
 
 [Documentation index](README.md) · [Getting started](GETTING_STARTED.md)
 
-Download the GitPulse 0.2.0 beta, [`v0.2.0-beta.1`](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1).
+Download the Waylode 0.2.0 beta, [`v0.2.0-beta.1`](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1).
 It is a GitHub pre-release with macOS installers only; Windows and Linux installers come with a later release.
 Choose an asset from the selected release; repository manifests describe the
 checkout and do not establish which release is publicly available.
@@ -20,7 +20,7 @@ the asset for your machine. Building an installer does not establish that every
 workflow has been tested on that platform.
 
 > [!NOTE]
-> GitPulse is developed and hand-tested on macOS. Windows and Linux builds are
+> Waylode is developed and hand-tested on macOS. Windows and Linux builds are
 > produced and covered by the automated suites, but are not exercised against a
 > running app by a person. Some features are deliberately macOS-only — desktop
 > notifications among them — and others are simply untried elsewhere.
@@ -31,7 +31,7 @@ see [Contributing](../CONTRIBUTING.md).
 
 ### macOS
 
-Open the DMG and drag GitPulse into Applications. Bundles use an ad-hoc signature
+Open the DMG and drag Waylode into Applications. Bundles use an ad-hoc signature
 by default to seal resources; that is not a Developer ID signature or
 notarization. Check the release's signing status before installing it.
 
@@ -43,15 +43,15 @@ xattr -dr com.apple.quarantine /Applications/GitPulse.app
 ```
 
 This removes a local quarantine attribute; it does not verify or notarize the app.
-Open GitPulse from Applications, Finder, or Spotlight.
+Open Waylode from Applications, Finder, or Spotlight.
 
-To let Claude Code or Codex use GitPulse's MCP tools, open
-**Settings → Agents → Connect your agent** once GitPulse runs from
+To let Claude Code or Codex use Waylode's MCP tools, open
+**Settings → Agents → Connect your agent** once Waylode runs from
 Applications. The `gitpulse-mcp` and `gitpulse-hook` binaries ship inside
 `GitPulse.app/Contents/MacOS/`; connecting links them into `~/.local/bin` and
 registers the MCP server through each agent's own CLI, after showing you the
 plan. Because the links point into the app, they follow the app when you update
-it. Connecting does not install GitPulse's Claude Code plugin, which is what
+it. Connecting does not install Waylode's Claude Code plugin, which is what
 wires its hooks; **Copy setup prompt** includes the plugin's install commands,
 and its hooks find `gitpulse-hook` only when `~/.local/bin` is on your shell's
 `PATH`. The plugin also provides the `gitpulse` server, so use the plugin or
@@ -89,11 +89,11 @@ macOS pins each LaunchAgent it loads at login to the signature of the program
 the agent starts. For a team-signed build that pin is the team and signing
 identifier, which a rebuild keeps. An ad-hoc signature has no team identity, so
 the pin is that build's code hash, and every new build has a different one. If
-you replaced an ad-hoc GitPulse, or replaced one build with another signed by a
-different identity, while **Also run when GitPulse is closed** was on, the cleaner
-agent's next run (within 60 seconds) is killed before any GitPulse code runs.
+you replaced an ad-hoc Waylode, or replaced one build with another signed by a
+different identity, while **Also run when Waylode is closed** was on, the cleaner
+agent's next run (within 60 seconds) is killed before any Waylode code runs.
 macOS saves a `gitpulse-*.ips` report with "Launch Constraint Violation" and may
-show "gitpulse quit unexpectedly". The GitPulse window is not affected. launchd
+show "gitpulse quit unexpectedly". The Waylode window is not affected. launchd
 then re-pins the agent to the new build, and the run after that succeeds. The
 launch-at-login agent starts only at login, so it does not hit this within a
 session.
@@ -114,7 +114,7 @@ the agent is not installed.
 
 #### Upgrading from the `com.gitpulse.desktop` bundle identifier
 
-GitPulse's bundle identifier is now `dev.vbcr.gitpulse`. The first launch
+Waylode's bundle identifier is now `dev.vbcr.gitpulse`. The first launch
 copies the page's website data (`~/Library/WebKit/com.gitpulse.desktop/WebsiteData`)
 to the new identifier, moves a saved Claude API key to its new Keychain item,
 and replaces the cleaner agent `com.gitpulse.hygiene` with
@@ -129,25 +129,25 @@ and a Full Disk Access grant has to be given again.
 
 Cmd-Q, Dock → Quit, the status menu's Quit item, and a Quit Apple event
 (`osascript -e 'quit app id "dev.vbcr.gitpulse"'`) all go through the same
-confirmation. GitPulse asks first when Git actions are still running, editor saves
+confirmation. Waylode asks first when Git actions are still running, editor saves
 are in flight, or editor drafts are unsaved, and quits immediately otherwise.
-A logout or restart waits while GitPulse asks, then continues if you quit, or
+A logout or restart waits while Waylode asks, then continues if you quit, or
 stops if you choose to keep working.
 
 - **Quit again to force it.** A second Quit while the confirmation is open
   quits at once without asking.
 - **A window that cannot answer does not block quitting.** If the window does
   not respond to a quit within 3 seconds, for example because its page crashed,
-  is reloading, or has hung, GitPulse quits.
+  is reloading, or has hung, Waylode quits.
 - **A crashed window reloads itself.** If the window's web content crashes,
-  GitPulse reloads it and records the crash in the log. When crashes repeat,
-  GitPulse waits longer before each reload, up to 30 seconds.
+  Waylode reloads it and records the crash in the log. When crashes repeat,
+  Waylode waits longer before each reload, up to 30 seconds.
 
-A script or agent that quits GitPulse with an Apple event needs macOS Automation
+A script or agent that quits Waylode with an Apple event needs macOS Automation
 permission for the program that sends it, such as Terminal or an agent's own
 binary. The first time, macOS shows a consent dialog. Until someone answers it, the
-event never reaches GitPulse and `osascript` fails with `AppleEvent timed out
-(-1712)`. GitPulse cannot see or answer that dialog. Allow or deny it, or change
+event never reaches Waylode and `osascript` fails with `AppleEvent timed out
+(-1712)`. Waylode cannot see or answer that dialog. Allow or deny it, or change
 it later in System Settings → Privacy & Security → Automation.
 
 #### Local builds and duplicate registrations
@@ -184,7 +184,7 @@ drops the stale `/Volumes/dmg.*` records.
 
 On Linux, install the `.deb` with your distribution's package tools, or mark the
 AppImage executable and run it. On Windows, run the selected MSI or EXE installer.
-Follow platform prompts, then open GitPulse and choose a repository. See
+Follow platform prompts, then open Waylode and choose a repository. See
 [Troubleshooting](../wiki/Troubleshooting.md) for missing Git or native libraries.
 
 ## Optional tools
@@ -208,7 +208,7 @@ and [Security](SECURITY.md).
 
 ## Versions and channels
 
-GitPulse releases come on two channels:
+Waylode releases come on two channels:
 
 - **Stable**, tagged `vX.Y.Z` and published as an ordinary GitHub release.
 - **Beta**, tagged `vX.Y.Z-beta.N` and published as a GitHub pre-release. A beta
@@ -248,7 +248,7 @@ that it could not check, rather than claiming the app is up to date.
 **Upgrading a profile that has opened a newer task store.** The DevCouncil task
 store (dc-store) migrates one way: a profile migrated to a newer schema cannot be
 read back by a host built against an older one. (The dc-store vendored in this
-tree is store schema 11 with workbench schema 17.) GitPulse, Manvi and DevCouncil
+tree is store schema 11 with workbench schema 17.) Waylode, Manvi and DevCouncil
 share that profile, so update all three together, built from the same dc-store
 schema, before any of them opens it. A connected app install updates the
 `gitpulse-mcp` and `gitpulse-hook` it links along with the app; a source build

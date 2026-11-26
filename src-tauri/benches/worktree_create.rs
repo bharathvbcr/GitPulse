@@ -35,13 +35,13 @@ mod common;
 
 use common::fixture::{build_repo, git, trust_repo, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::engine::cow_clone::{clone_ignored_caches, CacheSelection};
-use gitpulse_lib::engine::worktree::{add_worktree, add_worktree_with_devmap, DevmapMode};
-use gitpulse_lib::procguard::LockedSpawn;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use waylode_lib::engine::cow_clone::{clone_ignored_caches, CacheSelection};
+use waylode_lib::engine::worktree::{add_worktree, add_worktree_with_devmap, DevmapMode};
+use waylode_lib::procguard::LockedSpawn;
 
 const SPEC: Spec = Spec {
     files: 3000,
@@ -202,7 +202,7 @@ fn remove_lane(repo: &Repo, lane: &Path, branch: &str) {
 }
 
 fn main() {
-    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    waylode_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("worktree_create");
     let temp = tempfile::tempdir().expect("temp dir");
     // `GITPULSE_BENCH_REPO=<path>` times the same call on a real checkout (its
@@ -386,7 +386,7 @@ fn main() {
         )
         .expect("add_worktree_with_devmap");
         let started = Instant::now();
-        gitpulse_lib::codeintel::sync_worktree_overlay(text(&lane)).expect("overlay sync");
+        waylode_lib::codeintel::sync_worktree_overlay(text(&lane)).expect("overlay sync");
         let elapsed = started.elapsed();
         remove_lane(&repo, &lane, &branch);
         Sample::default().elapsed(elapsed)

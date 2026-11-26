@@ -1,5 +1,5 @@
 //! Adversarial review of card 15 (S3-11 + S6-06), MCP half: the live
-//! `gitpulse_landed` and `gitpulse_provenance` payloads against their
+//! `waylode_landed` and `waylode_provenance` payloads against their
 //! advertised `outputSchema` on every fixture, and the read-only claim.
 
 use super::*;
@@ -196,8 +196,8 @@ fn assert_conforms(label: &str, payload: &Value, schema: &Value) {
 #[test]
 fn live_landed_and_provenance_payloads_meet_their_output_schemas_on_every_fixture() {
     let (_keep, cases) = fixtures();
-    let landed_schema = schema_of("gitpulse_landed");
-    let provenance_schema = schema_of("gitpulse_provenance");
+    let landed_schema = schema_of("waylode_landed");
+    let provenance_schema = schema_of("waylode_provenance");
     let mut seen = std::collections::BTreeSet::new();
     for (label, repo, commit, base) in &cases {
         let mut arguments = json!({ "repo_path": repo, "commit": commit });
@@ -208,11 +208,11 @@ fn live_landed_and_provenance_payloads_meet_their_output_schemas_on_every_fixtur
         }
         // An argument the boundary refuses never reaches the tool: that is an
         // answer too, and no payload to validate.
-        if validate_arguments("gitpulse_landed", &arguments).is_err() {
+        if validate_arguments("waylode_landed", &arguments).is_err() {
             println!("OUTSCHEMA {label}: refused at the argument boundary");
             continue;
         }
-        let landed = handle_tool_call("gitpulse_landed", &arguments)
+        let landed = handle_tool_call("waylode_landed", &arguments)
             .unwrap_or_else(|e| panic!("{label}: landed errored: {e}"));
         assert_conforms(&format!("landed/{label}"), &landed, &landed_schema);
         println!(
@@ -235,8 +235,8 @@ fn live_landed_and_provenance_payloads_meet_their_output_schemas_on_every_fixtur
         }
         seen.insert(landed["landed"].to_string());
 
-        if validate_arguments("gitpulse_provenance", &provenance_arguments).is_ok() {
-            let provenance = handle_tool_call("gitpulse_provenance", &provenance_arguments)
+        if validate_arguments("waylode_provenance", &provenance_arguments).is_ok() {
+            let provenance = handle_tool_call("waylode_provenance", &provenance_arguments)
                 .unwrap_or_else(|e| panic!("{label}: provenance errored: {e}"));
             assert_conforms(
                 &format!("provenance/{label}"),
@@ -272,7 +272,7 @@ fn live_landed_and_provenance_payloads_meet_their_output_schemas_on_every_fixtur
 fn gitpulse_landed_is_read_only_everywhere_the_server_says_so() {
     let tool = tools()
         .into_iter()
-        .find(|t| t["name"] == "gitpulse_landed")
+        .find(|t| t["name"] == "waylode_landed")
         .expect("advertised");
     assert_eq!(tool["annotations"]["readOnlyHint"], true);
     assert_eq!(tool["annotations"]["destructiveHint"], false, "{tool}");
@@ -281,7 +281,7 @@ fn gitpulse_landed_is_read_only_everywhere_the_server_says_so() {
         serde_json::from_str(contents[0]["text"].as_str().expect("text")).expect("json");
     let writes = manifest["writes"].as_array().expect("writes");
     assert!(
-        !writes.iter().any(|name| name == "gitpulse_landed"),
+        !writes.iter().any(|name| name == "waylode_landed"),
         "{writes:?}"
     );
     // And it is in the manifest's tool list at all.
@@ -290,12 +290,12 @@ fn gitpulse_landed_is_read_only_everywhere_the_server_says_so() {
         .map(|tools| {
             tools
                 .iter()
-                .any(|t| t == "gitpulse_landed" || t["name"] == "gitpulse_landed")
+                .any(|t| t == "waylode_landed" || t["name"] == "waylode_landed")
         })
         .unwrap_or(true);
     assert!(
         listed,
-        "gitpulse_landed missing from the manifest's tools: {manifest}"
+        "waylode_landed missing from the manifest's tools: {manifest}"
     );
 }
 
@@ -352,12 +352,12 @@ fn record_commit_run(repo: &str, commit: &str, commands: &[(&str, u64)], reflog_
 /// inferred session, an ambiguous one, a hand commit, and no ledger at all.
 #[test]
 fn the_session_fields_validate_against_the_output_schema_attributed_or_not() {
-    let schema = schema_of("gitpulse_provenance");
+    let schema = schema_of("waylode_provenance");
     let now = crate::ledger::ids::now_millis() / 1000 * 1000;
     let ask = |repo: &str, commit: &str| {
         let args = json!({ "repo_path": repo, "commit_sha": commit, "base_branch": "main" });
-        validate_arguments("gitpulse_provenance", &args).expect("arguments");
-        handle_tool_call("gitpulse_provenance", &args).expect("provenance")
+        validate_arguments("waylode_provenance", &args).expect("arguments");
+        handle_tool_call("waylode_provenance", &args).expect("provenance")
     };
 
     let (_a, attributed) = repo_with_root();
@@ -409,7 +409,7 @@ fn the_session_fields_validate_against_the_output_schema_attributed_or_not() {
 #[test]
 fn over_mcp_only_a_full_pass_is_verified_and_a_narrowed_pass_is_told_apart() {
     use crate::engine::provenance::VerificationNote;
-    let schema = schema_of("gitpulse_provenance");
+    let schema = schema_of("waylode_provenance");
     // Each verdict is a literal: provenance-verdict-contract reads every
     // `VerificationNote` construction in this file and must resolve its verdict.
     let passed = VerificationNote {
@@ -443,8 +443,8 @@ fn over_mcp_only_a_full_pass_is_verified_and_a_narrowed_pass_is_told_apart() {
         let sha = git(&repo, &["rev-parse", "HEAD"]);
         crate::engine::provenance::write_verification_note(&repo, &sha, &note).expect("write note");
         let args = json!({ "repo_path": repo, "commit_sha": sha, "base_branch": "main" });
-        validate_arguments("gitpulse_provenance", &args).expect("arguments");
-        let got = handle_tool_call("gitpulse_provenance", &args).expect("provenance");
+        validate_arguments("waylode_provenance", &args).expect("arguments");
+        let got = handle_tool_call("waylode_provenance", &args).expect("provenance");
         assert_conforms(verdict, &got, &schema);
         assert_eq!(got["notes_readable"], true, "{verdict}: {got}");
         assert_eq!(got["distance"], 0, "{verdict}: measured at the tip: {got}");
@@ -531,7 +531,7 @@ fn put_row(
 #[test]
 fn every_session_basis_validates_against_the_output_schema() {
     use crate::ledger::attribution::basis;
-    let schema = schema_of("gitpulse_provenance");
+    let schema = schema_of("waylode_provenance");
     let now = crate::ledger::ids::now_millis() / 1000 * 1000;
     let cmd = "git commit -m x";
     let ok = Some("ok");
@@ -733,8 +733,8 @@ fn every_session_basis_validates_against_the_output_schema() {
         let sha = git(&repo, &["rev-parse", "HEAD"]);
         setup(&repo, &sha);
         let args = json!({ "repo_path": repo, "commit_sha": sha, "base_branch": "main" });
-        validate_arguments("gitpulse_provenance", &args).expect("arguments");
-        let got = handle_tool_call("gitpulse_provenance", &args).expect("provenance");
+        validate_arguments("waylode_provenance", &args).expect("arguments");
+        let got = handle_tool_call("waylode_provenance", &args).expect("provenance");
         assert_conforms(expected, &got, &schema);
         assert_eq!(got["session_basis"], *expected, "{got}");
         assert!(got["session_basis"].is_string() && got["session_ambiguous"].is_boolean());

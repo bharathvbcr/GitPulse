@@ -72,10 +72,10 @@ import { fileDigest, readInstallRecord, recordPath, sourceDigest } from "./insta
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /** The executable name both MCP manifests spawn. */
-export const SERVER_BIN = "gitpulse-mcp";
+export const SERVER_BIN = "waylode-mcp";
 
 /**
- * The executable `plugins/gitpulse/hooks/hooks.json` spawns for every hook.
+ * The executable `plugins/waylode/hooks/hooks.json` spawns for every hook.
  *
  * It is checked here for the same reason the server is, and a sharper one. The
  * server's absence is loud: a client that cannot spawn it shows a failed MCP
@@ -86,16 +86,16 @@ export const SERVER_BIN = "gitpulse-mcp";
  * gate never run looks exactly like one where they ran and found nothing,
  * which is the single confusion this whole package is built to avoid.
  */
-export const HOOK_BIN = "gitpulse-hook";
+export const HOOK_BIN = "waylode-hook";
 
 /** Where the shipped hook manifests live, relative to the repo root. */
-const HOOKS_MANIFEST = path.join("plugins", "gitpulse", "hooks", "hooks.json");
-const AGY_HOOKS_MANIFEST = path.join("plugins", "gitpulse-agy", "hooks.json");
+const HOOKS_MANIFEST = path.join("plugins", "waylode", "hooks", "hooks.json");
+const AGY_HOOKS_MANIFEST = path.join("plugins", "waylode-agy", "hooks.json");
 
 /** Handshake budget. An unresponsive server must fail, never hang a release. */
 export const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 1_048_576;
-const MANIFEST_URI = "gitpulse://server/manifest";
+const MANIFEST_URI = "waylode://server/manifest";
 
 /**
  * Resolve `name` against PATH without shelling out to `which`, so the answer
@@ -314,7 +314,7 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
         params: {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "gitpulse-mcp-doctor", version: "1" },
+          clientInfo: { name: "waylode-mcp-doctor", version: "1" },
         },
       })}\n`,
     );
@@ -456,7 +456,7 @@ export function declaredHookSubcommands(root = REPO_ROOT) {
  * Claude Code its worktree. The same string as `LAUNCHER_PREFIX` in
  * src-tauri/src/hooks/worktree.rs, which `plugin-contract.test.ts` checks.
  */
-export const WORKTREE_LAUNCHER_PREFIX = 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/gitpulse-worktree.sh" ';
+export const WORKTREE_LAUNCHER_PREFIX = 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/waylode-worktree.sh" ';
 
 /**
  * A manifest command without the worktree launcher in front of it, trimmed:
@@ -747,7 +747,7 @@ export function classifyProvenance({ record, treeDigest, treeFileCount, binPaths
 /* ── the installed plugin cache ──────────────────────────────────────────── */
 
 /** The plugin's id in `installed_plugins.json`: `<plugin>@<marketplace>`. */
-export const PLUGIN_ID = "gitpulse@gitpulse";
+export const PLUGIN_ID = "waylode@waylode";
 
 /** Where Claude Code keeps its plugin state. */
 export function claudeConfigDir(env = process.env) {
@@ -888,8 +888,8 @@ export function readRepoHooks(root = REPO_ROOT) {
  * @param {{ home?: string, platform?: string, xdg?: string | undefined }} [env]
  */
 export function appConfigDir({ home = homedir(), platform = process.platform, xdg = process.env.XDG_CONFIG_HOME } = {}) {
-  if (platform === "darwin") return path.join(home, "Library", "Application Support", "GitPulse");
-  return path.join(xdg || path.join(home, ".config"), "gitpulse");
+  if (platform === "darwin") return path.join(home, "Library", "Application Support", "Waylode");
+  return path.join(xdg || path.join(home, ".config"), "waylode");
 }
 
 /**
@@ -918,12 +918,12 @@ export function appConfigDir({ home = homedir(), platform = process.platform, xd
 export function classifyLease({ binDir, linkTarget, servesLease = null, targetIdentity = null, resolved, error }) {
   const link = path.join(binDir, "cargo");
   if (linkTarget === null) {
-    return { status: "absent", detail: `${link} does not exist: GitPulse has not made its lease links, so builds are not leased` };
+    return { status: "absent", detail: `${link} does not exist: Waylode has not made its lease links, so builds are not leased` };
   }
   if (servesLease === false) {
     return {
       status: "stale",
-      detail: `${link} points at ${linkTarget}, which is not a build-lease wrapper (its --version says ${targetIdentity ? JSON.stringify(targetIdentity) : "nothing"}): run as cargo it exits 0 without building. Restart a current GitPulse so it removes the link, or delete ${binDir}`,
+      detail: `${link} points at ${linkTarget}, which is not a build-lease wrapper (its --version says ${targetIdentity ? JSON.stringify(targetIdentity) : "nothing"}): run as cargo it exits 0 without building. Restart a current Waylode so it removes the link, or delete ${binDir}`,
     };
   }
   if (servesLease !== true) {
@@ -1078,7 +1078,7 @@ export function formatReport(result) {
   if (lease) {
     lines.push(
       lease.status === "gated"
-        ? "OK: a login shell runs GitPulse's lease wrapper for cargo, so heavy builds take a slot."
+        ? "OK: a login shell runs Waylode's lease wrapper for cargo, so heavy builds take a slot."
         : lease.status === "absent"
           ? "NOTE (absent): no lease links to check, so this half did not run; it is not a pass."
           : `FAIL (${lease.status}): heavy cargo builds from an agent session are not leased.`,
@@ -1137,7 +1137,7 @@ export function usage() {
       { flag: "--hook-bin <path>", description: `probe this executable instead of resolving ${HOOK_BIN} on PATH` },
       { flag: "--expect <ver>", description: "version to require instead of package.json's" },
       { flag: "--claude-dir <path>", description: "Claude config directory holding plugins/ (default $CLAUDE_CONFIG_DIR, else ~/.claude)" },
-      { flag: "--config-dir <path>", description: "GitPulse's per-user config directory holding lease-bin/ (default: the app's own)" },
+      { flag: "--config-dir <path>", description: "Waylode's per-user config directory holding lease-bin/ (default: the app's own)" },
       { flag: "--timeout <ms>", description: `handshake budget (default ${DEFAULT_TIMEOUT_MS})` },
       { flag: "--json", description: "print the result as JSON" },
       { flag: "--help, -h", description: "print this message and exit 0" },

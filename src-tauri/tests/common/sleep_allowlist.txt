@@ -56,9 +56,9 @@ site | src/alerts/intake_adv_tests.rs | answers_flat_out_do_not_cost_other_sessi
 # src/alerts/intake_tests.rs
 site | src/alerts/intake_tests.rs | fifty_thousand_bells_on_one_session_drop_no_hook_report | 0 | spacing
 
-# src/bin/gitpulse-mcp.rs
-site | src/bin/gitpulse-mcp.rs | Trickle::write | 0 | fixture-delay
-site | src/bin/gitpulse-mcp.rs | a_request_whose_thread_cannot_start_is_still_answered_once | 0 | bounded-poll
+# src/bin/waylode-mcp.rs
+site | src/bin/waylode-mcp.rs | Trickle::write | 0 | fixture-delay
+site | src/bin/waylode-mcp.rs | a_request_whose_thread_cannot_start_is_still_answered_once | 0 | bounded-poll
 
 # src/codeintel/mod.rs
 site | src/codeintel/mod.rs | an_earlier_registration_wakes_a_timer_waiting_on_a_later_one | 0 | race-widen
@@ -243,6 +243,9 @@ site | src/leak_scan/recall_tests.rs | run | 0 | bounded-poll
 site | src/logging/performance.rs | a_burst_of_quick_calls_wakes_the_watchdog_once_not_once_per_call | 0 | spacing
 site | src/logging/performance.rs | wait_until | 0 | bounded-poll
 
+# src/mavi/session.rs
+site | src/mavi/session.rs | written_answer | 0 | bounded-poll
+
 # src/mcp/worktree_seed_tests.rs
 site | src/mcp/worktree_seed_tests.rs | assert_build_runs_in | 0 | bounded-poll
 
@@ -313,7 +316,7 @@ site | src/terminal/host/client_adversarial_tests.rs | serve | 3 | fixture-delay
 site | src/terminal/host/client_adversarial_tests.rs | until | 0 | bounded-poll
 
 # src/terminal/host/client_tests.rs
-site | src/terminal/host/client_tests.rs | FakeHost::start | 0 | unbounded-poll
+site | src/terminal/host/client_tests.rs | FakeHost::start_on | 0 | unbounded-poll
 site | src/terminal/host/client_tests.rs | a_failed_first_listing_is_retried_in_the_background | 0 | bounded-poll
 site | src/terminal/host/client_tests.rs | a_session_that_exited_is_no_longer_known | 0 | bounded-poll
 site | src/terminal/host/client_tests.rs | delivered_exits_are_not_vouched_for_while_their_recording_is_pending | 0 | bounded-poll
@@ -334,6 +337,9 @@ site | src/terminal/mod.rs | characterization_a_terminal_claude_with_no_registry
 site | src/terminal/mod.rs | output_printed_while_detached_is_replayed_to_the_next_view | 0 | bounded-poll
 site | src/terminal/mod.rs | read_pid | 0 | bounded-poll
 site | src/terminal/mod.rs | wait_until | 0 | bounded-poll
+
+# src/terminal/port_probe.rs
+site | src/terminal/port_probe.rs | start_listener_named | 0 | bounded-poll
 
 # src/test_support.rs
 site | src/test_support.rs | wait_gone | 0 | bounded-poll
@@ -553,3 +559,8 @@ site | tests/terminal_session_survival.rs | detaching_leaves_the_process_running
 site | tests/terminal_session_survival.rs | read_pid | 0 | bounded-poll
 site | tests/terminal_session_survival.rs | settled_count | 0 | bounded-poll
 site | tests/terminal_session_survival.rs | wait_until | 0 | bounded-poll
+
+# src/sysload/relief_tests.rs
+# The kernel applies SIGSTOP/SIGCONT to a real child asynchronously and offers no
+# event for it short of consuming the wait statuses `Child::wait` owns, so `ps` is polled.
+site | src/sysload/relief_tests.rs | Sleeper::wait_for | 0 | bounded-poll

@@ -38,7 +38,7 @@ describe("syncWindowChrome", () => {
   it("does nothing outside Tauri", async () => {
     setTauriWindow(false);
     const sync = await freshSync();
-    await sync("GitPulse", 1);
+    await sync("Waylode", 1);
     expect(tauriWindow.setTitle).not.toHaveBeenCalled();
     expect(tauriWindow.setBadgeCount).not.toHaveBeenCalled();
   });
@@ -55,9 +55,9 @@ describe("syncWindowChrome", () => {
 
   it("normalizes non-positive badges and re-syncs when they change", async () => {
     const sync = await freshSync();
-    await sync("GitPulse", 0);
+    await sync("Waylode", 0);
     expect(tauriWindow.setBadgeCount).toHaveBeenCalledWith(undefined);
-    await sync("GitPulse", 2);
+    await sync("Waylode", 2);
     expect(tauriWindow.setBadgeCount).toHaveBeenLastCalledWith(2);
     expect(tauriWindow.setBadgeCount).toHaveBeenCalledTimes(2);
   });
@@ -105,7 +105,7 @@ describe("syncWindowChrome", () => {
 
 describe("repoWindowTitle", () => {
   it("formats repo and branch for Mission Control / the Window menu", () => {
-    expect(repoWindowTitle(null, null)).toBe("GitPulse");
+    expect(repoWindowTitle(null, null)).toBe("Waylode");
     expect(repoWindowTitle("/Users/acme/gitpulse", "main")).toBe("gitpulse — main");
     expect(repoWindowTitle("/Users/acme/gitpulse", null)).toBe("gitpulse");
   });

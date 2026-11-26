@@ -23,11 +23,11 @@ mod hermetic_env;
 #[path = "common/marked_children.rs"]
 mod marked_children;
 
-use gitpulse_lib::hooks::signal_guard::{check_command, live_match_pids};
-use gitpulse_lib::procguard::LockedSpawn;
 use marked_children::Marked;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
+use waylode_lib::hooks::signal_guard::{check_command, live_match_pids};
+use waylode_lib::procguard::LockedSpawn;
 
 /// The real `pgrep`, read-only, with exactly the arguments given. The pid is
 /// the first word of each line: procps `-a` is `--list-full` and prints

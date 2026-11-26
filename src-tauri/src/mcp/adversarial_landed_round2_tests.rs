@@ -1,4 +1,4 @@
-//! Adversarial review (round 2) of the `gitpulse_landed` MCP surface: argument
+//! Adversarial review (round 2) of the `waylode_landed` MCP surface: argument
 //! validation at the trust boundary and what a hostile revision can do once it
 //! is let through.
 
@@ -45,7 +45,7 @@ fn oversize_unknown_and_empty_arguments_are_refused_before_git_runs() {
     ];
     for arguments in cases {
         assert!(
-            validate_arguments("gitpulse_landed", &arguments).is_err(),
+            validate_arguments("waylode_landed", &arguments).is_err(),
             "{arguments} was accepted"
         );
     }
@@ -72,10 +72,10 @@ fn hostile_revisions_are_unresolvable_and_never_an_answer() {
             if let Some(base) = &base {
                 arguments["base"] = json!(base);
             }
-            if validate_arguments("gitpulse_landed", &arguments).is_err() {
+            if validate_arguments("waylode_landed", &arguments).is_err() {
                 continue;
             }
-            let answer = handle_tool_call("gitpulse_landed", &arguments)
+            let answer = handle_tool_call("waylode_landed", &arguments)
                 .unwrap_or_else(|e| panic!("{commit:?}/{base:?}: handler errored: {e}"));
             // A hostile revision may resolve to something real (`:/root`), but a
             // multi-line or option-shaped one must not be read as two commits.
@@ -96,7 +96,7 @@ fn hostile_revisions_are_unresolvable_and_never_an_answer() {
 fn the_tool_is_advertised_read_only_and_with_a_closed_input_schema() {
     let tool = catalog()
         .iter()
-        .find(|t| t["name"] == "gitpulse_landed")
+        .find(|t| t["name"] == "waylode_landed")
         .expect("advertised")
         .clone();
     assert_eq!(tool["annotations"]["readOnlyHint"], true);

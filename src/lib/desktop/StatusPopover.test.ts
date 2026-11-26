@@ -210,14 +210,14 @@ describe("reduced transparency in the status popover", () => {
 });
 
 describe("status popover logo and agent requests overhaul", () => {
-  it("replaces legacy Activity icons with the current GitPulse Logo badge", () => {
+  it("replaces legacy Activity icons with the current Waylode Logo badge", () => {
     expect(source).toContain('import Logo from "../components/Logo.svelte"');
     expect(source).toContain("<Logo ");
     expect(source).not.toContain("Activity");
     const { body } = render(StatusPopover, { props: { snapshot: statusFixture("changes"), onaction: () => {} } });
-    expect(body).toContain('aria-label="GitPulse"');
+    expect(body).toContain('aria-label="Waylode"');
     const empty = render(StatusPopover, { props: { snapshot: null, onaction: () => {} } }).body;
-    expect(empty).toContain('aria-label="GitPulse"');
+    expect(empty).toContain('aria-label="Waylode"');
   });
 
   it("renders waiting agent requests above the fold with blocking vs error distinction and overflow link", () => {

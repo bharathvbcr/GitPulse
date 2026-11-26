@@ -301,7 +301,7 @@ describe("coverage issue drafts stay safe to publish", () => {
     const draft = buildCoverageIssueDraft(report, "/repo", huge);
     expect(new TextEncoder().encode(draft.body).byteLength).toBeLessThanOrEqual(60 * 1024);
     expect(draft.clipped).toBe(true);
-    expect(draft.body).toContain("GitPulse clipped this draft");
+    expect(draft.body).toContain("Waylode clipped this draft");
   });
 
   it("does not split a multi-byte character while clipping", () => {
