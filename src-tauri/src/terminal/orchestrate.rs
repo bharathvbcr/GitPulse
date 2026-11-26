@@ -1059,7 +1059,7 @@ impl OrchestrationRegistry {
         let parser = track_screen.then(|| {
             vt100::Parser::new(nz_u16(size.rows), nz_u16(size.cols), PARSER_SCROLLBACK_ROWS)
         });
-        let host_scanner = track_screen.then(|| host_scanner());
+        let host_scanner = track_screen.then(host_scanner);
         let blocks = track_screen.then(CommandBlockRecorder::default);
         let mut inner = self.lock();
         inner.sessions.insert(
@@ -1175,7 +1175,7 @@ impl OrchestrationRegistry {
                 self.feed.register(&snap.session_id);
                 tracked = true;
             }
-            let host_scanner = track_screen.then(|| host_scanner());
+            let host_scanner = track_screen.then(host_scanner);
             let telemetry = crate::terminal::new_shared_telemetry();
             *telemetry
                 .0

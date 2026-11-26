@@ -4933,13 +4933,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 split: a.split,
                 rows: a.rows.map(|r| r as u16),
                 cols: a.cols.map(|c| c as u16),
-                agent: (a.model.is_some() || a.mode.is_some() || a.settings.is_some()).then(|| {
+                agent: (a.model.is_some() || a.mode.is_some() || a.settings.is_some()).then_some(
                     crate::terminal::orchestrate::AgentLaunchOptions {
                         model: a.model,
                         mode: a.mode,
                         settings: a.settings,
-                    }
-                }),
+                    },
+                ),
             })
         }
         "gitpulse_terminal_exec" => {

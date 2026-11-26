@@ -328,7 +328,7 @@ fn the_current_protocols_own_socket_is_not_a_legacy_host() {
 /// retired when idle, and never driven as if it were current.
 #[test]
 fn a_protocol_four_host_is_another_protocols_host_to_this_build() {
-    assert!(proto::PROTOCOL > 4, "this build must not speak protocol 4");
+    const { assert!(proto::PROTOCOL > 4, "this build must not speak protocol 4") };
     let fake = Fake::v4(well_behaved());
     let scan = discover(fake.dir(), proto::PROTOCOL);
     assert_eq!(scan.hosts.len(), 1, "{:?}", scan.hosts);

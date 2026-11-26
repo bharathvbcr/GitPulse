@@ -541,7 +541,7 @@ fn rapid_disconnect_and_relaunch_never_refuses_successor_as_duplicate_window() {
 #[test]
 fn a_probe_from_a_later_protocol_records_what_the_older_host_still_holds() {
     use crate::terminal::host::legacy::{LegacyError, LegacyStatus};
-    assert!(PROTOCOL > 4, "this build is the later protocol");
+    const { assert!(PROTOCOL > 4, "this build is the later protocol") };
     let fake = FakeHost::start_on(4);
     let client = HostClient::new(fake.config());
     assert!(

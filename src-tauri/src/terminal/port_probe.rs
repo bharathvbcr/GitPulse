@@ -734,6 +734,8 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::listening_loopback_ports_for_root_pid;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::procguard::LockedSpawn;
     // The tests that bind sockets run on macOS and Linux only.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::net::{TcpListener, UdpSocket};
@@ -820,7 +822,7 @@ mod tests {
             .env("GITPULSE_PORT_PROBE_HELPER_FILE", &port_file)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_locked()
             .expect("start listener child");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         let port = loop {
@@ -863,7 +865,7 @@ mod tests {
             .args(["-c", &script, "sh"])
             .arg(dir.path())
             .process_group(0)
-            .spawn()
+            .spawn_locked()
             .expect("start the tab's shell");
         let port_of = |name: &str| {
             std::fs::read_to_string(dir.path().join(format!("{name}.port")))
