@@ -141,6 +141,23 @@ describe("CommitRow ref chips", () => {
 });
 
 
+/**
+ * Ref chips hold their width and the summary gives way; a chip that does not
+ * fit leaves the row whole and is counted by a "+N" chip (both measured in
+ * the reflog browser harness). What SSR can pin is that nothing is capped:
+ * before anything is measured, every ref is drawn and nothing claims a fold.
+ */
+describe("CommitRow ref strip", () => {
+  it("draws every ref and no fold chip until a measurement says one left", () => {
+    const names = ["one", "two", "three", "four", "five", "six"];
+    const refs = names.map((name) => ({ name, kind: "local-branch" as const }));
+    const { body } = render(CommitRow, { props: { row, refs } });
+    for (const name of names) expect(body).toContain(`>${name}</span>`);
+    expect(body).toContain("data-row-refs");
+    expect(body).not.toContain("data-row-refs-hidden");
+  });
+});
+
 describe("CommitRow timestamp style", () => {
   const at = (props: Record<string, unknown>) =>
     render(CommitRow, { props: { row, ...props } }).body;

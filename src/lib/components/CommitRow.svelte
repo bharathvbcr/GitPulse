@@ -35,6 +35,7 @@
   import { popover, popoverExit } from "../ui/popover";
 
   import type { RefItem } from "../graph/graphDecorations";
+  import { wrappedChildren } from "../dom/wrappedChildren";
   import type { SuspectMark } from "../codeintel/suspectsQuery";
 
   let {
@@ -228,6 +229,20 @@
   });
 
   let conventional = $derived(getConventionalType(row.summary || ""));
+
+  /**
+   * How a ref chip gives way when the chips alone overflow the row. A short
+   * label (`main`, `v2`) never shrinks: squeezed, it became a bare icon.
+   * A long one ellipsizes, but no narrower than its icon plus a few glyphs:
+   * the floor sits below any label past the cut-off, so it never pads one.
+   */
+  const SHORT_REF_LABEL = 12;
+  function refChipFit(label: string): string {
+    return label.length <= SHORT_REF_LABEL ? "shrink-0" : "min-w-[4.5rem] max-w-[11rem]";
+  }
+  /** Ref chips the strip moved off its one visible line (see wrappedChildren). */
+  let wrappedRefs = $state(0);
+  const hiddenRefs = $derived(wrappedRefs > 0 ? refs.slice(Math.max(0, refs.length - wrappedRefs)) : []);
 </script>
 
 <div
@@ -259,87 +274,117 @@
     {/if}
   </button>
 
-  <!-- Commit Summary, Badges & Ref Pills -->
-  <div class="flex-1 flex items-center gap-2 truncate">
+  <!-- Commit Summary, Badges & Ref Pills.
+       The chips hold their width and the summary takes what is left: the
+       summary's basis is 0, so a long message ellipsizes instead of
+       squeezing every chip to a sliver ("fea", "mai"). Chips shrink only when
+       they overflow the row's other three quarters (the summary keeps a
+       quarter): a long ref name ellipsizes (see refChipFit), and a chip that
+       still does not fit leaves the row whole (see data-row-refs). -->
+  <div class="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
     {#if conventional}
-      <span class="gp-chip font-semibold" data-tone={conventional.tone}>
+      <span class="gp-chip shrink-0 font-semibold" data-tone={conventional.tone}>
         {conventional.type}
       </span>
     {/if}
 
     {#if suspect}
-      <span class="gp-chip" data-tone="danger" title={suspect.title}>suspect #{suspect.rank}</span>
+      <span class="gp-chip shrink-0" data-tone="danger" title={suspect.title}>suspect #{suspect.rank}</span>
     {/if}
 
     {#if row.is_merge}
-      <span class="gp-chip font-medium" data-tone="accent">
-        <GitMerge size={10} />
+      <span class="gp-chip shrink-0 font-medium" data-tone="accent">
+        <GitMerge size={10} class="shrink-0" />
         merge
       </span>
     {/if}
 
-    {#each refs as r}
-      {#if r.kind === "head"}
-        <span class="gp-chip font-mono font-semibold" data-tone="accent">
-          <Compass size={10} />
-          HEAD
-        </span>
-      {:else if r.kind === "current-branch"}
-        <!-- The branch colour is the graph's own lane colour (canvas palette),
-             so it is handed through as a style, not mapped to a role tone. -->
-        <span
-          class="gp-chip font-mono font-semibold"
-          style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
-        >
-          <GitBranch size={10} />
-          {r.name}
-        </span>
-      {:else if r.kind === "remote-branch"}
-        <span class="gp-chip font-mono" data-tone="info">
-          <Cloud size={10} />
-          {r.name}
-        </span>
-      {:else if r.kind === "tag"}
-        <span
-          class="gp-chip font-mono"
-          data-tone="warn"
-          title={r.comparedTo
-            ? r.aheadOfBase && r.aheadOfBase > 0
-              ? `Tag ${r.name} — ${r.aheadOfBase} commits not in ${r.comparedTo}`
-              : `Tag ${r.name} — every commit is already in ${r.comparedTo}`
-            : `Tag ${r.name}`}
-        >
-          <Tag size={10} />
-          {r.name}
-          {#if r.comparedTo && r.aheadOfBase && r.aheadOfBase > 0}
-            <span class="opacity-80">+{r.aheadOfBase}</span>
+    {#if refs.length > 0}
+      <!-- The refs give way as a group, and a chip is whole or gone, never
+           cut: the strip wraps onto lines it clips, so a chip that does not
+           fit leaves the row entirely, and the "+N" chip after the strip
+           counts the ones that left and names them in its title. -->
+      <span
+        class="flex h-5 min-w-0 flex-wrap items-center gap-x-2 overflow-hidden"
+        data-row-refs
+        use:wrappedChildren={{ key: refs, onCount: (n) => (wrappedRefs = n) }}
+      >
+        {#each refs as r}
+          {#if r.kind === "head"}
+            <span class="gp-chip shrink-0 font-mono font-semibold" data-tone="accent">
+              <Compass size={10} class="shrink-0" />
+              HEAD
+            </span>
+          {:else if r.kind === "current-branch"}
+            <!-- The branch colour is the graph's own lane colour (canvas palette),
+                 so it is handed through as a style, not mapped to a role tone. -->
+            <span
+              class="gp-chip {refChipFit(r.name)} font-mono font-semibold"
+              style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
+              title={r.name}
+            >
+              <GitBranch size={10} class="shrink-0" />
+              <span class="min-w-0 truncate">{r.name}</span>
+            </span>
+          {:else if r.kind === "remote-branch"}
+            <span class="gp-chip {refChipFit(r.name)} font-mono" data-tone="info" title={r.name}>
+              <Cloud size={10} class="shrink-0" />
+              <span class="min-w-0 truncate">{r.name}</span>
+            </span>
+          {:else if r.kind === "tag"}
+            <span
+              class="gp-chip {refChipFit(r.name)} font-mono"
+              data-tone="warn"
+              title={r.comparedTo
+                ? r.aheadOfBase && r.aheadOfBase > 0
+                  ? `Tag ${r.name} — ${r.aheadOfBase} commits not in ${r.comparedTo}`
+                  : `Tag ${r.name} — every commit is already in ${r.comparedTo}`
+                : `Tag ${r.name}`}
+            >
+              <Tag size={10} class="shrink-0" />
+              <span class="min-w-0 truncate">{r.name}</span>
+              {#if r.comparedTo && r.aheadOfBase && r.aheadOfBase > 0}
+                <span class="shrink-0 opacity-80">+{r.aheadOfBase}</span>
+              {/if}
+            </span>
+          {:else if r.kind === "other"}
+            <!--
+              A ref outside branches, remotes and tags, drawn only under the "all
+              refs" scope. Muted and marked with its full path so it reads as
+              "some other ref" rather than as a branch: an agent-harness
+              checkpoint wearing a branch chip is exactly the mislabelling that
+              made these lanes unreadable.
+            -->
+            <span
+              class="gp-chip {refChipFit(shortRefLabel(r.name))} font-mono"
+              data-tone="neutral"
+              title="refs/{r.name} — outside branches, remotes and tags"
+            >
+              <Hash size={10} class="shrink-0" />
+              <span class="min-w-0 truncate">{shortRefLabel(r.name)}</span>
+            </span>
+          {:else}
+            <span class="gp-chip {refChipFit(r.name)} font-mono text-textPrimary" data-tone="neutral" title={r.name}>
+              <GitBranch size={10} class="shrink-0 text-textMuted" />
+              <span class="min-w-0 truncate">{r.name}</span>
+            </span>
           {/if}
-        </span>
-      {:else if r.kind === "other"}
-        <!--
-          A ref outside branches, remotes and tags, drawn only under the "all
-          refs" scope. Muted and marked with its full path so it reads as
-          "some other ref" rather than as a branch: an agent-harness
-          checkpoint wearing a branch chip is exactly the mislabelling that
-          made these lanes unreadable.
-        -->
-        <span
-          class="gp-chip font-mono"
-          data-tone="neutral"
-          title="refs/{r.name} — outside branches, remotes and tags"
-        >
-          <Hash size={10} />
-          {shortRefLabel(r.name)}
-        </span>
-      {:else}
-        <span class="gp-chip font-mono text-textPrimary" data-tone="neutral">
-          <GitBranch size={10} class="text-textMuted" />
-          {r.name}
-        </span>
-      {/if}
-    {/each}
+        {/each}
+      </span>
+    {/if}
+    {#if hiddenRefs.length > 0}
+      <span
+        class="gp-chip shrink-0 font-mono"
+        data-tone="neutral"
+        data-kind="count"
+        title={hiddenRefs.map((r) => (r.kind === "other" ? `refs/${r.name}` : r.name)).join("\n")}
+        data-row-refs-hidden
+      >
+        +{hiddenRefs.length}
+      </span>
+    {/if}
 
-    <span class="truncate select-text" title={row.summary || undefined}>{row.summary || "No commit message"}</span>
+    <span class="min-w-[25%] flex-1 basis-0 truncate select-text" title={row.summary || undefined}>{row.summary || "No commit message"}</span>
 
     {#if mergeTarget}
       <span class="sr-only">

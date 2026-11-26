@@ -324,6 +324,54 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
  await until(()=>!table(),"named graph");
  check("asking for Graph by name opens the commit graph",()=>option("Commits").getAttribute("aria-pressed")==="true");
 
+ // --- row chips and the hover card hold their layout --------------------------
+ // Measured, not read from classes: a chip squeezed by a long summary still has
+ // every class it had. Mounted beside the view, not in it, so the list checks
+ // above never see these rows.
+ {
+  const CommitRow=(await import("../src/lib/components/CommitRow.svelte")).default;
+  const GraphNodeTooltip=(await import("../src/lib/components/GraphNodeTooltip.svelte")).default;
+  const lab=document.createElement("div");document.body.appendChild(lab);
+  const host=(width)=>{const el=document.createElement("div");el.style.width=width+"px";lab.appendChild(el);return el;};
+  const LONG="feat(graph): a commit subject long enough to run well past the row, so the summary has to give way and the chips must not";
+  const fixtureRow=(i,extra={})=>({id:hex(900+i),parent_ids:[hex(901+i)],summary:LONG,author_name:"Ada Lovelace",author_email:"ada@example.com",timestamp:1_700_000_000,lane:0,color_index:0,active_lanes:[0],active_lane_colors:[0],connections:[],is_merge:false,is_root:false,is_mainline:true,...extra});
+  const TIP=[{name:"HEAD",kind:"head"},{name:"main",kind:"current-branch"},{name:"origin/main",kind:"remote-branch"},{name:"v1.2.3",kind:"tag",aheadOfBase:4,comparedTo:"main"}];
+  const whole=(el)=>el.scrollWidth<=el.clientWidth+1;
+  const chipsOf=(el)=>[...el.querySelectorAll(".gp-chip")];
+  const summaryOf=(el)=>[...el.querySelectorAll("span[title]")].find(s=>s.title===LONG);
+  const wide=host(900);
+  mount(CommitRow,{target:wide,props:{row:fixtureRow(0),refs:TIP}});
+  const crowded=host(1400);
+  const many=["one","two","three","four","five","six"].map(name=>({name,kind:"local-branch"}));
+  mount(CommitRow,{target:crowded,props:{row:fixtureRow(1,{summary:"fix: tiny"}),refs:many}});
+  const narrow={spacious:host(560),compact:host(560)};
+  for(const density of ["spacious","compact"])mount(CommitRow,{target:narrow[density],props:{row:fixtureRow(2),refs:TIP,density}});
+  const card=host(320);
+  mount(GraphNodeTooltip,{target:card,props:{row:fixtureRow(3,{summary:"Fix https://example.com/a/very/long/url/without/any/spaces/that/has/to/wrap/inside/the/card"}),mainlineName:"origin/an-extremely-long-mainline-branch-name-that-cannot-fit"}});
+  // ResizeObserver reports on rendering frames, not timers: settle on frames.
+  const frame=()=>Promise.race([new Promise(r=>requestAnimationFrame(()=>r())),wait(100)]);
+  for(let i=0;i<6;i++){await tick();await frame();}
+  check("a long summary leaves every chip on a wide row whole",()=>chipsOf(wide).length===5&&chipsOf(wide).every(c=>whole(c)&&[...c.querySelectorAll("span")].every(whole)),()=>chipsOf(wide).map(c=>c.textContent.trim()+":"+c.clientWidth+"/"+c.scrollWidth).join(", "));
+  check("the summary gives way instead: it ellipsizes and stays on the row",()=>{const s=summaryOf(wide);return s&&s.clientWidth>100&&s.scrollWidth>s.clientWidth;});
+  check("a row with room draws every ref, with no fold chip",()=>{const chips=chipsOf(crowded);return chips.length===7&&chips.every(whole)&&!crowded.querySelector("[data-row-refs-hidden]")&&many.every(r=>crowded.textContent.includes(r.name));},()=>chipsOf(crowded).map(c=>c.textContent.trim()).join(", "));
+  for(const density of ["spacious","compact"]){
+   const el=narrow[density];
+   const strip=el.querySelector("[data-row-refs]")??summaryOf(el)?.parentElement;
+   const fold=el.querySelector("[data-row-refs-hidden]");
+   const layout=()=>{const box=strip.getBoundingClientRect();return chipsOf(strip).filter(c=>TIP.some(t=>c.textContent.includes(t.name))).map(c=>{const r=c.getBoundingClientRect();const inside=r.right<=box.right+0.5&&r.bottom<=box.bottom+0.5&&whole(c)&&[...c.querySelectorAll("span")].every(whole);const gone=r.top>=box.bottom-0.5;return {name:c.textContent.trim(),inside,gone};});};
+   check(`on a narrow ${density} row every ref chip is whole on the row or wholly off it, never cut`,()=>{const l=layout();return l.length===4&&l.every(c=>c.inside||c.gone)&&l.some(c=>c.inside);},()=>JSON.stringify(layout()));
+   check(`the narrow ${density} row's +N chip counts and names exactly the refs that left`,()=>{const gone=layout().filter(c=>c.gone).map(c=>c.name);if(gone.length===0)return !fold;const names=TIP.slice(TIP.length-gone.length).map(r=>r.name);return fold&&fold.textContent.trim()===`+${gone.length}`&&fold.title===names.join("\n");},()=>JSON.stringify({gone:layout().filter(c=>c.gone).map(c=>c.name),fold:fold?.textContent.trim(),title:fold?.title}));
+   check(`the narrow ${density} row leaves no gap where the departed chips were`,()=>{const box=strip.getBoundingClientRect();const shown=chipsOf(strip).filter(c=>c.getBoundingClientRect().top<box.bottom-0.5);const lastRight=Math.max(...shown.map(c=>c.getBoundingClientRect().right));return shown.length>0&&box.right-lastRight<=2;},()=>{const box=strip.getBoundingClientRect();return JSON.stringify({strip:[box.left,box.right],chips:chipsOf(strip).map(c=>{const r=c.getBoundingClientRect();return [c.textContent.trim(),r.left,r.right,r.top];})});});
+   check(`the summary keeps its share of a narrow ${density} row`,()=>{const s=summaryOf(el);const area=s?.parentElement;return s&&area&&s.clientWidth>=area.clientWidth*0.2;},()=>{const s=summaryOf(el);return s?s.clientWidth+"/"+s.parentElement.clientWidth:"no summary";});
+  }
+  const tip=card.querySelector('[role="tooltip"]');
+  const subject=tip&&[...tip.querySelectorAll("div")].find(d=>d.children.length===0&&d.textContent.trim().startsWith("Fix https://"));
+  check("a hover card wraps an unbreakable subject inside the card",()=>subject&&subject.getBoundingClientRect().right<=tip.getBoundingClientRect().right+0.5&&whole(subject),()=>subject?subject.clientWidth+"/"+subject.scrollWidth:"no subject");
+  const mainline=tip?.querySelector('[data-testid="mainline-chip"]');
+  check("a long mainline name ellipsizes inside its chip and the card",()=>{const label=mainline?.querySelector("span")??mainline;return label&&mainline.getBoundingClientRect().right<=tip.getBoundingClientRect().right+0.5&&(label.scrollWidth<=label.clientWidth+1||getComputedStyle(label).textOverflow==="ellipsis")&&label!==mainline;},()=>mainline?mainline.outerHTML.slice(0,160):"no chip");
+  lab.remove();
+ }
+
  check("No unexpected commands",()=>unexpected.length===0);
  check("No runtime errors",()=>crashes.length===0);
 }catch(error){stopped(error);}

@@ -186,6 +186,15 @@ describe("GraphNodeTooltip", () => {
   });
 });
 
+describe("GraphNodeTooltip author line", () => {
+  it("keeps the spaces around the separator between name and email", () => {
+    // Leading template whitespace inside the email span was collapsed away,
+    // which printed "Ada Lovelace· ada@example.com".
+    const { body } = render(GraphNodeTooltip, { props: { row } });
+    expect(body).toMatch(/<span class="text-textMuted">(?:<!---->)?\s·\sada@example\.com/);
+  });
+});
+
 describe("GraphNodeTooltip id line layout", () => {
   const source = readFileSync(new URL("./GraphNodeTooltip.svelte", import.meta.url), "utf8");
 

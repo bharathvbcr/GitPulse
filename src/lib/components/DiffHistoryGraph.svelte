@@ -665,7 +665,7 @@
       {mainlineName}
       {hasMore}
     >
-      <div class="max-h-56 overflow-hidden px-3 pb-2.5 text-meta" data-card-details>
+      <div class="max-h-56 overflow-hidden px-3 pb-2.5 text-meta [overflow-wrap:anywhere]" data-card-details>
         {#if !cardInfo || cardInfo.body.state === "loading"}
           <p class="text-textMuted">Reading the commit message…</p>
         {:else if cardInfo.body.state === "error"}

@@ -115,7 +115,10 @@
       {/if}
     </div>
     <div class="min-w-0 flex-1">
-      <div class="text-xs font-semibold leading-4">{row.summary || "No commit message"}</div>
+      <!-- A subject with no break opportunity (a URL, a path) must wrap
+           inside the card rather than run out of it, and a very long one
+           stops at four lines. -->
+      <div class="line-clamp-4 text-xs font-semibold leading-4 [overflow-wrap:anywhere]">{row.summary || "No commit message"}</div>
       <!-- Chips wrap under the id instead of sharing its line: as shrink-0
            siblings of a break-all span they could squeeze the 40-char id to
            a few pixels and wrap it one character per line. -->
@@ -133,11 +136,13 @@
           <!-- The straight column-0 rail, labelled by the branch it belongs
                to: a leftmost line with no name is just a colour. -->
           <span
-            class="gp-chip shrink-0 font-semibold"
+            class="gp-chip min-w-0 font-semibold"
             style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
             data-testid="mainline-chip"
           >
-            {mainlineLabel}
+            <!-- A long branch name ellipsizes here; a bare text node in the
+                 chip's flex box would be clipped mid-glyph with no ellipsis. -->
+            <span class="min-w-0 truncate">{mainlineLabel}</span>
           </span>
         {/if}
       </div>
@@ -192,7 +197,7 @@
   {#if refs.length > 0}
     <div class="flex flex-wrap gap-1 bg-background px-3 py-2">
       {#each visibleRefs as ref}
-        <span class="gp-chip max-w-40 font-mono" data-tone="neutral">
+        <span class="gp-chip min-w-0 max-w-40 font-mono" data-tone="neutral">
           {#if ref.kind === "tag"}
             <Tag size={9} class="shrink-0 text-warn" />
             {#if ref.comparedTo && ref.aheadOfBase && ref.aheadOfBase > 0}
@@ -208,11 +213,11 @@
           {:else}
             <GitBranch size={9} class="shrink-0 text-accent" />
           {/if}
-          <span class="truncate">{ref.name}</span>
+          <span class="min-w-0 truncate">{ref.name}</span>
         </span>
       {/each}
       {#if hiddenRefCount > 0}
-        <span class="gp-chip" data-tone="neutral">
+        <span class="gp-chip shrink-0" data-tone="neutral">
           +{hiddenRefCount} more
         </span>
       {/if}
@@ -235,7 +240,10 @@
       class="truncate text-right"
       title={(row.author_name || "Unknown") + (row.author_email ? ` <${row.author_email}>` : "")}
     >
-      {row.author_name || "Unknown"}{#if row.author_email}<span class="text-textMuted"> · {row.author_email}</span>{/if}
+      <!-- The separator's spaces live in the expression: leading template
+           whitespace inside the span is collapsed away, which printed
+           "Lovelace· ada@…". -->
+      {row.author_name || "Unknown"}{#if row.author_email}<span class="text-textMuted">{` · ${row.author_email}`}</span>{/if}
     </dd>
 
     <dt class="flex items-center gap-1 text-textMuted"><CalendarClock size={11} /> Created</dt>
