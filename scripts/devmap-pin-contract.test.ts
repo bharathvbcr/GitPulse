@@ -99,6 +99,32 @@ describe("devmap pin contract", () => {
     expect(stated, `ci.yml states schema ${stated}, the vendored crates are at ${vendored}`).toBe(vendored);
   });
 
+  it("builds devmap from the DevCouncil commit the vendored devmap crates come from", () => {
+    // The schema numbers can stay put while what the CLI writes changes under
+    // them: extract 101 moved the store's content_hash to a length-folded
+    // identity with devmap-store still at 29. A CLI from another commit then
+    // writes hashes the vendored reader rejects, and every overlay fixture
+    // reads as changed since its index was built. So every pin names the
+    // vendored commit itself.
+    const vendor = JSON.parse(read("src-tauri/vendored/VENDOR.json")) as {
+      crates: { name: string; origin: { repo: string; commit: string } }[];
+    };
+    const devmapCommits = new Set(
+      vendor.crates.filter((c) => c.origin.repo === "devcouncil" && c.name.startsWith("devmap-")).map((c) => c.origin.commit),
+    );
+    expect(devmapCommits.size, `the vendored devmap crates come from ${[...devmapCommits].join(", ")}`).toBe(1);
+    const [vendored] = devmapCommits;
+    const pins: [string, string | undefined][] = [
+      ...[".github/workflows/ci.yml", ".github/workflows/coverage.yml", ".github/workflows/test-parallel.yml", ".github/workflows/release.yml"].map(
+        (path): [string, string | undefined] => [path, devmapPin(read(path))],
+      ),
+      ["Containerfile.linux-test", /^ARG DEVMAP_REV=(\S+)\s*$/m.exec(read("Containerfile.linux-test"))?.[1]],
+    ];
+    for (const [path, pin] of pins) {
+      expect(pin, `${path} builds devmap from ${pin}, the vendored devmap crates come from ${vendored}`).toBe(vendored);
+    }
+  });
+
   it("the coverage ordering rule fails on a job that installs devmap late or never", () => {
     const missing = coverage.replace("name: Install devmap", "name: Fetch devmap");
     expect(missing).not.toBe(coverage);
