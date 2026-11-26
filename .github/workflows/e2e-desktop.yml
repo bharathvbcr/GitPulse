@@ -558,12 +558,14 @@ jobs:
           # of what the smoke relies on does not carry across.
           $groups = & $exe.FullName --integrity Medium whoami /groups
           if (-not ($groups -match 'Medium Mandatory Level')) { throw "gsudo did not de-elevate: $($groups -match 'Mandatory Level')" }
-          & $exe.FullName --integrity Medium cmd /c 'exit 7'
+          # The program the smoke runs, so the probe has no quoting of its own:
+          # gsudo re-quotes `cmd /c 'exit 7'` and cmd answered 1.
+          & $exe.FullName --integrity Medium node -e 'process.exit(7)'
           if ($LASTEXITCODE -ne 7) { throw "gsudo did not pass the exit code through (got $LASTEXITCODE)" }
           $env:GITPULSE_GSUDO_PROBE = 'carried'
-          $seen = "$(& $exe.FullName --integrity Medium cmd /c 'echo %GITPULSE_GSUDO_PROBE%')".Trim()
+          $seen = "$(& $exe.FullName --integrity Medium node -e 'console.log(process.env.GITPULSE_GSUDO_PROBE)')".Trim()
           if ($seen -ne 'carried') { throw "gsudo did not carry the environment (saw '$seen')" }
-          $cwd = "$(& $exe.FullName --integrity Medium cmd /c 'cd')".Trim()
+          $cwd = "$(& $exe.FullName --integrity Medium node -e 'console.log(process.cwd())')".Trim()
           if ($cwd -ne (Get-Location).Path) { throw "gsudo changed the working directory ('$cwd')" }
           Write-Output "gsudo $env:GSUDO_VERSION de-elevates: $($groups -match 'Mandatory Level')"
 

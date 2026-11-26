@@ -283,6 +283,39 @@ export class WebDriverClient {
     return this.request("POST", `/session/${this.sessionId}/execute/sync`, { script, args }, timeoutMs);
   }
 
+  /**
+   * Waits until the webview has left its initial blank document for the app's
+   * own page, and returns `{ href, ready }` for it.
+   *
+   * WebView2 hands the session over while it is still on that initial document
+   * (origin `://`). A script started there is destroyed when the app's page
+   * replaces it, and msedgedriver answers it at once with "script timeout"
+   * (run 45844814075: the probe began at .494, `Page.frameNavigated` to
+   * `http://tauri.localhost/` came at .751, the error at .757). WebKitGTK hands
+   * it over on the app's page already, so this returns on the first look there.
+   *
+   * @param {number} [timeoutMs]
+   * @param {(ms: number) => Promise<void>} [pause]
+   */
+  async waitForAppDocument(timeoutMs = 20_000, pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+    const deadline = Date.now() + timeoutMs;
+    let last = "nothing answered";
+    while (Date.now() < deadline) {
+      try {
+        const state = await this.executeScript("return { href: location.href, ready: document.readyState };", [], 5_000);
+        last = JSON.stringify(state);
+        if (state && typeof state.href === "string" && /^(https?|tauri):/i.test(state.href) && state.ready !== "loading") {
+          return state;
+        }
+      } catch (error) {
+        // A navigation in flight can fail the look itself; the next one sees where it landed.
+        last = error instanceof Error ? error.message : String(error);
+      }
+      await pause(150);
+    }
+    throw new Error(`the app's page did not load in the webview within ${timeoutMs} ms (last: ${last})`);
+  }
+
   /** @param {string} script @param {unknown[]} [args] @param {number} [timeoutMs] */
   async executeAsyncScript(script, args = [], timeoutMs = 35_000) {
     if (!this.sessionId) throw new Error("No active WebDriver session");
@@ -788,6 +821,7 @@ async function runSmoke(opts) {
 
     await step("cold-start", async () => {
       await client.createSession(opts.binary, [repoAlpha], webviewOptionsFor(profileRoot));
+      await client.waitForAppDocument();
       const boot = await client.executeAsyncScript(`
         const done = arguments[arguments.length - 1];
         const deadline = Date.now() + 20000;

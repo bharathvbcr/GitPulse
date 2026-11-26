@@ -154,6 +154,38 @@ describe("e2e-driver-smoke", () => {
     ]);
   });
 
+  it("waits for the app's page before probing: WebView2 hands the session over on its blank first document", async () => {
+    // As msedgedriver answered in run 45844814075: blank, a look lost to the
+    // navigation, the app's page still loading, then loaded.
+    const answers: Array<{ status: number; value: unknown }> = [
+      { status: 200, value: { href: "about:blank", ready: "complete" } },
+      { status: 500, value: { error: "javascript error", message: "Execution context was destroyed." } },
+      { status: 200, value: { href: "http://tauri.localhost/", ready: "loading" } },
+      { status: 200, value: { href: "http://tauri.localhost/", ready: "complete" } },
+    ];
+    let looks = 0;
+    const fakeFetch: typeof fetch = async () => {
+      const answer = answers[Math.min(looks++, answers.length - 1)];
+      return new Response(JSON.stringify({ value: answer.value }), { status: answer.status });
+    };
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    client.sessionId = "sess-w";
+    const pauses: number[] = [];
+    const state = await client.waitForAppDocument(20_000, async (ms) => { pauses.push(ms); });
+    expect(state).toEqual({ href: "http://tauri.localhost/", ready: "complete" });
+    expect(looks).toBe(4);
+    expect(pauses).toHaveLength(3);
+  });
+
+  it("names the last answer when the app's page never loads, instead of probing a blank document", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ value: { href: "about:blank", ready: "complete" } }), { status: 200 });
+    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    client.sessionId = "sess-w";
+    await expect(client.waitForAppDocument(30, async () => { await new Promise((r) => setTimeout(r, 10)); }))
+      .rejects.toThrow(/did not load in the webview within 30 ms \(last: .*about:blank/);
+  });
+
   it("enforces the overall --timeout budget on WebDriver requests", async () => {
     expect(remainingBudgetMs(10_000, 5_000, 2_000)).toBe(5_000);
     expect(remainingBudgetMs(10_000, 5_000, 8_500)).toBe(1_500);
