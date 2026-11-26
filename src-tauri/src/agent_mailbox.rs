@@ -291,8 +291,10 @@ impl HumanIssuanceVerifier for LedgerHumanVerifier {
     }
 }
 
-/// Verifier that rejects every `HumanConfirmed` claim (simulates owner restart
-/// or unreachable broker socket — never fails open).
+/// Verifier that rejects every `HumanConfirmed` claim (simulates an owner
+/// restart, or a broker that answers and refuses). A broker nobody listens on is
+/// not this: the default mailbox keeps a sidecar's trust then (see
+/// `HumanIssuanceVerifier` callers in `authenticate_provenance`).
 #[cfg(test)]
 pub(crate) struct RejectAllHumanVerifier;
 

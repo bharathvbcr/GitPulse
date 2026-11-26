@@ -1698,14 +1698,17 @@ pub enum IssuanceAnswer {
     /// Something answered on the socket and did not verify it, or the exchange
     /// failed part way.
     Refused,
-    /// Nothing listens: the socket file is missing or refuses connections.
+    /// Nothing can listen: the socket file is missing, refuses connections, or
+    /// its path is too long to bind at all.
     NoBroker,
 }
 
 /// Sends a read-only `verify_human_issuance` query to `socket_path`.
-/// Never fails open: any I/O error after connecting, or a malformed reply, is
-/// [`IssuanceAnswer::Refused`]; only a socket nobody listens on is
-/// [`IssuanceAnswer::NoBroker`].
+/// Any I/O error after connecting, or a malformed reply, is
+/// [`IssuanceAnswer::Refused`]. Only a socket nobody can be listening on is
+/// [`IssuanceAnswer::NoBroker`]: the file is missing, refuses connections, or
+/// its path is too long for `sun_path` (`InvalidInput`), so no broker could
+/// have bound it.
 #[cfg(unix)]
 pub fn query_human_issuance_via_socket(
     socket_path: &Path,
@@ -1719,7 +1722,9 @@ pub fn query_human_issuance_via_socket(
         Err(error)
             if matches!(
                 error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::InvalidInput
             ) =>
         {
             return IssuanceAnswer::NoBroker;
@@ -1932,6 +1937,18 @@ mod tests {
             now + 120,
         )
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_too_long_to_bind_is_no_broker_not_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let too_long = dir.path().join("b".repeat(300)).join("approval.sock");
+        assert_eq!(
+            query_human_issuance_via_socket(&too_long, "s-human", "req-1", "00"),
+            IssuanceAnswer::NoBroker,
+            "sun_path overflow means no broker could have bound it; it must not downgrade as a refusal"
+        );
     }
 
     #[test]
