@@ -32,7 +32,7 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   # Keep in lockstep with ci.yml / coverage.yml / test-parallel.yml so preflight
   # tests the exact devmap and manvi commits CI verifies.
-  DEVMAP_REV: 2acef200df69622b459278e1d88745bfb393d043
+  DEVMAP_REV: 135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1
   MANVI_REV: abb2a72276269c63f6300a59a26e774a0383a8ab
 
 jobs:
