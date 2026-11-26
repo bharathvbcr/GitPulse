@@ -159,8 +159,11 @@
         // An exit's animation can read "finished" a while before Svelte removes
         // its element (the onfinish callback waits on a frame, which a loaded
         // host delivers late), so also wait out every unit still marked inert
-        // by its exit. Bounded: a unit that never leaves still fails its check.
-        for (let i = 0; i < 100 && document.querySelector("[data-tab-motion][inert]"); i += 1) await wait(20);
+        // by its exit, and every menu still closing (`out:popoverExit`), which
+        // WKWebView once left in the DOM past this wait and "choosing Clone
+        // closes the menu" read it as still open. Bounded: a unit or menu that
+        // never leaves still fails its check.
+        for (let i = 0; i < 100 && document.querySelector('[data-tab-motion][inert], [role="menu"][inert]'); i += 1) await wait(20);
       };
       const $ = (selector, root = document) => root.querySelector(selector);
       const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
