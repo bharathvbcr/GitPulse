@@ -2474,7 +2474,7 @@ done
     /// script with `sidecar::bind_test_binary`.
     #[cfg(unix)]
     struct SiblingFixture {
-        main: tempfile::TempDir,
+        _main: tempfile::TempDir,
         _wt_b: tempfile::TempDir,
         main_path: String,
         rel_wt_b: String,
@@ -2567,7 +2567,7 @@ done
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         SiblingFixture {
-            main,
+            _main: main,
             _wt_b: wt_b,
             main_path,
             rel_wt_b,
