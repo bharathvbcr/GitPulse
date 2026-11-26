@@ -2537,8 +2537,8 @@ fn first_parent_chain_stops_at_known_tip_oldest_first() {
     assert!(hostile.is_err());
 }
 
-/// Regression (audit dirty-tree): restacking with uncommitted changes used to
-/// hand `git rebase` a dirty tree; now it is refused before any state moves.
+/// Regression (audit dirty-tree): restacking with an overlapping uncommitted
+/// change falls back from ODB replay and is refused before any state moves.
 #[test]
 fn restack_refuses_dirty_worktree_without_moving_refs() {
     let repo = TestRepo::init();
@@ -2549,10 +2549,16 @@ fn restack_refuses_dirty_worktree_without_moving_refs() {
     repo.commit_all("feature work");
     let feature_before = git_out(repo.dir.path(), &["rev-parse", "feature"]);
 
+    // Advance `main` on `dirty.txt` so an uncommitted `dirty.txt` in `feature`
+    // overlaps incoming changes and cannot advance safely via ODB fast path.
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("dirty.txt", "main version\n");
+    repo.commit_all("main touches dirty.txt");
+    run_git(repo.dir.path(), &["checkout", "feature"]);
     repo.write("dirty.txt", "uncommitted\n");
 
     let err = GitWriter::restack(&repo.path_str(), "feature", "main")
-        .expect_err("dirty tree must be refused");
+        .expect_err("overlapping dirty tree must be refused");
     assert!(
         err.contains("uncommitted"),
         "error must name the real cause: {err}",
@@ -2560,6 +2566,42 @@ fn restack_refuses_dirty_worktree_without_moving_refs() {
     );
     let feature_after = git_out(repo.dir.path(), &["rev-parse", "feature"]);
     assert_eq!(feature_before, feature_after, "refs must not move");
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("dirty.txt")).unwrap(),
+        "uncommitted\n"
+    );
+}
+
+#[test]
+fn restack_disjoint_dirty_worktree_succeeds_via_odb_fast_path_and_preserves_dirt() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("base");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("g.txt", "g\n");
+    repo.commit_all("feature work");
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("main_only.txt", "main advance\n");
+    repo.commit_all("main advance");
+    let main_tip = git_out(repo.dir.path(), &["rev-parse", "main"]);
+
+    run_git(repo.dir.path(), &["checkout", "feature"]);
+    repo.write("disjoint.txt", "keep me\n");
+
+    GitWriter::restack(&repo.path_str(), "feature", "main")
+        .expect("disjoint dirty worktree should restack via ODB fast path");
+    assert_eq!(
+        git_out(repo.dir.path(), &["rev-parse", "feature^"]),
+        main_tip
+    );
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("disjoint.txt")).unwrap(),
+        "keep me\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("main_only.txt")).unwrap(),
+        "main advance\n"
+    );
 }
 
 /// A conflicting rebase must roll back cleanly: no half-applied state, HEAD
