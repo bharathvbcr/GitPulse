@@ -80,16 +80,6 @@ export function defaultSeedBinary(platform = process.platform, env = process.env
 }
 
 /**
- * Builds an isolated process environment so the E2E run never reads or writes
- * the developer's or runner's real GitPulse config, data, cache, gitconfig, or
- * WebView2 user-data folder.
- *
- * @param {string} profileRoot
- * @param {Record<string, string | undefined>} baseEnv
- * @param {NodeJS.Platform} [platform]
- * @returns {Record<string, string | undefined>}
- */
-/**
  * The `tauri:options.webviewOptions` for a session: on Windows, the isolated
  * WebView2 profile folder, which tauri-driver forwards to Edge WebDriver as
  * `ms:edgeOptions.webviewOptions` (the documented way to choose it).
@@ -102,6 +92,16 @@ export function webviewOptionsFor(profileRoot, platform = process.platform) {
   return platform === "win32" ? { userDataFolder: path.join(profileRoot, "webview2") } : undefined;
 }
 
+/**
+ * Builds an isolated process environment so the E2E run never reads or writes
+ * the developer's or runner's real GitPulse config, data, cache, gitconfig, or
+ * WebView2 user-data folder.
+ *
+ * @param {string} profileRoot
+ * @param {Record<string, string | undefined>} baseEnv
+ * @param {NodeJS.Platform} [platform]
+ * @returns {Record<string, string | undefined>}
+ */
 export function buildIsolatedEnv(profileRoot, baseEnv, platform = process.platform) {
   const home = path.join(profileRoot, "home");
   const config = path.join(profileRoot, "config");
@@ -523,6 +523,26 @@ function findOrphanProcesses(marker) {
     .split("\n")
     .filter((line) => line.includes(marker) && !line.includes("e2e-driver-smoke"))
     .map((line) => line.trim());
+}
+
+/**
+ * The Edge WebDriver, app and WebView2 browser processes on Windows, each as
+ * "pid name parent command-line" with the command line cut at 700 characters,
+ * at most 24 rows. A failed query is reported as such, not as no processes.
+ * @returns {string[]}
+ */
+function windowsAttachProcesses() {
+  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('msedgedriver.exe','gitpulse.exe','msedgewebview2.exe') } | Select-Object -First 24 | ForEach-Object { \"$($_.ProcessId) $($_.Name) parent=$($_.ParentProcessId) $($_.CommandLine)\" }";
+  const res = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+  if (res.status !== 0) return [`(process query failed: status ${res.status}, ${String(res.stderr ?? res.error ?? "").trim().slice(0, 300)})`];
+  return String(res.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (line.length > 700 ? `${line.slice(0, 700)}…` : line));
 }
 
 /** @param {SmokeOptions} opts */
@@ -987,6 +1007,13 @@ async function runSmoke(opts) {
     }
     if (driverStderr.trim()) {
       console.error(`tauri-driver stderr:\n${driverStderr.trim()}`);
+    }
+    if (process.platform === "win32") {
+      // Edge WebDriver logs nothing here, so show what it was attaching to:
+      // whether a WebView2 browser process exists, and with which
+      // --remote-debugging-port and --user-data-dir.
+      const rows = windowsAttachProcesses();
+      console.error(`WebView2 attach processes (${rows.length}):\n${rows.join("\n") || "(none)"}`);
     }
     if (error instanceof Error) console.error(`E2E smoke failed: ${error.message}`);
   } finally {

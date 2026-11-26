@@ -118,7 +118,7 @@ describe("e2e-driver-smoke", () => {
     const base = "http://127.0.0.1:4444";
     const client = new WebDriverClient(base, fakeFetch);
     expect(await client.createSession("/bin/gitpulse", ["/tmp/repo"])).toBe("sess-123");
-    expect(seen.find(s => s.url.endsWith("/session"))?.body?.capabilities?.alwaysMatch?.["tauri:options"]).toEqual({ application: "/bin/gitpulse", args: ["/tmp/repo"] });
+    expect(seen.find(s => s.url.endsWith("/session"))?.body).toEqual({ capabilities: { alwaysMatch: { "tauri:options": { application: "/bin/gitpulse", args: ["/tmp/repo"] } } } });
     expect(await client.executeScript("return 1", [])).toEqual({ ok: true });
     const dir = mkdtempSync(path.join(tmpdir(), "gp-e2e-unit-"));
     try {
