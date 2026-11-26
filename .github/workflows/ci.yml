@@ -20,9 +20,10 @@ permissions:
 env:
   # The DevCouncil commit `devmap` is built from for the tests that drive the CLI:
   # the one the vendored devmap crates were synced to (store schema 29). A new
-  # re-vendor moves this with it; `bun run check:vendor-schema` below fails the
-  # job when they disagree.
-  DEVMAP_REV: b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+  # re-vendor moves this with it: `bun run check:vendor-schema` below fails the
+  # job when the schema numbers disagree, and scripts/devmap-pin-contract.test.ts
+  # fails when this is not the commit VENDOR.json records for the devmap crates.
+  DEVMAP_REV: 2acef200df69622b459278e1d88745bfb393d043
   # The Manvi commit the MANVI gate tests run against (see the manvi steps).
   # Its own scripts/module-pins.txt pins the DevCouncil and gusset it builds with.
   MANVI_REV: abb2a72276269c63f6300a59a26e774a0383a8ab
