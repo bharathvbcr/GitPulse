@@ -751,12 +751,10 @@ mod tests {
         git_in(root, &["checkout", "-q", "-"]);
         git_in(root, &["rm", "-q", "a.txt"]);
         git_in(root, &["commit", "-q", "-m", "delete"]);
-        let merged = std::process::Command::new("git")
-            .args(["merge", "-q", "other"])
-            .current_dir(root)
-            .output()
-            .expect("merge");
-        assert!(!merged.status.success(), "the merge must conflict");
+        assert!(
+            crate::test_support::git_merge_in(root, &["merge", "-q", "other"]),
+            "the merge must conflict"
+        );
         match porcelain_v1_z(root, None).expect("status") {
             GixStatus::Porcelain(text) => assert_eq!(text, "DU a.txt\0", "{text:?}"),
             GixStatus::Fallback(reason) => panic!("expected porcelain, fell back: {reason}"),
