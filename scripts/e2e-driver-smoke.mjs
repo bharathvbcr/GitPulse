@@ -538,12 +538,18 @@ function findOrphanProcesses(marker) {
  * @returns {string[]}
  */
 function windowsAttachProcesses() {
-  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('msedgedriver.exe','gitpulse.exe','msedgewebview2.exe') } | Select-Object -First 24 | ForEach-Object { \"$($_.ProcessId) $($_.Name) parent=$($_.ParentProcessId) $($_.CommandLine)\" }";
-  const res = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+  // PowerShell 7 (pwsh, on every GitHub Windows image) exposes CommandLine on
+  // Get-Process, which starts far faster than a CIM query: the CIM form ran
+  // past its 15 s bound on a runner and showed nothing.
+  const ps = "Get-Process -Name msedgedriver,gitpulse,msedgewebview2 -ErrorAction SilentlyContinue | Select-Object -First 24 | ForEach-Object { \"$($_.Id) $($_.ProcessName) parent=$($_.Parent.Id) $($_.CommandLine)\" }";
+  const res = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", ps], {
     encoding: "utf8",
-    timeout: 15_000,
+    timeout: 45_000,
   });
-  if (res.status !== 0) return [`(process query failed: status ${res.status}, ${String(res.stderr ?? res.error ?? "").trim().slice(0, 300)})`];
+  if (res.error || res.status !== 0) {
+    const why = res.error ? res.error.message : `exit ${res.status}: ${String(res.stderr ?? "").trim()}`;
+    return [`(process query failed: ${why.slice(0, 300)})`];
+  }
   return String(res.stdout ?? "")
     .split(/\r?\n/)
     .map((line) => line.trim())
