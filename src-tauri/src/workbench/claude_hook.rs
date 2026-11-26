@@ -644,7 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn permission_request_carries_both_async_notify_and_sync_permission_bridge() {
+    /// The bridge can answer `allow`, and its client trusts whatever answers on
+    /// approval-broker.sock, which no release binds: any same-user process could
+    /// bind it and approve every prompt. Neither the manifest nor an injected
+    /// launch carries it until the broker authenticates itself to the hook.
+    fn permission_request_carries_async_notify_and_no_unauthenticated_bridge() {
         let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
         let injected =
             settings_hooks(Path::new("/Applications/Git Pulse.app/gitpulse-hook")).unwrap();
@@ -663,17 +667,11 @@ mod tests {
                 .find(|h| h["command"].as_str().unwrap().ends_with("notify permission_request"))
                 .unwrap_or_else(|| panic!("{label}: missing notify permission_request"));
             assert_eq!(notify["async"], json!(true), "{label}");
-            let bridge = handlers
-                .iter()
-                .find(|h| h["command"].as_str().unwrap().ends_with(" permission-bridge"))
-                .unwrap_or_else(|| panic!("{label}: missing permission-bridge"));
-            assert!(bridge.get("async").is_none(), "{label}");
-            assert!(bridge.get("asyncRewake").is_none(), "{label}");
-            let timeout = bridge["timeout"].as_u64().unwrap();
-            assert!(timeout <= 1800, "{label}: {timeout}");
             assert!(
-                timeout > crate::hooks::permission_bridge::PERMISSION_BRIDGE_WAIT.as_secs(),
-                "{label}: timeout {timeout} must exceed PERMISSION_BRIDGE_WAIT"
+                !handlers
+                    .iter()
+                    .any(|h| h["command"].as_str().unwrap().ends_with(" permission-bridge")),
+                "{label}: permission-bridge is registered, but the broker is not authenticated"
             );
         }
     }

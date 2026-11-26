@@ -847,7 +847,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
     expect(wait).toBeGreaterThan(hookDurationSeconds("TOTAL_BUDGET"));
   });
 
-  it("keeps permission-bridge separate from async notify permission_request and preserves the narrow allow invariant", () => {
+  it("does not register permission-bridge while the approval broker cannot prove who it is, and preserves the narrow allow invariant", () => {
     const manifest = JSON.parse(readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8")) as {
       hooks: {
         PermissionRequest: Array<{ hooks: Array<{ command: string; timeout: number; async?: boolean; asyncRewake?: boolean }> }>;
@@ -855,17 +855,15 @@ describe("hook budgets sit inside the host's timeouts", () => {
     };
     const handlers = manifest.hooks.PermissionRequest.flatMap((g) => g.hooks);
     const notifyEntry = handlers.find((h) => h.command === "gitpulse-hook notify permission_request");
-    const bridgeEntry = handlers.find((h) => h.command === "gitpulse-hook permission-bridge");
     expect(notifyEntry, "existing async notify permission_request must remain untouched").toBeDefined();
     expect(notifyEntry!.async).toBe(true);
     expect(notifyEntry!.timeout).toBe(5);
-    expect(bridgeEntry, "permission-bridge must be registered as a separate PermissionRequest entry").toBeDefined();
-    expect(bridgeEntry!.async).toBeUndefined();
-    expect(bridgeEntry!.asyncRewake).toBeUndefined();
-
-    const wait = permissionBridgeWaitSeconds();
-    expect(bridgeEntry!.timeout - wait).toBeGreaterThanOrEqual(30);
-    expect(bridgeEntry!.timeout).toBeLessThanOrEqual(1800);
+    // The bridge can answer `allow`. Its client trusts whatever process answers on
+    // approval-broker.sock, and nothing in a release binds that socket, so any
+    // process running as the same user could bind it and approve every prompt.
+    // It stays unregistered until the broker authenticates itself to the hook.
+    const bridgeEntry = handlers.find((h) => bareHookCommand(String(h.command)).split(/\s+/)[1] === "permission-bridge");
+    expect(bridgeEntry, "permission-bridge must not be registered until the broker is authenticated").toBeUndefined();
 
     // PreToolUse PermissionDecision enum in hooks/mod.rs must NEVER carry an Allow variant.
     const enumBlock = /pub enum PermissionDecision\s*\{([\s\S]*?)\}/.exec(hookSource)?.[1] ?? "";
