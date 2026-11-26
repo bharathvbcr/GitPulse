@@ -561,11 +561,17 @@ jobs:
           # gsudo's exit code does not carry the child's here (a child that
           # exited 7 came back as 1 through cmd and as 0 through node), so the
           # smoke step takes its verdict from summary.json, never from it.
+          # gsudo re-runs its command through this shell, which re-parses an
+          # inline script (`node -e 'console.log(...)'` lost its quotes and ran
+          # `process.env...` as a command), so the probe is a file whose path
+          # needs no quoting, and it answers in JSON.
           $env:GITPULSE_GSUDO_PROBE = 'carried'
-          $seen = "$(& $exe.FullName --integrity Medium node -e 'console.log(process.env.GITPULSE_GSUDO_PROBE)')".Trim()
-          if ($seen -ne 'carried') { throw "gsudo did not carry the environment (saw '$seen')" }
-          $cwd = "$(& $exe.FullName --integrity Medium node -e 'console.log(process.cwd())')".Trim()
-          if ($cwd -ne (Get-Location).Path) { throw "gsudo changed the working directory ('$cwd')" }
+          $probe = Join-Path $env:RUNNER_TEMP 'gsudo-probe.mjs'
+          Set-Content -Path $probe -Encoding utf8 -Value 'console.log(JSON.stringify({ probe: process.env.GITPULSE_GSUDO_PROBE ?? "", cwd: process.cwd() }))'
+          $answer = "$(& $exe.FullName --integrity Medium node $probe)".Trim()
+          try { $seen = $answer | ConvertFrom-Json } catch { throw "the gsudo probe did not answer in JSON: '$answer'" }
+          if ($seen.probe -ne 'carried') { throw "gsudo did not carry the environment (saw '$($seen.probe)')" }
+          if ($seen.cwd -ne (Get-Location).Path) { throw "gsudo changed the working directory ('$($seen.cwd)')" }
           Write-Output "gsudo $env:GSUDO_VERSION de-elevates: $($groups -match 'Mandatory Level')"
 
       - name: Real-Binary tauri-driver E2E Smoke (Windows)

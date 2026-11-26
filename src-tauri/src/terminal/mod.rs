@@ -5520,6 +5520,7 @@ fn close_console_when_the_shell_exits(
 ) {
     let child = Arc::clone(child);
     let master = Arc::downgrade(master);
+    let session = session_id.to_owned();
     let spawned = crate::supervisor::spawn_one_of_many(
         format!("terminal-console-{session_id}"),
         "terminal console close",
@@ -5537,14 +5538,28 @@ fn close_console_when_the_shell_exits(
                     drop(held);
                     thread::sleep(CONSOLE_EXIT_POLL);
                 }
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
+                    // Each step of the close is on record with its time, so a
+                    // session that still does not end says which step stalled:
+                    // this line without the next is a close that never
+                    // returned; both without "terminal session ended" is a
+                    // console that closed and left its output pipe open.
+                    log::info!(target: "terminal", "terminal shell exited ({status:?}); closing its console: session={session}");
                     let console = held
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
+                    let closing = Instant::now();
                     // Outside the lock: closing waits for the reader to drain
                     // what the console still holds.
+                    let had_console = console.is_some();
                     drop(console);
+                    log::info!(
+                        target: "terminal",
+                        "terminal console closed in {} ms (it was {}): session={session}",
+                        closing.elapsed().as_millis(),
+                        if had_console { "open" } else { "already closed" },
+                    );
                     return;
                 }
                 Err(error) => {
