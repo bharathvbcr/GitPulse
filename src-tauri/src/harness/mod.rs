@@ -808,6 +808,12 @@ fn is_dash_c_text(word: &str) -> bool {
     word.starts_with("-C")
 }
 
+/// A word made only of ASCII digits: the count of a search's `-C<n>` context
+/// flag, never a directory git could be pointed at by this reader.
+fn is_context_count(word: &str) -> bool {
+    !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// How far into nested shell scripts (`bash -c "bash -c '…'"`) the -C reader
 /// follows. A script nested deeper that contains an evaluator is refused: a
 /// check that could not finish must not read as one that passed.
@@ -904,15 +910,38 @@ fn clause_has_unresolved_git_c(clause: &str, in_script: bool, depth: usize) -> b
     // Unquoted words only: a quoted "git -C" is text being searched for or
     // printed, not a command.
     let mut seen_git = false;
-    for tok in tokens.iter().filter(|tok| !tok.is_redirect && !tok.quoted) {
-        for word in tok.text.split_whitespace() {
-            if seen_git && is_dash_c_text(word) {
+    // A bare `-C` was read after git; the next word says whether it is a
+    // search's context flag (`-C 3`) or git's -C aimed at a directory.
+    let mut bare_c = false;
+    for tok in tokens.iter().filter(|tok| !tok.is_redirect) {
+        if tok.quoted {
+            if bare_c {
                 return true;
+            }
+            continue;
+        }
+        for word in tok.text.split_whitespace() {
+            if std::mem::take(&mut bare_c) {
+                if is_context_count(word) {
+                    continue;
+                }
+                return true;
+            }
+            if seen_git && is_dash_c_text(word) {
+                match word.strip_prefix("-C") {
+                    Some("") => bare_c = true,
+                    Some(rest) if is_context_count(rest) => {}
+                    _ => return true,
+                }
+                continue;
             }
             if is_git_text(word) {
                 seen_git = true;
             }
         }
+    }
+    if bare_c {
+        return true;
     }
     let Some((at, kind)) = locate_evaluator(&tokens) else {
         return false;
@@ -938,8 +967,10 @@ fn clause_has_unresolved_git_c(clause: &str, in_script: bool, depth: usize) -> b
 /// scope. A clause git is located in is left to [`sibling_git_clauses`]. A quoted
 /// string that no evaluator runs (`rg -n "git -C" src`, `echo "git -C <dir>"`), a
 /// `-C` before any git word (`grep -C 3 git f`) and one after git's subcommand
-/// (`git log -C`) are not this case. Over-reports on purpose in one place:
-/// an unquoted `rg git -C2 f`.
+/// (`git log -C`) are not this case. A digits-only `-C` argument after an
+/// unquoted git word (`rg -n git -C2 src`, `grep -rn git -C 3 src`) is read as a
+/// search context flag, accepting that a git `-C` aimed at a directory named
+/// only with digits, behind an unknown wrapper, is not caught.
 fn unresolved_git_c(command: &str) -> Option<&str> {
     split_shell_clauses(command)
         .into_iter()
@@ -2820,15 +2851,29 @@ done
         ]);
     }
 
-    #[cfg(unix)]
+    /// Accepted gap, owner decision 2026-11-25 (card ft-42081f16, criterion
+    /// 64(a)): a quoted `"git"` is text being searched for, so `rg "git" -C 3 src`
+    /// is allowed. The cost is that `strace "git" -C ../x checkout`, a quoted git
+    /// behind a wrapper not in COMMAND_WRAPPERS, is not counted either.
     #[test]
-    #[ignore = "owner decision: an unknown wrapper followed by a quoted git or a quoted -C (strace \"git\" -C, strace git \"-C\") is skipped by the unquoted-only reader; counting whole quoted \"git\" tokens would bring back the rg \"git\" -C 3 false refusal"]
-    fn lane_c_quoted_git_or_dash_c_behind_an_unknown_wrapper_is_refused() {
-        lane_c_assert_covered(&[
-            "strace \"git\" -C ../{R} checkout -- x",
-            "strace git \"-C\" ../{R} checkout -- x",
-            "strace \\git -C ../{R} checkout -- x",
-        ]);
+    fn lane_c_quoted_git_behind_an_unknown_wrapper_is_an_accepted_gap() {
+        for command in ["rg \"git\" -C 3 src", "rg -n \"git\" -C3 src"] {
+            assert!(unresolved_git_c(command).is_none(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn lane_c_git_dash_c_with_a_directory_argument_stays_refused() {
+        for command in [
+            "strace git -C ../wt-b checkout -- x",
+            "strace git -C2x checkout",
+            "strace git -C",
+            "strace git -C 3x checkout",
+            "bash -c 'strace git -C ../wt-b checkout -- x'",
+            "echo git -C ../x",
+        ] {
+            assert!(unresolved_git_c(command).is_some(), "{command:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -2918,12 +2963,13 @@ done
     }
 
     #[test]
-    #[ignore = "lane C attack: false refusal; an unquoted git then -C as arguments of a search (grep -n git -C3 f, grep -rn git -C 3 src) is refused as git.c_unresolved (the rg \"git\" -C 3 form is only allowed because git is quoted)"]
     fn lane_c_grep_with_unquoted_git_pattern_and_context_flag_is_not_refused() {
         for command in [
             "grep -n git -C3 f",
             "grep -rn git -C 3 src",
             "rg -n git -C2 src",
+            "rg -n git -C 2 src",
+            "bash -c 'rg -n git -C2 src'",
         ] {
             assert!(unresolved_git_c(command).is_none(), "{command:?}");
         }
