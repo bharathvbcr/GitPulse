@@ -6,6 +6,7 @@
 //! flows through this seam without importing `git_cli`.
 
 mod clock;
+pub(crate) mod deferral_retry;
 mod env;
 mod gate;
 #[cfg(unix)]

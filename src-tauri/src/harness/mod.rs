@@ -136,7 +136,7 @@ fn judge_command_allowing(
     let command = render_command(argv);
     // Resolved once: the scope this action is judged under and the ledger row
     // that records the judgement are addressed by the same answer.
-    let address = crate::ledger::bindings::repository_address(repo_path);
+    let address = settled(|| crate::ledger::bindings::repository_address(repo_path));
     if let Err(refused) = review::gate(repo_path, argv) {
         let action = crate::ledger::action_for_argv(argv);
         record_gate(
@@ -935,7 +935,8 @@ enum HookScope {
 }
 
 fn hook_scope(repo_path: &str) -> HookScope {
-    let binding = crate::ledger::bindings::resolve_binding_readonly(repo_path, repo_path);
+    let binding =
+        settled(|| crate::ledger::bindings::resolve_binding_readonly(repo_path, repo_path));
     match scope_from_binding(binding) {
         Ok(Some(scope)) => HookScope::Declared(scope),
         Ok(None) => HookScope::Unbound,
@@ -967,7 +968,7 @@ pub(crate) fn guard_file(
     op: &str,
 ) -> Result<PolicyVerdict, String> {
     let action = format!("file.{}", if op.is_empty() { "write" } else { op });
-    let address = crate::ledger::bindings::repository_address(repo_path);
+    let address = settled(|| crate::ledger::bindings::repository_address(repo_path));
     let scope = match scope_at(&address) {
         Ok(scope) => scope,
         Err(failure) if failure.kind == ScopeFailureKind::Missing => {
@@ -1036,7 +1037,7 @@ fn guard_files_with(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let address = crate::ledger::bindings::repository_address(repo_path);
+    let address = settled(|| crate::ledger::bindings::repository_address(repo_path));
     let scope = match scope_at(&address) {
         Ok(scope) => scope,
         Err(_) => return files.iter().map(|f| guard_file(repo_path, f, op)).collect(),
@@ -1173,7 +1174,7 @@ pub(crate) fn time_file_checks_for_bench(
     op: &str,
     workers: usize,
 ) -> Result<(Vec<(std::time::Duration, PolicyVerdict)>, usize), String> {
-    let address = crate::ledger::bindings::repository_address(repo_path);
+    let address = settled(|| crate::ledger::bindings::repository_address(repo_path));
     let scope = scope_at(&address).map_err(|failure| failure.reason)?;
     let scope_bytes = scope.as_ref().map_or(0, |scope| {
         serde_json::to_vec(scope).map_or(0, |bytes| bytes.len())
@@ -1309,6 +1310,44 @@ impl ScopeFailure {
             self.reason
         )
     }
+}
+
+/// Longest a gate decision may already have spent on its first binding lookup
+/// and still look again, counted from the start of that lookup.
+const GATE_DEFERRAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A binding lookup, asked once more if the spawn gate deferred the Git read
+/// behind it.
+///
+/// A deferral means GitPulse could not look, so the gate refuses on it rather
+/// than judge an unread scope. Refusing on the first one turned a transient
+/// load spike into hard blocks: 7 of 200 bus sends from eight concurrent
+/// `gitpulse-mcp` processes were refused this way on Windows CI. One bounded
+/// retry, shared with the MCP read tools; a second deferral still refuses.
+/// Only the lookup is repeated, never the action it gates.
+fn settled<T>(
+    read: impl FnMut() -> Result<T, crate::ledger::LedgerError>,
+) -> Result<T, crate::ledger::LedgerError> {
+    crate::engine::process::deferral_retry::with_production_retry_window(
+        GATE_DEFERRAL_RETRY_WINDOW,
+        |retry| settle(read, retry),
+    )
+}
+
+/// [`settled`] with the retry's clock, sleep and jitter supplied.
+fn settle<T>(
+    read: impl FnMut() -> Result<T, crate::ledger::LedgerError>,
+    retry: &crate::engine::process::deferral_retry::DeferralRetry<'_>,
+) -> Result<T, crate::ledger::LedgerError> {
+    crate::engine::process::deferral_retry::retry_once_on_deferral(
+        read,
+        |result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.code == crate::ledger::bindings::DEFERRED_WORKTREE)
+        },
+        retry,
+    )
 }
 
 /// The scope at a family address the app's gate resolved for this action.
@@ -1665,7 +1704,9 @@ mod scope_tests {
     /// The scope the app's gate computes for `repo`: one family resolution,
     /// then the binding at that address.
     fn scope_for(repo: &str) -> Result<Option<HostScope>, ScopeFailure> {
-        scope_at(&crate::ledger::bindings::repository_address(repo))
+        scope_at(&settled(|| {
+            crate::ledger::bindings::repository_address(repo)
+        }))
     }
 
     /// `git worktree list` children spawned in `cwd` while `f` ran.
@@ -2346,5 +2387,80 @@ mod judge_in_order_tests {
         assert!(judge_in_order(&[], 8, |_| 0u8, |_| false).is_empty());
         let one = judge_in_order(&["a.md"], 8, |_| 7u8, |_| false);
         assert_eq!(one, vec![Some(7)]);
+    }
+}
+
+/// The gate's one retry of a deferred binding lookup.
+#[cfg(test)]
+mod settle_tests {
+    use super::settle;
+    use crate::engine::process::deferral_retry::DeferralRetry;
+    use crate::ledger::bindings::DEFERRED_WORKTREE;
+    use crate::ledger::LedgerError;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    fn deferred() -> LedgerError {
+        LedgerError::new(DEFERRED_WORKTREE, "git worktree deferred under load")
+    }
+
+    /// Answers `answers` in order, counting calls and recorded sleeps.
+    fn run(
+        answers: Vec<Result<u8, LedgerError>>,
+        window: Duration,
+    ) -> (Result<u8, LedgerError>, usize, usize) {
+        let start = Instant::now();
+        let slept = Cell::new(0usize);
+        let sleep = |_: Duration| slept.set(slept.get() + 1);
+        let jitter = |_: u64| 0;
+        let now = || start;
+        let retry = DeferralRetry {
+            sleep: &sleep,
+            jitter: &jitter,
+            now: &now,
+            deadline: start + window,
+        };
+        let mut answers = answers.into_iter();
+        let calls = Cell::new(0usize);
+        let result = settle(
+            || {
+                calls.set(calls.get() + 1);
+                answers.next().expect("asked more often than answered")
+            },
+            &retry,
+        );
+        (result, calls.get(), slept.get())
+    }
+
+    #[test]
+    fn a_deferred_lookup_is_asked_once_more_and_its_answer_is_used() {
+        let (result, calls, slept) = run(vec![Err(deferred()), Ok(7)], Duration::from_secs(5));
+        assert_eq!(result.expect("the retry answered"), 7);
+        assert_eq!((calls, slept), (2, 1));
+    }
+
+    #[test]
+    fn a_second_deferral_still_refuses() {
+        let (result, calls, _) = run(
+            vec![Err(deferred()), Err(deferred())],
+            Duration::from_secs(5),
+        );
+        assert_eq!(result.expect_err("fails closed").code, DEFERRED_WORKTREE);
+        assert_eq!(calls, 2, "one retry, never more");
+    }
+
+    #[test]
+    fn any_other_failure_is_not_retried() {
+        let broken = LedgerError::new("invalid_worktree", "not a worktree");
+        let (result, calls, slept) = run(vec![Err(broken)], Duration::from_secs(5));
+        assert_eq!(result.expect_err("refused").code, "invalid_worktree");
+        assert_eq!((calls, slept), (1, 0));
+    }
+
+    #[test]
+    fn no_retry_is_started_past_the_window() {
+        let (result, calls, slept) = run(vec![Err(deferred())], Duration::ZERO);
+        assert_eq!(result.expect_err("refused").code, DEFERRED_WORKTREE);
+        assert_eq!((calls, slept), (1, 0));
     }
 }
