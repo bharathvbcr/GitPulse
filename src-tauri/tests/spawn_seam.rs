@@ -39,6 +39,15 @@ const ALLOWED: &[(&str, &str)] = &[
          whole life would starve every git call behind it",
     ),
     (
+        "src/remote/codex_app_server.rs",
+        "`codex app-server`: one long-lived JSON-RPC child per hosted thread that \
+         reads requests on stdin and answers on stdout until `shutdown`. A gate \
+         permit, a timeout or an output cap would end the session it exists to \
+         serve. The file only builds the `Command`; `procguard::spawn` starts it \
+         (trust admission, its own process group, the quit sweep) and \
+         `Registration::stop_and_reap` stops it. Not git",
+    ),
+    (
         "src/mavi/mod.rs",
         "Mavi's agent (`claude`, or `ssh` running it on a host): one long-lived \
          child per thread that reads a conversation from stdin and streams it \

@@ -14,19 +14,22 @@
 //!      (never `updatedInput` or `updatedPermissions`, Opus P0-4).
 //!   3. GitPulse never mutates Codex's trust store.
 
+use crate::procguard::{self, Registration};
+use crate::supervisor;
 use crate::remote::pty_gate::sha256_hex;
 use gitpulse_protocol::canonical::canonical_json_string;
 use gitpulse_protocol::wire::ApprovalDecisionKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::AsyncWriteExt;
+use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, oneshot};
 
 /// Forbidden parameter keys that remote callers must NEVER supply or relax.
@@ -251,13 +254,31 @@ pub fn refuse_remote_policy_change(
     Ok(())
 }
 
+impl Drop for CodexAppServerClient {
+    fn drop(&mut self) {
+        let child = self
+            .child
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((mut child, registration)) = child {
+            reap(&mut child, &registration);
+        }
+    }
+}
+
+/// Stops the child's whole process group and reaps it.
+fn reap(child: &mut Child, registration: &Registration) {
+    let _ = registration.stop_and_reap(child, Duration::ZERO);
+}
+
 /// In-flight JSON-RPC calls, keyed by request id, each waiting for its reply.
 type PendingCalls = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexError>>>>>;
 
 /// Active `codex app-server` JSON-RPC stdio client owned by `gitpulsed`.
 pub struct CodexAppServerClient {
     config: CodexLaunchConfig,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<(Child, Registration)>>,
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     next_id: AtomicU64,
     pending_calls: PendingCalls,
@@ -275,20 +296,27 @@ impl CodexAppServerClient {
             .current_dir(&config.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
 
-        let mut child = cmd
-            .spawn()
+        // Started through procguard, like every long-lived child: trust
+        // admission, its own process group, and the quit sweep.
+        let (mut child, registration) = procguard::spawn(&mut cmd, "codex app-server")
             .map_err(|e| CodexError::SpawnFailed(format!("{}: {e}", config.program.display())))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| CodexError::SpawnFailed("child stdin unavailable".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| CodexError::SpawnFailed("child stdout unavailable".into()))?;
+        let Some(stdin) = child.stdin.take() else {
+            reap(&mut child, &registration);
+            return Err(CodexError::SpawnFailed("child stdin unavailable".into()));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            reap(&mut child, &registration);
+            return Err(CodexError::SpawnFailed("child stdout unavailable".into()));
+        };
+        let stdin = match ChildStdin::from_std(stdin) {
+            Ok(stdin) => stdin,
+            Err(e) => {
+                reap(&mut child, &registration);
+                return Err(CodexError::SpawnFailed(format!("child stdin: {e}")));
+            }
+        };
 
         let pending_calls: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
         let pending_approvals: Arc<Mutex<HashMap<String, CodexApprovalRequest>>> =
@@ -299,9 +327,10 @@ impl CodexAppServerClient {
         let calls_reader = Arc::clone(&pending_calls);
         let approvals_reader = Arc::clone(&pending_approvals);
 
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+        let reader = move || {
+            let lines = std::io::BufReader::new(stdout).lines();
+            for line in lines {
+                let Ok(line) = line else { break };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -324,7 +353,7 @@ impl CodexAppServerClient {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .insert(req.item_id.clone(), req.clone());
-                        let _ = approvals_tx.send(req).await;
+                        let _ = approvals_tx.blocking_send(req);
                     }
                 } else if has_id {
                     // Response to our client -> server request.
@@ -352,9 +381,7 @@ impl CodexAppServerClient {
                     // Server notification (turn/started, turn/completed, etc.).
                     let method = msg["method"].as_str().unwrap_or_default().to_string();
                     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                    let _ = notifications_tx
-                        .send(CodexNotification { method, params })
-                        .await;
+                    let _ = notifications_tx.blocking_send(CodexNotification { method, params });
                 }
             }
 
@@ -367,11 +394,15 @@ impl CodexAppServerClient {
             for (_, tx) in drained {
                 let _ = tx.send(Err(CodexError::Closed));
             }
-        });
+        };
+        if let Err(e) = supervisor::spawn_once("codex-app-server-reader", "codex app-server reader", reader) {
+            reap(&mut child, &registration);
+            return Err(CodexError::SpawnFailed(format!("reader thread: {e}")));
+        }
 
         Ok(Self {
             config,
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(Some((child, registration))),
             stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
             next_id: AtomicU64::new(1),
             pending_calls,
@@ -532,9 +563,8 @@ impl CodexAppServerClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(mut child) = child {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        if let Some((mut child, registration)) = child {
+            reap(&mut child, &registration);
         }
     }
 
