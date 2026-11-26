@@ -76,7 +76,6 @@ describe("mergeVerifiedAttempt", () => {
     ["the worktree moved past the verified head", { head: "fedcba0987654321" }, {}, /moved to fedcba09 after 12345678/],
     ["the worktree has uncommitted files", { dirty_files: 2 }, {}, /2 uncommitted files no verdict covered/],
     ["the worktree's changes couldn't be counted", { dirty_files: null }, {}, /couldn't be counted/],
-    ["the main checkout is dirty", {}, { dirty_files: 1 }, /main worktree \/work\/repo has 1 uncommitted file/],
     ["the main checkout couldn't be checked", {}, { dirty_files: null }, /couldn't be checked for uncommitted work/],
     ["the main checkout is detached", {}, { branch: null }, /not on a branch/],
     ["the attempt has no branch", { branch: null }, {}, /not on a branch/],
@@ -84,6 +83,13 @@ describe("mergeVerifiedAttempt", () => {
     setup(own, main);
     await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(message);
     expect(merged()).toBe(false);
+  });
+
+  it("passes through to cmd_worktree_merge_teardown when the main checkout has uncommitted files (delegating disjointness to Rust)", async () => {
+    setup({}, { dirty_files: 3 });
+    const result = await mergeVerifiedAttempt(run, "1234567890abcdef");
+    expect(result.head).toBe("1234567890abcdef");
+    expect(merged()).toBe(true);
   });
 
   it("merges nothing when another attempt works in the main checkout, or live attempts could not all be read", async () => {

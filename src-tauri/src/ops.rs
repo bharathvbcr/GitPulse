@@ -613,6 +613,150 @@ pub fn prepare_release(
     })
 }
 
+const MAX_REF_INVENTORY_SAMPLES: usize = 10;
+
+/// Non-standard ref namespaces inventoried by [`non_standard_ref_inventory`].
+/// These namespaces may hold user backups, agent checkpoints, or internal
+/// Waylode state and are never auto-deleted by inventory scans.
+pub const NON_STANDARD_REF_NAMESPACES: [&str; 5] = [
+    "refs/backup",
+    "refs/codex",
+    "refs/gitpulse",
+    "refs/integration",
+    "refs/rewrite",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NonStandardRefSample {
+    pub refname: String,
+    pub object_id: String,
+    /// Committer or tagger unix timestamp in seconds, when Git provides one.
+    pub timestamp: Option<i64>,
+    /// Age in seconds relative to the inventory timestamp, when known.
+    pub age_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NonStandardRefNamespaceSummary {
+    pub namespace: String,
+    pub count: usize,
+    pub oldest_timestamp: Option<i64>,
+    pub newest_timestamp: Option<i64>,
+    pub oldest_age_secs: Option<u64>,
+    pub newest_age_secs: Option<u64>,
+    pub samples: Vec<NonStandardRefSample>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NonStandardRefInventory {
+    pub total_refs: usize,
+    pub namespaces: Vec<NonStandardRefNamespaceSummary>,
+}
+
+/// Read-only inventory of non-standard ref namespaces (`refs/backup/*`,
+/// `refs/codex/*`, `refs/gitpulse/*`, `refs/integration/*`, `refs/rewrite/*`),
+/// reporting per-namespace counts and age/sample summaries without deleting any
+/// user or backup refs.
+pub fn non_standard_ref_inventory(
+    repo_path: &str,
+) -> Result<NonStandardRefInventory, CommandError> {
+    let now_secs = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX);
+    non_standard_ref_inventory_at(repo_path, now_secs)
+}
+
+pub fn non_standard_ref_inventory_at(
+    repo_path: &str,
+    now_secs: i64,
+) -> Result<NonStandardRefInventory, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    let mut args = vec![
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)%00%(creatordate:unix)",
+    ];
+    args.extend_from_slice(&NON_STANDARD_REF_NAMESPACES);
+    let raw = git_text(&repo, &args)?;
+
+    let mut grouped: HashMap<&'static str, Vec<NonStandardRefSample>> = HashMap::new();
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\0').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let refname = parts[0].trim();
+        let object_id = parts[1].trim();
+        let timestamp = parts
+            .get(2)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<i64>().ok());
+        let age_secs =
+            timestamp.map(|ts| u64::try_from(now_secs.saturating_sub(ts).max(0)).unwrap_or(0));
+
+        let Some(&ns) = NON_STANDARD_REF_NAMESPACES.iter().find(|&&prefix| {
+            refname.len() > prefix.len() + 1
+                && refname.starts_with(prefix)
+                && refname.as_bytes()[prefix.len()] == b'/'
+        }) else {
+            continue;
+        };
+        grouped.entry(ns).or_default().push(NonStandardRefSample {
+            refname: refname.to_string(),
+            object_id: object_id.to_string(),
+            timestamp,
+            age_secs,
+        });
+    }
+
+    let mut total_refs = 0usize;
+    let mut namespaces = Vec::new();
+    for &ns in &NON_STANDARD_REF_NAMESPACES {
+        let Some(mut entries) = grouped.remove(ns) else {
+            continue;
+        };
+        let count = entries.len();
+        total_refs += count;
+        let oldest_timestamp = entries.iter().filter_map(|e| e.timestamp).min();
+        let newest_timestamp = entries.iter().filter_map(|e| e.timestamp).max();
+        let oldest_age_secs = oldest_timestamp
+            .map(|ts| u64::try_from(now_secs.saturating_sub(ts).max(0)).unwrap_or(0));
+        let newest_age_secs = newest_timestamp
+            .map(|ts| u64::try_from(now_secs.saturating_sub(ts).max(0)).unwrap_or(0));
+        // Newest first, tie-broken deterministically by refname.
+        entries.sort_by(|a, b| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| a.refname.cmp(&b.refname))
+        });
+        let truncated = entries.len() > MAX_REF_INVENTORY_SAMPLES;
+        entries.truncate(MAX_REF_INVENTORY_SAMPLES);
+        namespaces.push(NonStandardRefNamespaceSummary {
+            namespace: ns.to_string(),
+            count,
+            oldest_timestamp,
+            newest_timestamp,
+            oldest_age_secs,
+            newest_age_secs,
+            samples: entries,
+            truncated,
+        });
+    }
+
+    Ok(NonStandardRefInventory {
+        total_refs,
+        namespaces,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1536,5 +1680,51 @@ mod tests {
             "{:?}",
             plan.unchecked_reason
         );
+    }
+
+    #[test]
+    fn non_standard_ref_inventory_counts_ages_and_preserves_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        let head = git(p, &["rev-parse", "HEAD"]);
+
+        let seeded = [
+            "refs/backup/before-rebase",
+            "refs/backup/user-save",
+            "refs/codex/turn-1",
+            "refs/gitpulse/ops/1",
+            "refs/integration/lane-a",
+            "refs/rewrite/stack-1",
+        ];
+        for r in seeded {
+            git(p, &["update-ref", r, &head]);
+        }
+
+        let head_ts = git(p, &["show", "-s", "--format=%ct", &head])
+            .parse::<i64>()
+            .expect("unix timestamp");
+        let now_secs = head_ts + 120;
+        let inv = non_standard_ref_inventory_at(p.to_str().unwrap(), now_secs)
+            .expect("non-standard ref inventory");
+
+        assert_eq!(inv.total_refs, 6);
+        assert_eq!(inv.namespaces.len(), 5);
+        let backup = inv
+            .namespaces
+            .iter()
+            .find(|n| n.namespace == "refs/backup")
+            .expect("refs/backup summary");
+        assert_eq!(backup.count, 2);
+        assert_eq!(backup.oldest_age_secs, Some(120));
+        assert_eq!(backup.newest_age_secs, Some(120));
+        assert!(!backup.truncated);
+        assert_eq!(backup.samples.len(), 2);
+
+        // Inventory is strictly read-only: every user/backup ref remains untouched.
+        for r in seeded {
+            assert_eq!(git(p, &["rev-parse", "--verify", r]), head, "{r} deleted!");
+        }
     }
 }

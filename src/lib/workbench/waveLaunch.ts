@@ -105,14 +105,13 @@ export interface PostMerge { base: string; head: string }
 /** `dirty` null: the count could not be read. `operation`: what is parked in the checkout ("merge", "squash merge", ...), or null when nothing is. */
 export interface MainState { dirty: number | null; operation: string | null }
 
-/** Why the main checkout is not free to launch from or merge into, or "" when it is. A state that could not be read is not free. */
+/** Why the main checkout is not free to launch from or merge into, or "" when it is. A state that could not be read or has a parked operation is not free; dirty-path disjointness is delegated to Rust. */
 function mainBlocker(state: MainState | null | undefined): string {
-  // Free only on a reading that says so: a whole-number zero count and no operation. Anything else, a malformed reading included, is not free.
+  // Block only on unreadable state or a parked operation; dirty-path disjointness is enforced in Rust.
   if (!state || typeof state !== "object") return "the main worktree couldn't be read";
   if (typeof state.operation === "string" && state.operation) return `a ${state.operation} is in progress in the main worktree`;
   const { dirty } = state;
-  if (typeof dirty === "number" && Number.isInteger(dirty) && dirty > 0) return `the main worktree has ${dirty} uncommitted file${dirty === 1 ? "" : "s"}`;
-  if (!(typeof dirty === "number" && Number.isInteger(dirty) && dirty === 0)) return "the main worktree's uncommitted changes couldn't be counted";
+  if (!(typeof dirty === "number" && Number.isInteger(dirty) && dirty >= 0)) return "the main worktree's uncommitted changes couldn't be counted";
   if (state.operation !== null) return "the main worktree's operation state couldn't be read";
   return "";
 }
@@ -380,8 +379,8 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
   const stopTerminal = (state: WaveState, note: string) => settle((m) => m, state, note);
 
   const launchBatch = async (): Promise<boolean> => {
-    // A parked merge or a person's uncommitted work in the main checkout is not
-    // this wave's to build on: the next batch's merges would land over it.
+    // A parked operation or unreadable main checkout is not this wave's to build on;
+    // dirty-path disjointness is checked in Rust when each member lands.
     let blocker: string;
     try { blocker = mainBlocker(await deps.mainState(abort.signal)); }
     catch (cause) { blocker = `the main worktree couldn't be read (${message(cause)})`; }

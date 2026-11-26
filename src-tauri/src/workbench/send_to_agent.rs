@@ -162,6 +162,96 @@ fn unavailable(reason: impl Into<String>) -> Route {
     }
 }
 
+/// Result of checking whether a saved attempt's underlying agent session is
+/// still running before allowing headless [`Route::Resume`] (Opus A3-6 / P1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SessionLiveness {
+    /// Confirmed running via OS process birth identity, active peer record, or
+    /// live alerts-hub state snapshot.
+    Live { detail: String },
+    /// No live process or active session observed.
+    NotLive,
+    /// Liveness could not be determined; fail closed rather than double-resuming.
+    Unknown { reason: String },
+}
+
+/// Checks OS process birth identity, live alerts-hub state, and `peers.json`
+/// reconciliation before allowing headless `Route::Resume`.
+pub(super) fn probe_session_liveness(run: &Value, session_id: Option<&str>) -> SessionLiveness {
+    // 1. OS process creation identity if the run record carries a PID.
+    if let Some(pid) = run
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok())
+        .filter(|p| *p > 0)
+    {
+        if let Some(expected) = run
+            .get("process_start")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            match super::process_birth::probe(pid, expected) {
+                super::process_birth::Liveness::Alive => {
+                    return SessionLiveness::Live {
+                        detail: format!("process {pid} is still alive"),
+                    };
+                }
+                super::process_birth::Liveness::Unknown(reason) => {
+                    return SessionLiveness::Unknown { reason };
+                }
+                super::process_birth::Liveness::Gone => {}
+            }
+        } else if let Some(start_ns) = run.get("proc_start_ns").and_then(Value::as_u64) {
+            match super::process_birth::running_since(pid, u128::from(start_ns)) {
+                super::process_birth::Liveness::Alive => {
+                    return SessionLiveness::Live {
+                        detail: format!("process {pid} is still alive"),
+                    };
+                }
+                super::process_birth::Liveness::Unknown(reason) => {
+                    return SessionLiveness::Unknown { reason };
+                }
+                super::process_birth::Liveness::Gone => {}
+            }
+        }
+    }
+
+    // 2. Live alerts-hub session state snapshot + reconciled peer registry.
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        if let crate::alerts::HubStateRead::Ok(snap) = crate::alerts::read_state_snapshot() {
+            if let Some(entry) = snap.sessions.iter().find(|s| {
+                s.state != "ended"
+                    && (s.key.eq_ignore_ascii_case(sid)
+                        || s.provider_session_id
+                            .as_deref()
+                            .is_some_and(|p| p.eq_ignore_ascii_case(sid)))
+            }) {
+                return SessionLiveness::Live {
+                    detail: format!(
+                        "session {sid} is still live in alerts hub ({})",
+                        entry.state
+                    ),
+                };
+            }
+        }
+        if let Some(cwd) = run
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty() && std::path::Path::new(c).is_dir())
+        {
+            if let Ok(peer) = crate::engine::agent_bus::resolve_target_peer(cwd, sid) {
+                if peer.liveness == "live" {
+                    return SessionLiveness::Live {
+                        detail: format!("peer {} is still live", peer.record.peer_id),
+                    };
+                }
+            }
+        }
+    }
+
+    SessionLiveness::NotLive
+}
+
 /// Which route a message to this attempt would take.
 ///
 /// `listening` says whether a hook is waiting on a session; `resumable` is
@@ -169,9 +259,29 @@ fn unavailable(reason: impl Into<String>) -> Route {
 /// `managed_status` is the status read of a live managed run (called only for
 /// one). Each is a closure so a test can answer them and a route that needs
 /// none of them asks none: no check is made that the answer would not use.
+#[cfg(test)]
 pub(super) fn decide(
     run: &Value,
     listening: impl Fn(&str) -> bool,
+    resumable: impl FnOnce() -> Value,
+    managed_status: impl FnOnce() -> Result<Value, WorkbenchError>,
+) -> Route {
+    decide_with_liveness(
+        run,
+        listening,
+        |_, _| SessionLiveness::NotLive,
+        resumable,
+        managed_status,
+    )
+}
+
+/// [`decide`] with an explicit session liveness check before permitting
+/// headless [`Route::Resume`] (prevents double-resuming a live session whose
+/// run row was marked ended or whose `Stop` waiter is mid-turn).
+pub(super) fn decide_with_liveness(
+    run: &Value,
+    listening: impl Fn(&str) -> bool,
+    session_liveness: impl FnOnce(&Value, Option<&str>) -> SessionLiveness,
     resumable: impl FnOnce() -> Value,
     managed_status: impl FnOnce() -> Result<Value, WorkbenchError>,
 ) -> Route {
@@ -205,7 +315,29 @@ pub(super) fn decide(
                 error.message
             )),
         },
-        (Some("managed"), false, true) => resume_or(provider, resumable),
+        (Some("managed"), false, true) => {
+            let sid = session_of(run);
+            match session_liveness(run, sid.as_deref()) {
+                SessionLiveness::Live { detail } => {
+                    if matches!(provider, "claude" | "agy") {
+                        if let Some(session) = sid {
+                            return Route::Mailbox {
+                                listening: listening(&session),
+                                session,
+                                provider: provider.to_owned(),
+                            };
+                        }
+                    }
+                    unavailable(format!(
+                        "Refusing headless resume because this session is still live ({detail})."
+                    ))
+                }
+                SessionLiveness::Unknown { reason } => unavailable(format!(
+                    "Could not verify whether this session has exited ({reason}); refusing headless resume to avoid double-resuming a live session."
+                )),
+                SessionLiveness::NotLive => resume_or(provider, resumable),
+            }
+        }
         (Some("external_terminal"), true, _) => {
             if !matches!(provider, "claude" | "agy") {
                 return unavailable(
@@ -228,20 +360,41 @@ pub(super) fn decide(
         }
         (Some("external_terminal"), false, true) => {
             // A conversation resumed from this attempt keeps the attempt's
-            // session id. If a hook is waiting on it, it is live right now and
-            // the message belongs there, not in a second resume.
+            // session id. If a hook is waiting on it, or OS/peer/hub liveness
+            // shows it is still running (even mid-turn with no Stop waiter),
+            // route to its mailbox or fail closed — never double-resume it.
+            let sid = session_of(run);
             if matches!(provider, "claude" | "agy") {
-                if let Some(session) = session_of(run) {
-                    if listening(&session) {
+                if let Some(ref session) = sid {
+                    if listening(session) {
                         return Route::Mailbox {
-                            session,
+                            session: session.clone(),
                             listening: true,
                             provider: provider.to_owned(),
                         };
                     }
                 }
             }
-            resume_or(provider, resumable)
+            match session_liveness(run, sid.as_deref()) {
+                SessionLiveness::Live { detail } => {
+                    if matches!(provider, "claude" | "agy") {
+                        if let Some(session) = sid {
+                            return Route::Mailbox {
+                                listening: false,
+                                session,
+                                provider: provider.to_owned(),
+                            };
+                        }
+                    }
+                    unavailable(format!(
+                        "Refusing headless resume because this session is still live ({detail})."
+                    ))
+                }
+                SessionLiveness::Unknown { reason } => unavailable(format!(
+                    "Could not verify whether this session has exited ({reason}); refusing headless resume to avoid double-resuming a live session."
+                )),
+                SessionLiveness::NotLive => resume_or(provider, resumable),
+            }
         }
         (_, false, false) => unavailable(match state {
             "prepared" => "This attempt has not started, so there is no agent to send a message to.",
@@ -443,9 +596,10 @@ pub(super) fn send_with_homes(
             .with_store(|store| query(store, "runs.get", &json!({"id": request.id}).to_string()))?;
         let run = &row["item"];
         let id = request.id.clone();
-        let route = decide(
+        let route = decide_with_liveness(
             run,
             |session| mailbox.listening(session, SystemTime::now()),
+            probe_session_liveness,
             || {
                 let checkout_exists = run["cwd"]
                     .as_str()

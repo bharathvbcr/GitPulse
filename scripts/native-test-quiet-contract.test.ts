@@ -25,6 +25,8 @@ export function runsARealLoop(source: string): boolean {
 export function silencesTheApp(source: string): boolean {
   return (
     /#\[path = "common\/quiet_app\.rs"\]\s*mod quiet_app;/.test(source) &&
+    // Launch without activating: only the builder carries that switch.
+    /quiet_app::background_launch\(tauri::Builder::default\(\)\)/.test(source) &&
     /quiet_app::out_of_the_way\(&mut app\)/.test(source) &&
     // Between build and run: setting it after `run` returns would never happen.
     source.indexOf("out_of_the_way(&mut app)") < source.search(/\bapp\.run\(/)
@@ -55,14 +57,25 @@ describe("native test quiet contract", () => {
     expect(readFileSync(HELPER, "utf8")).toContain("tauri::ActivationPolicy::Accessory");
   });
 
+  it("the helper keeps reveals off the screen", () => {
+    // Production paths the tests drive (a quit confirmation, an agent's browse
+    // request) call reveal_main, which would show and focus the window and put
+    // the Dock icon back.
+    const helper = readFileSync(HELPER, "utf8");
+    const body = helper.slice(helper.indexOf("pub fn out_of_the_way"));
+    expect(body.slice(0, body.indexOf("\n}"))).toContain("waylode_lib::desktop::keep_off_screen();");
+  });
+
   it("the detector rejects the shape before the fix and accepts it after", () => {
     const before = `fn main() {\n let app = tauri::Builder::default().build(ctx).unwrap();\n app.run(|_, _| {});\n}`;
-    const after = `#[path = "common/quiet_app.rs"]\nmod quiet_app;\nfn main() {\n let mut app = tauri::Builder::default().build(ctx).unwrap();\n quiet_app::out_of_the_way(&mut app);\n app.run(|_, _| {});\n}`;
-    const afterRun = `#[path = "common/quiet_app.rs"]\nmod quiet_app;\nfn main() {\n let mut app = tauri::Builder::default().build(ctx).unwrap();\n app.run(|_, _| {});\n quiet_app::out_of_the_way(&mut app);\n}`;
+    const after = `#[path = "common/quiet_app.rs"]\nmod quiet_app;\nfn main() {\n let mut app = quiet_app::background_launch(tauri::Builder::default()).build(ctx).unwrap();\n quiet_app::out_of_the_way(&mut app);\n app.run(|_, _| {});\n}`;
+    const afterRun = `#[path = "common/quiet_app.rs"]\nmod quiet_app;\nfn main() {\n let mut app = quiet_app::background_launch(tauri::Builder::default()).build(ctx).unwrap();\n app.run(|_, _| {});\n quiet_app::out_of_the_way(&mut app);\n}`;
+    const activating = `#[path = "common/quiet_app.rs"]\nmod quiet_app;\nfn main() {\n let mut app = tauri::Builder::default().build(ctx).unwrap();\n quiet_app::out_of_the_way(&mut app);\n app.run(|_, _| {});\n}`;
     expect(runsARealLoop(before)).toBe(true);
     expect(silencesTheApp(before)).toBe(false);
     expect(silencesTheApp(after)).toBe(true);
     expect(silencesTheApp(afterRun)).toBe(false);
+    expect(silencesTheApp(activating)).toBe(false);
     // A mock runtime that never runs the loop is not a target.
     expect(runsARealLoop(`tauri::test::mock_builder().build(ctx)`)).toBe(false);
   });

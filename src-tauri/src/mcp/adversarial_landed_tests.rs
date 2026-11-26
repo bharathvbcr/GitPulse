@@ -418,6 +418,7 @@ fn over_mcp_only_a_full_pass_is_verified_and_a_narrowed_pass_is_told_apart() {
         checked_by: "ci.local".into(),
         task_id: None,
         details: None,
+        tree_oid: None,
     };
     let cases = [
         (passed.clone(), true),

@@ -240,6 +240,15 @@ pub(crate) fn check_command_in_scope(lane: Lane, repo_path: &str, command: &str)
     {
         return caller;
     }
+    if caller.bound {
+        if let Some(clause) = unresolved_git_c(command) {
+            return ScopedVerdict {
+                bound: true,
+                unscoped: None,
+                verdict: unresolved_git_c_verdict(command, clause, &caller.verdict.task_id),
+            };
+        }
+    }
     for (sibling_root, rewritten_cmd) in sibling_git_clauses(Path::new(repo_path), command) {
         let Some(sib_str) = sibling_root.to_str() else {
             continue;
@@ -611,41 +620,17 @@ fn is_git_command_word(tok: &ShellToken<'_>) -> bool {
 
 fn parse_git_invocation(clause: &str) -> Option<GitInvocation<'_>> {
     let tokens = scan_shell_tokens(clause);
-    let mut at = 0usize;
-    while at < tokens.len() {
-        let tok = &tokens[at];
-        if tok.is_redirect {
-            at += 2;
-            continue;
-        }
-        if !tok.quoted
-            && (is_assignment_word(&tok.text)
-                || matches!(
-                    tok.text.as_str(),
-                    "if" | "elif"
-                        | "while"
-                        | "until"
-                        | "do"
-                        | "then"
-                        | "else"
-                        | "!"
-                        | "time"
-                        | "{"
-                        | "("
-                        | "command"
-                        | "builtin"
-                        | "noglob"
-                ))
-        {
-            at += 1;
-            continue;
-        }
-        break;
-    }
-    if at >= tokens.len() || !is_git_command_word(&tokens[at]) {
+    let at = locate_git(&tokens)?;
+    let c_args = git_c_args(&tokens, at);
+    if c_args.is_empty() {
         return None;
     }
+    Some(GitInvocation { tokens, c_args })
+}
 
+/// The `-C` global options of the git word at `at`: (flag index, value index
+/// when separate, value, value expands).
+fn git_c_args(tokens: &[ShellToken<'_>], at: usize) -> Vec<(usize, Option<usize>, String, bool)> {
     let mut c_args = Vec::new();
     let mut i = at + 1;
     while i < tokens.len() {
@@ -687,10 +672,335 @@ fn parse_git_invocation(clause: &str) -> Option<GitInvocation<'_>> {
         };
         i = next;
     }
-    if c_args.is_empty() {
+    c_args
+}
+
+/// The rule a `-C` that cannot be attributed to a git invocation is refused under.
+pub(crate) const GIT_C_UNRESOLVED: &str = "git.c_unresolved";
+
+/// Commands that run the command following them, after options of their own
+/// (so `git` after one is in command position). Mirrors DevCouncil's
+/// `commandWrappers` (backend/go_orchestrator/policy/command_harnessonly.go,
+/// read at 63ca82ea6fe7), whose `argumentWrappers` (command_argwrites.go) is a
+/// subset. A wrapper's options take arguments of an arity this reader cannot
+/// know (`sudo -u x`, `timeout -s KILL 5`, `nice -n 5`), so like DevCouncil it
+/// does not guess which word is the command: after a wrapper, the first later
+/// word that is git is taken as the command.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "env",
+    "nice",
+    "ionice",
+    "time",
+    "command",
+    "exec",
+    "builtin",
+    "nohup",
+    "setsid",
+    "sudo",
+    "doas",
+    "xargs",
+    "timeout",
+    "stdbuf",
+    "flock",
+    "chronic",
+    "caffeinate",
+    "watch",
+    "parallel",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir",
+    "chrt",
+    "taskset",
+    "unbuffer",
+];
+
+fn is_command_wrapper(tok: &ShellToken<'_>) -> bool {
+    if tok.expands {
+        return false;
+    }
+    let name = tok.text.rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = name.to_lowercase();
+    COMMAND_WRAPPERS.contains(&name.strip_suffix(".exe").unwrap_or(&name))
+}
+
+/// The index of the first word of the command the shell would run: past
+/// assignments, redirections and reserved words.
+fn command_position(tokens: &[ShellToken<'_>]) -> usize {
+    let mut at = 0usize;
+    while at < tokens.len() {
+        let tok = &tokens[at];
+        if tok.is_redirect {
+            at += 2;
+            continue;
+        }
+        if !tok.quoted
+            && (is_assignment_word(&tok.text)
+                || matches!(
+                    tok.text.as_str(),
+                    "if" | "elif"
+                        | "while"
+                        | "until"
+                        | "do"
+                        | "then"
+                        | "else"
+                        | "!"
+                        | "time"
+                        | "{"
+                        | "("
+                        | "command"
+                        | "builtin"
+                        | "noglob"
+                ))
+        {
+            at += 1;
+            continue;
+        }
+        break;
+    }
+    at
+}
+
+/// The index of the word the shell would run as git in one clause, or None.
+///
+/// Assignments, redirections, reserved words and [`COMMAND_WRAPPERS`] come
+/// first; a git word anywhere else (an argument of `echo`, a quoted command
+/// line) is not found here on purpose — the caller decides what an unreadable
+/// `-C` means (see [`unresolved_git_c`]).
+fn locate_git(tokens: &[ShellToken<'_>]) -> Option<usize> {
+    let at = command_position(tokens);
+
+    let first = tokens.get(at)?;
+    if is_git_command_word(first) {
+        return Some(at);
+    }
+    if !is_command_wrapper(first) {
         return None;
     }
-    Some(GitInvocation { tokens, c_args })
+    // A git word that is an option's argument (`sudo -u git git -C …`, `env -u
+    // git git -C …`) must not hide the real one: of the git words after the
+    // wrapper, take the first that carries a `-C`, else the first. Choosing a
+    // git that has a -C only ever adds a judgement (the sibling scope, or the
+    // refusal) for a command the first-git reading passed on unjudged.
+    let mut first = None;
+    let mut j = at + 1;
+    while j < tokens.len() {
+        if tokens[j].is_redirect {
+            j += 2;
+            continue;
+        }
+        if is_git_command_word(&tokens[j]) {
+            if !git_c_args(tokens, j).is_empty() {
+                return Some(j);
+            }
+            first.get_or_insert(j);
+        }
+        j += 1;
+    }
+    first
+}
+
+fn is_git_text(word: &str) -> bool {
+    word == "git" || word.ends_with("/git")
+}
+
+fn is_dash_c_text(word: &str) -> bool {
+    word.starts_with("-C")
+}
+
+/// A word made only of ASCII digits: the count of a search's `-C<n>` context
+/// flag, never a directory git could be pointed at by this reader.
+fn is_context_count(word: &str) -> bool {
+    !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// How far into nested shell scripts (`bash -c "bash -c '…'"`) the -C reader
+/// follows. A script nested deeper that contains an evaluator is refused: a
+/// check that could not finish must not read as one that passed.
+const MAX_SCRIPT_DEPTH: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Evaluator {
+    /// `eval`: its arguments are joined into one script.
+    Eval,
+    /// A shell, `su` or `script`: the argument of its `-c` is a script.
+    Shell,
+}
+
+fn evaluator_of(tok: &ShellToken<'_>) -> Option<Evaluator> {
+    let name = tok.text.rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = name.to_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
+        "eval" => Some(Evaluator::Eval),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "su" | "script" => Some(Evaluator::Shell),
+        _ => None,
+    }
+}
+
+/// The first shell evaluator in command position: the command word itself, or
+/// one behind a [`COMMAND_WRAPPERS`] word (`env bash -c …`, `xargs sh -c …`,
+/// `find -exec sh -c …`). A word like `sh` that is only an argument
+/// (`echo sh -c …`) is not one.
+fn locate_evaluator(tokens: &[ShellToken<'_>]) -> Option<(usize, Evaluator)> {
+    let start = command_position(tokens);
+    let mut armed = false;
+    let mut j = start;
+    while j < tokens.len() {
+        let tok = &tokens[j];
+        if tok.is_redirect {
+            j += 2;
+            continue;
+        }
+        if j == start {
+            armed = true;
+        }
+        if armed {
+            if let Some(kind) = evaluator_of(tok) {
+                return Some((j, kind));
+            }
+        }
+        armed = is_command_wrapper(tok) || (armed && j != start);
+        j += 1;
+    }
+    None
+}
+
+/// The script string an evaluator runs: the argument of its `-c` (also inside
+/// a short-option cluster such as `-lc`) for a shell, `su` or `script`, or
+/// everything after `eval`. None when it runs a script file or reads stdin.
+fn script_of(tokens: &[ShellToken<'_>], at: usize, kind: Evaluator) -> Option<String> {
+    match kind {
+        Evaluator::Eval => {
+            let words: Vec<&str> = tokens[at + 1..]
+                .iter()
+                .filter(|tok| !tok.is_redirect)
+                .map(|tok| tok.text.as_str())
+                .collect();
+            (!words.is_empty()).then(|| words.join(" "))
+        }
+        Evaluator::Shell => (at + 1..tokens.len()).find_map(|k| {
+            let flag = tokens[k].text.as_str();
+            let cluster = flag.starts_with('-')
+                && !flag.starts_with("--")
+                && flag.len() > 1
+                && flag[1..].chars().all(char::is_alphabetic)
+                && flag.contains('c');
+            if !(cluster || flag == "--command") {
+                return None;
+            }
+            // `bash -c -- 'script'`: a lone `--` ends the options, the script follows.
+            let next = match tokens.get(k + 1) {
+                Some(tok) if tok.text == "--" => tokens.get(k + 2),
+                other => other,
+            };
+            next.map(|tok| tok.text.clone())
+        }),
+    }
+}
+
+/// Whether one clause carries a `-C` that no located git invocation accounts
+/// for. `in_script` is true for a clause read out of a string an evaluator
+/// runs, where even a located `git -C` is refused: [`sibling_git_clauses`]
+/// resolves the target of a clause it can see, not one inside a string.
+fn clause_has_unresolved_git_c(clause: &str, in_script: bool, depth: usize) -> bool {
+    let tokens = scan_shell_tokens(clause);
+    if locate_git(&tokens).is_some() {
+        return in_script && parse_git_invocation(clause).is_some();
+    }
+    // Unquoted words only: a quoted "git -C" is text being searched for or
+    // printed, not a command.
+    let mut seen_git = false;
+    // A bare `-C` was read after git; the next word says whether it is a
+    // search's context flag (`-C 3`) or git's -C aimed at a directory.
+    let mut bare_c = false;
+    for tok in tokens.iter().filter(|tok| !tok.is_redirect) {
+        if tok.quoted {
+            if bare_c {
+                return true;
+            }
+            continue;
+        }
+        for word in tok.text.split_whitespace() {
+            if std::mem::take(&mut bare_c) {
+                if is_context_count(word) {
+                    continue;
+                }
+                return true;
+            }
+            if seen_git && is_dash_c_text(word) {
+                match word.strip_prefix("-C") {
+                    Some("") => bare_c = true,
+                    Some(rest) if is_context_count(rest) => {}
+                    _ => return true,
+                }
+                continue;
+            }
+            if is_git_text(word) {
+                seen_git = true;
+            }
+        }
+    }
+    if bare_c {
+        return true;
+    }
+    let Some((at, kind)) = locate_evaluator(&tokens) else {
+        return false;
+    };
+    let Some(script) = script_of(&tokens, at, kind) else {
+        return false;
+    };
+    depth >= MAX_SCRIPT_DEPTH
+        || split_shell_clauses(&script)
+            .into_iter()
+            .any(|inner| clause_has_unresolved_git_c(inner, true, depth + 1))
+}
+
+/// A clause with a `-C` that no located git invocation accounts for:
+///
+/// - unquoted `git` then `-C…` where git is not the command (`echo git -C ../x`,
+///   a wrapper not in [`COMMAND_WRAPPERS`]), and
+/// - a script string run by a shell evaluator (`bash -c '…'`, `sh -lc "…"`,
+///   `eval "…"`, also behind a wrapper) that holds a git `-C`, located or not.
+///
+/// Such a `-C` may be aimed at another worktree whose scope was never
+/// consulted, so a bound caller is refused rather than judged against its own
+/// scope. A clause git is located in is left to [`sibling_git_clauses`]. A quoted
+/// string that no evaluator runs (`rg -n "git -C" src`, `echo "git -C <dir>"`), a
+/// `-C` before any git word (`grep -C 3 git f`) and one after git's subcommand
+/// (`git log -C`) are not this case. A digits-only `-C` argument after an
+/// unquoted git word (`rg -n git -C2 src`, `grep -rn git -C 3 src`) is read as a
+/// search context flag, accepting that a git `-C` aimed at a directory named
+/// only with digits, behind an unknown wrapper, is not caught.
+fn unresolved_git_c(command: &str) -> Option<&str> {
+    split_shell_clauses(command)
+        .into_iter()
+        .find(|clause| clause_has_unresolved_git_c(clause, false, 0))
+}
+
+fn unresolved_git_c_verdict(command: &str, clause: &str, task_id: &str) -> PolicyVerdict {
+    let shown: String = clause.trim().chars().take(120).collect();
+    PolicyVerdict {
+        status: PolicyStatus::Blocked,
+        checked: false,
+        target: command.to_string(),
+        rule: GIT_C_UNRESOLVED.to_string(),
+        severity: "hard".to_string(),
+        reason: format!(
+            "`-C` appears in `{shown}` but the git invocation it belongs to could not be \
+             located, so the checkout it points at cannot be judged against its own task scope."
+        ),
+        demoted: String::new(),
+        grant_id: String::new(),
+        granted_by: String::new(),
+        widened: String::new(),
+        degraded: Vec::new(),
+        task_id: task_id.to_string(),
+        detail:
+            "GitPulse refused before asking the harness: run git directly, or as `env git -C …`, \
+                 so the target worktree can be resolved."
+                .to_string(),
+        detail_code: "git_c_unresolved".to_string(),
+    }
 }
 
 pub(crate) fn has_divergent_relative_git_c(cwd: &Path, repo_root: &Path, command: &str) -> bool {
@@ -2199,9 +2509,22 @@ done
         assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
     }
 
+    /// A bound checkout `main`, a bound sibling worktree `wt_b` beside it, and a
+    /// fake sidecar script that denies `unplanned.txt` under TASK-WTB. The
+    /// sidecar logs every request it judged to `requests`. The caller binds the
+    /// script with `sidecar::bind_test_binary`.
     #[cfg(unix)]
-    #[test]
-    fn sibling_git_c_command_checks_sibling_worktree_scope_and_forwards_rewritten_command() {
+    struct SiblingFixture {
+        _main: tempfile::TempDir,
+        _wt_b: tempfile::TempDir,
+        main_path: String,
+        rel_wt_b: String,
+        requests: PathBuf,
+        script: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn sibling_fixture() -> SiblingFixture {
         use std::os::unix::fs::PermissionsExt;
 
         let main = git_repo();
@@ -2235,7 +2558,13 @@ done
             .expect("canonical wt_b")
             .to_string_lossy()
             .into_owned();
-        let rel_wt_b = wt_b.path().file_name().unwrap().to_str().unwrap();
+        let rel_wt_b = wt_b
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let db = crate::tasks::store_path(&main_path);
         std::fs::create_dir_all(db.parent().expect("store parent")).expect("store dir");
@@ -2277,8 +2606,28 @@ done
         .replace("@REQUESTS@", &requests.display().to_string());
         std::fs::write(&script, body).expect("write fake sidecar");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        SiblingFixture {
+            _main: main,
+            _wt_b: wt_b,
+            main_path,
+            rel_wt_b,
+            requests,
+            script,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_git_c_command_checks_sibling_worktree_scope_and_forwards_rewritten_command() {
+        let fixture = sibling_fixture();
+        let (main_path, rel_wt_b, requests) = (
+            fixture.main_path.clone(),
+            fixture.rel_wt_b.clone(),
+            fixture.requests.clone(),
+        );
         let serial = sidecar::test_serial();
-        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
+        let _binary = sidecar::bind_test_binary(&serial, fixture.script.to_string_lossy());
 
         let cmd = format!("git -C ../{rel_wt_b} checkout -- unplanned.txt");
         let judged = check_command_in_scope(Lane::Shared, &main_path, &cmd);
@@ -2309,6 +2658,593 @@ done
                 .any(|l| l.contains("git checkout -- src/sibling.rs") && !l.contains("out.txt")),
             "expected rewritten sibling command without -C or caller redirect, got: {sibling_lines:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_behind_a_wrapper_is_judged_against_the_sibling_it_names() {
+        let fixture = sibling_fixture();
+        let serial = sidecar::test_serial();
+        let _binary = sidecar::bind_test_binary(&serial, fixture.script.to_string_lossy());
+        let rel = &fixture.rel_wt_b;
+        let wrappers = [
+            "env",
+            "env -i",
+            "env FOO=1",
+            "env -u HOME",
+            "FOO=1 env",
+            "/usr/bin/env",
+            "nice -n 5",
+            "nohup",
+            "sudo",
+            "sudo -u root",
+            "exec",
+            "xargs",
+            "timeout 5",
+            "timeout -s KILL 5",
+            "command",
+            "time",
+            "env nice -n 5",
+            "setsid",
+        ];
+        for wrapper in wrappers {
+            for target in [
+                format!("../{rel}"),
+                format!("'../{rel}'"),
+                format!("\"../{rel}\""),
+            ] {
+                let cmd = format!("{wrapper} git -C {target} checkout -- unplanned.txt");
+                let judged = check_command_in_scope(Lane::Shared, &fixture.main_path, &cmd);
+                assert!(
+                    judged.verdict.blocks() && judged.verdict.rule == "scope.unplanned",
+                    "expected the sibling's scope to judge {cmd:?}, got {judged:?}"
+                );
+                assert_eq!(judged.verdict.task_id, "TASK-WTB", "{cmd:?}");
+            }
+        }
+        let logged = std::fs::read_to_string(&fixture.requests).unwrap_or_default();
+        assert!(
+            logged.contains("env git checkout -- unplanned.txt"),
+            "the wrapper stays in the command the sibling is asked about, got: {logged}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dash_c_that_names_no_git_invocation_is_refused_for_a_bound_caller() {
+        let fixture = sibling_fixture();
+        let serial = sidecar::test_serial();
+        let _binary = sidecar::bind_test_binary(&serial, fixture.script.to_string_lossy());
+        let rel = &fixture.rel_wt_b;
+        let unreadable = [
+            format!("bash -c 'git -C ../{rel} checkout -- unplanned.txt'"),
+            format!("echo git -C ../{rel} checkout -- unplanned.txt"),
+            format!("somewrapper git -C ../{rel} checkout -- unplanned.txt"),
+            format!("true && eval \"git -C ../{rel} checkout -- unplanned.txt\""),
+            format!("sh -lc \"git -C ../{rel} checkout -- unplanned.txt\""),
+            format!("env bash -c 'git -C ../{rel} checkout -- unplanned.txt'"),
+            "xargs sh -c 'git -C \"$0\" status'".to_string(),
+            "find . -exec sh -c 'git -C \"$1\" status' _ {} \\;".to_string(),
+            "bash -c \"bash -c 'git -C ../x status'\"".to_string(),
+        ];
+        for cmd in &unreadable {
+            let judged = check_command_in_scope(Lane::Shared, &fixture.main_path, cmd);
+            assert!(judged.bound, "{cmd:?}");
+            assert!(
+                judged.verdict.blocks() && judged.verdict.rule == GIT_C_UNRESOLVED,
+                "expected {cmd:?} refused as an unresolved -C, got {judged:?}"
+            );
+            assert!(!judged.verdict.checked, "GitPulse refused, not the harness");
+            assert!(judged.verdict.reason.contains("-C"), "{judged:?}");
+        }
+
+        // Neighbours that carry a -C but are not git's, or are readable git,
+        // are not caught by the new refusal.
+        for cmd in [
+            "ls -C".to_string(),
+            "grep -C 3 git seed.txt".to_string(),
+            "rg -C2 git seed.txt".to_string(),
+            "git log -C --stat".to_string(),
+            "git status".to_string(),
+            format!("env git -C ../{rel} status"),
+            // Searches for the text "git -C" are routine and must not be refused.
+            "rg -n \"git -C\" src".to_string(),
+            "grep -rn 'git -C' .".to_string(),
+            "rg \"git\" -C 3 src".to_string(),
+            "echo \"use git -C <dir>\"".to_string(),
+            "bash -c 'rg \"git -C\" src'".to_string(),
+            "bash -c 'git status'".to_string(),
+            "bash -c 'git log -C --stat'".to_string(),
+            "bash script.sh".to_string(),
+        ] {
+            let judged = check_command_in_scope(Lane::Shared, &fixture.main_path, &cmd);
+            assert_ne!(judged.verdict.rule, GIT_C_UNRESOLVED, "{cmd:?}: {judged:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unbound_caller_is_not_refused_for_an_unresolved_dash_c() {
+        let main = git_repo();
+        crate::test_support::trust_repo(main.path());
+        let main_path = main
+            .path()
+            .canonicalize()
+            .expect("canonical main")
+            .to_string_lossy()
+            .into_owned();
+        let script = main.path().join("allow-manvi");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  reply "$line" '{"action":"allow","rule":"","severity":"","reason":"allowed","target":"","task_id":"","demoted":"","degraded":[]}'
+done
+"#,
+        )
+        .expect("write fake sidecar");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let serial = sidecar::test_serial();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
+        let judged = check_command_in_scope(
+            Lane::Shared,
+            &main_path,
+            "bash -c 'git -C ../elsewhere status'",
+        );
+        assert!(!judged.bound);
+        assert_ne!(judged.verdict.rule, GIT_C_UNRESOLVED, "{judged:?}");
+        assert!(!judged.verdict.blocks(), "{judged:?}");
+    }
+
+    /// Lane C adversarial coverage: a command that names the sibling worktree
+    /// is "covered" when it is either judged against that sibling's scope
+    /// ([sibling_git_clauses]) or refused as an unresolved -C.
+    #[cfg(unix)]
+    fn lane_c_covered(fixture: &SiblingFixture, template: &str) -> (bool, bool, String) {
+        let command = template.replace("{R}", &fixture.rel_wt_b);
+        let refused = unresolved_git_c(&command).is_some();
+        let judged = !sibling_git_clauses(Path::new(&fixture.main_path), &command).is_empty();
+        (refused, judged, command)
+    }
+
+    #[cfg(unix)]
+    fn lane_c_assert_covered(templates: &[&str]) {
+        let fixture = sibling_fixture();
+        for template in templates {
+            let (refused, judged, command) = lane_c_covered(&fixture, template);
+            assert!(
+                refused || judged,
+                "{command:?} writes into the sibling and is neither judged against it nor refused"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_wrapped_and_odd_spellings_are_judged_or_refused() {
+        lane_c_assert_covered(&[
+            "git -C../{R} checkout -- x",
+            "env -- git -C ../{R} checkout -- x",
+            "command -p git -C ../{R} checkout -- x",
+            "sudo -- git -C ../{R} checkout -- x",
+            "nice -n -5 git -C ../{R} checkout -- x",
+            "/usr/bin/env git -C ../{R} checkout -- x",
+            "\\git -C ../{R} checkout -- x",
+            "\"git\" -C ../{R} checkout -- x",
+            "g\\it -C ../{R} checkout -- x",
+            "strace git -C ../{R} checkout -- x",
+            "bash -xc 'git -C ../{R} checkout -- x'",
+            "bash --norc -c 'git -C ../{R} checkout -- x'",
+            "true; env git -C ../{R} x",
+            "a && env git -C ../{R} x",
+            "a || env git -C ../{R} x",
+            "(env git -C ../{R} x)",
+            "{ env git -C ../{R} x; }",
+            "true\nenv git -C ../{R} x",
+            "cat f | env git -C ../{R} x",
+            "bash -c \"bash -c \\\"bash -c 'bash -c \\\\\\\"bash -c \\\\\\\\\\\\\\\"git -C ../{R} x\\\\\\\\\\\\\\\"\\\\\\\"'\\\"\"",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_a_lookalike_git_is_not_git_and_nothing_panics() {
+        let fixture = sibling_fixture();
+        let (_, judged, command) = lane_c_covered(&fixture, "g\u{456}t -C ../{R} checkout -- x");
+        assert!(!judged, "{command:?}");
+    }
+
+    #[test]
+    fn lane_c_routine_read_only_commands_are_not_refused() {
+        for command in [
+            "rg -n \"git -C\" src",
+            "git log -C",
+            "git grep -n \"git -C\"",
+            "bash -c 'rg \"git -C\" src'",
+            "grep -C3 git f",
+            "git -C . status",
+            "env git status",
+            "make -C sub git",
+            "make -C sub && git status",
+            "tar -C dir -xf x.tar; git status",
+            "bash -c 'echo hi'",
+            "echo $(git log -C)",
+        ] {
+            assert!(unresolved_git_c(command).is_none(), "{command:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_git_named_wrapper_argument_does_not_hide_the_real_git() {
+        lane_c_assert_covered(&[
+            "sudo -u git git -C ../{R} checkout -- x",
+            "env -u git git -C ../{R} checkout -- x",
+        ]);
+    }
+
+    /// Accepted gap, owner decision 2026-11-25 (card ft-42081f16, criterion
+    /// 64(a)): a quoted `"git"` is text being searched for, so `rg "git" -C 3 src`
+    /// is allowed. The cost is that `strace "git" -C ../x checkout`, a quoted git
+    /// behind a wrapper not in COMMAND_WRAPPERS, is not counted either.
+    #[test]
+    fn lane_c_quoted_git_behind_an_unknown_wrapper_is_an_accepted_gap() {
+        for command in ["rg \"git\" -C 3 src", "rg -n \"git\" -C3 src"] {
+            assert!(unresolved_git_c(command).is_none(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn lane_c_git_dash_c_with_a_directory_argument_stays_refused() {
+        for command in [
+            "strace git -C ../wt-b checkout -- x",
+            "strace git -C2x checkout",
+            "strace git -C",
+            "strace git -C 3x checkout",
+            "bash -c 'strace git -C ../wt-b checkout -- x'",
+            "echo git -C ../x",
+        ] {
+            assert!(unresolved_git_c(command).is_some(), "{command:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pre-existing on main: lane C attack: an expanding command word ($(which git), GIT-default expansion, $GIT) followed by -C is neither located as git nor refused (pre-existing: main never judged it either)"]
+    fn lane_c_expanding_command_word_with_dash_c_is_refused() {
+        lane_c_assert_covered(&[
+            "$(which git) -C ../{R} checkout -- x",
+            "${GIT:-git} -C ../{R} checkout -- x",
+            "$GIT -C ../{R} checkout -- x",
+            "\"$GIT\" -C ../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pre-existing on main: lane C attack: git glued to a subshell or substitution opener ((git -C, $(git -C, x=$(git -C, backticks) is not in command position for either reader (pre-existing: main never judged it either)"]
+    fn lane_c_git_glued_to_a_subshell_or_substitution_is_refused() {
+        lane_c_assert_covered(&[
+            "(git -C ../{R} checkout -- x)",
+            "$(git -C ../{R} checkout -- x)",
+            "x=$(git -C ../{R} checkout -- x)",
+            "echo `git -C ../{R} checkout -- x`",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_double_dash_between_dash_c_and_the_script_is_read() {
+        lane_c_assert_covered(&["bash -c -- 'git -C ../{R} checkout -- x'"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pre-existing on main: lane C attack: -C naming a subdirectory of the sibling worktree does not resolve to a registered worktree root, so it is neither judged against the sibling nor refused (pre-existing: same resolution on main)"]
+    fn lane_c_dash_c_into_a_sibling_subdirectory_is_judged_or_refused() {
+        lane_c_assert_covered(&[
+            "git -C ../{R}/src checkout -- x",
+            "env git -C ../{R}/src checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pre-existing on main: lane C attack: a located git whose -C value expands (tilde, variable, glob) is skipped by sibling_git_clauses and is not refused (pre-existing: same on main)"]
+    fn lane_c_dash_c_value_that_expands_is_refused() {
+        lane_c_assert_covered(&[
+            "git -C ~/{R} checkout -- x",
+            "git -C \"$WT\" checkout -- x",
+            "git -C ../wt-* checkout -- x",
+            "env git -C $(pwd)/../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pre-existing on main: lane C attack: --git-dir/--work-tree, GIT_DIR/GIT_WORK_TREE and -c core.worktree aim git at the sibling with no -C; parse_git_invocation skips the values and nothing judges them (pre-existing: main skips them identically)"]
+    fn lane_c_git_dir_and_work_tree_spellings_are_judged_or_refused() {
+        lane_c_assert_covered(&[
+            "git --git-dir=../{R}/.git --work-tree=../{R} checkout -- x",
+            "git --work-tree=../{R} checkout -- x",
+            "GIT_DIR=../{R}/.git GIT_WORK_TREE=../{R} git checkout -- x",
+            "git -c core.worktree=../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pre-existing on main: lane C attack: a script the evaluator reads from stdin or builds by expansion (here-string, pipe into sh, bash -c with a command substitution) is not inspectable and is not refused (inherent; main never read scripts)"]
+    fn lane_c_uninspectable_scripts_are_refused() {
+        lane_c_assert_covered(&[
+            "bash <<<'git -C ../{R} x'",
+            "echo 'git -C ../{R} x' | sh",
+            "sh -c \"$(printf 'git -C ../{R} x')\"",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pre-existing on main: lane C attack: changing directory (cd, env -C, bash -c 'cd … && git') moves git into the sibling with no -C; residual gap, identical on main"]
+    fn lane_c_directory_change_into_a_sibling_is_refused() {
+        lane_c_assert_covered(&[
+            "bash -c 'cd ../{R} && git checkout -- x'",
+            "cd ../{R} && git checkout -- x",
+            "env -C ../{R} git checkout -- x",
+        ]);
+    }
+
+    #[test]
+    fn lane_c_grep_with_unquoted_git_pattern_and_context_flag_is_not_refused() {
+        for command in [
+            "grep -n git -C3 f",
+            "grep -rn git -C 3 src",
+            "rg -n git -C2 src",
+            "rg -n git -C 2 src",
+            "bash -c 'rg -n git -C2 src'",
+        ] {
+            assert!(unresolved_git_c(command).is_none(), "{command:?}");
+        }
+    }
+
+    /// Deterministic fuzz: shell-ish strings built from the attack tokens,
+    /// quotes and unicode must never panic any reader, and the readers
+    /// terminate (the loops are bounded by token count and MAX_SCRIPT_DEPTH).
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_fuzz_readers_never_panic() {
+        let fixture = sibling_fixture();
+        let main = Path::new(&fixture.main_path);
+        let tokens: Vec<String> = [
+            "git",
+            "-C",
+            "-C../x",
+            "../{R}",
+            "env",
+            "sudo",
+            "nice",
+            "-n",
+            "5",
+            "--",
+            "bash",
+            "-c",
+            "-lc",
+            "sh",
+            "eval",
+            "xargs",
+            "find",
+            "-exec",
+            "checkout",
+            "x",
+            ";",
+            "&&",
+            "||",
+            "|",
+            "(",
+            ")",
+            "{",
+            "}",
+            "'",
+            "\"",
+            "\\",
+            "$",
+            "$(",
+            "`",
+            "$'",
+            "<<<",
+            ">",
+            "2>&1",
+            "&",
+            "\n",
+            " ",
+            "g\u{456}t",
+            "日本",
+            "é",
+            "git -C ../{R} x",
+            "'git -C ../{R} x'",
+            "\"bash -c 'git -C y'\"",
+            "VAR=1",
+            "--git-dir=../{R}",
+            "--work-tree",
+            "~",
+            "*",
+            "-c",
+            "core.worktree=1",
+            "\u{0}",
+            "\r",
+        ]
+        .iter()
+        .map(|t| t.replace("{R}", &fixture.rel_wt_b))
+        .collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let started = std::time::Instant::now();
+        for round in 0..600 {
+            let len = 1 + (next() % 14) as usize;
+            let mut command = String::new();
+            for _ in 0..len {
+                command.push_str(&tokens[(next() % tokens.len() as u64) as usize]);
+                if next() % 3 != 0 {
+                    command.push(' ');
+                }
+            }
+            let _ = unresolved_git_c(&command);
+            let _ = scan_shell_tokens(&command).len();
+            if round % 8 == 0 {
+                let _ = sibling_git_clauses(main, &command);
+                let _ = has_divergent_relative_git_c(main, main, &command);
+            }
+        }
+        // A very long single clause and a deep nest stay finite.
+        let long = format!("env {}git -C x", "nice ".repeat(5_000));
+        let _ = unresolved_git_c(&long);
+        let _ = sibling_git_clauses(main, &long);
+        let mut nested = "git -C ../x y".to_string();
+        for _ in 0..6 {
+            nested = format!("bash -c '{}'", nested.replace('\'', "'\\''"));
+        }
+        assert!(
+            unresolved_git_c(&nested).is_some(),
+            "a deep nest is refused, not passed"
+        );
+        eprintln!("lane C fuzz finished in {:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod git_invocation_tests {
+    use super::*;
+
+    fn c_values(clause: &str) -> Option<Vec<String>> {
+        parse_git_invocation(clause)
+            .map(|inv| inv.c_args.into_iter().map(|(_, _, val, _)| val).collect())
+    }
+
+    fn some(values: &[&str]) -> Option<Vec<String>> {
+        Some(values.iter().map(|v| v.to_string()).collect())
+    }
+
+    #[test]
+    fn git_is_found_behind_each_wrapper_and_its_options() {
+        for prefix in [
+            "",
+            "env",
+            "env -i",
+            "env -u HOME",
+            "env FOO=1 BAR=2",
+            "/usr/bin/env",
+            "nice -n 5",
+            "nice -n5",
+            "ionice -c 3",
+            "nohup",
+            "setsid",
+            "sudo",
+            "sudo -u root",
+            "doas",
+            "exec",
+            "xargs",
+            "xargs -n 1",
+            "timeout 5",
+            "timeout -s KILL 5",
+            "stdbuf -oL",
+            "command",
+            "builtin",
+            "time",
+            "FOO=1 env",
+            "env nice -n 5 timeout 9",
+            "if",
+            "! env",
+        ] {
+            let clause = format!("{prefix} git -C ../wt-b checkout -- x");
+            assert_eq!(c_values(&clause), some(&["../wt-b"]), "{clause:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_and_unicode_paths_survive_behind_a_wrapper() {
+        assert_eq!(
+            c_values("env git -C 'wt é/日本' checkout"),
+            some(&["wt é/日本"])
+        );
+        assert_eq!(c_values("env git -C \"wt-ü\" status"), some(&["wt-ü"]));
+        assert_eq!(c_values("sudo git -C../wt-b status"), some(&["../wt-b"]));
+        assert_eq!(
+            c_values("env git -C a -C b status"),
+            some(&["a", "b"]),
+            "chained -C stays in order"
+        );
+    }
+
+    #[test]
+    fn a_word_git_that_is_not_in_command_position_is_not_an_invocation() {
+        for clause in [
+            "echo git -C ../wt-b",
+            "grep git -C 3 file",
+            "somewrapper git -C ../wt-b status",
+            "bash -c 'git -C ../wt-b status'",
+            "ls git",
+            "env",
+            "env -i",
+            "env git",
+            "git status",
+            "git log -C --stat",
+            "env $VAR -C x",
+        ] {
+            assert_eq!(c_values(clause), None, "{clause:?}");
+        }
+        // An expanding git word is never trusted to be git.
+        assert_eq!(c_values("env $G -C ../wt-b status"), None);
+    }
+
+    #[test]
+    fn the_unresolved_dash_c_reader_names_only_clauses_git_cannot_be_found_in() {
+        for (command, refused) in [
+            ("echo git -C ../x", true),
+            ("bash -c 'git -C ../x status'", true),
+            ("ls && somewrapper git -C ../x", true),
+            ("sh -lc \"git -C ../x y\"", true),
+            ("sh -ec 'git -C ../x y'", true),
+            ("/bin/bash.exe -c 'git -C ../x y'", true),
+            ("env bash -c 'git -C ../x y'", true),
+            ("xargs sh -c 'git -C \"$0\" status'", true),
+            ("eval \"git -C ../x y\"", true),
+            ("su root -c 'git -C ../x y'", true),
+            ("script -q f -c 'git -C ../x y'", true),
+            ("bash -c 'x; git -C ../x y'", true),
+            ("bash -c \"sh -c 'git -C ../x y'\"", true),
+            ("rg -n \"git -C\" src", false),
+            ("grep -rn 'git -C' .", false),
+            ("rg \"git\" -C 3 src", false),
+            ("echo \"use git -C <dir>\"", false),
+            ("echo sh -c 'git -C x'", false),
+            ("bash -c 'git status'", false),
+            ("bash -c 'rg \"git -C\" src'", false),
+            ("bash -c \"$CMD\"", false),
+            ("bash script.sh", false),
+            ("env git -C ../x status", false),
+            ("git -C ../x status", false),
+            ("git log -C", false),
+            ("grep -C 3 git f", false),
+            ("ls -C", false),
+            ("echo -C git", false),
+            ("", false),
+        ] {
+            assert_eq!(unresolved_git_c(command).is_some(), refused, "{command:?}");
+        }
     }
 }
 

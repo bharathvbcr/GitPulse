@@ -394,6 +394,9 @@ pub struct CollisionRisk {
     /// True when `file_claims` holds only the newest rows up to its cap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claims_truncated: bool,
+    /// Worktrees whose uncommitted-path scan stopped at [`worktree::MAX_CHANGED_PATHS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncated_worktrees: Vec<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -648,6 +651,7 @@ fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
         claims_error: String::new(),
         claims_total: 0,
         claims_truncated: false,
+        truncated_worktrees: Vec::new(),
     }
 }
 
@@ -2145,12 +2149,16 @@ fn collision_from_list_reading(
     scope: CollisionScope<'_>,
 ) -> CollisionRisk {
     let shared = shared_paths(live);
-    // A worktree that two sessions share is scanned ahead of the cap: it is
-    // the one place a collision is already known to be possible.
-    let (first, rest): (Vec<&WorktreeInfo>, Vec<&WorktreeInfo>) = list
-        .iter()
-        .filter(|w| !w.is_bare)
-        .partition(|w| shared.contains(w.path.as_str()));
+    // A worktree that two sessions share (or the caller's target worktree) is
+    // scanned ahead of the cap: it is the one place a collision is already
+    // known to be possible, or the target whose clean status isolates it.
+    let (first, rest): (Vec<&WorktreeInfo>, Vec<&WorktreeInfo>) =
+        list.iter().filter(|w| !w.is_bare).partition(|w| {
+            shared.contains(w.path.as_str())
+                || scope
+                    .involving
+                    .is_some_and(|target| same_path(&w.path, target))
+        });
 
     type Read = PathsRead;
     let mut scans: Vec<(&WorktreeInfo, Option<Read>)> = Vec::new();
@@ -2196,12 +2204,25 @@ fn collision_from_list_reading(
     let mut scanned = 0u32;
     let mut failed = 0u32;
     let mut paths_truncated = false;
+    let mut truncated_worktrees: Vec<String> = Vec::new();
+    let mut target_clean_untruncated = false;
     let mut shared_scans: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
     for (wt, result) in scans {
         match result.unwrap_or_else(|| Err("the worktree was not read".to_string().into())) {
             Ok((paths, truncated)) => {
                 scanned += 1;
                 paths_truncated |= truncated;
+                if truncated {
+                    truncated_worktrees.push(wt.path.clone());
+                }
+                if scope
+                    .involving
+                    .is_some_and(|target| same_path(&wt.path, target))
+                    && !truncated
+                    && paths.is_empty()
+                {
+                    target_clean_untruncated = true;
+                }
                 if shared.contains(wt.path.as_str()) {
                     shared_scans.insert(wt.path.as_str(), (paths.clone(), truncated));
                 }
@@ -2252,10 +2273,12 @@ fn collision_from_list_reading(
         })
         .collect();
     items.sort_by(|a, b| a.path.cmp(&b.path));
+    truncated_worktrees.sort();
+    truncated_worktrees.dedup();
     // The focus row is not an overlap unless a second worktree holds it.
     let overlapping_files = items.iter().filter(|item| item.worktrees.len() > 1).count() as u32;
-    let truncated =
-        items.len() > MAX_COLLISION_ITEMS || paths_truncated || unscanned > 0 || failed > 0;
+    let truncated = !target_clean_untruncated
+        && (items.len() > MAX_COLLISION_ITEMS || paths_truncated || unscanned > 0 || failed > 0);
     if items.len() > MAX_COLLISION_ITEMS {
         // The row the caller asked about outranks the alphabet: moved to the
         // front, it survives the cut however many paths sort before it.
@@ -2332,6 +2355,7 @@ fn collision_from_list_reading(
         claims_error: String::new(),
         claims_total: 0,
         claims_truncated: false,
+        truncated_worktrees,
     }
 }
 
@@ -2475,7 +2499,7 @@ pub(crate) const MAX_RETURNED_CLAIMS: usize = 256;
 /// says so in `claims_truncated` and `claims_total`.
 fn attach_file_claims(risk: &mut CollisionRisk, repo_path: &str, only: Option<&str>) {
     let now = claims::now_ms();
-    match claims::read_for_worktree(Path::new(repo_path), now) {
+    match claims::read_unified(Path::new(repo_path), now) {
         Ok(read) => {
             if let Some(degraded) = read.degraded() {
                 risk.claims_error = degraded;
@@ -6703,6 +6727,51 @@ mod tests {
             "{:?}",
             next.collisions
         );
+    }
+
+    #[test]
+    fn clean_target_collisions_involving_reports_not_truncated_and_names_truncated_worktree() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(1);
+        let huge = &linked[0];
+        for i in 0..(worktree::MAX_CHANGED_PATHS + 10) {
+            fs::write(huge.join(format!("untracked_{i:04}.txt")), "x").unwrap();
+        }
+        let repo_str = main.path().to_str().unwrap();
+        let huge_canon = crate::engine::process::canonicalize_plain(huge).unwrap();
+
+        // Repo-wide scan is honestly truncated and names the truncated worktree.
+        let wide = collision_risk(repo_str);
+        assert!(wide.truncated, "{wide:?}");
+        assert!(
+            wide.truncated_worktrees
+                .iter()
+                .any(|w| same_path(w, &huge_canon)),
+            "truncated_worktrees must name huge worktree: {:?}",
+            wide.truncated_worktrees
+        );
+
+        // Clean target `change_context` -> `collisions_involving` is NOT poisoned by `huge`.
+        let ctx = change_context(repo_str, Some(repo_str));
+        assert!(ctx.collisions.ok, "{:?}", ctx.collisions);
+        assert!(
+            !ctx.collisions.truncated,
+            "clean target must report truncated: false even when another worktree is truncated: {:?}",
+            ctx.collisions
+        );
+        assert_eq!(ctx.collisions.overlapping_files, 0);
+        assert!(
+            ctx.collisions
+                .truncated_worktrees
+                .iter()
+                .any(|w| same_path(w, &huge_canon)),
+            "truncated_worktrees must still name huge worktree: {:?}",
+            ctx.collisions.truncated_worktrees
+        );
+
+        // Dirty target fails closed with `truncated: true` because `huge`'s truncated tail could overlap it.
+        fs::write(main.path().join("dirty.txt"), "y").unwrap();
+        let dirty_ctx = change_context(repo_str, Some(repo_str));
+        assert!(dirty_ctx.collisions.truncated, "{:?}", dirty_ctx.collisions);
     }
 }
 

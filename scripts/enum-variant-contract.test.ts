@@ -68,6 +68,50 @@ const NO_TS_MIRROR = new Map<string, string>([
     "`gitpulse_landed` is an MCP read tool: its `reason` code reaches agents over MCP and has no frontend consumer",
   ],
   [
+    "UserPresence",
+    "the desktop presence probe's answer, passed between Rust modules and over the local approval socket; no IPC command carries it and the frontend never reads it",
+  ],
+  [
+    "ResolveStatus",
+    "the outcome of resolving a remote approval, returned to the control-plane relay and the hook socket; no IPC command carries it and the frontend never branches on it",
+  ],
+  [
+    "HookBrokerReply",
+    "the reply on the local approval-broker socket to the `permission-bridge` hook process (a separate binary); it never crosses the Tauri IPC boundary",
+  ],
+  [
+    "ControlPlaneOwnerMode",
+    "written into `control-plane.lock` for the next lock holder to read; the frontend never sees the owner record",
+  ],
+  [
+    "CodexApprovalPolicy",
+    "the host-configured policy `wayloded` hands to `codex app-server` over JSON-RPC stdio; no IPC command carries it",
+  ],
+  [
+    "CodexSandboxMode",
+    "the host-configured sandbox `wayloded` hands to `codex app-server` over JSON-RPC stdio; no IPC command carries it",
+  ],
+  [
+    "RemoteApprovalPolicy",
+    "read from `remote-control.json` by `wayloded` and the approval path; no IPC command carries it and the frontend never branches on it",
+  ],
+  [
+    "KeychainStatus",
+    "internally tagged enum, not a unit enum; reported by the remote-control config code so `wayloded --relay` never hangs on a locked Keychain; no IPC command carries it and the frontend never reads it",
+  ],
+  [
+    "PtyGateDenial",
+    "the refusal reason of the remote PTY gate (remote/pty_gate.rs), meant for the relay peer; no production caller yet, no IPC command carries it and no frontend reads it",
+  ],
+  [
+    "RelayWireMessage",
+    "untagged enum, not a unit enum; the relay tunnel's wire message, whose parts are mirrored for the mobile app in packages/waylode-core/src/protocol/types.ts, not for the desktop frontend",
+  ],
+  [
+    "RemoteApprovalState",
+    "the remote-approval state persisted to the remote-approval.state file that waylode-hook and the approval broker read (remote/tunnel.rs); no IPC command carries it and no frontend reads it",
+  ],
+  [
     "LandedAtSource",
     "`gitpulse_landed` is an MCP read tool: its `landed_at_source` reaches agents over MCP and has no frontend consumer",
   ],

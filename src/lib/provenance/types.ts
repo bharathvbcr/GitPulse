@@ -16,6 +16,7 @@ export interface VerificationNote {
   checked_by: string;
   task_id: string | null;
   details: string | null;
+  tree_oid?: string;
 }
 
 /** One agent session episode, attached to the commit it produced. */

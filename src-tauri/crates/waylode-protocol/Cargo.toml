@@ -1,0 +1,27 @@
+[package]
+name = "waylode-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Mobile-safe shared protocol, Noise IK E2EE tunnel, P-256 approval verification, and canonicalization crate for GitPulse"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "waylode_protocol"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+base64 = "0.23"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
+getrandom = "0.4"
+hkdf = "0.13"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-curve25519", "use-sha2", "use-getrandom", "std"] }
+thiserror = "2"
+x25519-dalek = { version = "3", default-features = false, features = ["zeroize"] }
+zeroize = { version = "1", features = ["derive"] }

@@ -10,7 +10,6 @@
 //! 4. Restoration from those backups only, verified against the backed-up commits.
 
 use crate::ipc_error::CommandError;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -23,7 +22,7 @@ use crate::engine::git_writer::{
     checked_out_branches, is_full_oid, repo_mutation_lock, validate_oid, validate_ref_name,
     BranchDeleteJournal,
 };
-use crate::engine::object_quarantine::{merge_tree_candidate, merge_tree_resolved, MergeCandidate};
+use crate::engine::object_quarantine::{merge_tree_candidate, MergeCandidate, ObjectQuarantine};
 use crate::engine::process::canonicalize_plain;
 use crate::ledger::Outcome;
 
@@ -644,25 +643,40 @@ pub(crate) fn tree_merge_checks(
 
     let deadline = Instant::now() + TREE_CHECKS_DEADLINE;
     let over_budget = format!("the limit of {MAX_TREE_CHECKS} tree checks per scan was reached");
+    let deadline_msg = format!(
+        "the {}s tree-check deadline was reached",
+        TREE_CHECKS_DEADLINE.as_secs()
+    );
+    let any_selected = selected.iter().any(|&s| s);
+    let mut stream = if any_selected {
+        Some(ObjectQuarantine::open_stream(repo, deadline))
+    } else {
+        None
+    };
     let verdicts: Vec<TreeMerge> = branches
-        .par_iter()
+        .iter()
         .enumerate()
         .map(|(at, (name, tip))| {
             if !selected[at] {
                 return TreeMerge::Unknown(over_budget.clone());
             }
             if Instant::now() >= deadline {
-                return TreeMerge::Unknown(format!(
-                    "the {}s tree-check deadline was reached",
-                    TREE_CHECKS_DEADLINE.as_secs()
-                ));
+                return TreeMerge::Unknown(deadline_msg.clone());
             }
-            // The tip is already a full object name, so the merge runs
-            // without a resolve per branch; a short one goes by name.
-            let candidate = if is_full_oid(tip) {
-                merge_tree_resolved(repo, base_oid, tip, deadline)
-            } else {
-                merge_tree_candidate(repo, base_oid, name, deadline)
+            let candidate = match stream.as_mut() {
+                Some(Ok(stream)) => {
+                    if is_full_oid(tip) {
+                        stream.merge_candidate(base_oid, tip)
+                    } else {
+                        stream.merge_candidate_or_resolve(base_oid, name)
+                    }
+                }
+                Some(Err(err)) => MergeCandidate::Unknown {
+                    reason: err.to_string(),
+                },
+                None => MergeCandidate::Unknown {
+                    reason: over_budget.clone(),
+                },
             };
             TreeMerge::of(candidate, &default_tree)
         })
@@ -2340,6 +2354,8 @@ mod tests {
         let (dir, repo) = seeded_repo();
         git_in(&repo, &["branch", "develop"]);
         for (remote, branch) in [("origin", "main"), ("upstream", "develop")] {
+            // checkout.defaultRemote only counts when it names a configured
+            // remote, so each one needs a remote.<name>.url, not just refs.
             git_in(
                 &repo,
                 &[
@@ -2487,7 +2503,7 @@ mod tests {
         // protects the default branch from the delete. Previously one,
         // shared through the memo; the protection no longer trusts it.
         assert_eq!(default_lookups, 2, "default-branch lookups: {used:#?}");
-        assert_eq!(merge_trees, BRANCHES, "merge-tree per target: {used:#?}");
+        assert_eq!(merge_trees, 1, "single merge-tree stream: {used:#?}");
         assert_eq!(deletes, BRANCHES);
         // 16 plus the two `git config` reads that tell a partial clone once
         // for the whole scan (a merge there would make git fetch blobs), plus
@@ -2495,9 +2511,51 @@ mod tests {
         // `gitpulse.lockedBranch` + `for-each-ref`) once per scan and clean.
         const CONSTANT: usize = 22;
         assert!(
-            used.len() <= 2 * BRANCHES + CONSTANT,
+            used.len() <= BRANCHES + CONSTANT,
             "{} spawns for {BRANCHES} branches: {used:#?}",
             used.len()
+        );
+    }
+
+    #[test]
+    fn twenty_branch_tree_merge_checks_uses_single_stream() {
+        const BRANCHES: usize = 20;
+        let (_dir, repo) = seeded_repo();
+        let root = rev(&repo, "HEAD").unwrap();
+        let tree = rev(&repo, "HEAD^{tree}").unwrap();
+        let mut owned = Vec::new();
+        for i in 0..BRANCHES {
+            let name = format!("feat/s{i:02}");
+            let tip = git_text(&repo, &["commit-tree", &tree, "-p", &root, "-m", &name])
+                .unwrap()
+                .trim()
+                .to_string();
+            git_in(&repo, &["update-ref", &format!("refs/heads/{name}"), &tip]);
+            owned.push((name, tip));
+        }
+        let tips: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(name, tip)| (name.as_str(), tip.as_str()))
+            .collect();
+
+        let spawned = || crate::engine::process::spawn_log::spawns_in(&repo);
+        let before = spawned().len();
+        let checks = tree_merge_checks(&repo, &root, &tips);
+        let used: Vec<Vec<String>> = spawned()[before..].to_vec();
+        let merge_trees = used
+            .iter()
+            .filter(|a| a.iter().any(|x| x == "merge-tree"))
+            .count();
+
+        assert_eq!(checks.unchecked, 0, "{:?}", checks.reason);
+        assert_eq!(checks.verdicts.len(), BRANCHES);
+        assert!(checks
+            .verdicts
+            .iter()
+            .all(|v| matches!(v, TreeMerge::Merged)));
+        assert_eq!(
+            merge_trees, 1,
+            "expected 1 merge-tree stream spawn for 20 branches: {used:#?}"
         );
     }
 

@@ -644,6 +644,45 @@ mod tests {
         assert_eq!(for_launch("agy"), HookInjection::NotApplicable);
     }
 
+    #[test]
+    /// The bridge can answer `allow`, and its client trusts whatever answers on
+    /// approval-broker.sock, which no release binds: any same-user process could
+    /// bind it and approve every prompt. Neither the manifest nor an injected
+    /// launch carries it until the broker authenticates itself to the hook.
+    fn permission_request_carries_async_notify_and_no_unauthenticated_bridge() {
+        let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+        let injected =
+            settings_hooks(Path::new("/Applications/Git Pulse.app/gitpulse-hook")).unwrap();
+        for (label, event_val) in [
+            ("manifest", &manifest["hooks"]["PermissionRequest"]),
+            ("injected", &injected["PermissionRequest"]),
+        ] {
+            let handlers: Vec<&Value> = event_val
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .collect();
+            let notify = handlers
+                .iter()
+                .find(|h| {
+                    h["command"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("notify permission_request")
+                })
+                .unwrap_or_else(|| panic!("{label}: missing notify permission_request"));
+            assert_eq!(notify["async"], json!(true), "{label}");
+            assert!(
+                !handlers.iter().any(|h| h["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" permission-bridge")),
+                "{label}: permission-bridge is registered, but the broker is not authenticated"
+            );
+        }
+    }
+
     /// Adversary: base 0ea2cc37's Unix renderer, reproduced literally, equals
     /// the new one for awkward paths.
     #[test]

@@ -43,6 +43,30 @@
       "name": "adopt_with",
       "file": "src-tauri/src/ledger/anchor.rs",
       "reason": "injects the approval and the path prober of a ledger adoption. Per its doc comment the re-anchor record and the audit row are written in one transaction, and a ledger that moved during the probe retries (STALE_PROBE): a race, not a kill between two durable steps. Inferred from the doc comment, not from a test."
+    },
+    {
+      "kind": "env",
+      "name": "GITPULSE_TEST_MUTATION_REPO",
+      "file": "src-tauri/src/engine/git_writer.rs",
+      "reason": "test-only child-process selector for repo_mutation_lock_hold_child and repo_mutation_lock_race_child to verify cross-process mutation lock serialization, not a crash-window fault seam"
+    },
+    {
+      "kind": "env",
+      "name": "GITPULSE_TEST_MUTATION_READY",
+      "file": "src-tauri/src/engine/git_writer.rs",
+      "reason": "test-only readiness marker path for repo_mutation_lock_hold_child to signal lock acquisition to the parent test, not a crash-window fault seam"
+    },
+    {
+      "kind": "env",
+      "name": "GITPULSE_TEST_MUTATION_RELEASE",
+      "file": "src-tauri/src/engine/git_writer.rs",
+      "reason": "test-only release marker path for repo_mutation_lock_hold_child to unblock child exit after testing lock contention, not a crash-window fault seam"
+    },
+    {
+      "kind": "env",
+      "name": "GITPULSE_TEST_MUTATION_TAG",
+      "file": "src-tauri/src/engine/git_writer.rs",
+      "reason": "test-only worker label for repo_mutation_lock_race_child to name distinct files committed concurrently under the mutation lock, not a crash-window fault seam"
     }
   ],
   "rows": [

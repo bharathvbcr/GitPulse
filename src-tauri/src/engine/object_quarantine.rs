@@ -29,13 +29,16 @@
 //! with this value.
 
 use crate::engine::git_cli::{
-    git_captured, git_captured_quarantined, git_text_with_timeout, resolve_git_common_dir,
+    git_captured, git_captured_quarantined, git_spawn_quarantined_streaming, git_text_with_timeout,
+    resolve_git_common_dir, without_lazy_fetch,
 };
-use crate::engine::process::{is_run_timeout, BoundedRun, DEFAULT_TIMEOUT};
+use crate::engine::process::{is_run_timeout, BoundedRun, StreamingChild, DEFAULT_TIMEOUT};
 use crate::ipc_error::CommandError;
 use std::ffi::OsString;
 use std::fmt;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,6 +88,20 @@ pub enum MergeOutcome {
 /// Most conflicted paths one outcome carries. The count past it is kept in
 /// `paths_total`, so a cut list is never read as the whole list.
 pub const MAX_CONFLICT_PATHS: usize = 200;
+
+/// Most times one [`MergeTreeStream`] respawns after an unexpected child exit
+/// (such as an unrelated-history `rc=128` or missing-OID `rc=1`) within one batch.
+pub const MAX_STREAM_RESPAWNS: usize = 4;
+
+/// Maximum path count accepted for a single conflict-message group in
+/// `git merge-tree --messages` output (closes negative/overflow `atoi` bugs).
+pub const MAX_MESSAGE_PATH_COUNT: usize = 1024;
+
+/// Upper bound on bytes buffered for a single NUL-NUL stream record.
+const MAX_STREAM_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Upper bound on stderr bytes read from an exited stream child.
+const MAX_STREAM_STDERR_BYTES: usize = 64 * 1024;
 
 /// What a merge of two commits would do, as the conflict engine reports it:
 /// three states, and the third is not a flavour of the first.
@@ -227,6 +244,507 @@ impl ObjectQuarantine {
             &String::from_utf8_lossy(&run.stderr),
         )
     }
+
+    /// Opens a batch-scoped `git merge-tree --stdin --write-tree --name-only --no-messages -z`
+    /// stream inside a fresh object quarantine, holding one `SpawnPermit` and
+    /// one rate token for the batch.
+    ///
+    /// Never kept globally idle across batches: dropping the returned
+    /// [`MergeTreeStream`] kills and reaps any live child, releases the permit,
+    /// and deletes the quarantine directory.
+    pub fn open_stream(
+        repo: &Path,
+        batch_deadline: Instant,
+    ) -> Result<MergeTreeStream, QuarantineError> {
+        if Instant::now() >= batch_deadline {
+            return Err(QuarantineError::DeadlineExceeded);
+        }
+        let quarantine = Self::new(repo)?;
+        let live =
+            without_lazy_fetch(|| spawn_merge_tree_stream(repo, &quarantine, batch_deadline))?;
+        Ok(MergeTreeStream {
+            repo: repo.to_path_buf(),
+            quarantine,
+            batch_deadline,
+            live: Some(live),
+            respawns: 0,
+            spawns: 1,
+            single_shot_fallback: false,
+        })
+    }
+}
+
+struct LiveStream {
+    child: StreamingChild,
+    stdin: Option<BufWriter<ChildStdin>>,
+    stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+}
+
+enum StreamReadError {
+    Deadline,
+    UnexpectedEof(String),
+    Malformed(String),
+}
+
+/// Batch-scoped streaming `git merge-tree --stdin` session inside one
+/// [`ObjectQuarantine`].
+pub struct MergeTreeStream {
+    repo: PathBuf,
+    quarantine: ObjectQuarantine,
+    batch_deadline: Instant,
+    live: Option<LiveStream>,
+    respawns: usize,
+    spawns: usize,
+    single_shot_fallback: bool,
+}
+
+impl MergeTreeStream {
+    /// Path of the underlying scratch quarantine object directory.
+    #[cfg(test)]
+    pub(crate) fn quarantine_path(&self) -> &Path {
+        self.quarantine.path()
+    }
+
+    /// Number of child respawns performed after unexpected stream exits.
+    #[cfg(test)]
+    pub(crate) fn respawn_count(&self) -> usize {
+        self.respawns
+    }
+
+    /// Total number of `merge-tree --stdin` processes spawned in this batch.
+    #[cfg(test)]
+    pub(crate) fn spawn_count(&self) -> usize {
+        self.spawns
+    }
+
+    /// Merges two full-OID commits using the batch stream (or single-shot fallback
+    /// if Git lacks `--stdin`).
+    pub fn merge_tree(
+        &mut self,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<MergeOutcome, QuarantineError> {
+        self.merge_tree_with_base(None, ours, theirs, self.batch_deadline)
+    }
+
+    /// [`Self::merge_tree`] bounded by `pair_deadline.min(batch_deadline)`.
+    pub fn merge_tree_until(
+        &mut self,
+        ours: &str,
+        theirs: &str,
+        pair_deadline: Instant,
+    ) -> Result<MergeOutcome, QuarantineError> {
+        self.merge_tree_with_base(None, ours, theirs, pair_deadline)
+    }
+
+    /// Merges `ours` and `theirs` (optionally against explicit `base`) in strict
+    /// 1-at-a-time lockstep.
+    pub fn merge_tree_with_base(
+        &mut self,
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        pair_deadline: Instant,
+    ) -> Result<MergeOutcome, QuarantineError> {
+        for operand in base.into_iter().chain([ours, theirs]) {
+            if !is_object_name(operand) {
+                return Err(QuarantineError::Git(
+                    format!("merge-tree operand {operand:?} is not a full object name").into(),
+                ));
+            }
+        }
+        let effective_deadline = pair_deadline.min(self.batch_deadline);
+        if Instant::now() >= effective_deadline {
+            return Err(QuarantineError::DeadlineExceeded);
+        }
+        if self.single_shot_fallback {
+            return self.run_single_shot(base, ours, theirs, effective_deadline);
+        }
+        without_lazy_fetch(|| self.merge_stream_step(base, ours, theirs, effective_deadline))
+    }
+
+    /// [`Self::merge_tree`] mapped into [`MergeCandidate`].
+    pub fn merge_candidate(&mut self, ours: &str, theirs: &str) -> MergeCandidate {
+        self.merge_candidate_until(ours, theirs, self.batch_deadline)
+    }
+
+    /// [`Self::merge_tree_until`] mapped into [`MergeCandidate`].
+    pub fn merge_candidate_until(
+        &mut self,
+        ours: &str,
+        theirs: &str,
+        pair_deadline: Instant,
+    ) -> MergeCandidate {
+        match self.merge_tree_until(ours, theirs, pair_deadline) {
+            Ok(MergeOutcome::Clean { tree }) => MergeCandidate::Clean { tree },
+            Ok(MergeOutcome::Conflicted {
+                paths, paths_total, ..
+            }) => MergeCandidate::Conflict { paths, paths_total },
+            Err(e) => MergeCandidate::Unknown {
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    /// Resolves `head_or_ref` if it is not already a full object name, then
+    /// merges it against full OID `base` via the stream.
+    pub(crate) fn merge_candidate_or_resolve(
+        &mut self,
+        base: &str,
+        head_or_ref: &str,
+    ) -> MergeCandidate {
+        let resolved = if is_object_name(head_or_ref) {
+            head_or_ref.to_string()
+        } else {
+            match without_lazy_fetch(|| {
+                resolve_commit(&self.repo, head_or_ref, self.batch_deadline)
+            }) {
+                Ok(oid) => oid,
+                Err(e) => {
+                    return MergeCandidate::Unknown {
+                        reason: e.into_message(),
+                    };
+                }
+            }
+        };
+        self.merge_candidate(base, &resolved)
+    }
+
+    fn merge_stream_step(
+        &mut self,
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        effective_deadline: Instant,
+    ) -> Result<MergeOutcome, QuarantineError> {
+        if self.live.is_none() {
+            if self.respawns >= MAX_STREAM_RESPAWNS {
+                return Err(QuarantineError::Git(
+                    format!("git merge-tree stream exceeded {MAX_STREAM_RESPAWNS} respawns").into(),
+                ));
+            }
+            self.respawns += 1;
+            let live = spawn_merge_tree_stream(&self.repo, &self.quarantine, self.batch_deadline)?;
+            self.spawns += 1;
+            self.live = Some(live);
+        }
+
+        let line = match base {
+            Some(base_oid) => format!("{base_oid} -- {ours} {theirs}\n"),
+            None => format!("{ours} {theirs}\n"),
+        };
+        let write_err = {
+            let live = self.live.as_mut().expect("live stream initialized");
+            let stdin = live.stdin.as_mut().expect("stream stdin present");
+            stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush())
+                .err()
+        };
+        if let Some(err) = write_err {
+            return self.handle_stream_death(
+                base,
+                ours,
+                theirs,
+                effective_deadline,
+                &err.to_string(),
+            );
+        }
+
+        let read_result = {
+            let live = self.live.as_mut().expect("live stream present");
+            read_stream_record(live, effective_deadline)
+        };
+        match read_result {
+            Ok(outcome) => Ok(outcome),
+            Err(StreamReadError::Deadline) => {
+                if let Some(mut live) = self.live.take() {
+                    drop(live.stdin.take());
+                    let _ = live.child.kill_and_reap();
+                }
+                Err(QuarantineError::DeadlineExceeded)
+            }
+            Err(StreamReadError::UnexpectedEof(detail) | StreamReadError::Malformed(detail)) => {
+                self.handle_stream_death(base, ours, theirs, effective_deadline, &detail)
+            }
+        }
+    }
+
+    fn handle_stream_death(
+        &mut self,
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        effective_deadline: Instant,
+        detail: &str,
+    ) -> Result<MergeOutcome, QuarantineError> {
+        let Some(mut live) = self.live.take() else {
+            return Err(QuarantineError::Git(detail.to_string().into()));
+        };
+        drop(live.stdin.take());
+        let status_code = live
+            .child
+            .wait_and_reap()
+            .ok()
+            .and_then(|status| status.code())
+            .unwrap_or(-1);
+        let stderr = read_bounded_stderr(live.stderr.take());
+        let trimmed = stderr.trim();
+        if status_code == 129
+            || matches!(
+                classify_failure(status_code, trimmed),
+                QuarantineError::Unsupported(_)
+            )
+        {
+            self.single_shot_fallback = true;
+            return self.run_single_shot(base, ours, theirs, effective_deadline);
+        }
+        let reason = if !trimmed.is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("git merge-tree --stdin exited {status_code}: {detail}")
+        };
+        Err(QuarantineError::Git(reason.into()))
+    }
+
+    fn run_single_shot(
+        &self,
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        effective_deadline: Instant,
+    ) -> Result<MergeOutcome, QuarantineError> {
+        without_lazy_fetch(|| match base {
+            None => self
+                .quarantine
+                .merge_tree(&self.repo, ours, theirs, effective_deadline),
+            Some(base_oid) => {
+                let run = self.quarantine.run(
+                    &self.repo,
+                    &[
+                        "merge-tree",
+                        "--write-tree",
+                        "--name-only",
+                        "--no-messages",
+                        "-z",
+                        "--merge-base",
+                        base_oid,
+                        ours,
+                        theirs,
+                    ],
+                    effective_deadline,
+                )?;
+                parse_merge_tree_output(
+                    &run.stdout,
+                    run.status_code,
+                    &String::from_utf8_lossy(&run.stderr),
+                )
+            }
+        })
+    }
+}
+
+fn spawn_merge_tree_stream(
+    repo: &Path,
+    quarantine: &ObjectQuarantine,
+    batch_deadline: Instant,
+) -> Result<LiveStream, QuarantineError> {
+    let remaining = batch_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(QuarantineError::DeadlineExceeded);
+    }
+    let timeout = remaining.min(DEFAULT_TIMEOUT);
+    let mut child = git_spawn_quarantined_streaming(
+        repo,
+        &[
+            "merge-tree",
+            "--stdin",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+        ],
+        &quarantine.dir,
+        &quarantine.alternates,
+        timeout,
+    )
+    .map_err(|e| {
+        if is_run_timeout(e.message()) {
+            QuarantineError::DeadlineExceeded
+        } else {
+            QuarantineError::Git(e)
+        }
+    })?;
+    let Some(stdin) = child.take_stdin() else {
+        return Err(QuarantineError::Setup(
+            "merge-tree --stdin missing stdin pipe".into(),
+        ));
+    };
+    let Some(stdout) = child.take_stdout() else {
+        return Err(QuarantineError::Setup(
+            "merge-tree --stdin missing stdout pipe".into(),
+        ));
+    };
+    let stderr = child.take_stderr();
+    Ok(LiveStream {
+        child,
+        stdin: Some(BufWriter::new(stdin)),
+        stdout,
+        stderr,
+        read_buf: Vec::new(),
+        read_pos: 0,
+    })
+}
+
+fn read_bounded_stderr(stderr: Option<ChildStderr>) -> String {
+    let Some(pipe) = stderr else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    let _ = pipe
+        .take(MAX_STREAM_STDERR_BYTES as u64)
+        .read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn read_nul_field(
+    live: &mut LiveStream,
+    deadline: Instant,
+) -> Result<Option<Vec<u8>>, StreamReadError> {
+    if live.read_pos > 0 && (live.read_pos == live.read_buf.len() || live.read_pos >= 8192) {
+        live.read_buf.drain(..live.read_pos);
+        live.read_pos = 0;
+    }
+    let mut scratch = [0u8; 4096];
+    loop {
+        if let Some(rel) = live.read_buf[live.read_pos..]
+            .iter()
+            .position(|&byte| byte == 0)
+        {
+            let field = live.read_buf[live.read_pos..live.read_pos + rel].to_vec();
+            live.read_pos += rel + 1;
+            return Ok(Some(field));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(StreamReadError::Deadline);
+        }
+        match live.child.wait_stdout_readable(&live.stdout, remaining) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => return Err(StreamReadError::UnexpectedEof(e.to_string())),
+        }
+        match live.stdout.read(&mut scratch) {
+            Ok(0) => {
+                if live.read_pos < live.read_buf.len() {
+                    return Err(StreamReadError::UnexpectedEof(
+                        "git merge-tree --stdin closed stdout mid-record".into(),
+                    ));
+                }
+                return Ok(None);
+            }
+            Ok(n) => {
+                let buffered = live.read_buf.len().saturating_sub(live.read_pos);
+                if buffered.saturating_add(n) > MAX_STREAM_RECORD_BYTES {
+                    return Err(StreamReadError::Malformed(format!(
+                        "git merge-tree --stdin record exceeded {MAX_STREAM_RECORD_BYTES} bytes"
+                    )));
+                }
+                live.read_buf.extend_from_slice(&scratch[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(StreamReadError::UnexpectedEof(e.to_string())),
+        }
+    }
+}
+
+fn read_stream_record(
+    live: &mut LiveStream,
+    deadline: Instant,
+) -> Result<MergeOutcome, StreamReadError> {
+    let status = read_nul_field(live, deadline)?
+        .ok_or_else(|| StreamReadError::UnexpectedEof("unexpected EOF".into()))?;
+    let clean = match status.as_slice() {
+        b"1" => true,
+        b"0" => false,
+        other => {
+            return Err(StreamReadError::Malformed(format!(
+                "unexpected merge-tree stream status {:?}",
+                String::from_utf8_lossy(other)
+            )));
+        }
+    };
+    let tree_bytes = read_nul_field(live, deadline)?.ok_or_else(|| {
+        StreamReadError::UnexpectedEof("unexpected EOF reading merge-tree OID".into())
+    })?;
+    let tree = String::from_utf8_lossy(&tree_bytes).trim().to_string();
+    if !is_object_name(&tree) {
+        return Err(StreamReadError::Malformed(format!(
+            "invalid merge-tree OID {tree:?}"
+        )));
+    }
+    let mut named = Vec::new();
+    loop {
+        let field = read_nul_field(live, deadline)?.ok_or_else(|| {
+            StreamReadError::UnexpectedEof("unexpected EOF reading merge-tree paths".into())
+        })?;
+        if field.is_empty() {
+            break;
+        }
+        if clean {
+            return Err(StreamReadError::Malformed(
+                "clean merge-tree record carried unexpected path entries".into(),
+            ));
+        }
+        named.push(render_path(&field));
+    }
+    if clean {
+        Ok(MergeOutcome::Clean { tree })
+    } else {
+        if named.is_empty() {
+            return Err(StreamReadError::Malformed(
+                "git merge-tree reported a conflict and named no path".into(),
+            ));
+        }
+        let paths_total = named.len();
+        Ok(MergeOutcome::Conflicted {
+            tree,
+            paths: named.into_iter().take(MAX_CONFLICT_PATHS).collect(),
+            paths_total,
+        })
+    }
+}
+
+/// Parses a `--messages` conflict-group path count strictly as a bounded
+/// `usize` (`<= MAX_MESSAGE_PATH_COUNT`), rejecting negative numbers, signs,
+/// whitespace, non-digits, and counts above 1024.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn parse_merge_tree_message_count(field: &[u8]) -> Result<usize, QuarantineError> {
+    if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
+        return Err(QuarantineError::Git(
+            format!(
+                "invalid merge-tree message path count: {:?}",
+                String::from_utf8_lossy(field)
+            )
+            .into(),
+        ));
+    }
+    let text = std::str::from_utf8(field).map_err(|_| {
+        QuarantineError::Git("invalid UTF-8 in merge-tree message path count".into())
+    })?;
+    let count = text.parse::<usize>().map_err(|_| {
+        QuarantineError::Git(format!("merge-tree message path count overflow: {text}").into())
+    })?;
+    if count > MAX_MESSAGE_PATH_COUNT {
+        return Err(QuarantineError::Git(
+            format!("merge-tree message path count {count} exceeds limit {MAX_MESSAGE_PATH_COUNT}")
+                .into(),
+        ));
+    }
+    Ok(count)
 }
 
 /// Parses `git merge-tree --write-tree --name-only --no-messages -z`.
@@ -338,8 +856,8 @@ pub fn merge_tree_candidate(
 
 /// Err when `repo` is a partial clone, or when that could not be told: a merge
 /// there reads file contents, and git would fetch the missing ones from the
-/// remote. A caller that merges many pairs asks once and then calls
-/// [`merge_tree_resolved`].
+/// remote. A caller that merges many pairs asks once and then opens a stream
+/// with [`ObjectQuarantine::open_stream`].
 pub(crate) fn refuse_partial_clone(repo: &Path) -> Result<(), CommandError> {
     match is_partial_clone(repo) {
         Ok(false) => Ok(()),
@@ -352,18 +870,6 @@ pub(crate) fn refuse_partial_clone(repo: &Path) -> Result<(), CommandError> {
             format!("could not tell whether this is a partial clone, so nothing was run: {reason}")
         })),
     }
-}
-
-/// [`merge_tree_candidate`] for operands that are already full commit names,
-/// in a repository the caller has already checked with
-/// [`refuse_partial_clone`]: one quarantine and one `merge-tree` per call.
-pub(crate) fn merge_tree_resolved(
-    repo: &Path,
-    base: &str,
-    head: &str,
-    deadline: Instant,
-) -> MergeCandidate {
-    crate::engine::git_cli::without_lazy_fetch(|| merge_resolved(repo, base, head, deadline))
 }
 
 fn merge_resolved(repo: &Path, base: &str, head: &str, deadline: Instant) -> MergeCandidate {
@@ -607,3 +1113,184 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "object_quarantine_adv_tests.rs"]
 mod adv_tests;
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::procguard::LockedSpawn;
+    use std::process::Command;
+
+    fn soon() -> Instant {
+        Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(60))
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let mut cmd = Command::new("git");
+        crate::test_support::pin_git(&mut cmd);
+        let out = cmd
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit_file(dir: &Path, file: &str, content: &str) -> String {
+        if let Some(parent) = dir.join(file).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(dir.join(file), content).unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", file]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn twenty_pair_mixed_batch_completes_in_one_stream_with_at_most_two_respawns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.name", "T"]);
+        git(repo, &["config", "user.email", "t@e.com"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(repo);
+
+        commit_file(repo, "shared.txt", "root\n");
+        let base = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["checkout", "-q", "-b", "ours-conflict"]);
+        let ours_conflict = commit_file(repo, "shared.txt", "ours\n");
+        git(repo, &["checkout", "-q", &base]);
+        let mut clean_tips = Vec::new();
+        for i in 0..15 {
+            git(
+                repo,
+                &["checkout", "-q", "-b", &format!("clean-{i}"), &base],
+            );
+            clean_tips.push(commit_file(
+                repo,
+                &format!("clean_{i}.txt"),
+                &format!("c{i}\n"),
+            ));
+        }
+        git(repo, &["checkout", "-q", "-b", "theirs-conflict", &base]);
+        let theirs_conflict = commit_file(repo, "shared.txt", "theirs\n");
+        git(repo, &["checkout", "-q", "--orphan", "island"]);
+        git(repo, &["rm", "-rf", "-q", "."]);
+        let orphan = commit_file(repo, "orphan.txt", "alone\n");
+        git(repo, &["checkout", "-q", "main"]);
+
+        // 20 mixed pairs: clean, conflict, 1 unrelated-history (rc=128), 1 bad OID (rc=1).
+        let bad_oid = "deadbeef".repeat(5);
+        let mut pairs: Vec<(&str, &str, &str)> = Vec::new();
+        for tip in clean_tips.iter().take(10) {
+            pairs.push((ours_conflict.as_str(), tip.as_str(), "clean"));
+        }
+        pairs.push((&ours_conflict, &theirs_conflict, "conflict"));
+        pairs.push((&ours_conflict, &orphan, "unrelated"));
+        for tip in clean_tips.iter().take(3) {
+            pairs.push((ours_conflict.as_str(), tip.as_str(), "clean"));
+        }
+        pairs.push((&ours_conflict, &bad_oid, "bad_oid"));
+        pairs.push((&ours_conflict, &theirs_conflict, "conflict"));
+        for tip in clean_tips.iter().take(3) {
+            pairs.push((ours_conflict.as_str(), tip.as_str(), "clean"));
+        }
+        assert_eq!(pairs.len(), 20);
+
+        let mut stream = ObjectQuarantine::open_stream(repo, soon()).expect("open_stream");
+        let q_dir = stream.quarantine_path().to_path_buf();
+        assert!(q_dir.is_dir());
+        for (idx, (a, b, kind)) in pairs.iter().enumerate() {
+            let verdict = stream.merge_candidate(a, b);
+            match *kind {
+                "clean" => assert!(
+                    matches!(verdict, MergeCandidate::Clean { .. }),
+                    "pair {idx}: {verdict:?}"
+                ),
+                "conflict" => assert!(
+                    matches!(verdict, MergeCandidate::Conflict { .. }),
+                    "pair {idx}: {verdict:?}"
+                ),
+                "unrelated" | "bad_oid" => assert!(
+                    matches!(&verdict, MergeCandidate::Unknown { reason } if !reason.is_empty()),
+                    "pair {idx} ({kind}) must be Unknown, never Clean: {verdict:?}"
+                ),
+                other => unreachable!("{other}"),
+            }
+        }
+        assert!(
+            stream.respawn_count() <= 2,
+            "expected <= 2 respawns, got {}",
+            stream.respawn_count()
+        );
+        assert_eq!(stream.spawn_count(), 1 + stream.respawn_count());
+        drop(stream);
+        assert!(
+            !q_dir.exists(),
+            "quarantine {} survived stream drop",
+            q_dir.display()
+        );
+    }
+
+    #[test]
+    fn parse_message_count_rejects_negative_and_oversized_counts() {
+        assert!(parse_merge_tree_message_count(b"-3").is_err());
+        assert!(parse_merge_tree_message_count(b"999999999").is_err());
+        assert!(parse_merge_tree_message_count(b"1025").is_err());
+        assert!(parse_merge_tree_message_count(b"+5").is_err());
+        assert!(parse_merge_tree_message_count(b"").is_err());
+        assert!(parse_merge_tree_message_count(b"abc").is_err());
+        assert_eq!(parse_merge_tree_message_count(b"0").unwrap(), 0);
+        assert_eq!(parse_merge_tree_message_count(b"1024").unwrap(), 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_129_falls_back_to_single_shot() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.name", "T"]);
+        git(repo, &["config", "user.email", "t@e.com"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(repo);
+        let base = commit_file(repo, "root.txt", "root\n");
+        git(repo, &["checkout", "-q", "-b", "feat"]);
+        let feat = commit_file(repo, "f.txt", "f\n");
+        git(repo, &["checkout", "-q", "main"]);
+        let main = commit_file(repo, "m.txt", "m\n");
+        let _ = base;
+
+        let real_git = {
+            let out = Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output_locked()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = shim_dir.path().join("git");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--stdin\" ]; then\n    echo \"error: unknown option \\`stdin'\" >&2\n    echo \"usage: git merge-tree [<options>] <branch1> <branch2>\" >&2\n    exit 129\n  fi\ndone\nexec {real_git} \"$@\"\n"
+        );
+        std::fs::write(&shim, script).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let orig = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = std::env::join_paths(
+            std::iter::once(shim_dir.path().to_path_buf()).chain(std::env::split_paths(&orig)),
+        )
+        .unwrap();
+
+        crate::engine::git_cli::with_test_git_path(&new_path, || {
+            let mut stream = ObjectQuarantine::open_stream(repo, soon()).expect("open_stream");
+            let verdict = stream.merge_candidate(&main, &feat);
+            assert!(
+                matches!(verdict, MergeCandidate::Clean { .. }),
+                "expected single-shot fallback clean, got {verdict:?}"
+            );
+            assert!(stream.single_shot_fallback);
+        });
+    }
+}
