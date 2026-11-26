@@ -2506,6 +2506,8 @@ mod tests {
                     state: "blocked".into(),
                     event: Some("permission_request".into()),
                     changed_ms: now_ms - 5_000,
+                    active_subagents: Vec::new(),
+                    fully_idle: None,
                 },
                 HubSessionState {
                     key: "hook-claude-abc".into(),
@@ -2514,6 +2516,8 @@ mod tests {
                     state: "done".into(),
                     event: Some("turn_finished".into()),
                     changed_ms: now_ms - 12_000,
+                    active_subagents: Vec::new(),
+                    fully_idle: None,
                 },
             ],
         };

@@ -418,4 +418,5 @@ blob-report/
 *.stackdump
 *.pdb
 
+/src-tauri/crates/waylode-protocol/target/
 /crates/waylode-worktree/target/

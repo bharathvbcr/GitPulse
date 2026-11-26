@@ -25,7 +25,9 @@
 //! "suppressed because you were looking at it" is the only thing that
 //! distinguishes working-as-intended from broken.
 
+pub mod approval_broker;
 pub mod bridge;
+pub mod control_plane;
 mod intake;
 #[cfg(unix)]
 mod limits;
@@ -59,6 +61,21 @@ pub fn default_state_snapshot_path() -> Option<PathBuf> {
     Some(crate::tool_config::default_config_dir()?.join(STATE_SNAPSHOT_NAME))
 }
 
+/// Maximum distinct subagents tracked per parent session in [`HubSessionState`].
+const MAX_SUBAGENTS_PER_SESSION: usize = 32;
+
+/// One live subagent reported under a parent session via hook `subagent` + `agent_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentState {
+    pub agent_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub changed_ms: u64,
+}
+
 /// One session's live state published by the alerts worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubSessionState {
@@ -71,6 +88,10 @@ pub struct HubSessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     pub changed_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_subagents: Vec<SubagentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fully_idle: Option<bool>,
 }
 
 /// Atomic snapshot written by the app's alerts worker. `writer_pid` and
@@ -923,6 +944,8 @@ struct Tracked {
     provider_session_id: Option<String>,
     place: Option<String>,
     hub_state: Option<HubEntryState>,
+    fully_idle: Option<bool>,
+    subagents: HashMap<String, SubagentState>,
 }
 
 struct HubEntryState {
@@ -949,6 +972,8 @@ impl Tracked {
             provider_session_id: None,
             place: None,
             hub_state: None,
+            fully_idle: None,
+            subagents: HashMap::new(),
         }
     }
 
@@ -1040,6 +1065,9 @@ fn snapshot_of(
         .iter()
         .filter_map(|(key, entry)| {
             let state = entry.hub_state.as_ref()?;
+            let mut active_subagents: Vec<SubagentState> =
+                entry.subagents.values().cloned().collect();
+            active_subagents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
             Some(HubSessionState {
                 key: key.clone(),
                 provider_session_id: entry.provider_session_id.clone(),
@@ -1047,6 +1075,8 @@ fn snapshot_of(
                 state: state.state.to_owned(),
                 event: state.event.map(str::to_owned),
                 changed_ms: state.changed_ms,
+                active_subagents,
+                fully_idle: entry.fully_idle,
             })
         })
         .collect();
@@ -1321,9 +1351,79 @@ fn mapped_standing_state(standing: &Standing) -> &'static str {
     }
 }
 
+fn subagent_state_for_event(event: Option<&'static str>, urgency: bridge::Urgency) -> &'static str {
+    match event {
+        Some("idle_prompt") => "idle",
+        Some("agent_completed" | "turn_finished") => "done",
+        Some("prompt_submitted" | "tool_finished") => "working",
+        Some(
+            "permission_request"
+            | "permission_prompt"
+            | "agent_needs_input"
+            | "elicitation_dialog"
+            | "elicitation_url_dialog"
+            | "error",
+        ) => "blocked",
+        _ => match urgency {
+            bridge::Urgency::Blocking | bridge::Urgency::Error => "blocked",
+            bridge::Urgency::Informational => "idle",
+            bridge::Urgency::Clear => "working",
+        },
+    }
+}
+
+fn update_subagent_state(entry: &mut Tracked, notice: &Notice, now_ms: u64) {
+    if !notice.subagent && notice.agent_id.is_none() {
+        return;
+    }
+    let agent_id = match notice.agent_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => id.to_owned(),
+        None => "subagent".to_owned(),
+    };
+    if notice.event == Some("session_ended") {
+        entry.subagents.remove(&agent_id);
+        return;
+    }
+    let next_state = subagent_state_for_event(notice.event, notice.urgency());
+    let detail = notice.detail.as_deref().and_then(|raw| {
+        let clean = text::sanitize(raw);
+        let clipped: String = clean.chars().take(ANNOUNCE_DETAIL_CHARS).collect();
+        (!clipped.trim().is_empty()).then_some(clipped)
+    });
+    if entry.subagents.len() >= MAX_SUBAGENTS_PER_SESSION
+        && !entry.subagents.contains_key(&agent_id)
+    {
+        if let Some(oldest) = entry
+            .subagents
+            .iter()
+            .min_by_key(|(_, sub)| sub.changed_ms)
+            .map(|(k, _)| k.clone())
+        {
+            entry.subagents.remove(&oldest);
+        }
+    }
+    let changed_ms = entry
+        .subagents
+        .get(&agent_id)
+        .filter(|prev| prev.state == next_state)
+        .map_or(now_ms, |prev| prev.changed_ms);
+    entry.subagents.insert(
+        agent_id.clone(),
+        SubagentState {
+            agent_id,
+            state: next_state.to_owned(),
+            event: notice.event.map(str::to_owned),
+            detail,
+            changed_ms,
+        },
+    );
+}
+
 fn update_hub_state(entry: &mut Tracked, event: Option<&'static str>, is_agent: bool, now_ms: u64) {
     if event == Some("session_ended") {
         entry.hub_state = None;
+        entry.subagents.clear();
+        entry.fully_idle = None;
         return;
     }
     if !is_agent {
@@ -1417,6 +1517,12 @@ fn admit_at(
     if let Some(place) = notice.place.as_deref().filter(|s| !s.is_empty()) {
         entry.place = Some(place.to_owned());
     }
+    if !notice.subagent {
+        if let Some(idle) = notice.fully_idle {
+            entry.fully_idle = Some(idle);
+        }
+    }
+    update_subagent_state(entry, &notice, now_ms);
     let event = notice.event;
     let subagent = notice.subagent;
     let urgency = notice.urgency();

@@ -267,6 +267,7 @@ site | src/procguard/mod.rs | spawning_waits_behind_the_inheritance_lock | 0 | h
 site | src/procguard/mod.rs | the_sweep_asks_before_it_insists | 0 | bounded-poll
 
 # src/storage/hygiene/global/tests.rs
+site | src/remote/tests.rs | ptyd_takeover_retries_through_post_fin_drain_race_and_succeeds | 1 | unbounded-poll   # the fake ptyd listener polls a non-blocking accept; it ends when the test drops the socket
 site | src/storage/hygiene/global/tests.rs | wait | 0 | bounded-poll
 
 # src/supervisor.rs

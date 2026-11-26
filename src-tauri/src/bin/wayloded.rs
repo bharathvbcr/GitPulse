@@ -1,10 +1,10 @@
-//! `gitpulsed` — GitPulse's control plane without a window.
+//! `wayloded` — Waylode's control plane without a window.
 //!
 //! # Why this exists
 //!
 //! Attribution catch-up — reading agent transcripts and the reflog and turning
 //! them into durable, attributed ledger rows — only ran when the desktop app
-//! opened a repository. An agent working for six hours with GitPulse closed
+//! opened a repository. An agent working for six hours with Waylode closed
 //! produced a transcript nothing ingested, so the ledger's answer to "who
 //! changed this, and when" had a six-hour hole in it that nothing on screen
 //! said was there. The record is supposed to be the thing that does not depend
@@ -16,7 +16,7 @@
 //!
 //! # What it deliberately is not
 //!
-//! It does not serve requests. `gitpulse-mcp` already does that, over stdio,
+//! It does not serve requests. `waylode-mcp` already does that, over stdio,
 //! and a second request surface answering the same questions from the same
 //! store would be a second thing to keep in step. This process only *writes*
 //! what nothing else was writing.
@@ -77,20 +77,28 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_REPOS: usize = 32;
 
 const USAGE: &str = "\
-wayloded — Waylode attribution daemon
+wayloded — Waylode attribution and remote relay daemon
 
 USAGE:
     wayloded [OPTIONS] <REPO>...
+    wayloded --relay [--once] [--config-dir <DIR>]
 
 Runs transcript and reflog catch-up for each repository on an interval, so the
 ledger keeps recording who changed what while the desktop app is closed.
+With --relay, runs the outbound-only paid remote-control sidecar using its own
+single-owner lock (wayloded-relay.lock), reading workspace_registry and
+repository_trust dynamically. On the free tier or when remote_control opt-in is
+disabled, --relay refuses and exits with code 4 before opening any socket or
+network connection.
 
 ARGS:
-    <REPO>...   Absolute paths to git repositories (at most 32)
+    <REPO>...   Absolute paths to git repositories (at most 32; catch-up mode)
 
 OPTIONS:
     --interval <SECS>   Seconds between cycles (default 300, min 15, max 86400)
-    --once              Run one cycle and exit
+    --once              Run one cycle (or relay preflight check) and exit
+    --relay             Run in outbound-only remote control relay mode (paid opt-in)
+    --config-dir <DIR>  Absolute config directory override for --relay mode
     --version           Print version and exit
     --help              Print this message
 
@@ -140,6 +148,7 @@ EXIT:
        not be taken
     2  the arguments could not be understood
     3  another wayloded already runs for this profile
+    4  --relay refused: free tier or remote_control opt-in is disabled
 ";
 
 #[derive(Debug, PartialEq)]
@@ -149,10 +158,17 @@ struct Config {
     once: bool,
 }
 
+#[derive(Debug, PartialEq)]
+struct RelayCliConfig {
+    once: bool,
+    config_dir: Option<std::path::PathBuf>,
+}
+
 /// What parsing the command line produced.
 #[derive(Debug, PartialEq)]
 enum Parsed {
     Run(Config),
+    Relay(RelayCliConfig),
     Help,
     Version,
     /// Refused, with the reason. Never a silently-corrected value: an interval
@@ -164,7 +180,10 @@ enum Parsed {
 fn parse(argv: &[String]) -> Parsed {
     let mut repos = Vec::new();
     let mut interval = DEFAULT_INTERVAL;
+    let mut interval_set = false;
     let mut once = false;
+    let mut relay = false;
+    let mut config_dir: Option<std::path::PathBuf> = None;
     let mut i = 0;
 
     while i < argv.len() {
@@ -172,6 +191,18 @@ fn parse(argv: &[String]) -> Parsed {
             "--help" | "-h" => return Parsed::Help,
             "--version" | "-V" => return Parsed::Version,
             "--once" => once = true,
+            "--relay" => relay = true,
+            "--config-dir" => {
+                let Some(raw) = argv.get(i + 1) else {
+                    return Parsed::Error("--config-dir needs an absolute directory path".into());
+                };
+                let path = std::path::PathBuf::from(raw);
+                if !path.is_absolute() {
+                    return Parsed::Error(format!("--config-dir {raw:?} must be an absolute path"));
+                }
+                config_dir = Some(path);
+                i += 1;
+            }
             "--interval" => {
                 let Some(raw) = argv.get(i + 1) else {
                     return Parsed::Error("--interval needs a number of seconds".into());
@@ -196,6 +227,7 @@ fn parse(argv: &[String]) -> Parsed {
                     ));
                 }
                 interval = requested;
+                interval_set = true;
                 i += 1;
             }
             other if other.starts_with('-') => {
@@ -204,6 +236,23 @@ fn parse(argv: &[String]) -> Parsed {
             path => repos.push(path.to_string()),
         }
         i += 1;
+    }
+
+    if relay {
+        if !repos.is_empty() {
+            return Parsed::Error(
+                "--relay reads workspace_registry and repository_trust dynamically; do not pass <REPO> arguments"
+                    .into(),
+            );
+        }
+        if interval_set {
+            return Parsed::Error("--interval cannot be combined with --relay".into());
+        }
+        return Parsed::Relay(RelayCliConfig { once, config_dir });
+    }
+
+    if config_dir.is_some() {
+        return Parsed::Error("--config-dir is only valid with --relay".into());
     }
 
     if repos.is_empty() {
@@ -301,7 +350,7 @@ fn guarded_cycle(
                 .map(|text| (*text).to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "a non-text panic".to_string());
-            log::error!(target: "gitpulsed", "catch-up for {repo} panicked: {what}");
+            log::error!(target: "wayloded", "catch-up for {repo} panicked: {what}");
             CycleReport {
                 repo: repo.to_string(),
                 cycle,
@@ -411,7 +460,7 @@ fn main() {
     // deferred, on every thread this process starts. First, so no thread has
     // already been given the app's default.
     waylode_lib::engine::process::run_process_as_background();
-    // And from the per-user spawn budget every GitPulse process shares, before
+    // And from the per-user spawn budget every Waylode process shares, before
     // any spawn builds the gate.
     waylode_lib::engine::process::run_process_with_shared_spawn_budget();
     // The daemon runs unattended for hours, which is precisely when nobody is
@@ -437,6 +486,23 @@ fn main() {
         Parsed::Error(reason) => {
             log::error!(target: "wayloded", "{reason}; run wayloded --help for usage");
             waylode_lib::procguard::exit(2);
+        }
+        Parsed::Relay(relay_cfg) => {
+            let config_dir = match relay_cfg
+                .config_dir
+                .or_else(waylode_lib::tool_config::default_config_dir)
+            {
+                Some(dir) => dir,
+                None => {
+                    log::error!(
+                        target: "wayloded",
+                        "application config directory unavailable; cannot start --relay"
+                    );
+                    waylode_lib::procguard::exit(1);
+                }
+            };
+            let code = waylode_lib::remote::run_relay_mode(&config_dir, relay_cfg.once, None);
+            waylode_lib::procguard::exit(code);
         }
         Parsed::Run(config) => {
             // One daemon per profile. Held for the process's life; the kernel
@@ -717,7 +783,7 @@ mod tests {
 
     #[test]
     fn unknown_options_are_refused_rather_than_treated_as_paths() {
-        // Without this, `gitpulsed --interva1 60 /repo` would watch a
+        // Without this, `wayloded --interva1 60 /repo` would watch a
         // repository called "--interva1" and one called "60".
         let Parsed::Error(e) = parse(&args(&["--interva1", "60", "/repo"])) else {
             panic!("expected a refusal");
@@ -914,5 +980,102 @@ mod tests {
                 "the usage text does not document {field}"
             );
         }
+    }
+
+    #[test]
+    fn parses_relay_mode_and_refuses_mixed_repo_or_interval_args() {
+        let dir = abs("tmp/gp-cfg");
+        let Parsed::Relay(cfg) = parse(&args(&["--relay", "--once", "--config-dir", &dir])) else {
+            panic!("expected relay config");
+        };
+        assert!(cfg.once);
+        assert_eq!(cfg.config_dir, Some(std::path::PathBuf::from(&dir)));
+
+        assert!(matches!(
+            parse(&args(&["--relay", &abs("repo")])),
+            Parsed::Error(_)
+        ));
+        assert!(matches!(
+            parse(&args(&["--relay", "--interval", "60"])),
+            Parsed::Error(_)
+        ));
+        assert!(matches!(
+            parse(&args(&["--relay", "--config-dir", "./relative"])),
+            Parsed::Error(_)
+        ));
+        assert!(USAGE.contains("--relay"));
+        assert!(USAGE.contains("4  --relay refused"));
+    }
+
+    #[test]
+    fn relay_mode_refuses_free_tier_and_opt_out_with_exit_4_before_any_socket() {
+        let free_dir = tempfile::tempdir().expect("free config dir");
+        assert_eq!(
+            waylode_lib::remote::run_relay_mode(free_dir.path(), true, None),
+            4,
+            "default free config must exit 4"
+        );
+        assert!(
+            !free_dir
+                .path()
+                .join("wayloded/wayloded-relay.lock")
+                .exists(),
+            "exit 4 refusal must happen before acquiring lock or opening any socket"
+        );
+
+        let opt_out_dir = tempfile::tempdir().expect("opt-out config dir");
+        let opt_out = waylode_lib::remote::config::RemoteControlConfig {
+            tier: waylode_lib::remote::config::Tier::Pro,
+            remote_control_enabled: false,
+            ..Default::default()
+        };
+        std::fs::write(
+            opt_out_dir
+                .path()
+                .join(waylode_lib::remote::config::REMOTE_CONFIG_FILE),
+            serde_json::to_vec(&opt_out).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            waylode_lib::remote::run_relay_mode(opt_out_dir.path(), true, None),
+            4,
+            "pro tier with remote_control_enabled=false must exit 4"
+        );
+        assert!(
+            !opt_out_dir
+                .path()
+                .join("wayloded/wayloded-relay.lock")
+                .exists(),
+            "opt-out refusal must happen before acquiring lock or opening any socket"
+        );
+
+        let pro_dir = tempfile::tempdir().expect("pro config dir");
+        let pro = waylode_lib::remote::config::RemoteControlConfig {
+            tier: waylode_lib::remote::config::Tier::Pro,
+            remote_control_enabled: true,
+            keychain_access_group: "com.gitpulse.test.unprovisioned-group".into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            pro_dir
+                .path()
+                .join(waylode_lib::remote::config::REMOTE_CONFIG_FILE),
+            serde_json::to_vec(&pro).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            waylode_lib::remote::run_relay_mode(pro_dir.path(), true, None),
+            4,
+            "pro tier without provisioned OS Keychain trust anchor must fail closed with exit 4 (never in-memory fallback)"
+        );
+        let state = waylode_lib::remote::tunnel::read_remote_approval_state(pro_dir.path())
+            .expect("state written");
+        assert!(state.is_released(), "expected released state: {state:?}");
+        let state_json = serde_json::to_string(&state).unwrap();
+        assert!(
+            state_json.contains("trust_anchor_unavailable")
+                || state_json.contains("keychain_locked"),
+            "expected trust_anchor_unavailable or keychain_locked, got {state_json}"
+        );
     }
 }

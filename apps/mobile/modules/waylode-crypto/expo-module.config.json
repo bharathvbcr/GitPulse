@@ -1,0 +1,9 @@
+{
+  "platforms": ["ios", "android"],
+  "ios": {
+    "modules": ["WaylodeCryptoModule"]
+  },
+  "android": {
+    "modules": ["com.gitpulse.crypto.WaylodeCryptoModule"]
+  }
+}

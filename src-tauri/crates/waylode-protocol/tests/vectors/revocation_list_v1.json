@@ -1,0 +1,19 @@
+{
+  "expired_at_sec": 1800086400,
+  "identity_pub_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+  "identity_pub_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+  "identity_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "list": {
+    "expires_at": 1800086400,
+    "identity_sig_b64": "oI7AcdnOZYGM8EbdbZ8Usx8CTrpzH2On5NdplOfRuA8A3XJZuBXp4aPCZxH21F5jG8KdXT+qh0USGQZiSy8eDQ==",
+    "issued_at": 1800000000,
+    "revoked_device_ids": [
+      "dev_lost_01",
+      "dev_stolen_02"
+    ],
+    "version": 3
+  },
+  "preimage_hex": "67697470756c73652d70726f746f636f6c2f76312f7265766f636174696f6e2d6c697374000000000000000003000000006b49d200000000006b4b238000000002000b6465765f6c6f73745f3031000d6465765f73746f6c656e5f3032",
+  "schema": "gitpulse-protocol/v1/revocation-list",
+  "valid_at_sec": 1800000100
+}

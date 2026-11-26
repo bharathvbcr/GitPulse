@@ -39,11 +39,13 @@
 //!   or group/other permissions are refused.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The longest message stored directly in a mailbox file, in bytes of UTF-8.
@@ -92,8 +94,224 @@ const SCAN_LIMIT: usize = 1024;
 /// An empty session directory older than this is removed.
 const EMPTY_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 
+/// Maximum in-memory `HumanConfirmed` issuance records retained per process.
+/// Never written to a `0600` file on disk: any same-UID agent process can read
+/// and write `0600` files, so trust lives solely in the control-plane owner
+/// process's memory (Opus P0-3 / #15).
+const MAX_HUMAN_ISSUANCES: usize = MAX_SESSIONS * MAX_PENDING;
+/// Lifetime of an in-memory human issuance record (`PENDING_TTL + CLAIMED_TTL`).
+const HUMAN_ISSUANCE_TTL: Duration = Duration::from_secs(2 * 60 * 60 + 10 * 60);
+
 /// Serializes in-process callers alongside advisory `flock` across processes.
 static DEPOSIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Lowercase hex SHA-256 of normalized message bytes.
+pub(crate) fn text_sha256_hex(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn const_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Untrusted `PeerAgent` provenance used whenever a `HumanConfirmed` sidecar
+/// fails issuance verification (forged sidecar, tampered body, cross-session
+/// replay, or owner restart). Never fails open.
+pub(crate) fn downgraded_peer_provenance(request_id: &str) -> EnvelopeProvenance {
+    EnvelopeProvenance::PeerAgent {
+        msg_id: request_id.to_owned(),
+        from_peer: "unverified-local-mailbox".to_owned(),
+        provider: "unknown".to_owned(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop: 0,
+        max_hops: 1,
+        truncated_in_bus: false,
+        repo_root: String::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HumanIssuanceEntry {
+    text_sha256: String,
+    expires_at_ms: u64,
+    seq: u64,
+}
+
+#[derive(Debug, Default)]
+struct HumanIssuanceState {
+    next_seq: u64,
+    entries: HashMap<(PathBuf, String, String), HumanIssuanceEntry>,
+}
+
+/// In-memory issuance ledger for `EnvelopeProvenance::HumanConfirmed` messages.
+///
+/// Only the control-plane owner process populates this ledger (strictly in-process,
+/// never via a Unix socket write op and never backed by an agent-writable `0600`
+/// file). Hook processes verify envelopes via a read-only broker socket query;
+/// any unknown, tampered, expired, or post-restart envelope is downgraded to
+/// untrusted `PeerAgent` XML framing.
+#[derive(Debug, Default)]
+pub(crate) struct HumanIssuanceLedger {
+    state: Mutex<HumanIssuanceState>,
+}
+
+impl HumanIssuanceLedger {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn record_scoped(
+        &self,
+        scope: &Path,
+        session_uuid: &str,
+        request_id: &str,
+        text: &str,
+        created_at_ms: u64,
+    ) -> u64 {
+        let normalized = normalize_crlf(text);
+        let text_sha256 = text_sha256_hex(normalized.as_ref());
+        let session_key = session_uuid.to_ascii_lowercase();
+        let ttl_ms = millis_of(HUMAN_ISSUANCE_TTL);
+        let now_ms = millis(SystemTime::now()).max(created_at_ms);
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .entries
+            .retain(|_, entry| entry.expires_at_ms >= now_ms);
+        let key = (scope.to_path_buf(), session_key, request_id.to_owned());
+        if let Some(existing) = guard.entries.get(&key) {
+            if const_time_eq(existing.text_sha256.as_bytes(), text_sha256.as_bytes()) {
+                return existing.seq;
+            }
+        }
+        if guard.entries.len() >= MAX_HUMAN_ISSUANCES && !guard.entries.contains_key(&key) {
+            if let Some(oldest) = guard
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.seq)
+                .map(|(k, _)| k.clone())
+            {
+                guard.entries.remove(&oldest);
+            }
+        }
+        guard.next_seq = guard.next_seq.saturating_add(1);
+        let seq = guard.next_seq;
+        guard.entries.insert(
+            key,
+            HumanIssuanceEntry {
+                text_sha256,
+                expires_at_ms,
+                seq,
+            },
+        );
+        seq
+    }
+
+    pub(crate) fn verify_scoped(
+        &self,
+        scope: &Path,
+        session_uuid: &str,
+        request_id: &str,
+        text_sha256: &str,
+    ) -> bool {
+        let now_ms = millis(SystemTime::now());
+        let key = (
+            scope.to_path_buf(),
+            session_uuid.to_ascii_lowercase(),
+            request_id.to_owned(),
+        );
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = guard.entries.get(&key) else {
+            return false;
+        };
+        entry.expires_at_ms >= now_ms
+            && const_time_eq(entry.text_sha256.as_bytes(), text_sha256.as_bytes())
+    }
+}
+
+/// Process-wide in-memory human-issuance ledger held by the control-plane owner.
+pub(crate) fn process_human_issuance_ledger() -> &'static HumanIssuanceLedger {
+    static LEDGER: OnceLock<HumanIssuanceLedger> = OnceLock::new();
+    LEDGER.get_or_init(HumanIssuanceLedger::new)
+}
+
+/// Verifies whether a `HumanConfirmed` mailbox envelope was genuinely issued
+/// by the control-plane owner process for this `(session_uuid, request_id, text_sha256)`.
+pub(crate) trait HumanIssuanceVerifier: Send + Sync {
+    fn verify_human_issuance(
+        &self,
+        mailbox_root: &Path,
+        session_uuid: &str,
+        request_id: &str,
+        text_sha256: &str,
+    ) -> bool;
+}
+
+/// Verifier that checks an explicit in-memory [`HumanIssuanceLedger`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LedgerHumanVerifier {
+    ledger: Arc<HumanIssuanceLedger>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl LedgerHumanVerifier {
+    pub(crate) fn new(ledger: Arc<HumanIssuanceLedger>) -> Self {
+        Self { ledger }
+    }
+}
+
+impl HumanIssuanceVerifier for LedgerHumanVerifier {
+    fn verify_human_issuance(
+        &self,
+        mailbox_root: &Path,
+        session_uuid: &str,
+        request_id: &str,
+        text_sha256: &str,
+    ) -> bool {
+        self.ledger
+            .verify_scoped(mailbox_root, session_uuid, request_id, text_sha256)
+    }
+}
+
+/// Verifier that rejects every `HumanConfirmed` claim (simulates an owner
+/// restart, or a broker that answers and refuses). A broker nobody listens on is
+/// not this: the default mailbox keeps a sidecar's trust then (see
+/// `HumanIssuanceVerifier` callers in `authenticate_provenance`).
+#[cfg(test)]
+pub(crate) struct RejectAllHumanVerifier;
+
+#[cfg(test)]
+impl HumanIssuanceVerifier for RejectAllHumanVerifier {
+    fn verify_human_issuance(
+        &self,
+        _mailbox_root: &Path,
+        _session_uuid: &str,
+        _request_id: &str,
+        _text_sha256: &str,
+    ) -> bool {
+        false
+    }
+}
 
 /// Why a mailbox call did not do what was asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +474,12 @@ pub(crate) struct ClaimedEnvelope {
     pub(crate) claim: Claim,
     pub(crate) provenance: EnvelopeProvenance,
     pub(crate) created_at_ms: u64,
+    /// `true` ONLY when `provenance == EnvelopeProvenance::HumanConfirmed` AND
+    /// the envelope matched a control-plane human issuance record for
+    /// `(session_uuid, request_id, sha256(text))`. Defense in depth so
+    /// `deliver::render_message` can never emit `human_reminder` for an
+    /// unverified envelope.
+    pub(crate) human_verified: bool,
 }
 
 /// Where one deposited message stands.
@@ -491,22 +715,179 @@ impl Drop for AdvisoryLock {
 }
 
 /// The mailbox rooted at one directory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Mailbox {
     root: PathBuf,
+    /// Optional explicit in-memory issuance ledger (defaults to
+    /// [`process_human_issuance_ledger`]).
+    ledger: Option<Arc<HumanIssuanceLedger>>,
+    /// Optional explicit verifier for `HumanConfirmed` envelopes (defaults to
+    /// checking the in-process ledger; `at_default()` also checks the live
+    /// control-plane broker over its read-only socket query).
+    verifier: Option<Arc<dyn HumanIssuanceVerifier>>,
+    /// Whether this mailbox is the default config-dir mailbox eligible to query
+    /// `approval-broker.sock` for cross-process `HumanConfirmed` verification.
+    query_broker_socket: bool,
+}
+
+impl std::fmt::Debug for Mailbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mailbox")
+            .field("root", &self.root)
+            .field("query_broker_socket", &self.query_broker_socket)
+            .finish()
+    }
 }
 
 impl Mailbox {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            ledger: None,
+            verifier: None,
+            query_broker_socket: false,
+        }
+    }
+
+    /// Constructs a mailbox backed by an explicit issuance verifier (used by
+    /// tests and broker-connected hooks).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_verifier(root: PathBuf, verifier: Arc<dyn HumanIssuanceVerifier>) -> Self {
+        Self {
+            root,
+            ledger: None,
+            verifier: Some(verifier),
+            query_broker_socket: false,
+        }
+    }
+
+    /// Constructs a mailbox backed by an isolated in-memory issuance ledger
+    /// and matching verifier.
+    #[cfg(test)]
+    pub(crate) fn with_isolated_ledger(root: PathBuf, ledger: Arc<HumanIssuanceLedger>) -> Self {
+        let verifier = Arc::new(LedgerHumanVerifier::new(ledger.clone()));
+        Self {
+            root,
+            ledger: Some(ledger),
+            verifier: Some(verifier),
+            query_broker_socket: false,
+        }
     }
 
     /// The mailbox beside the notification socket, in GitPulse's configuration
     /// directory.
     pub(crate) fn at_default() -> Result<Self, MailboxError> {
         crate::tool_config::default_config_dir()
-            .map(|dir| Self::new(dir.join("agent-mailbox")))
+            .map(|dir| Self {
+                root: dir.join("agent-mailbox"),
+                ledger: None,
+                verifier: None,
+                query_broker_socket: true,
+            })
             .ok_or_else(|| MailboxError::Io("There is no GitPulse configuration directory.".into()))
+    }
+
+    fn record_human_issuance(
+        &self,
+        session_uuid: &str,
+        request_id: &str,
+        text: &str,
+        created: u64,
+    ) {
+        match &self.ledger {
+            Some(ledger) => {
+                ledger.record_scoped(&self.root, session_uuid, request_id, text, created);
+            }
+            None => {
+                process_human_issuance_ledger().record_scoped(
+                    &self.root,
+                    session_uuid,
+                    request_id,
+                    text,
+                    created,
+                );
+            }
+        }
+    }
+
+    fn verify_human_issuance(
+        &self,
+        session_uuid: &str,
+        request_id: &str,
+        text_sha256: &str,
+    ) -> bool {
+        if let Some(verifier) = &self.verifier {
+            return verifier.verify_human_issuance(
+                &self.root,
+                session_uuid,
+                request_id,
+                text_sha256,
+            );
+        }
+        if let Some(ledger) = &self.ledger {
+            return ledger.verify_scoped(&self.root, session_uuid, request_id, text_sha256);
+        }
+        if process_human_issuance_ledger().verify_scoped(
+            &self.root,
+            session_uuid,
+            request_id,
+            text_sha256,
+        ) {
+            return true;
+        }
+        if self.query_broker_socket {
+            // No release starts the approval broker yet. While nothing listens on its
+            // socket, a HumanConfirmed sidecar the app wrote into this private mailbox
+            // keeps the trust it had before the control plane, so a person's message
+            // claimed by `gitpulse-hook deliver` in another process still reads as
+            // theirs. Only a broker that answers and does not verify downgrades it.
+            #[cfg(unix)]
+            {
+                use crate::alerts::approval_broker::{
+                    query_human_issuance_via_default_socket, IssuanceAnswer,
+                };
+                return query_human_issuance_via_default_socket(
+                    session_uuid,
+                    request_id,
+                    text_sha256,
+                ) != IssuanceAnswer::Refused;
+            }
+            #[cfg(not(unix))]
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Authenticates `provenance` for `(session_uuid, request_id, text)`.
+    ///
+    /// A `HumanConfirmed` sidecar that the issuance ledger or a listening broker
+    /// refuses is downgraded to untrusted `PeerAgent` framing
+    /// (`human_verified = false`). The default mailbox with no broker listening
+    /// keeps the sidecar's trust (see [`Self::verify_human_issuance`]).
+    fn authenticate_provenance(
+        &self,
+        session_uuid: &str,
+        request_id: &str,
+        text: &str,
+        provenance: EnvelopeProvenance,
+    ) -> (EnvelopeProvenance, bool) {
+        if provenance == EnvelopeProvenance::HumanConfirmed {
+            let digest = text_sha256_hex(text);
+            if self.verify_human_issuance(session_uuid, request_id, &digest) {
+                (EnvelopeProvenance::HumanConfirmed, true)
+            } else {
+                log::warn!(
+                    target: "mailbox",
+                    "downgrading unverified HumanConfirmed envelope (session={session_uuid}, request_id={request_id}) to untrusted PeerAgent framing"
+                );
+                (downgraded_peer_provenance(request_id), false)
+            }
+        } else {
+            (provenance, false)
+        }
     }
 
     pub(crate) fn session_path(&self, session: &str) -> Result<PathBuf, MailboxError> {
@@ -837,6 +1218,9 @@ impl Mailbox {
                             "That request id already carried a different message.".into(),
                         ));
                     }
+                    if provenance == EnvelopeProvenance::HumanConfirmed {
+                        self.record_human_issuance(&key, request_id, normalized.as_ref(), stamp);
+                    }
                     return Ok(Deposit {
                         request_id: request_id.to_owned(),
                         created_at_ms: stamp,
@@ -912,6 +1296,9 @@ impl Mailbox {
             let _ = std::fs::remove_file(&temp);
             self.remove_provenance(&key, request_id);
             return Err(io("could not publish the message", &error));
+        }
+        if provenance == EnvelopeProvenance::HumanConfirmed {
+            self.record_human_issuance(&key, request_id, normalized.as_ref(), created);
         }
         Ok(Deposit {
             request_id: request_id.to_owned(),
@@ -1079,8 +1466,12 @@ impl Mailbox {
                 break;
             }
             if let Some((_, _, id)) = parse_message_name(&name) {
-                if let Ok(prov) = self.read_provenance(&key, id) {
-                    if !accept(&prov) {
+                if let (Ok(text), Ok(prov)) = (
+                    read_message(&dir.join(&name)),
+                    self.read_provenance(&key, id),
+                ) {
+                    let (effective, _) = self.authenticate_provenance(&key, id, &text, prov);
+                    if !accept(&effective) {
                         refused = true;
                         continue;
                     }
@@ -1098,6 +1489,8 @@ impl Mailbox {
                 self.read_provenance(&key, &id),
             ) {
                 (Ok(text), Ok(provenance)) => {
+                    let (provenance, human_verified) =
+                        self.authenticate_provenance(&key, &id, &text, provenance);
                     claimed_batch.push(ClaimedEnvelope {
                         claim: Claim {
                             request_id: id,
@@ -1105,6 +1498,7 @@ impl Mailbox {
                         },
                         provenance,
                         created_at_ms,
+                        human_verified,
                     });
                 }
                 (Err(error), _) | (_, Err(error)) => {
@@ -1181,6 +1575,8 @@ impl Mailbox {
                 self.read_provenance(&key, id),
             ) {
                 (Ok(text), Ok(provenance)) => {
+                    let (provenance, human_verified) =
+                        self.authenticate_provenance(&key, id, &text, provenance);
                     if accept(&provenance) {
                         out.push((
                             name.clone(),
@@ -1191,6 +1587,7 @@ impl Mailbox {
                                 },
                                 provenance,
                                 created_at_ms,
+                                human_verified,
                             },
                         ));
                     }
@@ -1694,9 +2091,24 @@ where
         let now = SystemTime::now();
         let mut won = Vec::new();
         for item in items {
-            let unchanged = mailbox
-                .read_provenance(&key, &item.envelope.claim.request_id)
-                .is_ok_and(|held| held == item.envelope.provenance && accept(&held));
+            let unchanged = match (
+                read_message(&dir.join(&item.file)),
+                mailbox.read_provenance(&key, &item.envelope.claim.request_id),
+            ) {
+                (Ok(held_text), Ok(raw_prov)) => {
+                    let (held_prov, held_verified) = mailbox.authenticate_provenance(
+                        &key,
+                        &item.envelope.claim.request_id,
+                        &held_text,
+                        raw_prov,
+                    );
+                    held_text == item.envelope.claim.text
+                        && held_prov == item.envelope.provenance
+                        && held_verified == item.envelope.human_verified
+                        && accept(&held_prov)
+                }
+                _ => false,
+            };
             if !unchanged {
                 continue;
             }

@@ -28,9 +28,19 @@
 //! The invariant this module exists to keep is the repository's own, the one
 //! `insights` and `harness::policy` are both built around: a check that could
 //! not run must never produce the same output as a check that ran and found
-//! nothing. Every path here that fails to check something says so in a
-//! `systemMessage`, and no path ever emits `allow` — an approval this hook did
-//! not earn would silently override the user's own permission rules.
+//! nothing. Every `PreToolUse` path here that fails to check something says so
+//! in a `systemMessage`, and no `PreToolUse` path ever emits `allow` — an
+//! approval a repository check did not earn would silently override the user's
+//! own permission rules.
+//!
+//! Narrow carve-out (Opus P1): [`permission_bridge`] is the **sole** subcommand
+//! permitted to emit a `PermissionRequest` `{"behavior":"allow"}` verdict, and
+//! ONLY when the local control-plane [`crate::alerts::approval_broker::ApprovalBroker`]
+//! resolved the exact `(session_id, input_sha256)` ticket via an in-process
+//! Desktop click or a cryptographically verified P-256 mobile hardware
+//! signature (strictly `AllowOnce` / `Deny` / `DenyAndInterrupt`; never
+//! `updatedInput` or `updatedPermissions`). Every bypass or error path exits 0
+//! with empty stdout.
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -52,6 +62,7 @@ mod heavy_commands;
 pub mod lease_env;
 #[cfg(unix)]
 pub mod lease_wrapper;
+pub mod permission_bridge;
 
 /// Whether `program args` is a build that takes a build slot: the one reading
 /// of the heavy table (`heavy_commands::leased`) the lease wrapper acts on and
@@ -380,6 +391,9 @@ pub struct HookInput {
     /// this is `false` for every payload documented today, and a removal of a
     /// worktree with work in it is refused.
     pub discard_changes: bool,
+    /// Raw `tool_input` (or Antigravity `toolCall.args`) JSON value preserved
+    /// verbatim for canonical SHA-256 hashing in [`permission_bridge`].
+    pub raw_tool_input: Option<Value>,
 }
 
 /// The Antigravity event a subcommand serves, for a payload that does not name
@@ -504,6 +518,7 @@ impl HookInput {
             worktree_name: string_at(Some(value), "name"),
             worktree_path: string_at(Some(value), "worktree_path"),
             discard_changes: value.get("discard_changes").and_then(Value::as_bool) == Some(true),
+            raw_tool_input: tool_input.or(tool_args).cloned(),
         }
     }
 }
@@ -5266,7 +5281,7 @@ fn report_agent_touched_file(_input: &HookInput) {}
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
 /// Every subcommand `gitpulse-hook` answers to.
-pub const SUBCOMMANDS: [&str; 9] = [
+pub const SUBCOMMANDS: [&str; 10] = [
     "collision-guard",
     "command-gate",
     "session-brief",
@@ -5274,6 +5289,7 @@ pub const SUBCOMMANDS: [&str; 9] = [
     "deliver",
     "peer-inbox",
     "stop-or-notify",
+    "permission-bridge",
     // `worktree::CREATE` and `worktree::REMOVE`, spelled out because
     // `plugin-contract.test.ts` reads this list as literals.
     "worktree-create",
@@ -5340,6 +5356,7 @@ pub fn dispatch(
         "deliver" => deliver::run(input),
         "peer-inbox" => Ok(run_peer_inbox(input)),
         "stop-or-notify" => run_stop_or_notify(input),
+        "permission-bridge" => permission_bridge::dispatch_fallback(input),
         // Not a JSON answer: the worktree events take a path on stdout and an
         // exit code, so the binary runs them through `worktree::run` before it
         // gets here.
