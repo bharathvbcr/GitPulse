@@ -256,6 +256,46 @@ pub fn read_for_worktree(worktree: &Path, now_ms: u64) -> Result<StoreRead, Stri
     read_store(&store_path(&common), now_ms, DEFAULT_TTL_MS, DEFAULT_CAP)
 }
 
+/// Active claims for the repository that contains `worktree`, combining
+/// `file-claims.jsonl` with live lane claims from
+/// `<git-common-dir>/gitpulse/lanes/claims.json` (projected as
+/// [`ClaimSource::Declared`] with `run_id: Some("lane:<agent_id>")`).
+pub fn read_unified(worktree: &Path, now_ms: u64) -> Result<StoreRead, String> {
+    let mut store_read = read_for_worktree(worktree, now_ms)?;
+    if store_read.untrusted {
+        return Ok(store_read);
+    }
+    let repo_str = worktree.to_string_lossy();
+    let live_lanes = crate::engine::agent_bus::list_live_lanes_at(repo_str.as_ref(), now_ms)
+        .map_err(|err| err.into_message())?;
+    for lane in live_lanes {
+        let wt = lane
+            .worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| worktree.display().to_string());
+        let run_id = Some(format!("lane:{}", lane.agent_id));
+        for raw_path in &lane.claimed_files {
+            let Ok(path) = normalize_rel(raw_path) else {
+                continue;
+            };
+            store_read.rows.push(FileClaim {
+                source: ClaimSource::Declared,
+                session_id: lane.session_id.clone(),
+                run_id: run_id.clone(),
+                path,
+                worktree: wt.clone(),
+                ts_ms: lane.updated_at_ms,
+                cwd: lane.worktree_path.clone(),
+            });
+        }
+    }
+    store_read.rows.sort_by_key(|claim| claim.ts_ms);
+    Ok(store_read)
+}
+
 /// Reads the store without taking a lock, and without writing anything. A torn
 /// or foreign line is skipped and counted; it never fails the read. The tools
 /// that call this are advertised read-only, so a degraded store is reported

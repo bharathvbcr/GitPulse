@@ -5475,6 +5475,7 @@ mod tests {
             claims_error: String::new(),
             claims_total: 0,
             claims_truncated: false,
+            truncated_worktrees: Vec::new(),
         }
     }
 
@@ -6135,6 +6136,7 @@ mod tests {
             claims_error: String::new(),
             claims_total: 0,
             claims_truncated: false,
+            truncated_worktrees: Vec::new(),
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "a.txt", &|_| String::new());
         assert!(facts.ok, "one worktree was read, so the scan ran");
@@ -6200,6 +6202,7 @@ mod tests {
             claims_error: String::new(),
             claims_total: 0,
             claims_truncated: false,
+            truncated_worktrees: Vec::new(),
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "src/lib.rs", &no_sessions);
         assert!(!facts.ok);
@@ -9340,6 +9343,7 @@ done
             claims_error: String::new(),
             claims_total: 0,
             claims_truncated: false,
+            truncated_worktrees: Vec::new(),
         };
         snapshot.ledger.recording = false;
         snapshot.ledger.recording_state = "unknown".to_string();

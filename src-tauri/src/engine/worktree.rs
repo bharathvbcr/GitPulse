@@ -8910,6 +8910,10 @@ mod tests {
             claimed_files: Vec::new(),
             claimed_symbols: Vec::new(),
             updated_at_ms: 0,
+            expires_at_ms: None,
+            owner_pid: None,
+            owner_proc_start_ns: None,
+            session_id: None,
         }
     }
 
