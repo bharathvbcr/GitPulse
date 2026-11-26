@@ -59,8 +59,8 @@ describe("worktree listing depth", () => {
       "lib/components/WorktreesPanel.svelte": ["full"],
       // Dirty counts only.
       "lib/work/load.ts": ["dirty"],
-      // Branch, head and the dirty counts a merge or removal is judged on.
-      "lib/workbench/attemptWorktree.ts": ["dirty"],
+      // Branch, head and the dirty counts single-lane and batched merges are judged on.
+      "lib/workbench/attemptWorktree.ts": ["dirty", "dirty"],
       // The attempt's head, and the main checkout's dirty count a wave merges and launches on.
       "lib/workbench/waveHost.ts": ["listing", "dirty"],
     });

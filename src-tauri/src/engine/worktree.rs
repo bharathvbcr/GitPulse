@@ -6239,7 +6239,7 @@ fn integrate_branch_locked<'a>(
         let _ = crate::devmap::init::ensure_dir_excluded(
             repo,
             ".devcouncil",
-            "# Added by GitPulse ledger",
+            "# Added by Waylode ledger",
         );
         if let Err(err) =
             crate::ledger::land_identity::record_land_identity(repo, &target_ref, &merged_tip, oid)
