@@ -715,22 +715,15 @@ pub(crate) fn augment_ide_peers_in(
             if !presence_locked && !pid_alive {
                 continue;
             }
-            if sid_lower
-                .as_deref()
-                .is_some_and(|sid| existing_sids.contains(sid))
-            {
-                continue;
-            }
-            if peer
-                .pid
-                .is_some_and(|pid| pid > 0 && existing_pids.contains(&pid))
-            {
-                continue;
-            }
             if let Some(ref sid) = sid_lower {
+                if existing_sids.contains(sid) {
+                    continue;
+                }
                 existing_sids.insert(sid.clone());
-            }
-            if let Some(pid) = peer.pid.filter(|&p| p > 0) {
+            } else if let Some(pid) = peer.pid.filter(|&p| p > 0) {
+                if existing_pids.contains(&pid) {
+                    continue;
+                }
                 existing_pids.insert(pid);
             }
 
@@ -2571,6 +2564,7 @@ mod tests {
         std::fs::create_dir_all(&presence_dir).unwrap();
 
         let conv_locked = "aaaaaaaa-1111-4222-8333-444444444444";
+        let conv_locked_2 = "cccccccc-1111-4222-8333-444444444444";
         let conv_stale = "bbbbbbbb-1111-4222-8333-444444444444";
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -2579,11 +2573,22 @@ mod tests {
             .write(true)
             .open(presence_dir.join(format!("{conv_locked}.lock")))
             .unwrap();
+        let lock_file_2 = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(presence_dir.join(format!("{conv_locked_2}.lock")))
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             assert_eq!(
                 unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::flock(lock_file_2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
             );
         }
@@ -2596,9 +2601,20 @@ mod tests {
                     "provider": "antigravity",
                     "surface": "ide",
                     "provider_session_id": conv_locked,
+                    "pid": 40908,
                     "worktree_path": repo_str,
                     "turn_state": "idle",
                     "updated_at_ms": 1000
+                },
+                {
+                    "peer_id": format!("agy:{conv_locked_2}"),
+                    "provider": "agy",
+                    "surface": "ide",
+                    "provider_session_id": conv_locked_2,
+                    "pid": 40908,
+                    "worktree_path": repo_str,
+                    "turn_state": "running",
+                    "updated_at_ms": 1001
                 },
                 {
                     "peer_id": format!("agy:{conv_stale}"),
@@ -2633,14 +2649,20 @@ mod tests {
             .find(|k| k.kind == "antigravity")
             .expect("antigravity kind status");
         if cfg!(unix) {
-            assert!(agy.sessions >= 1, "expected antigravity >= 1: {facet:?}");
-            assert_eq!(facet.sessions, 1, "{facet:?}");
-            assert_eq!(facet.worktrees[0].sessions.len(), 1);
             assert_eq!(
-                facet.worktrees[0].sessions[0].session_id.as_deref(),
-                Some(conv_locked)
+                agy.sessions, 2,
+                "both presence-locked agy IDE sessions sharing pid must be surfaced: {facet:?}"
             );
-            assert!(facet.worktrees[0].sessions[0].ide_hosted);
+            assert_eq!(facet.sessions, 2, "{facet:?}");
+            assert_eq!(facet.worktrees[0].sessions.len(), 2);
+            let sids: Vec<Option<&str>> = facet.worktrees[0]
+                .sessions
+                .iter()
+                .map(|s| s.session_id.as_deref())
+                .collect();
+            assert!(sids.contains(&Some(conv_locked)), "{sids:?}");
+            assert!(sids.contains(&Some(conv_locked_2)), "{sids:?}");
+            assert!(facet.worktrees[0].sessions.iter().all(|s| s.ide_hosted));
 
             // Second augmentation pass must deduplicate without double-counting.
             augment_ide_peers_in(
@@ -2656,9 +2678,10 @@ mod tests {
                     .find(|k| k.kind == "antigravity")
                     .unwrap()
                     .sessions,
-                1
+                2
             );
         }
         drop(lock_file);
+        drop(lock_file_2);
     }
 }
