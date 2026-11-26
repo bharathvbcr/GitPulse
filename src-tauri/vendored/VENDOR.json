@@ -229,7 +229,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-analyze",
-        "commit": "2acef200df69622b459278e1d88745bfb393d043"
+        "commit": "135ba7edbb0a02ee2f51ed187efbdfbd915cd3d1"
       },
       "omitted": [
         "tests/",
