@@ -37,8 +37,11 @@ struct ScaleFarm {
 fn build_scale_farm() -> ScaleFarm {
     let main = tempfile::tempdir().expect("main dir");
     let linked = tempfile::tempdir().expect("linked dir");
-    let repo = main.path().canonicalize().expect("canonical main");
-    let linked_root = linked.path().canonicalize().expect("canonical linked");
+    // git cannot create a worktree under a `\\?\` path, which is what
+    // `canonicalize` gives on Windows; the plain spelling is canonical too.
+    let plain = gitpulse_lib::engine::process::canonicalize_plain;
+    let repo = plain(main.path()).expect("canonical main");
+    let linked_root = plain(linked.path()).expect("canonical linked");
 
     common::run_git(&repo, &["init", "-q", "-b", "main"]);
     fs::write(repo.join(".gitignore"), ".devcouncil/\n").expect("gitignore");

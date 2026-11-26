@@ -36,15 +36,17 @@ mod scrubbed_env_adversarial_tests;
 #[cfg(test)]
 mod tests;
 
+/// Public for integration tests, which hand git paths it must be able to open.
+pub use env::canonicalize_plain;
 pub use env::find_external_tool_with;
 #[cfg(any(windows, test))]
 pub(crate) use env::simplified_windows_path;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use env::XCRUN_GIT_SHIM;
 pub(crate) use env::{
-    build_capture_command, canonicalize_plain, extended_child_path, external_tool_fallback_dirs,
-    find_external_tool, find_in_dirs, pin_git_environment, plain_path_text,
-    resolve_spawn_program_in, resolve_spawn_program_with, PathSource,
+    build_capture_command, extended_child_path, external_tool_fallback_dirs, find_external_tool,
+    find_in_dirs, pin_git_environment, plain_path_text, resolve_spawn_program_in,
+    resolve_spawn_program_with, PathSource,
 };
 #[cfg(test)]
 pub(crate) use env::{
