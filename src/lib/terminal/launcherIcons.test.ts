@@ -43,23 +43,28 @@ describe("launcher icons", () => {
     }
   });
 
-  it("draws Manvi's published mark: its 7x7 grid M on the Red700 tile, in Red050", () => {
-    // Manvi's own grid (manvi/ui/logo/logo.go), from which svg.go renders
-    // assets/manvi-mark.svg; '#' is the M knocked out of the tile.
-    const grid = [".......", ".#...#.", ".##.##.", ".#.#.#.", ".#...#.", ".#...#.", "......."];
+  it("draws Manvi's published Fold M mark with brand plate, palette, and unique gradient IDs", () => {
     const source = readFileSync(new URL("../components/BrandMark.svelte", import.meta.url), "utf8");
-    const pathSource = /const MANVI_M =([\s\S]*?);/.exec(source)?.[1] ?? "";
-    const d = [...pathSource.matchAll(/"([^"]*)"/g)].map((m) => m[1]).join("");
-    const drawn = Array.from({ length: 7 }, () => Array<string>(7).fill("."));
-    for (const [, x, y, w, h] of d.matchAll(/M(\d+) (\d+)h(\d+)v(\d+)h-\d+z/g)) {
-      for (let row = Number(y) / 12; row < (Number(y) + Number(h)) / 12; row++) {
-        for (let col = Number(x) / 12; col < (Number(x) + Number(w)) / 12; col++) drawn[row][col] = "#";
-      }
+    const outline = /const MANVI_FOLD_OUTLINE =\s*"([^"]+)";/.exec(source)?.[1] ?? "";
+    const lit = /const MANVI_FOLD_LIT =\s*"([^"]+)";/.exec(source)?.[1] ?? "";
+    expect(outline).toBe(
+      "M58 223L100 97L136 97L160 169L184 97L220 97L262 223L226 223L202 151L178 223L142 223L118 151L94 223Z",
+    );
+    expect(lit).toBe("M58 223L94 223L136 97L100 97ZM142 223L178 223L220 97L184 97Z");
+    expect(source).toContain('viewBox="0 0 320 320"');
+    expect(source).toContain('plateTop: "#24131b"');
+    expect(source).toContain('plateBottom: "#0c090c"');
+    expect(source).toContain('glow: "#d92d3f"');
+    expect(source).toContain('litTop: "#f0959e"');
+    expect(source).toContain('litMid: "#e0616f"');
+    expect(source).toContain('litBottom: "#d92d3f"');
+    expect(source).toContain('shadeTop: "#b02636"');
+    expect(source).toContain('shadeBottom: "#7a1626"');
+    expect(source).toContain("const uid = $props.id();");
+    for (const id of ["plate", "glow", "lit", "shade"]) {
+      expect(source).toContain(`id={\`\${uid}-manvi-${id}\`}`);
+      expect(source).toContain(`url(#\${uid}-manvi-${id})`);
     }
-    expect(d.length).toBeGreaterThan(0);
-    expect(drawn.map((row) => row.join(""))).toEqual(grid);
-    expect(source).toMatch(/const MANVI_TILE = "#7a1626";/);
-    expect(source).toMatch(/const MANVI_GLYPH = "#fdf2f3";/);
   });
 
   it("falls back to the shell glyph for an unknown or missing kind", () => {

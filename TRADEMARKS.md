@@ -1,9 +1,10 @@
 # GitPulse trademark policy
 
-The GitPulse code is under the [MIT License](LICENSE). The MIT License covers
-the code. It does not cover the name "GitPulse" or the GitPulse logos (the
-Pulse G mark and the app icon), which are trademarks of Bharath Chandra
-Vaddaram. This page says how you may use them.
+The GitPulse code is dual-licensed under the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE) ([LICENSE](LICENSE)). Those
+licenses cover the code. They do not cover the name "GitPulse" or the GitPulse
+logos (the Pulse G mark and the app icon), which are trademarks of Bharath
+Chandra Vaddaram. This page says how you may use them.
 
 ## What you may do without asking
 

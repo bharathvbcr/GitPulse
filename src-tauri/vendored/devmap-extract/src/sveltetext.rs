@@ -1,26 +1,36 @@
-//! Svelte template text: the same-width repair for a bare `&` or `>`.
+//! Svelte template repairs: same-width rewrites for constructs
+//! `tree-sitter-svelte-ng` 1.0.2 rejects.
 //!
-//! tree-sitter-svelte-ng reads HTML text with the HTML rules of its own
-//! scanner, and two characters that are legal text in a browser are not text to
-//! it: a bare `&` (`Code Age & Half-Life`, `Scan & Clean`), and a `>` that
-//! follows text on a line of its own (`for > 6 months`). Each becomes an ERROR
-//! node that swallows the rest of the text run, and the file is `Partial` with
-//! the whole element charged as a region outside every surviving declaration.
-//! Measured on the frozen GitPulse corpus: all eleven partial Svelte files, and
-//! only those, fail this way (tree-sitter-svelte-ng 1.0.2, the latest release).
-//! The one that fails whole (`src/App.svelte`, a root ERROR over 62,974 bytes)
-//! holds three such characters in a 40 KB template.
+//! Two shapes break valid Svelte 5 files:
+//!
+//! 1. **Svelte 5 `{@attach expr}` attachments** inside element/component start
+//!    tags (`<div {@attach watchRow}>`). `tree-sitter-svelte-ng` 1.0.2 predates
+//!    Svelte 5.29 attachments and its external scanner refuses any `{` followed
+//!    by `@` inside an attribute position, which breaks the `start_tag` and can
+//!    cascade into a whole-file ERROR. Writing spaces over the 7 bytes `@attach`
+//!    turns it into `{       expr}`, which the grammar parses as a shorthand
+//!    expression attribute whose `svelte_raw_text` starts directly on `expr`,
+//!    keeping every byte offset unchanged so `embedded` extracts the attachment
+//!    expression's references and calls at their exact offsets.
+//! 2. **Bare `&` or `>` in HTML text.** `tree-sitter-svelte-ng` reads HTML text
+//!    with HTML scanner rules that reject a bare `&` (`Code Age & Half-Life`)
+//!    and a `>` following text (`for > 6 months`). Each becomes an ERROR node
+//!    that swallows the text run.
 //!
 //! # The rewrite
 //!
-//! A letter is text wherever a bare `&` or `>` is, so writing one over the
-//! character changes nothing the extractors read: the repaired copy is only
-//! *parsed*. Its length is the file's, so every byte offset its tree reports is
-//! an offset of the original file, and the extractors go on reading the
-//! original text through the repaired tree, as they do for Kotlin's `;` rewrite
-//! ([`crate::kotlinsemi`]). The copy is dropped as soon as the last parse is
-//! done; no node's text is ever taken from it.
+//! The repaired copy is only *parsed*. Its length is the file's, so every byte
+//! offset its tree reports is an offset of the original file, and the
+//! extractors go on reading the original text through the repaired tree, as
+//! they do for Kotlin's `;` rewrite ([`crate::kotlinsemi`]). The copy is
+//! dropped as soon as the last parse is done; no node's text is ever taken from
+//! it.
 //!
+//! * First, `{@attach` inside start tags (outside `<script>`, `<style>`, HTML
+//!   comments, and quoted attribute values) has `@attach` overwritten with
+//!   spaces. When that produces edits, the file is re-parsed before scanning
+//!   ampersands so a cascading whole-file ERROR no longer hides `<script>`,
+//!   `<style>`, and `{...}` shields.
 //! * Every `&` that does not start a character reference (`&amp;`, `&#38;`,
 //!   `&#x26;`) is written over, except inside the places `&` is code: a
 //!   `<script>` or `<style>` element, and a `{...}` of any kind (`{a && b}`,
@@ -88,33 +98,44 @@ pub(crate) fn repair(
         return None;
     }
     let mut text = source.as_bytes().to_vec();
-    let shielded = shielded_ranges(first.root_node(), deadline)?;
-    let mut edits = write_over_ampersands(&mut text, &shielded);
-    // `None` is the failed tree itself: the text has not changed since it.
     let mut current: Option<Tree> = None;
-    let mut dirty = edits > 0;
-    for pass in 0..=MAX_PASSES {
-        if dirty {
-            // Only an ASCII byte was written over an ASCII byte.
-            let rewritten = std::str::from_utf8(&text).ok()?;
-            match parse_until(parser, rewritten, deadline) {
-                (Some(next), false) => current = Some(next),
-                _ => return None,
+    let mut edits = write_over_attachments(&mut text);
+    if edits > 0 {
+        let rewritten = std::str::from_utf8(&text).ok()?;
+        match parse_until(parser, rewritten, deadline) {
+            (Some(next), false) => current = Some(next),
+            _ => return None,
+        }
+    }
+    let after_attach = current.as_ref().unwrap_or(first);
+    if after_attach.root_node().has_error() {
+        let shielded = shielded_ranges(after_attach.root_node(), deadline)?;
+        let amp_edits = write_over_ampersands(&mut text, &shielded);
+        edits += amp_edits;
+        let mut dirty = amp_edits > 0;
+        for pass in 0..=MAX_PASSES {
+            if dirty {
+                // Only an ASCII byte was written over an ASCII byte.
+                let rewritten = std::str::from_utf8(&text).ok()?;
+                match parse_until(parser, rewritten, deadline) {
+                    (Some(next), false) => current = Some(next),
+                    _ => return None,
+                }
             }
+            let tree = current.as_ref().unwrap_or(first);
+            if !tree.root_node().has_error() || pass == MAX_PASSES {
+                break;
+            }
+            let fresh = greater_thans(tree.root_node(), &text, deadline)?;
+            if fresh.is_empty() {
+                break;
+            }
+            for at in fresh {
+                text[at] = FILL;
+                edits += 1;
+            }
+            dirty = true;
         }
-        let tree = current.as_ref().unwrap_or(first);
-        if !tree.root_node().has_error() || pass == MAX_PASSES {
-            break;
-        }
-        let fresh = greater_thans(tree.root_node(), &text, deadline)?;
-        if fresh.is_empty() {
-            break;
-        }
-        for at in fresh {
-            text[at] = FILL;
-            edits += 1;
-        }
-        dirty = true;
     }
     let tree = current?;
     if error_of(tree.root_node(), deadline)? < error_of(first.root_node(), deadline)? {
@@ -122,6 +143,205 @@ pub(crate) fn repair(
     } else {
         None
     }
+}
+
+/// Blank `@attach` inside Svelte 5 `{@attach expr}` attributes on element and
+/// component start tags with ASCII spaces, preserving exact byte length.
+///
+/// Scans the source linearly while skipping `<script>…</script>`,
+/// `<style>…</style>`, HTML comments (`<!--…-->`), quoted attribute values, and
+/// nested `{…}` expressions so JS strings or comments containing `{@attach`
+/// are never modified.
+fn write_over_attachments(text: &mut [u8]) -> usize {
+    const PREFIX: &[u8] = b"@attach";
+    let mut written = 0usize;
+    let mut i = 0usize;
+    let len = text.len();
+    while i < len {
+        // HTML comment `<!-- ... -->`
+        if text[i..].starts_with(b"<!--") {
+            if let Some(end) = find_bytes(text, i + 4, b"-->") {
+                i = end + 3;
+                continue;
+            }
+            break;
+        }
+        // Start tag `<tag ...>` (skipping `</...>` end tags and `<!...>`).
+        if text[i] == b'<'
+            && i + 1 < len
+            && (text[i + 1].is_ascii_alphabetic() || text[i + 1] == b'_')
+        {
+            let name_start = i + 1;
+            let mut j = name_start;
+            while j < len
+                && (text[j].is_ascii_alphanumeric() || matches!(text[j], b'-' | b':' | b'.' | b'_'))
+            {
+                j += 1;
+            }
+            let is_script = text[name_start..j].eq_ignore_ascii_case(b"script");
+            let is_style = text[name_start..j].eq_ignore_ascii_case(b"style");
+            // Scan inside the start tag up to its closing `>`.
+            let mut self_closing = false;
+            while j < len {
+                match text[j] {
+                    b'>' => {
+                        self_closing = j > name_start && text[j - 1] == b'/';
+                        j += 1;
+                        break;
+                    }
+                    b'"' | b'\'' => {
+                        let quote = text[j];
+                        j += 1;
+                        while j < len && text[j] != quote {
+                            if text[j] == b'{' {
+                                j = skip_balanced_js_braces(text, j);
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        if j < len {
+                            j += 1;
+                        }
+                    }
+                    b'{' => {
+                        let mut k = j + 1;
+                        while k < len && text[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if text[k..].starts_with(PREFIX)
+                            && text
+                                .get(k + PREFIX.len())
+                                .is_some_and(u8::is_ascii_whitespace)
+                        {
+                            for b in &mut text[k..k + PREFIX.len()] {
+                                *b = b' ';
+                            }
+                            written += 1;
+                        }
+                        j = skip_balanced_js_braces(text, j);
+                    }
+                    _ => j += 1,
+                }
+            }
+            i = j;
+            if !self_closing && (is_script || is_style) {
+                let close = if is_script {
+                    b"</script" as &[u8]
+                } else {
+                    b"</style"
+                };
+                if let Some(close_at) = find_ascii_ci_bytes(text, i, close) {
+                    if let Some(gt) = text[close_at..].iter().position(|&b| b == b'>') {
+                        i = close_at + gt + 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            continue;
+        }
+        // Outside tags: skip top-level `{...}` expressions (e.g. `{#if ...}`)
+        // so `<` inside JS expressions (`{a < b}`) does not look like a tag.
+        if text[i] == b'{' {
+            i = skip_balanced_js_braces(text, i);
+            continue;
+        }
+        i += 1;
+    }
+    written
+}
+
+/// Starting at `{`, advance past the matching `}` respecting JS strings,
+/// template literals, line/block comments, and nested `{...}`.
+fn skip_balanced_js_braces(text: &[u8], start: usize) -> usize {
+    let len = text.len();
+    if start >= len || text[start] != b'{' {
+        return start.saturating_add(1).min(len);
+    }
+    let mut i = start + 1;
+    let mut depth = 1usize;
+    while i < len && depth > 0 {
+        match text[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'\'' | b'"' => {
+                let q = text[i];
+                i += 1;
+                while i < len {
+                    if text[i] == b'\\' {
+                        i = (i + 2).min(len);
+                    } else if text[i] == q {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'`' => {
+                i = skip_js_template_string(text, i);
+            }
+            b'/' if text.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < len && text[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if text.get(i + 1) == Some(&b'*') => {
+                if let Some(end) = find_bytes(text, i + 2, b"*/") {
+                    i = end + 2;
+                } else {
+                    return len;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// Starting at `` ` ``, advance past the closing `` ` `` respecting escapes and
+/// `${...}` template interpolations.
+fn skip_js_template_string(text: &[u8], start: usize) -> usize {
+    let len = text.len();
+    let mut i = start + 1;
+    while i < len {
+        match text[i] {
+            b'\\' => i = (i + 2).min(len),
+            b'`' => return i + 1,
+            b'$' if text.get(i + 1) == Some(&b'{') => {
+                i = skip_balanced_js_braces(text, i + 1);
+            }
+            _ => i += 1,
+        }
+    }
+    len
+}
+
+fn find_bytes(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || from + needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|pos| from + pos)
+}
+
+fn find_ascii_ci_bytes(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || from + needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+        .map(|pos| from + pos)
 }
 
 /// How much of a tree is error: the bytes under its outermost ERROR nodes, then
@@ -330,7 +550,9 @@ mod tests {
 
     #[test]
     fn a_character_reference_is_named_and_a_bare_ampersand_is_not() {
-        for named in ["&amp;", "&lt;", "&frac12;", "&#38;", "&#x26;", "&#X26;", "&copy; x"] {
+        for named in [
+            "&amp;", "&lt;", "&frac12;", "&#38;", "&#x26;", "&#X26;", "&copy; x",
+        ] {
             assert!(is_character_reference(named.as_bytes()), "{named}");
         }
         for bare in [

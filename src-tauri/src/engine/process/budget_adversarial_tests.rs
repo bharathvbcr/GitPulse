@@ -33,6 +33,25 @@ fn open_in(dir: &tempfile::TempDir, name: &str) -> SharedBudget {
     SharedBudget::open(&dir.path().join(name)).expect("open")
 }
 
+/// Makes the record's bytes exactly `blob`, on the same file, without first
+/// truncating it to nothing as `fs::write` does. On Linux a truncation to zero
+/// drops the record's dirty page, so the next write dirties a fresh one and is
+/// charged 4 KiB again; the model below did that hundreds of thousands of
+/// times, 1.3 GiB of page-dirtying in one test that the disk-write watchdog
+/// counted (ubuntu-latest), though next to none of it reached the disk. The
+/// handles under test see the same bytes either way.
+fn put_record_bytes(path: &std::path::Path, blob: &[u8]) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    file.write_all(blob).unwrap();
+    file.set_len(blob.len() as u64).unwrap();
+}
+
 /// The pre-change decision: read, refill, take, and ALWAYS write. The oracle
 /// the skipped-write path must never beat.
 fn take_always_writing(
@@ -61,17 +80,6 @@ fn take_always_writing(
         (true, Err(r)) => Take::Unavailable(r),
         (false, Err(r)) => Take::DeniedUnrecorded(r),
     }
-}
-
-/// Leaves `path` holding exactly `blob`, as `std::fs::write` would, without
-/// truncating it to nothing first. Truncating to zero drops the cached page, so
-/// every blob dirtied a fresh 4 KiB block: the ~180 000 blobs of the model
-/// check wrote 1.3 GiB, most of the lib suite's disk-write budget. Overwriting
-/// in place and then cutting to length lands the same bytes on the record.
-fn overwrite_in_place(path: &Path, blob: &[u8]) {
-    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    file.write_all(blob).unwrap();
-    file.set_len(blob.len() as u64).unwrap();
 }
 
 struct ModelResult {
@@ -128,8 +136,8 @@ fn model(seed: u64, burst: u32, per_sec: u32, steps: u64) -> ModelResult {
                     }
                     _ => vec![0xFF; RECORD_LEN],
                 };
-                overwrite_in_place(&dir.path().join("lane"), &blob);
-                overwrite_in_place(&dir.path().join("oracle"), &blob);
+                put_record_bytes(&dir.path().join("lane"), &blob);
+                put_record_bytes(&dir.path().join("oracle"), &blob);
             }
         }
     }
@@ -459,16 +467,27 @@ fn four_waiters_each_get_tokens_under_the_nap_schedule() {
 #[test]
 fn reactive_waiters_are_served_in_arrival_order() {
     let (_dir, gate) = drained_gate(8, 4);
-    let began = Instant::now();
     let served = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         let mut waiters = Vec::new();
-        for (id, arrives_ms) in [(0_usize, 60_u64), (1, 155), (2, 165)] {
+        for id in 0..3_usize {
             let served = &served;
-            waiters.push(scope.spawn(move || {
-                let arrives = began + Duration::from_millis(arrives_ms);
-                std::thread::sleep(arrives.saturating_duration_since(Instant::now()));
-                let deadline = Instant::now() + Duration::from_millis(3_000);
+            let waiter = scope.spawn(move || {
+                // Sequence waiter arrival deterministically without timed
+                // sleeps: wait until prior waiters are queued in `reactive_line`
+                // (or already recorded in `served` on an overloaded host).
+                if id > 0 {
+                    assert!(
+                        crate::test_support::wait_until(Duration::from_secs(5), || {
+                            gate.state.lock().unwrap().reactive_line.len()
+                                + served.lock().unwrap().len()
+                                >= id
+                        }),
+                        "prior waiter {id} never reached reactive_line"
+                    );
+                }
+                let deadline = Instant::now()
+                    + crate::test_support::coverage_relaxed(Duration::from_millis(5_000));
                 let got = with_admission(Admission::Reactive, || {
                     gate.acquire_judged(deadline, &|| false)
                 });
@@ -476,7 +495,8 @@ fn reactive_waiters_are_served_in_arrival_order() {
                 // The grants are a refill interval apart, far more than the
                 // time between a grant and this push.
                 served.lock().unwrap().push(id);
-            }));
+            });
+            waiters.push(waiter);
         }
         for waiter in waiters {
             waiter.join().unwrap();

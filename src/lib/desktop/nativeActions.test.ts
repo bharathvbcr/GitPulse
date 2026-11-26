@@ -8,6 +8,7 @@ function handlers(): NativeMenuHandlers & { calls: string[] } {
   return {
     calls,
     activateRepo: (path) => calls.push(`activate:${path}`),
+    focusAgent: (id) => calls.push(`focusAgent:${id}`),
     clearRecents: () => calls.push("clearRecents"),
     checkUpdates: () => calls.push("checkUpdates"),
     stageAll: () => calls.push("stageAll"),
@@ -281,7 +282,7 @@ describe("dispatchNativeMenu — every id reaches its own handler", () => {
     // A handler added without a route here would otherwise go unnoticed; the
     // path-taking and error handlers are routed separately below.
     const routed = new Set(ROUTES.map(([, handler]) => handler));
-    const exempt = new Set(["setTab", "activateRepo", "openRecent", "openRepo", "openError", "setDropActive", "jumpRepoTab"]);
+    const exempt = new Set(["setTab", "activateRepo", "focusAgent", "openRecent", "openRepo", "openError", "setDropActive", "jumpRepoTab"]);
     const declared = Object.keys(handlers()).filter((k) => k !== "calls");
     const unrouted = declared.filter((k) => !routed.has(k) && !exempt.has(k));
     expect(unrouted).toEqual([]);
@@ -326,5 +327,12 @@ describe("native menu live-context gate", () => {
     expect(dispatchNativeMenu({ id: "activate-repo", path: "/r/a:b" }, h)).toBe(true);
     expect(h.calls).toEqual(["activate:/r/a:b"]);
     expect(dispatchNativeMenu({ id: "activate-repo" }, h)).toBe(false);
+  });
+  it("routes focus-agent with an exact id and refuses a missing id", () => {
+    const h = handlers();
+    expect(dispatchNativeMenu({ id: "focus-agent", path: "term:abc:1" }, h)).toBe(true);
+    expect(h.calls).toEqual(["focusAgent:term:abc:1"]);
+    expect(dispatchNativeMenu({ id: "focus-agent" }, h)).toBe(false);
+    expect(dispatchNativeMenu({ id: "focus-agent", path: "" }, h)).toBe(false);
   });
 });

@@ -76,7 +76,7 @@ describe("sessions a reloaded page left running", () => {
     expect(record.status).toBe(ENDING_STATUS);
     expect(record.reveal).toBeUndefined();
     await record.close();
-    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } });
+    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a", origin: "sessions_list_stop" } });
     expect(get(registry)).toEqual([]);
   });
 
@@ -84,7 +84,7 @@ describe("sessions a reloaded page left running", () => {
     const { registry, calls, adopt } = setup([row()]);
     await adopt();
     await get(registry)[0].close();
-    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } });
+    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a", origin: "sessions_list_stop" } });
     expect(get(registry)).toEqual([]);
   });
 
@@ -251,7 +251,7 @@ describe("a tab's process kept after its view went away", () => {
     const invoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => { calls.push({ command, args }); return null as T; };
     keepDetached(row(), tabSlot, { invoke, bus, confirm: async () => true });
     await get(registry)[0].close();
-    expect(calls).toEqual([{ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } }]);
+    expect(calls).toEqual([{ command: "cmd_terminal_kill", args: { sessionId: "term-1-a", origin: "sessions_list_stop" } }]);
     expect(get(registry)).toHaveLength(0);
   });
 
@@ -330,5 +330,35 @@ describe("a tab's process kept after its view went away", () => {
       confirm: async () => true,
     });
     expect(get(liveBeatsStaleRegistry)[0]?.title).toBe("User Pinned Name");
+  });
+});
+
+describe("protection a reload would otherwise forget", () => {
+  it("is read from the host listing, and the listing's absence of it clears it", async () => {
+    const { protectedSessions } = await import("./protection");
+    expect(parseListing({ ...row(), protected: true })?.protected).toBe(true);
+    expect(parseListing({ ...row(), protected: "yes" })?.protected).toBeUndefined();
+    const locked = setup([row({ protected: true }), row({ id: "term-1-b", detached: false })]);
+    await locked.adopt();
+    expect([...get(protectedSessions)]).toEqual(["term-1-a"]);
+    await setup([row()]).adopt();
+    expect(get(protectedSessions).size).toBe(0);
+  });
+});
+
+describe("the adoption latches tell a failed listing from an empty one", () => {
+  it("a failed listing does not settle, and says it failed; a later success settles", async () => {
+    const { detachedAdoptionSettled, detachedAdoptionFailed } = await import("./detachedSessions");
+    const { terminalSessions } = await import("./sessionRegistry");
+    const bus = fakeBus().bus;
+    const confirm = async () => true;
+    const down = async <T,>(): Promise<T> => { throw new Error("host busy"); };
+    await expect(adoptDetachedSessions({ invoke: down, bus, registry: terminalSessions, confirm })).rejects.toThrow("host busy");
+    expect(get(detachedAdoptionSettled)).toBe(false);
+    expect(get(detachedAdoptionFailed)).toBe(true);
+    const up = async <T,>(): Promise<T> => [] as T;
+    expect(await adoptDetachedSessions({ invoke: up, bus, registry: terminalSessions, confirm })).toBe(0);
+    expect(get(detachedAdoptionSettled)).toBe(true);
+    expect(get(detachedAdoptionFailed)).toBe(false);
   });
 });

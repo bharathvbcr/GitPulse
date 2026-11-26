@@ -56,16 +56,26 @@ impl<'a> QueryEngine<'a> {
             };
         }
         let q_lower = req.query.to_lowercase();
+        let q_trimmed = req.query.trim();
         let mut hits = Vec::new();
 
         for ext in self.extractions {
+            let path_l = ext.file_path.to_lowercase();
             for sym in &ext.symbols {
                 let name_l = sym.name.to_lowercase();
                 let qn_l = sym.qualified_name.to_lowercase();
-                if !(name_l.contains(&q_lower) || qn_l.contains(&q_lower)) {
+                let qualified_hit = q_lower.contains("::")
+                    && crate::query_match::traversal_start_matches(
+                        q_trimmed,
+                        &sym.qualified_name,
+                        &ext.file_path,
+                    )
+                    || (q_lower.contains("::")
+                        && crate::query_match::traversal_start_matches(&q_lower, &qn_l, &path_l));
+                if !(name_l.contains(&q_lower) || qn_l.contains(&q_lower) || qualified_hit) {
                     continue;
                 }
-                let score = if name_l == q_lower || qn_l == q_lower {
+                let score = if name_l == q_lower || qn_l == q_lower || qualified_hit {
                     1.0
                 } else if name_l.starts_with(&q_lower) {
                     0.95
@@ -216,10 +226,18 @@ impl<'a> QueryEngine<'a> {
                     .cloned()
                     .chain(inbound_nodes.iter().cloned())
                     .collect();
-                if matches!(
+                let pure_scoped_symbol = matches!(
                     crate::query_match::classify(target),
-                    crate::query_match::StartQuery::Symbol(_)
-                ) {
+                    crate::query_match::StartQuery::Qualified { .. }
+                ) && !named.iter().any(|(sym, file)| {
+                    crate::query_match::qualified_file_or_module_matches(target, sym, file)
+                });
+                if pure_scoped_symbol
+                    || matches!(
+                        crate::query_match::classify(target),
+                        crate::query_match::StartQuery::Symbol(_)
+                    )
+                {
                     if let Err(error) = super::traversal::refuse_ambiguous(
                         target,
                         &named.iter().cloned().collect::<Vec<_>>(),

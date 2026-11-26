@@ -91,6 +91,21 @@ describe("DockHeader section switcher", () => {
     expect(one).toContain("1 agent needs you");
     expect(html({ agentAttention: 3 })).toContain("3 agents need you");
   });
+
+  it("shows a running spinner on Agents when agents are running and none need attention", () => {
+    expect(html({ agentsRunning: 0 })).not.toContain("dock-agents-running");
+    const running = html({ agentsRunning: 2, agentAttention: 0 });
+    expect(running).toContain("dock-agents-running");
+    expect(running).toContain('data-testid="dock-agents-running-count">2<');
+    expect(running).toContain("2 agents running");
+    expect(tagOf(running, 'data-testid="dock-section-agents"')).toContain("2 running");
+    // Attention dot takes precedence over the running indicator.
+    const both = html({ agentsRunning: 2, agentAttention: 1 });
+    expect(both).toContain("dock-agents-attention");
+    expect(both).not.toContain("dock-agents-running");
+    expect(both).toContain("1 agent needs you, 2 running");
+    expect(tagOf(both, 'data-testid="dock-section-agents"')).toContain("1 needs you, 2 running");
+  });
 });
 
 describe("DockHeader context and status", () => {

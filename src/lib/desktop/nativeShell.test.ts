@@ -60,6 +60,7 @@ function buildHandlers() {
   return {
     canDispatch: vi.fn(() => true),
     activateRepo: vi.fn(),
+    focusAgent: vi.fn(),
     clearRecents: vi.fn(),
     checkUpdates: vi.fn(),
     stageAll: vi.fn(),

@@ -74,6 +74,7 @@ pub(crate) enum PathSearch {
 /// Ordering, and therefore *which* shortest path is returned, is unchanged:
 /// edges are considered in descending confidence with a total tie-break, and
 /// the frontier is explored in the same first-in-first-out order.
+#[cfg(all(test, feature = "parse"))]
 pub(super) fn shortest_path(
     edges: &[ResolvedEdge],
     from: &str,
@@ -82,14 +83,33 @@ pub(super) fn shortest_path(
     max_nodes: usize,
     cancel: &Cancel,
 ) -> Result<PathSearch, QueryCancelled> {
+    shortest_path_walked(edges, from, to, max_depth, max_nodes, cancel).map(|(search, _)| search)
+}
+
+/// [`shortest_path`], also returning the `(symbol, file)` nodes the walk
+/// expanded from `from`, so `trace_between` can ask the unresolved ledger only
+/// about calls inside what this trace actually walked rather than stamping a
+/// repository-wide count onto every answer.
+pub(super) fn shortest_path_walked(
+    edges: &[ResolvedEdge],
+    from: &str,
+    to: &str,
+    max_depth: usize,
+    max_nodes: usize,
+    cancel: &Cancel,
+) -> Result<(PathSearch, BTreeSet<(String, String)>), QueryCancelled> {
+    let mut walked: BTreeSet<(String, String)> = BTreeSet::new();
     if max_depth == 0 || max_nodes == 0 {
-        return Ok(PathSearch::Exhausted {
-            depth_capped: max_depth == 0,
-            node_capped: max_nodes == 0,
-            visited: 0,
-            max_depth,
-            max_nodes,
-        });
+        return Ok((
+            PathSearch::Exhausted {
+                depth_capped: max_depth == 0,
+                node_capped: max_nodes == 0,
+                visited: 0,
+                max_depth,
+                max_nodes,
+            },
+            walked,
+        ));
     }
     // Set the instant a limit actually costs the walk a successor it would
     // otherwise have expanded. Reaching a cap with nothing left to explore is
@@ -128,9 +148,10 @@ pub(super) fn shortest_path(
         if !edge_node_matches(&edge.source_file, &edge.source_symbol, from) {
             continue;
         }
+        walked.insert((edge.source_symbol.clone(), edge.source_file.clone()));
         let node = (edge.target_file.clone(), edge.target_symbol.clone());
         if edge_node_matches(&node.0, &node.1, to) {
-            return Ok(PathSearch::Found(vec![(*edge).clone()]));
+            return Ok((PathSearch::Found(vec![(*edge).clone()]), walked));
         }
         if visited.len() >= max_nodes {
             node_capped = true;
@@ -161,6 +182,7 @@ pub(super) fn shortest_path(
             }
             continue;
         }
+        walked.insert((reached[entry].node.1.clone(), reached[entry].node.0.clone()));
         let Some(candidates) = outgoing.get(&reached[entry].node) else {
             continue;
         };
@@ -177,20 +199,22 @@ pub(super) fn shortest_path(
                     node: next,
                     depth: depth + 1,
                 });
-                return Ok(PathSearch::Found(path_to(
-                    &reached,
-                    &ordered,
-                    reached.len() - 1,
-                )));
+                return Ok((
+                    PathSearch::Found(path_to(&reached, &ordered, reached.len() - 1)),
+                    walked,
+                ));
             }
             if visited.len() >= max_nodes {
-                return Ok(PathSearch::Exhausted {
-                    depth_capped,
-                    node_capped: true,
-                    visited: visited.len(),
-                    max_depth,
-                    max_nodes,
-                });
+                return Ok((
+                    PathSearch::Exhausted {
+                        depth_capped,
+                        node_capped: true,
+                        visited: visited.len(),
+                        max_depth,
+                        max_nodes,
+                    },
+                    walked,
+                ));
             }
             if visited.insert(next.clone()) {
                 reached.push(Reached {
@@ -204,13 +228,16 @@ pub(super) fn shortest_path(
         }
     }
     if depth_capped || node_capped {
-        return Ok(PathSearch::Exhausted {
-            depth_capped,
-            node_capped,
-            visited: visited.len(),
-            max_depth,
-            max_nodes,
-        });
+        return Ok((
+            PathSearch::Exhausted {
+                depth_capped,
+                node_capped,
+                visited: visited.len(),
+                max_depth,
+                max_nodes,
+            },
+            walked,
+        ));
     }
-    Ok(PathSearch::NoPath)
+    Ok((PathSearch::NoPath, walked))
 }

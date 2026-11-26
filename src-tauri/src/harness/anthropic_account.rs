@@ -78,24 +78,46 @@ pub(crate) fn detect() -> Detection {
     detect_with(home.as_deref(), path.as_deref())
 }
 
+/// [`detect`] preserving typed spawn-gate deferrals (`DeferredUnderLoad`) so
+/// background callers such as `harness::steward` do not mistake a load-deferred
+/// launcher check for a broken `~/.anthropic-accounts` registry.
+pub(crate) fn try_detect() -> Result<Detection, crate::ipc_error::CommandError> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = std::env::var_os("PATH");
+    try_detect_with(home.as_deref(), path.as_deref())
+}
+
 pub(crate) fn detect_with(home: Option<&Path>, path_var: Option<&OsStr>) -> Detection {
+    match try_detect_with(home, path_var) {
+        Ok(detection) => detection,
+        Err(error) => Detection::Broken(error.into_message()),
+    }
+}
+
+pub(crate) fn try_detect_with(
+    home: Option<&Path>,
+    path_var: Option<&OsStr>,
+) -> Result<Detection, crate::ipc_error::CommandError> {
     let Some(home) = home else {
-        return Detection::Absent;
+        return Ok(Detection::Absent);
     };
     let registry = home.join(REGISTRY);
     match std::fs::symlink_metadata(&registry) {
         Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Detection::Absent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Detection::Absent),
         Err(error) => {
-            return Detection::Broken(format!("could not read {}: {error}", registry.display()))
+            return Ok(Detection::Broken(format!(
+                "could not read {}: {error}",
+                registry.display()
+            )))
         }
     }
     let Some(program) = find_external_tool_with(PROGRAM, path_var, Some(home.as_os_str())) else {
-        return Detection::Broken(format!(
+        return Ok(Detection::Broken(format!(
             "{} exists but `{PROGRAM}` is not on PATH or in ~/.local/bin, so GitPulse cannot \
              pair its key with its workspace. Reinstall Manvi's tools.",
             registry.display()
-        ));
+        )));
     };
     let program = PathBuf::from(program);
     let mut command = Command::new(&program);
@@ -121,17 +143,27 @@ pub(crate) fn detect_with(home: Option<&Path>, path_var: Option<&OsStr>) -> Dete
     .and_then(|run| run.require_complete("anthropic-account which"))
     {
         Ok(run) => run,
+        Err(error) if error.origin() == Some(crate::ipc_error::IpcErrorKind::DeferredUnderLoad) => {
+            return Err(crate::ipc_error::CommandError::typed(
+                crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
+                format!(
+                    "could not ask `{}` which account to use: {}",
+                    program.display(),
+                    error.message()
+                ),
+            ));
+        }
         Err(error) => {
-            return Detection::Broken(format!(
+            return Ok(Detection::Broken(format!(
                 "could not ask `{}` which account to use: {}",
                 program.display(),
                 error.message()
-            ))
+            )))
         }
     };
     if !run.success {
         let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
-        return Detection::Broken(format!(
+        return Ok(Detection::Broken(format!(
             "`{} which` failed: {}",
             program.display(),
             if stderr.is_empty() {
@@ -139,15 +171,18 @@ pub(crate) fn detect_with(home: Option<&Path>, path_var: Option<&OsStr>) -> Dete
             } else {
                 &stderr
             }
-        ));
+        )));
     }
     match parse_which(&run.stdout) {
-        Ok(account) => Detection::Found {
+        Ok(account) => Ok(Detection::Found {
             program,
             home: home.to_path_buf(),
             account,
-        },
-        Err(why) => Detection::Broken(format!("`{} which --json`: {why}", program.display())),
+        }),
+        Err(why) => Ok(Detection::Broken(format!(
+            "`{} which --json`: {why}",
+            program.display()
+        ))),
     }
 }
 

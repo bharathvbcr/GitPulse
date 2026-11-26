@@ -162,10 +162,12 @@ mod tests {
                 idle_exit: None
             }
         );
+        // `/x/y` has no drive, so Windows reads it as relative.
+        let absolute = if cfg!(windows) { r"C:\x\y" } else { "/x/y" };
         assert_eq!(
-            parse(&args(&["--dir", "/x/y", "--idle-exit-ms", "2500"])),
+            parse(&args(&["--dir", absolute, "--idle-exit-ms", "2500"])),
             Parsed::Run {
-                dir: Some("/x/y".into()),
+                dir: Some(absolute.into()),
                 idle_exit: Some(Duration::from_millis(2500))
             }
         );

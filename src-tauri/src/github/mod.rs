@@ -2872,6 +2872,72 @@ pub fn view_pull_request(repo_path: &str, number: u64) -> Result<PullRequestDeta
     parse_pr_view(&stdout).map_err(CommandError::from)
 }
 
+/// Cap on inline pull request unified-diff payloads returned to the WebView.
+pub const MAX_PR_DIFF_BYTES: usize = 512 * 1024;
+
+/// Unified diff payload for one pull request (`gh pr diff`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestDiff {
+    pub number: u64,
+    pub patch: String,
+    pub truncated: bool,
+    pub total_bytes: usize,
+}
+
+/// Pure argv builder for `gh pr diff <number> --color=never`.
+pub fn pr_diff_leading_args(number: &str) -> [&str; 4] {
+    ["pr", "diff", number, "--color=never"]
+}
+
+/// Parses and safely bounds raw `gh pr diff` output on a UTF-8 line boundary.
+pub fn parse_pr_diff(number: u64, raw: &str) -> PullRequestDiff {
+    let total_bytes = raw.len();
+    if total_bytes <= MAX_PR_DIFF_BYTES {
+        return PullRequestDiff {
+            number,
+            patch: raw.to_string(),
+            truncated: false,
+            total_bytes,
+        };
+    }
+    let mut end = MAX_PR_DIFF_BYTES;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let line_cut = raw[..end].rfind('\n').filter(|pos| *pos > 0).unwrap_or(end);
+    PullRequestDiff {
+        number,
+        patch: raw[..line_cut].to_string(),
+        truncated: true,
+        total_bytes,
+    }
+}
+
+/// Fetches the unified diff for one pull request via `gh pr diff`. Read-only.
+pub fn fetch_pull_request_diff(
+    repo_path: &str,
+    number: u64,
+) -> Result<PullRequestDiff, CommandError> {
+    if number == 0 {
+        return Err("Invalid pull request number".into());
+    }
+    let repo = validate_repo(repo_path)?;
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason.into());
+    }
+    let remote = discover_github_remote(repo_path)?
+        .ok_or_else(|| "No GitHub remote configured".to_string())?;
+    let num_str = number.to_string();
+    let stdout = run_gh(
+        &remote,
+        &pr_diff_leading_args(&num_str),
+        Duration::from_secs(45),
+        Some(&repo),
+    )?;
+    let patch = String::from_utf8_lossy(&stdout);
+    Ok(parse_pr_diff(number, &patch))
+}
+
 /// What a review says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5346,37 +5412,87 @@ mod tests {
 
     /// A `gh` on PATH that rejects `--hostname` the way the real one does
     /// (`unknown flag: --hostname`, verified against gh 2.102.0) and logs every
-    /// argv it is handed, one line per call.
-    #[cfg(unix)]
-    fn install_fake_gh(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let log = dir.join("argv.log");
-        let script = format!(
+    /// argv it is handed into `log_dir`. Returns `(log_dir, stub_path)`.
+    ///
+    /// Writing one file per subcommand pair (`pr_list.log`, `issue_list.log`,
+    /// ...) on Windows avoids `ERROR_SHARING_VIOLATION` when
+    /// `load_github_context` spawns four concurrent `gh` calls against `cmd.exe`.
+    fn install_fake_gh(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let log_dir = dir.join("argv-logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let unix_log = log_dir.join("unix.log");
+        let unix_sh = format!(
             "#!/bin/sh\n\
-             echo \"$*\" >> '{log}'\n\
+             echo \"$*\" >> {log}\n\
              case \"$1\" in --version) echo 'gh version 2.102.0'; exit 0;; esac\n\
              for a in \"$@\"; do [ \"$a\" = --hostname ] && {{ echo 'unknown flag: --hostname' >&2; exit 1; }}; done\n\
              echo '[]'\n",
-            log = log.display()
+            log = crate::test_support::sh_quote(&unix_log)
+        );
+        let windows_cmd = format!(
+            "@echo off\r\n\
+             setlocal EnableExtensions\r\n\
+             set \"LOGDIR={log_dir}\"\r\n\
+             setlocal EnableDelayedExpansion\r\n\
+             set \"FIRST=%~1\"\r\n\
+             set \"SECOND=%~2\"\r\n\
+             if \"%~1\"==\"--version\" (\r\n\
+               echo gh version 2.102.0\r\n\
+               exit /b 0\r\n\
+             )\r\n\
+             set \"LINE=\"\r\n\
+             set \"BAD=0\"\r\n\
+             :loop\r\n\
+             if \"%~1\"==\"\" if \"%1\"==\"\" goto done\r\n\
+             if \"%~1\"==\"--hostname\" set \"BAD=1\"\r\n\
+             if defined LINE (\r\n\
+               set \"LINE=!LINE! %~1\"\r\n\
+             ) else (\r\n\
+               set \"LINE=%~1\"\r\n\
+             )\r\n\
+             shift\r\n\
+             goto loop\r\n\
+             :done\r\n\
+             >> \"!LOGDIR!\\!FIRST!_!SECOND!.log\" echo(!LINE!\r\n\
+             if \"!BAD!\"==\"1\" (\r\n\
+               echo unknown flag: --hostname 1>&2\r\n\
+               exit /b 1\r\n\
+             )\r\n\
+             echo []\r\n",
+            log_dir = crate::test_support::plain_git_path(&log_dir).display()
         );
         let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        log
+        let stub = crate::test_support::write_path_stub(&bin, "gh", &unix_sh, &windows_cmd);
+        (log_dir, stub)
+    }
+
+    fn read_fake_gh_logs(log_dir: &std::path::Path) -> String {
+        let mut paths: Vec<_> = std::fs::read_dir(log_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
+            .collect();
+        paths.sort();
+        let mut combined = String::new();
+        for path in paths {
+            let text = std::fs::read_to_string(&path).unwrap();
+            combined.push_str(&text.replace("\r\n", "\n"));
+            if !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+        }
+        combined
     }
 
     /// Every repo-context call against a GHES remote must pin the host through
     /// `--repo HOST/OWNER/REPO`; `gh pr/issue/run/release` have no
     /// `--hostname` flag, so one in the argv fails the whole panel.
-    #[cfg(unix)]
     #[test]
     fn ghes_remote_calls_pin_the_host_inside_repo_and_never_pass_hostname() {
         let serial = crate::harness::sidecar::test_serial();
         let fixture = tempfile::TempDir::new().unwrap();
-        let log = install_fake_gh(fixture.path());
-        let path = format!("{}:/usr/bin:/bin", fixture.path().join("bin").display());
+        let (log_dir, _) = install_fake_gh(fixture.path());
+        let path = crate::test_support::prepend_path_dir(&fixture.path().join("bin"));
         let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
         let repo = crate::test_support::git_repo();
         crate::test_support::git_in(
@@ -5396,7 +5512,7 @@ mod tests {
         )
         .expect("checkout must not be rejected for --hostname");
 
-        let calls = std::fs::read_to_string(log).unwrap();
+        let calls = read_fake_gh_logs(&log_dir);
         for sub in [
             "pr list",
             "issue list",
@@ -5477,13 +5593,12 @@ mod tests {
 
     /// `gh --version` ran before every GitHub call, the live run poll
     /// included. The answer changes only with the binary.
-    #[cfg(unix)]
     #[test]
     fn the_gh_probe_runs_once_per_binary_not_once_per_call() {
         let serial = crate::harness::sidecar::test_serial();
         let fixture = tempfile::TempDir::new().unwrap();
-        install_fake_gh(fixture.path());
-        let path = format!("{}:/usr/bin:/bin", fixture.path().join("bin").display());
+        let (_, gh) = install_fake_gh(fixture.path());
+        let path = crate::test_support::prepend_path_dir(&fixture.path().join("bin"));
         let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
         GH_PROBES.clear();
         let probes = || {
@@ -5496,9 +5611,11 @@ mod tests {
         };
         assert_eq!(probes(), 1, "five calls, one `gh --version`");
         // The binary changes (a longer script): the cached answer is dropped.
-        let gh = fixture.path().join("bin/gh");
         let mut script = std::fs::read_to_string(&gh).unwrap();
+        #[cfg(unix)]
         script.push_str("# upgraded\n");
+        #[cfg(windows)]
+        script.push_str("rem upgraded\r\n");
         std::fs::write(&gh, script).unwrap();
         assert_eq!(probes(), 1, "an upgraded gh is probed again");
     }
@@ -5510,13 +5627,12 @@ mod tests {
     /// the shared cache, and the next surface was answered by the real `gh`
     /// past the refusal. A refusal forced on this thread must reach the spawn
     /// whatever the cache holds.
-    #[cfg(unix)]
     #[test]
     fn a_forced_probe_failure_is_not_answered_from_a_warm_cache() {
         let serial = crate::harness::sidecar::test_serial();
         let fixture = tempfile::TempDir::new().unwrap();
-        install_fake_gh(fixture.path());
-        let path = format!("{}:/usr/bin:/bin", fixture.path().join("bin").display());
+        let _ = install_fake_gh(fixture.path());
+        let path = crate::test_support::prepend_path_dir(&fixture.path().join("bin"));
         let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
         GH_PROBES.clear();
         // Another test's probe, as it would leave the cache.
@@ -6159,5 +6275,31 @@ mod non_ascii_tail_tests {
         assert!(logged
             .lines()
             .any(|l| l.starts_with("issue close 77 --repo acme/repo")));
+    }
+
+    #[test]
+    fn parse_pr_diff_bounds_oversized_diffs_on_line_boundaries() {
+        assert_eq!(
+            pr_diff_leading_args("42"),
+            ["pr", "diff", "42", "--color=never"]
+        );
+
+        let small = "diff --git a/a.rs b/a.rs\n+hello\n";
+        let ok = parse_pr_diff(42, small);
+        assert_eq!(ok.number, 42);
+        assert!(!ok.truncated);
+        assert_eq!(ok.total_bytes, small.len());
+        assert_eq!(ok.patch, small);
+
+        let chunk = format!("+{}\n", "é".repeat(500));
+        let mut huge = String::new();
+        while huge.len() <= MAX_PR_DIFF_BYTES + 1024 {
+            huge.push_str(&chunk);
+        }
+        let capped = parse_pr_diff(99, &huge);
+        assert!(capped.truncated);
+        assert_eq!(capped.total_bytes, huge.len());
+        assert!(capped.patch.len() <= MAX_PR_DIFF_BYTES);
+        assert!(capped.patch.ends_with('é'));
     }
 }

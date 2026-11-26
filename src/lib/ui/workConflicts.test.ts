@@ -5,10 +5,15 @@ import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { repoStore } from "../stores/repoStore";
 import {
+  bumpConflictDraftProbe,
+  conflictDraftProbe,
   conflictsFocusRequest,
+  conflictsPanelOpen,
   openConflicts,
   requestConflictsFocus,
+  setConflictsPanelOpen,
   takeConflictsFocus,
+  takeConflictsReveal,
 } from "./workConflicts";
 
 const lib = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,23 +22,62 @@ const read = (path: string) => readFileSync(join(lib, path), "utf8");
 describe("the conflict editor's door", () => {
   beforeEach(() => {
     takeConflictsFocus();
+    takeConflictsReveal();
+    setConflictsPanelOpen(false);
   });
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("lands on Overview and leaves a request for the pane that mounts after", () => {
+  it("lands on Overview and leaves both focus and reveal requests for the pane that mounts after", () => {
     const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
     openConflicts();
     expect(navigate).toHaveBeenCalledWith("work", "overview");
     expect(get(conflictsFocusRequest)).toBe(true);
+    expect(takeConflictsReveal()).toBe(true);
+    expect(takeConflictsReveal()).toBe(false);
   });
 
   it("clears on read, so a later visit to Overview does not jump to the editor", () => {
     requestConflictsFocus();
+    expect(takeConflictsReveal()).toBe(false);
     expect(takeConflictsFocus()).toBe(true);
     expect(takeConflictsFocus()).toBe(false);
     expect(get(conflictsFocusRequest)).toBe(false);
+  });
+
+  it("does not clobber a pending reveal when a passive tab focus request arrives", () => {
+    requestConflictsFocus({ reveal: true });
+    requestConflictsFocus();
+    expect(get(conflictsFocusRequest)).toBe(true);
+    expect(takeConflictsReveal()).toBe(true);
+    expect(takeConflictsFocus()).toBe(true);
+  });
+
+  it("clears an orphaned reveal when a passive focus request arrives after focus was taken alone", () => {
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    openConflicts();
+    expect(navigate).toHaveBeenCalledWith("work", "overview");
+    expect(takeConflictsFocus()).toBe(true);
+    // Passive tab focus request when `pending` is already false clears orphaned `pendingReveal`.
+    requestConflictsFocus();
+    expect(get(conflictsFocusRequest)).toBe(true);
+    expect(takeConflictsReveal()).toBe(false);
+    expect(takeConflictsFocus()).toBe(true);
+  });
+
+  it("bumps conflictDraftProbe to notify draft counters", () => {
+    const before = get(conflictDraftProbe);
+    bumpConflictDraftProbe();
+    expect(get(conflictDraftProbe)).toBe(before + 1);
+  });
+
+  it("tracks whether the conflict editor panel is currently open", () => {
+    expect(get(conflictsPanelOpen)).toBe(false);
+    setConflictsPanelOpen(true);
+    expect(get(conflictsPanelOpen)).toBe(true);
+    setConflictsPanelOpen(false);
+    expect(get(conflictsPanelOpen)).toBe(false);
   });
 
   it("is the only way the conflict doors navigate", () => {

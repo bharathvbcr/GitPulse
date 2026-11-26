@@ -56,6 +56,13 @@ fn main() {
     // can block, so every later wait is cut to what the host's timeout leaves.
     hooks::start_deadline();
     let code = run_guarded(decide);
+    // `process::exit` below runs no destructor, so a harness sidecar this hook
+    // started (and the state directory it holds) is ended here, before the
+    // sweep takes down what is left. It waits for nothing: the host enforces a
+    // budget on the whole process, and a hook killed after its decision was
+    // printed loses the decision. A slot a call still holds is left to the
+    // sweep and the next process.
+    gitpulse_lib::harness::sidecar::shutdown_for_hook_exit();
     // The decision is already on stdout. Anything a check abandoned at its
     // deadline is still running: a `git status` or the harness sidecar, in its
     // own process group, able to hold `.git/index.lock` after the hook is gone.
@@ -103,6 +110,19 @@ where
     env_is_agy || args.into_iter().any(|arg| arg.as_ref() == "--host=agy")
 }
 
+fn strip_host_agy_flag(raw_args: &[String]) -> (bool, Vec<String>) {
+    let mut flag_is_agy = false;
+    let mut args = Vec::with_capacity(raw_args.len());
+    for arg in raw_args {
+        if arg == "--host=agy" {
+            flag_is_agy = true;
+        } else {
+            args.push(arg.clone());
+        }
+    }
+    (flag_is_agy, args)
+}
+
 /// Runs one hook invocation and returns its exit code, which
 /// [`hooks::diagnostic`] fixes at 0 for every outcome it reports.
 fn decide() -> i32 {
@@ -117,10 +137,7 @@ fn decide() -> i32 {
     let _ = gitpulse_lib::procguard::install_signal_handlers();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let (flag_is_agy, args): (bool, &[String]) = match raw_args.first().map(String::as_str) {
-        Some("--host=agy") => (true, &raw_args[1..]),
-        _ => (false, &raw_args[..]),
-    };
+    let (flag_is_agy, args) = strip_host_agy_flag(&raw_args);
 
     let antigravity_env = flag_is_agy || hooks::is_antigravity_env();
 
@@ -1052,6 +1069,14 @@ mod tests {
         items.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    /// An absolute path on the platform under test: `/repo/root` has no drive,
+    /// so Windows reads it as relative and refuses it.
+    const REPO_ROOT: &str = if cfg!(windows) {
+        r"C:\repo\root"
+    } else {
+        "/repo/root"
+    };
+
     const SAMPLE_TOKEN: &str =
         "gpst_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1092,7 +1117,7 @@ mod tests {
                 "--cols",
                 "120",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1100,7 +1125,7 @@ mod tests {
         assert_eq!(
             spawn,
             TermCliOutcome::Call(OrchestrateCall::Spawn {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1117,7 +1142,7 @@ mod tests {
 
         let open_file = parse_term_cli(
             &vec_args(&["open-file", "src/main.rs", "--line", "42", "--column=7"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1125,7 +1150,7 @@ mod tests {
         assert_eq!(
             open_file,
             TermCliOutcome::Call(OrchestrateCall::OpenFile {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1169,7 +1194,7 @@ mod tests {
                 "--no-wait-for-idle",
                 "--since-seq=7",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1177,7 +1202,7 @@ mod tests {
         assert_eq!(
             wait,
             TermCliOutcome::Call(OrchestrateCall::Wait {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1199,7 +1224,7 @@ mod tests {
                 "--grep=FAIL",
                 "--last-command-only",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1207,7 +1232,7 @@ mod tests {
         assert_eq!(
             read,
             TermCliOutcome::Call(OrchestrateCall::Read {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1232,7 +1257,7 @@ mod tests {
                 "Check build",
                 "--max-lines=300",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             None,
             None,
         )
@@ -1240,7 +1265,7 @@ mod tests {
         assert_eq!(
             exec,
             TermCliOutcome::Call(OrchestrateCall::Exec {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: None,
                 caller_token: None,
                 external_caller_id: Some(external_hook_caller_id()),
@@ -1258,7 +1283,7 @@ mod tests {
 
         let send = parse_term_cli(
             &vec_args(&["send", "term-100-2", "--input", "echo ok", "--no-newline"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1266,7 +1291,7 @@ mod tests {
         assert_eq!(
             send,
             TermCliOutcome::Call(OrchestrateCall::Send {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1278,7 +1303,7 @@ mod tests {
 
         let close = parse_term_cli(
             &vec_args(&["close", "term-100-2"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1286,7 +1311,7 @@ mod tests {
         assert_eq!(
             close,
             TermCliOutcome::Call(OrchestrateCall::Close {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1299,7 +1324,7 @@ mod tests {
     fn term_cli_refuses_unknown_flags_missing_credentials_and_bad_paths() {
         let missing_tok = parse_term_cli(
             &vec_args(&["list"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             None,
         )
@@ -1311,7 +1336,7 @@ mod tests {
 
         let bad_flag = parse_term_cli(
             &vec_args(&["list", "--bogus"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1329,7 +1354,7 @@ mod tests {
 
         let traversal = parse_term_cli(
             &vec_args(&["open-file", "../secret.txt"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1350,6 +1375,22 @@ mod tests {
         assert!(
             !is_agy_invocation_from(["--host=agyx", "notify"], false),
             "only the exact flag counts"
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["--host=agy", "peer-inbox"])),
+            (true, vec_args(&["peer-inbox"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["peer-inbox", "--host=agy"])),
+            (true, vec_args(&["peer-inbox"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["notify", "--host=agy", "permission_request"])),
+            (true, vec_args(&["notify", "permission_request"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["peer-inbox"])),
+            (false, vec_args(&["peer-inbox"]))
         );
     }
 }

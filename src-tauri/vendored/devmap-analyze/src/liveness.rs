@@ -2651,6 +2651,12 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
                     reason,
                 });
             }
+            // A language WITH a call extractor that was cut at the single-file
+            // call or reference ceiling is a `Partial` parse over the unread tail
+            // (devmap-extract carries the cut on `parse_outcome`, which is
+            // stored), and is charged by the `PartialParse` arm above. It is not
+            // read from `diagnostics` here: they are cleared before storage, so
+            // a gap built from them vanishes on a re-resolve from cached payloads.
             if !capabilities.contains(Capability::Imports) {
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),

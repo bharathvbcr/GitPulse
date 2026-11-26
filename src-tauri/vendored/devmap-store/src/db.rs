@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::edge_index::GenerationEdges;
 use devmap_analyze::model::*;
@@ -55,8 +55,53 @@ impl std::error::Error for StoreRefusal {}
 /// concurrently.
 static CONNECTION_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The writer locks this process holds, by lock-file path, and the thread that
+/// took each. An `flock` taken on a second descriptor conflicts with the
+/// first even inside one process, so code that already holds a store's lock
+/// and then opens that store (`devmap build` does) must not ask for it again;
+/// [`Store::open`] consults this to tell its own caller's lock from a rival's.
+static HELD_WRITER_LOCKS: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, std::thread::ThreadId>>,
+> = std::sync::Mutex::new(None);
+
+fn held_writer_locks() -> std::sync::MutexGuard<
+    'static,
+    Option<std::collections::HashMap<std::path::PathBuf, std::thread::ThreadId>>,
+> {
+    HELD_WRITER_LOCKS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 pub(crate) fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
+}
+
+thread_local! {
+    /// Set only by tests. Production leaves it `None`, and the read then does
+    /// nothing here.
+    static GENERATION_READ_PAUSE: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pause after a generation existence check has passed and before the select
+/// that reads that generation.
+///
+/// `#[cfg(test)]` items are not compiled into the library that `tests/*.rs`
+/// and `devmap-query`'s tests link, so this is `pub` and hidden rather than
+/// test-gated. A test sets it to commit a prune from a second connection at
+/// that one point. The hook is thread-local and runs on the reading thread.
+/// Nothing in production sets it; the cost is one thread-local read per call.
+#[doc(hidden)]
+pub fn set_generation_read_pause(hook: Option<fn()>) {
+    GENERATION_READ_PAUSE.with(|slot| slot.set(hook));
+}
+
+fn fire_generation_read_pause() {
+    GENERATION_READ_PAUSE.with(|slot| {
+        if let Some(hook) = slot.get() {
+            hook();
+        }
+    });
 }
 
 /// What a reader is told about a damaged full-text index, and what to do.
@@ -171,6 +216,13 @@ impl std::error::Error for UnsupportedSchema {}
 fn unsupported_schema_error(store: &str, found: i32) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(UnsupportedSchema::new(store, found)))
 }
+
+/// The head a build or drain stamps when `git rev-parse HEAD` cannot be read.
+///
+/// The one spelling of it: `devmap build`, the daemon's drain, the manifest and
+/// export fallbacks write it, and the status surfaces compare against it.
+/// `latest_generation_head_sha` returns it verbatim rather than as "never built".
+pub const UNAVAILABLE_HEAD: &str = "unavailable";
 
 /// Shared by [`Store::save_generation_timed`] and [`Store::restamp_latest_head`].
 /// A stamp is provenance, not a git-object proof: `"unavailable"` and `"unknown"`
@@ -555,15 +607,86 @@ pub struct PendingClaim {
 #[path = "db/tests/agentic_queue_regressions.rs"]
 mod agentic_queue_regressions;
 
+thread_local! {
+    /// The cancel flag of the lazy source-freshness walk running on this
+    /// thread, if one is. See [`WalkCancelScope`].
+    static WALK_CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, [`lock_conn`] on this thread stops waiting for the connection
+/// once the flag is set, and fails as a cancelled walk does.
+///
+/// A lazy walk's reads wait for the connection behind whoever holds it (a
+/// writer, another query). The querying thread joins the walk, so a wait that
+/// ignored the cancel would carry the query past its budget. Only the walk's
+/// thread enters this scope, and only around its source reads; every other
+/// caller of `lock_conn` waits as before, and so does the repair after a walk
+/// panic, which runs outside the scope.
+pub(crate) struct WalkCancelScope;
+
+impl WalkCancelScope {
+    pub(crate) fn enter(cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        WALK_CANCEL.with(|slot| *slot.borrow_mut() = Some(cancel));
+        Self
+    }
+}
+
+impl Drop for WalkCancelScope {
+    fn drop(&mut self) {
+        WALK_CANCEL.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Waits for the connection. Without a [`WalkCancelScope`] on this thread that is
+/// a plain blocking lock. Inside one it polls `try_lock` every millisecond and
+/// returns `None` once the cancel is set. The result is the `lock` result, so a
+/// poisoned mutex hands back its guard in the error.
+fn wait_conn(
+    mutex: &Mutex<Connection>,
+) -> Option<std::sync::LockResult<MutexGuard<'_, Connection>>> {
+    // `try_with`: a thread tearing down its locals has no scope to consult.
+    let cancel = WALK_CANCEL
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten();
+    let Some(cancel) = cancel else {
+        return Some(mutex.lock());
+    };
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(Ok(guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(Err(poisoned)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 /// Fail closed: poisoned mutex is an error, never a panic.
+///
+/// A cancel-aware wait (the lazy walk's thread, see [`WalkCancelScope`]) polls
+/// every millisecond rather than queueing on the mutex, so on a busy store it
+/// can lose the connection to blocking lockers again and again until its cancel
+/// fires. It then ends as a cancelled walk, and the query answers null with the
+/// reason. That fails safe, and is accepted: the walk is an optional upgrade of
+/// the answer, never a condition of it.
 fn lock_conn(
     mutex: &Mutex<Connection>,
 ) -> std::result::Result<MutexGuard<'_, Connection>, rusqlite::Error> {
-    mutex
-        .lock()
-        .map_err(|_: PoisonError<MutexGuard<'_, Connection>>| {
-            refusal("store mutex poisoned — refusing to continue (fail-closed)")
-        })
+    match wait_conn(mutex) {
+        Some(Ok(guard)) => Ok(guard),
+        Some(Err(_)) => Err(refusal(
+            "store mutex poisoned — refusing to continue (fail-closed)",
+        )),
+        None => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            devmap_extract::BuildCancelled,
+        ))),
+    }
 }
 
 /// What a read-only open is asked for: the memory its connection may use for
@@ -720,7 +843,106 @@ pub struct Store {
     /// generation they answered from, or an explicit unverified reason when
     /// nothing has been checked in this process.
     source_freshness_cache: Mutex<Option<CachedSourceFreshness>>,
+    /// Whether a live file watcher is reporting this store's edits. Set by the
+    /// daemon for as long as its watcher runs ([`Store::set_watcher_live`]);
+    /// false for the CLI and for an MCP-only process, which nothing watches.
+    /// A verdict remembered while it was true is not aged out (see
+    /// [`SOURCE_FRESHNESS_MAX_AGE`]).
+    source_freshness_watcher_live: std::sync::atomic::AtomicBool,
+    /// Whether a query that finds its unwatched verdict aged out (or absent)
+    /// may re-run the read-only source-freshness walk itself. Set by long-lived
+    /// readers ([`Store::enable_lazy_source_verification`], the MCP server's
+    /// store cache); a one-shot CLI process or hook never walks on a query.
+    lazy_source_verification: std::sync::atomic::AtomicBool,
+    /// Remembers when the last lazy walk started, so a store walks at most
+    /// once per [`SOURCE_FRESHNESS_MAX_AGE`] however many queries ask. Held
+    /// only to read and write that bookkeeping, never across the walk: a
+    /// query that arrives during a walk reads the cached verdict (and is told
+    /// a walk is running) instead of waiting for it.
+    lazy_walk: Mutex<LazyWalk>,
 }
+
+/// A test's stand-in for the start of a lazy walk; see [`LazyWalk::probe`].
+#[cfg(test)]
+pub(crate) type WalkProbe = std::sync::Arc<dyn Fn(&std::sync::atomic::AtomicBool) + Send + Sync>;
+
+/// State behind [`Store::query_source_freshness`]'s lazy re-walk.
+#[derive(Default)]
+pub(crate) struct LazyWalk {
+    pub(crate) last_attempt: Option<std::time::Instant>,
+    /// A walk is running now (set when it starts, cleared when it ends).
+    pub(crate) in_flight: bool,
+    /// Why the last walk could not decide (cancelled, failed, panicked, over
+    /// the memory bound) and the generation it was walking, kept for the age
+    /// window so a later query on that generation says so rather than reading
+    /// as if no walk had been tried. Cleared when a walk starts.
+    pub(crate) last_failure: Option<(u32, String)>,
+    /// Walks started, for tests.
+    #[cfg(test)]
+    pub(crate) walks: usize,
+    /// Runs in the walk's thread before the walk, with its cancel flag.
+    #[cfg(test)]
+    pub(crate) probe: Option<WalkProbe>,
+    /// Overrides [`SOURCE_FRESHNESS_WALK_BUDGET`].
+    #[cfg(test)]
+    pub(crate) budget: Option<std::time::Duration>,
+    /// Overrides [`SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES`].
+    #[cfg(test)]
+    pub(crate) max_source_bytes: Option<u64>,
+    /// Stands in for the process-wide walk places.
+    #[cfg(test)]
+    pub(crate) slots: Option<std::sync::Arc<WalkSlots>>,
+    /// Makes the walk thread fail to start, as the operating system can.
+    #[cfg(test)]
+    pub(crate) fail_spawn: bool,
+}
+
+/// A count of lazy walks running, with the most that may run at once.
+pub(crate) struct WalkSlots {
+    running: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+/// One running walk's place in a [`WalkSlots`]; freed on drop.
+pub(crate) struct WalkSlot<'a>(&'a WalkSlots);
+
+impl WalkSlots {
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self {
+            running: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// A place for one more walk, or `None` when `limit` are already running.
+    pub(crate) fn acquire(&self) -> Option<WalkSlot<'_>> {
+        use std::sync::atomic::Ordering;
+        self.running
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |running| {
+                (running < self.limit).then_some(running + 1)
+            })
+            .ok()
+            .map(|_| WalkSlot(self))
+    }
+}
+
+impl Drop for WalkSlot<'_> {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Every cached store in the process shares these places; see
+/// [`MAX_CONCURRENT_LAZY_WALKS`].
+#[cfg(not(test))]
+pub(crate) static PROCESS_WALK_SLOTS: WalkSlots = WalkSlots::new(MAX_CONCURRENT_LAZY_WALKS);
+
+/// Tests run in one process on many threads, so the process cap is replaced
+/// per store ([`LazyWalk::slots`]); a store that sets none is uncapped.
+#[cfg(test)]
+pub(crate) static TEST_UNCAPPED_WALK_SLOTS: WalkSlots = WalkSlots::new(usize::MAX);
 
 /// How long a held integrity answer may stand before it is read again.
 ///
@@ -735,6 +957,73 @@ pub struct Store {
 /// measured; the bound is the largest delay in reporting damage judged
 /// acceptable for a diagnostic, not a figure derived from the call rate.)
 const GENERATION_CHECK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a `fresh: true` verdict from [`Store::status`] may be repeated on
+/// query envelopes before it is reported as unverified.
+///
+/// The bound applies only to a verdict **no watcher backs**: the CLI, and an
+/// MCP-only process, where nothing reports an edit made after the walk. The
+/// daemon marks the store watcher-live while its watcher runs, and a verdict
+/// it remembers then is not aged out: an edit the watcher sees queues a path
+/// and ends the verdict at once (a non-empty pending queue blocks the cached
+/// answer), so a healthy watched daemon idle for an hour still answers
+/// `fresh: true`. A watcher that stops, or a verdict remembered before it
+/// started, falls back to this bound.
+///
+/// It is the same sixty seconds as [`GENERATION_CHECK_MAX_AGE`], the longest
+/// the store already accepts for an unreported fault. What re-stamps a verdict
+/// where no watcher backs it: `Store::status` (`devmap status`, the
+/// `devmap_status` tool, the daemon's post-drain walk), the only caller of
+/// the remember step, and in a long-lived reader (the MCP server's stores, see
+/// [`Store::enable_lazy_source_verification`]) the query itself: a verdict
+/// that is aged out, absent, or left describing an older generation by a build
+/// in another process (a hook-triggered one) is re-walked on the next query, at
+/// most once per bound per store, within [`SOURCE_FRESHNESS_WALK_BUDGET`]. A
+/// walk that does not finish leaves the envelope unverified with the reason. A
+/// one-shot process never walks on a query. A `fresh: false` verdict is not
+/// aged into null: it stays false until a walk (`status`, or the lazy one past
+/// the bound) says otherwise.
+pub const SOURCE_FRESHNESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a query waits for its own lazy source-freshness re-walk before it
+/// cancels it and answers `fresh: null` with the age and the reason, as it did
+/// before the walk existed.
+///
+/// This is when the cancel is sent. The walk runs on a scoped thread the query
+/// joins, so the query's wait is this budget plus the time the walk takes to
+/// notice the cancel. It notices between and inside its scan phases, and while
+/// it waits for the connection (see [`WalkCancelScope`]), which is where a
+/// walk blocked behind a writer would otherwise carry the query past the
+/// budget.
+/// What it does not interrupt, once it holds the connection, is each single
+/// statement: the repository-root read, the stored-hash read, the
+/// discovery-inventory read and the final generation-and-pending read, each of
+/// which can also wait up to SQLite's `busy_timeout` (5 s, `Store::BUSY_TIMEOUT`)
+/// for another process's lock. Nor does it interrupt the in-memory delta
+/// comparison. The query's wait can exceed the budget by the longest of those.
+///
+/// One wait is unbounded by design: after a walk panic, the repair (a ROLLBACK
+/// of any transaction the unwind left open, then clearing the mutex poison)
+/// waits for the connection without a bound, because a store left poisoned
+/// would refuse every later query.
+/// Queries beside a running walk never join it.
+pub const SOURCE_FRESHNESS_WALK_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(1500);
+
+/// The most source text one lazy walk may hold in memory. The scan reads every
+/// indexable source into memory (the comparison needs their hashes), outside
+/// the reader's page-cache bound ([`ReaderMemory`]), so a walk over a larger
+/// tree stops with a reason instead of growing the MCP process; `devmap status`
+/// has no such bound. Overshoot is at most one read ceiling per rayon thread.
+pub const SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The most lazy walks running at once in this process, across every cached
+/// store. A query that finds the cap reached answers its own fallback verdict
+/// and does not start a walk or spend the store's walk window, so the next
+/// query past the cap tries again. Bounds the CPU, descriptors and (with
+/// [`SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES`]) the memory a burst of stale
+/// stores can spend at once.
+pub const MAX_CONCURRENT_LAZY_WALKS: usize = 2;
 
 #[cfg(test)]
 thread_local! {
@@ -823,6 +1112,10 @@ struct GenerationChecks {
 /// Process-local memo of the last [`Store::status`] source check.
 #[derive(Debug, Clone)]
 struct CachedSourceFreshness {
+    /// When `status` finished the walk, on the memo clock.
+    verified_at: std::time::Instant,
+    /// A live watcher was reporting this store's edits when the walk finished.
+    watcher_backed: bool,
     generation_id: u32,
     fresh: Option<bool>,
     reason: Option<String>,
@@ -863,6 +1156,9 @@ impl WriterLock {
 impl Drop for WriterLock {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
+            if let (Some(path), Some(held)) = (self.path.as_ref(), held_writer_locks().as_mut()) {
+                held.remove(path);
+            }
             // Explicit rather than relying on close-releases-flock, so the
             // release is a statement in the code and not a side effect of drop
             // order. A failure here is not actionable — the descriptor closes
@@ -881,6 +1177,9 @@ pub struct QuerySourceFreshness {
     pub fresh: Option<bool>,
     pub generation_id: Option<u32>,
     pub reason: Option<String>,
+    /// Milliseconds since `status` last walked the tree for this verdict.
+    /// `None` when no walk backs the answer.
+    pub verified_age_ms: Option<u64>,
 }
 
 impl QuerySourceFreshness {
@@ -889,6 +1188,7 @@ impl QuerySourceFreshness {
             fresh: None,
             generation_id: None,
             reason: Some(reason.into()),
+            verified_age_ms: None,
         }
     }
 }
@@ -956,6 +1256,22 @@ pub struct StoreStatus {
     /// from a broken one without opening the database by hand. Each list is
     /// capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its own total.
     pub coverage_gaps: CoverageGaps,
+    /// The latest generation's `head_sha`, read in the snapshot that fixes the
+    /// generation, counts, gaps and provenance (not the source-freshness walk,
+    /// which runs after it). A surface that re-read it later could pair
+    /// generation N with generation N+1's head. `None` with no generation, or
+    /// when it could not be read (see [`Self::provenance_error`]).
+    pub head_sha: Option<String>,
+    /// The repository root the latest generation answers to (honouring a
+    /// caller's override), read in the same snapshot as [`Self::head_sha`].
+    pub repo_root: Option<String>,
+    /// Why `head_sha` or `repo_root` could not be read, when one could not
+    /// (already joined into `degraded_reason`). `None` is a clean read.
+    pub provenance_error: Option<String>,
+    /// How the latest generation's resolver stamp relates to this binary,
+    /// read once, in the same snapshot. `Err` carries the read failure so a
+    /// stamp that could not be read is never taken for current.
+    pub resolver_stamp: std::result::Result<ResolverStamp, String>,
 }
 
 impl StoreStatus {
@@ -2298,15 +2614,28 @@ fn fts_match_query(query: &str) -> Result<String> {
     // wildcards and hyphens inside a term stay data rather than becoming
     // syntax. `AND` is the only thing this function adds as syntax, and it adds
     // it *between* quoted terms where no user text can reach.
+    // Each whitespace-separated word — and each `::`-delimited segment of a
+    // qualified query (`webcontent::snapshot`, `sysload::webcontent::snapshot`,
+    // `Ring::dump`) — is its own quoted prefix term, joined by AND.
+    //
+    // A quoted FTS5 phrase requires its tokens to appear adjacently and in
+    // order inside a single column. For `"webcontent::snapshot"*`, unicode61
+    // treats `:` as a separator, so it demanded `webcontent` immediately before
+    // `snapshot`, missing `src-tauri/src/sysload/webcontent.rs::snapshot`
+    // because the `rs` extension token sits between them. Splitting on `::`
+    // turns that into `"webcontent"* AND "snapshot"*` while keeping single `:`
+    // (e.g. hostile column filters like `name:Trainer`) quoted as plain data.
     let mut terms = query
         .split_whitespace()
+        .flat_map(|word| word.split("::"))
+        .filter(|term| !term.is_empty())
         .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
         .peekable();
     if terms.peek().is_none() {
-        // Whitespace-only (or empty). No term to join, and an empty MATCH
-        // expression is a syntax error rather than an empty result — so this
-        // keeps the exact expression the single-phrase form produced, and with
-        // it whatever SQLite already did about it.
+        // Whitespace-only (or empty / bare `::`). No term to join, and an
+        // empty MATCH expression is a syntax error rather than an empty result
+        // — so this keeps the exact expression the single-phrase form produced,
+        // and with it whatever SQLite already did about it.
         return Ok(format!("\"{}\"*", query.replace('"', "\"\"")));
     }
     Ok(terms.collect::<Vec<_>>().join(" AND "))

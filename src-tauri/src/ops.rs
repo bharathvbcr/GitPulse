@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::ConventionalCommitParser;
 use crate::engine::deadbranch::{
-    classify_merge, is_ancestry_merged, needs_tree_check, tree_merge_checks, TreeMerge,
+    classify_merge, is_ancestry_merged, locked_in_refs, needs_tree_check, tree_merge_checks,
+    TreeMerge,
 };
 use crate::engine::git_cli::{git_captured, git_text, validate_repo};
 use crate::engine::git_writer::validate_ref_name;
@@ -179,10 +180,14 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
         .filter_map(|entry| entry.branch.as_deref())
         .filter(|name| *name != current.name)
         .collect();
+    // Locked-in branches (`gitpulse.lockedBranch`, `archive/`) are kept like
+    // checked-out ones. A config that cannot be read fails the plan.
+    let locked = locked_in_refs(&repo, &[])?;
     let is_protected = |branch: &BranchInfo| {
         branch.is_current
             || branch.is_default
             || checked_out_elsewhere.contains(branch.name.as_str())
+            || locked.contains(&format!("refs/heads/{}", branch.name))
     };
 
     // "Merged" is the dead-branch scan's own rule (`classify_merge`), not a
@@ -1147,6 +1152,14 @@ mod tests {
         git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
         let repo = tempfile::tempdir().expect("local repo");
         git(repo.path(), &["init", "-b", "main"]);
+        // `create_tag` writes an annotated tag with the product's own git,
+        // which reads the repository's identity, not this helper's
+        // environment; a CI runner has no global one.
+        git(repo.path(), &["config", "user.name", "GitPulse Test"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "gitpulse@example.test"],
+        );
         commit_file(repo.path(), "app.txt", "ready", "feat: ready release #1");
         git(
             repo.path(),
@@ -1371,6 +1384,32 @@ mod tests {
         let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
         assert!(names(&plan).is_empty(), "{:?}", names(&plan));
         assert_eq!(plan.protected_branches, 2);
+    }
+
+    #[test]
+    fn a_locked_in_branch_is_protected_even_when_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        for name in ["labs/x", "archive/y", "old"] {
+            git(p, &["branch", name]);
+        }
+        git(
+            p,
+            &[
+                "config",
+                "--local",
+                "--add",
+                "gitpulse.lockedBranch",
+                "labs",
+            ],
+        );
+        commit_file(p, "n.txt", "n", "feat: next");
+        let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
+        assert_eq!(names(&plan), vec!["old".to_string()]);
+        // main, labs/x and archive/y.
+        assert_eq!(plan.protected_branches, 3);
     }
 
     #[test]

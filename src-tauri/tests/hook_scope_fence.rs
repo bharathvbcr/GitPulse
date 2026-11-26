@@ -381,18 +381,17 @@ fn sibling_worktree_and_outside_reads_are_judged_end_to_end() {
         let answer = ask("command-gate", &bash(&cmd), home.path(), logs.path());
         assert!(!denied(&answer), "read-only {cmd} was refused: {answer:?}");
     }
-    let secret_read = format!("jq . {}", outside_env.display());
+    let outside_env_cmd = format!("jq . {}", outside_env.display());
     let answer = ask(
         "command-gate",
-        &bash(&secret_read),
+        &bash(&outside_env_cmd),
         home.path(),
         logs.path(),
     );
-    assert!(denied(&answer), "{secret_read} was not refused: {answer:?}");
+    assert!(denied(&answer), "outside .env read was not refused");
     assert!(
         reason_of(&answer).contains("command.secret_read"),
-        "{secret_read}: {:?}",
-        answer
+        "missing command.secret_read in refusal reason"
     );
 
     // AC3: under blocking posture, refusal texts name the judged alternative with no "..".

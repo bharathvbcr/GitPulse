@@ -23,7 +23,10 @@ use crate::codeintel::worktree_overlay::{
 use crate::engine::git_cli::{resolve_git_common_dir, validate_repo};
 use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
 use crate::engine::process::DEFAULT_TIMEOUT;
-use crate::engine::worktree::{list_worktrees, WorktreeInfo};
+use crate::engine::worktree::{
+    admit_worktree_pair, head_branch_from_metadata, list_worktrees, list_worktrees_lite,
+    WorktreeInfo,
+};
 use crate::ipc_error::CommandError;
 use devmap_query::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -40,6 +43,11 @@ pub const MAX_CLAIMED_ITEMS: usize = 128;
 pub const MAX_BUS_MESSAGES: usize = 256;
 pub const MAX_PINNED_OPEN_ASKS: usize = 64;
 pub const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024;
+/// Most unread direct messages kept past the row cap for one recipient, so one chatty
+/// pair cannot push a quiet peer's message out.
+pub const MAX_PINNED_UNREAD_PER_RECIPIENT: usize = 8;
+/// Most unread direct messages kept past the row cap across all recipients.
+pub const MAX_PINNED_UNREAD_DIRECT: usize = 64;
 pub const MAX_READ_BY_ENTRIES: usize = 64;
 pub const DEFAULT_MAX_HOPS: u32 = 6;
 pub const MAX_ODB_RADAR_PAIRS: usize = 32;
@@ -48,6 +56,11 @@ pub const MAX_RADAR_CONFLICTS_PER_LAYER: usize = 128;
 const LANES_SUBDIR: &str = "gitpulse/lanes";
 const CLAIMS_FILE: &str = "claims.json";
 const MESSAGES_FILE: &str = "messages.json";
+/// Largest `messages.json` any write leaves behind and any read accepts.
+const MESSAGES_FILE_CAP: u64 = 8 * 1024 * 1024;
+/// Largest `messages.json` a write will load so an over-cap file (written by an older build
+/// that counted body bytes, not stored bytes) can be compacted instead of failing forever.
+const MESSAGES_WRITE_CEILING: u64 = 4 * MESSAGES_FILE_CAP;
 const PEERS_FILE: &str = "peers.json";
 
 /// Registration and intent-claim record for one parallel agent lane.
@@ -209,6 +222,20 @@ pub struct AgentInboxPage {
     pub messages: Vec<AgentBusMessage>,
     pub latest_seq: u64,
     pub dropped_before_seq: u64,
+    /// Seqs of the rows in this page that sit below `dropped_before_seq`. Eviction spares
+    /// pinned rows (open asks, unread direct messages), so one can outlive later evictions;
+    /// this names them so "everything below `dropped_before_seq` was dropped" is never read
+    /// as covering a row the reader was just handed. Bounded by the pin caps.
+    #[serde(default)]
+    pub pinned_below_dropped_before_seq: Vec<u64>,
+}
+
+/// Seqs of the retained `rows` that are below `dropped_before_seq`, oldest first.
+fn seqs_below_dropped(rows: &[AgentBusMessage], dropped_before_seq: u64) -> Vec<u64> {
+    rows.iter()
+        .map(|m| m.seq)
+        .filter(|seq| *seq < dropped_before_seq)
+        .collect()
 }
 
 /// Grouped conversation thread and structured ask status modeled on Vespin.
@@ -342,10 +369,7 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// Both are read only by `acquire_bus_file_lock`'s unix arm.
-#[cfg(unix)]
 const BUS_LOCK_FILE: &str = ".bus.lock";
-#[cfg(unix)]
 const BUS_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn bus_lock_for(common_dir: &Path) -> Arc<Mutex<()>> {
@@ -358,44 +382,47 @@ fn bus_lock_for(common_dir: &Path) -> Arc<Mutex<()>> {
     )
 }
 
-/// An exclusive `flock(2)` held until dropped.
-#[cfg(unix)]
+/// An exclusive advisory lock on a file (`flock(2)` on unix, `LockFileEx` on
+/// Windows, both through the standard library) held until dropped.
 pub(crate) struct AdvisoryFileLock {
     file: fs::File,
 }
 
-#[cfg(unix)]
 impl Drop for AdvisoryFileLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: `self.file` remains open across this call before closing on drop.
-        unsafe {
-            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        // Closing the file releases the lock too; this says so first.
+        let _ = self.file.unlock();
     }
 }
 
-#[cfg(unix)]
+/// Opens `path` for locking: read and write, created when `create`, and
+/// private (mode 0600) where the platform has modes.
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn acquire_bus_file_lock(
     lanes_dir: &Path,
     create_dir: bool,
 ) -> Result<Option<AdvisoryFileLock>, CommandError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     if create_dir {
         fs::create_dir_all(lanes_dir).map_err(|e| {
             CommandError::from(format!("cannot create {}: {e}", lanes_dir.display()))
         })?;
     }
     let lock_path = lanes_dir.join(BUS_LOCK_FILE);
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create_dir)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)
-    {
+    let file = match open_lock_file(&lock_path, create_dir) {
         Ok(f) => f,
         Err(e) if !create_dir && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
@@ -408,36 +435,31 @@ fn acquire_bus_file_lock(
     lock_exclusive_within(file, &lock_path, BUS_LOCK_TIMEOUT, "coordination bus").map(Some)
 }
 
-/// Takes an exclusive `flock(2)` on the already-open `file`, retrying with
-/// backoff (1–25 ms) until `timeout`. `what` names the lock in errors.
-#[cfg(unix)]
+/// Takes an exclusive lock on the already-open `file`, retrying with backoff
+/// (1-25 ms) until `timeout`. `what` names the lock in errors.
 fn lock_exclusive_within(
     file: fs::File,
     lock_path: &Path,
     timeout: std::time::Duration,
     what: &str,
 ) -> Result<AdvisoryFileLock, CommandError> {
-    use std::os::unix::io::AsRawFd;
     let deadline = std::time::Instant::now() + timeout;
     let mut backoff_ms = 1u64;
     loop {
-        // SAFETY: `file` is a valid open file descriptor owned by this stack frame.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(AdvisoryFileLock { file });
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        let contended = err.kind() == std::io::ErrorKind::WouldBlock
-            || err.raw_os_error() == Some(libc::EWOULDBLOCK)
-            || err.raw_os_error() == Some(libc::EAGAIN);
-        if !contended {
-            return Err(CommandError::from(format!(
-                "cannot lock {what} {}: {err}",
-                lock_path.display()
-            )));
+        match file.try_lock() {
+            Ok(()) => return Ok(AdvisoryFileLock { file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(err))
+                if err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(CommandError::from(format!(
+                    "cannot lock {what} {}: {err}",
+                    lock_path.display()
+                )));
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Err(CommandError::from(format!(
@@ -451,49 +473,22 @@ fn lock_exclusive_within(
     }
 }
 
-/// An exclusive advisory lock on `lock_path`, created (mode 0600, with its
+/// An exclusive advisory lock on `lock_path`, created (private, with its
 /// directory) when missing, waited for up to `timeout`. Another process
 /// holding it is waited out; anything else is an error. `what` names the lock
-/// in errors. Elsewhere than Unix there is no such lock and this is `None`.
-#[cfg(unix)]
+/// in errors.
 pub(crate) fn exclusive_file_lock(
     lock_path: &Path,
     timeout: std::time::Duration,
     what: &str,
-) -> Result<Option<AdvisoryFileLock>, CommandError> {
-    use std::os::unix::fs::OpenOptionsExt;
+) -> Result<AdvisoryFileLock, CommandError> {
     if let Some(dir) = lock_path.parent() {
         fs::create_dir_all(dir)
             .map_err(|e| CommandError::from(format!("cannot create {}: {e}", dir.display())))?;
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock_path)
+    let file = open_lock_file(lock_path, true)
         .map_err(|e| format!("cannot open {what} lock {}: {e}", lock_path.display()))?;
-    lock_exclusive_within(file, lock_path, timeout, what).map(Some)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn exclusive_file_lock(
-    _lock_path: &Path,
-    _timeout: std::time::Duration,
-    _what: &str,
-) -> Result<Option<()>, CommandError> {
-    Ok(None)
-}
-
-#[cfg(not(unix))]
-fn acquire_bus_file_lock(lanes_dir: &Path, create_dir: bool) -> Result<Option<()>, CommandError> {
-    if create_dir {
-        fs::create_dir_all(lanes_dir).map_err(|e| {
-            CommandError::from(format!("cannot create {}: {e}", lanes_dir.display()))
-        })?;
-    }
-    Ok(None)
+    lock_exclusive_within(file, lock_path, timeout, what)
 }
 
 fn with_bus_lock<T>(
@@ -520,6 +515,18 @@ fn read_json_bounded<T: for<'de> Deserialize<'de> + Default>(
     path: &Path,
     cap_bytes: u64,
 ) -> Result<T, CommandError> {
+    read_json_bounded_hint(path, cap_bytes, "", "")
+}
+
+/// [`read_json_bounded`] whose over-cap and damaged-JSON errors end with `hint` and whose
+/// valid-JSON-of-another-shape error ends with `shape_hint`, so a reader that cannot repair
+/// the file can say who will, and not promise a repair that a write refuses.
+fn read_json_bounded_hint<T: for<'de> Deserialize<'de> + Default>(
+    path: &Path,
+    cap_bytes: u64,
+    hint: &str,
+    shape_hint: &str,
+) -> Result<T, CommandError> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
@@ -536,7 +543,7 @@ fn read_json_bounded<T: for<'de> Deserialize<'de> + Default>(
         .map_err(|e| CommandError::from(format!("cannot read {}: {e}", path.display())))?;
     if buf.len() as u64 > cap_bytes {
         return Err(CommandError::from(format!(
-            "coordination state {} exceeds {} byte cap",
+            "coordination state {} exceeds {} byte cap{hint}",
             path.display(),
             cap_bytes
         )));
@@ -545,8 +552,14 @@ fn read_json_bounded<T: for<'de> Deserialize<'de> + Default>(
         return Ok(T::default());
     }
     serde_json::from_slice(&buf).map_err(|e| {
+        if matches!(e.classify(), serde_json::error::Category::Data) {
+            return CommandError::from(format!(
+                "coordination state {} is valid JSON in a shape this build cannot read: {e}{shape_hint}",
+                path.display()
+            ));
+        }
         CommandError::from(format!(
-            "corrupt coordination state {}: {e}",
+            "corrupt coordination state {}: {e}{hint}",
             path.display()
         ))
     })
@@ -639,6 +652,7 @@ pub fn register_or_update_lane_with_conflicts(
     claimed_symbols: &[String],
 ) -> Result<(AgentLaneClaim, Vec<ClaimConflict>), CommandError> {
     let agent = sanitize_token("agent_id", agent_id, 128)?;
+    require_agent_sender(&agent)?;
     let branch_clean = sanitize_token("branch", branch, 256)?;
     let cone_clean = sanitize_claim_paths(sparse_cone, "sparse_cone")?;
     let files_clean = sanitize_claim_paths(claimed_files, "claimed_files")?;
@@ -817,25 +831,40 @@ pub fn lanes_messages_path(repo_path: &str, create_dir: bool) -> Result<PathBuf,
     Ok(lanes_dir.join(MESSAGES_FILE))
 }
 
+/// Canonical bus sender identity reserved exclusively for GitPulse's in-process
+/// Manvi system steward (`harness::steward`, [`MessageOrigin::SystemSteward`]).
+pub const STEWARD_SENDER: &str = "manvi-steward";
+/// Canonical bus thread key for Manvi system steward operational directives.
+pub const STEWARD_THREAD_KEY: &str = "manvi-system-steward";
+/// Canonical bus message kind for Manvi system steward operational directives.
+pub const STEWARD_MESSAGE_KIND: &str = "system-advisory";
+
 /// Who a bus message comes from, decided by the entry point that accepted it and never by
 /// the sender name the caller supplied.
 ///
-/// Only the app's own Tauri commands (a person using the UI) pass [`MessageOrigin::Person`].
-/// Every MCP tool, CLI and hook passes [`MessageOrigin::Agent`].
+/// Only the app's own Tauri commands (a person using the UI) pass [`MessageOrigin::Person`],
+/// and only the app's in-process steward (`harness::steward`) passes
+/// [`MessageOrigin::SystemSteward`]. Every MCP tool, CLI and hook passes
+/// [`MessageOrigin::Agent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageOrigin {
     /// A person acting in the GitPulse UI. Hop 0, and exempt from the hop limit.
     Person,
+    /// GitPulse's in-process Manvi system steward (`harness::steward`). Hop 0,
+    /// and the only origin permitted to post under [`STEWARD_SENDER`] or
+    /// [`STEWARD_MESSAGE_KIND`].
+    SystemSteward,
     /// An agent, whatever name it gives itself. Hop at least 1, and the hop limit applies.
     Agent,
 }
 
 impl MessageOrigin {
-    /// The hop this origin may carry: a person's message is hop 0, an agent's is never below 1.
+    /// The hop this origin may carry: a person's or system steward's message is hop 0,
+    /// an agent's is never below 1.
     #[must_use]
     pub fn effective_hop(self, requested: u32) -> u32 {
         match self {
-            Self::Person => 0,
+            Self::Person | Self::SystemSteward => 0,
             Self::Agent => requested.max(1),
         }
     }
@@ -850,12 +879,68 @@ fn is_reserved_person_name(name: &str) -> bool {
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
-/// Refuses a sender name reserved for a person. Every agent entry point calls this before it
-/// acts on the name, and [`post_peer_message`] calls it again for the posts it owns.
+/// Sender names reserved for GitPulse's Manvi system steward, including `prefix:id`
+/// peer forms, so no untrusted agent can spoof a host-governor directive on the bus.
+fn is_reserved_steward_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let head = lower.split(':').next().unwrap_or(lower.as_str());
+    matches!(
+        head,
+        "manvi-steward" | "system-steward" | "manvi-system-steward" | "gitpulse-steward"
+    )
+}
+
+/// The sender name GitPulse itself uses for notices it leaves in a mailbox (the overflow
+/// notice). The mailbox trusts it, so `require_agent_sender` keeps agents from using it.
+pub const GITPULSE_SENDER_NAME: &str = "gitpulse";
+
+/// Only the exact name is reserved, not `gitpulse:<x>`, because peer ids may use that form.
+fn is_reserved_gitpulse_name(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(GITPULSE_SENDER_NAME)
+}
+
+/// Message kinds reserved for [`MessageOrigin::SystemSteward`].
+fn is_reserved_steward_kind(kind: &str) -> bool {
+    let lower = kind.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "system-advisory" | "system_steward")
+}
+
+/// Thread keys reserved for [`MessageOrigin::SystemSteward`] so untrusted agents
+/// cannot inject messages into or withdraw the system steward thread.
+fn is_reserved_steward_thread_key(thread_key: &str) -> bool {
+    let lower = thread_key.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "manvi-system-steward" | "system-steward")
+}
+
+/// Refuses a sender name reserved for a person or GitPulse's Manvi system steward.
+/// Every agent entry point calls this before it acts on the name, and
+/// [`post_peer_message`] calls it again for the posts it owns.
 pub fn require_agent_sender(from_agent: &str) -> Result<(), CommandError> {
     if is_reserved_person_name(from_agent) {
         return Err(CommandError::from(
             "from_agent is a name reserved for the person using GitPulse; an agent must send as its own peer id",
+        ));
+    }
+    if is_reserved_steward_name(from_agent) {
+        return Err(CommandError::from(
+            "from_agent is reserved for GitPulse's Manvi system steward; an agent must send as its own peer id",
+        ));
+    }
+    if is_reserved_gitpulse_name(from_agent) {
+        return Err(CommandError::from(
+            "from_agent is reserved for GitPulse itself; an agent must send as its own peer id",
+        ));
+    }
+    Ok(())
+}
+
+/// A peer's role is a description ("developer", "reviewer"), never shown as a
+/// sender, so the person's names stay usable; only the steward's are refused,
+/// so no peer can present itself as the host governor.
+pub fn require_role_not_steward(role: &str) -> Result<(), CommandError> {
+    if is_reserved_steward_name(role) {
+        return Err(CommandError::from(
+            "role is reserved for GitPulse's Manvi system steward",
         ));
     }
     Ok(())
@@ -873,7 +958,7 @@ pub fn post_thread_message(
     body: &str,
     branch: Option<&str>,
 ) -> Result<AgentBusMessage, CommandError> {
-    post_peer_message(
+    post_message_locked(
         repo_path,
         origin,
         from_agent,
@@ -883,8 +968,10 @@ pub fn post_thread_message(
         body,
         branch,
         None,
+        None,
         1,
         DEFAULT_MAX_HOPS,
+        false,
     )
 }
 
@@ -906,11 +993,104 @@ pub fn post_peer_message(
     hop: u32,
     max_hops: u32,
 ) -> Result<AgentBusMessage, CommandError> {
+    post_peer_message_in_reply_to(
+        repo_path,
+        origin,
+        from_agent,
+        to_agent,
+        thread_key,
+        kind,
+        body,
+        branch,
+        explicit_msg_id,
+        None,
+        hop,
+        max_hops,
+    )
+}
+
+/// [`post_peer_message`] for a post that answers `in_reply_to` (a `msg_id`).
+///
+/// The bus owns the hop and the ceiling, derived under its lock so a concurrent post cannot read
+/// a stale thread. An agent's stored hop is the largest of the explicit hop, one past the last
+/// retained row of `thread_key`, one past the `in_reply_to` row, and 1. The stored `max_hops`
+/// is the request (clamped to 1..=32) lowered to the smallest ceiling any of those rows carries,
+/// so a reply can lower a thread's ceiling but never raise it. An exact retry still returns the
+/// stored row unchanged. An `in_reply_to` that names no retained row is refused under the lock
+/// (a row evicted after the caller read it must not silently restart the hop count).
+#[allow(clippy::too_many_arguments)]
+pub fn post_peer_message_in_reply_to(
+    repo_path: &str,
+    origin: MessageOrigin,
+    from_agent: &str,
+    to_agent: Option<&str>,
+    thread_key: Option<&str>,
+    kind: &str,
+    body: &str,
+    branch: Option<&str>,
+    explicit_msg_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    hop: u32,
+    max_hops: u32,
+) -> Result<AgentBusMessage, CommandError> {
+    post_message_locked(
+        repo_path,
+        origin,
+        from_agent,
+        to_agent,
+        thread_key,
+        kind,
+        body,
+        branch,
+        explicit_msg_id,
+        in_reply_to,
+        hop,
+        max_hops,
+        true,
+    )
+}
+
+/// The one writer behind [`post_thread_message`] and [`post_peer_message_in_reply_to`].
+/// `derive_hops` is the `gitpulse_agent_send` rule (see [`post_peer_message_in_reply_to`]);
+/// without it the stored hop and ceiling are the caller's, as every other agent post has them.
+#[allow(clippy::too_many_arguments)]
+fn post_message_locked(
+    repo_path: &str,
+    origin: MessageOrigin,
+    from_agent: &str,
+    to_agent: Option<&str>,
+    thread_key: Option<&str>,
+    kind: &str,
+    body: &str,
+    branch: Option<&str>,
+    explicit_msg_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    hop: u32,
+    max_hops: u32,
+    derive_hops: bool,
+) -> Result<AgentBusMessage, CommandError> {
     if origin == MessageOrigin::Agent {
         require_agent_sender(from_agent)?;
+        if is_reserved_steward_kind(kind) {
+            return Err(CommandError::from(
+                "kind is reserved for GitPulse's Manvi system steward",
+            ));
+        }
+        if let Some(tk) = thread_key {
+            if is_reserved_steward_thread_key(tk) {
+                return Err(CommandError::from(
+                    "thread_key is reserved for GitPulse's Manvi system steward",
+                ));
+            }
+        }
     }
     let hop = origin.effective_hop(hop);
     let from = sanitize_token("from_agent", from_agent, 128)?;
+    if origin == MessageOrigin::SystemSteward && from != STEWARD_SENDER {
+        return Err(CommandError::from(format!(
+            "SystemSteward origin requires from_agent = '{STEWARD_SENDER}'"
+        )));
+    }
     let to = match to_agent.map(str::trim).filter(|s| !s.is_empty()) {
         Some(target) => Some(sanitize_token("to_agent", target, 128)?),
         None => None,
@@ -920,14 +1100,31 @@ pub fn post_peer_message(
         None => None,
     };
     let msg_kind = sanitize_token("kind", kind, 64)?;
+    if origin == MessageOrigin::SystemSteward && msg_kind != STEWARD_MESSAGE_KIND {
+        return Err(CommandError::from(format!(
+            "SystemSteward origin requires kind = '{STEWARD_MESSAGE_KIND}'"
+        )));
+    }
     let normalized_body = crate::agent_mailbox::normalize_crlf(body);
     let trimmed_body = normalized_body.trim();
     if trimmed_body.is_empty() || trimmed_body.contains('\0') {
         return Err(CommandError::from("message body must not be empty"));
     }
-    if trimmed_body.len() > MAX_MESSAGE_BODY_BYTES {
+    if crate::agent_mailbox::has_disallowed_control(trimmed_body) {
+        return Err(CommandError::from(
+            "message body cannot contain control characters other than line breaks and tabs",
+        ));
+    }
+    // The file stores the body JSON-escaped (a quote or backslash is two bytes), so the cap
+    // counts the stored form: counting raw bytes let a quote-heavy body double its footprint.
+    let stored_len = serde_json::to_string(trimmed_body)
+        .map_err(|e| CommandError::from(format!("cannot encode message body: {e}")))?
+        .len()
+        .saturating_sub(2);
+    if stored_len > MAX_MESSAGE_BODY_BYTES {
         return Err(CommandError::from(format!(
-            "message body exceeds maximum of {MAX_MESSAGE_BODY_BYTES} bytes"
+            "message body exceeds maximum of {MAX_MESSAGE_BODY_BYTES} bytes: {} bytes raw, {stored_len} bytes as stored (JSON-escaped)",
+            trimmed_body.len()
         )));
     }
     let msg_branch = match branch.map(str::trim).filter(|s| !s.is_empty()) {
@@ -946,11 +1143,22 @@ pub fn post_peer_message(
         None => None,
     };
     let effective_max_hops = max_hops.clamp(1, 32);
+    let reply_to_id = match in_reply_to.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            if !crate::agent_mailbox::valid_request_id(id) {
+                return Err(CommandError::from(
+                    "in_reply_to must be 1 to 64 ASCII letters, digits, '-' or '_'",
+                ));
+            }
+            Some(id.to_string())
+        }
+        None => None,
+    };
 
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, true, || {
         let messages_path = lanes_dir.join(MESSAGES_FILE);
-        let mut state: MessagesState = read_json_bounded(&messages_path, 8 * 1024 * 1024)?;
+        let mut state = load_messages_for_write(&lanes_dir, &messages_path)?;
 
         if let Some(ref want_id) = caller_msg_id {
             if let Some(existing) = state
@@ -958,16 +1166,101 @@ pub fn post_peer_message(
                 .iter()
                 .find(|m| m.msg_id.as_deref() == Some(want_id.as_str()))
             {
-                if existing.body == trimmed_body && existing.from_agent == from {
+                // A retry is the same message only when every field that routes or threads it
+                // matches. A reused id aimed at another recipient, kind or thread would otherwise
+                // be reported as the first message while the caller believes it went elsewhere.
+                let mut differs: Vec<&str> = Vec::new();
+                if existing.body != trimmed_body {
+                    differs.push("body");
+                }
+                if existing.from_agent != from {
+                    differs.push("from_agent");
+                }
+                if existing.to_agent != to {
+                    differs.push("to_agent");
+                }
+                if existing.kind != msg_kind {
+                    differs.push("kind");
+                }
+                if existing.thread_key != t_key {
+                    differs.push("thread_key");
+                }
+                if differs.is_empty() {
                     return Ok(existing.clone());
                 }
                 return Err(CommandError::from(format!(
-                    "msg_id '{want_id}' already exists with a different payload"
+                    "msg_id '{want_id}' already exists with a different payload (mismatched: {})",
+                    differs.join(", ")
                 )));
             }
         }
 
+        if let Some(ref want_id) = caller_msg_id {
+            if let Some(legacy) = state
+                .messages
+                .iter()
+                .find(|m| m.msg_id.is_none() && *want_id == format!("msg-{}", m.seq))
+            {
+                return Err(CommandError::from(format!(
+                    "msg_id '{want_id}' is the effective id of a retained legacy message (seq {}); \
+                     reusing it would make acknowledgements and lookups ambiguous, so choose another id",
+                    legacy.seq
+                )));
+            }
+        }
+
+        // The hop and the ceiling come from the rows as they are now, under the lock.
+        let mut hop_floor = 0u32;
+        let mut ceiling = effective_max_hops;
+        // A person's or the steward's row is hop 0 and carries a default ceiling nobody chose
+        // for the thread, so only agent rows bind it.
+        let binds_ceiling = |row: &AgentBusMessage| row.hop != Some(0);
+        let mut inherit = |row: &AgentBusMessage| {
+            hop_floor = hop_floor.max(row.hop.unwrap_or(0).saturating_add(1));
+            if let Some(row_max) = row.max_hops.filter(|_| binds_ceiling(row)) {
+                ceiling = ceiling.min(row_max.max(1));
+            }
+        };
+        if let Some(id) = reply_to_id.as_deref().filter(|_| derive_hops) {
+            // Checked here, under the lock: a row evicted since the caller looked it up would
+            // otherwise be skipped silently and the reply would restart the hop count at 1.
+            let Some(idx) = message_index_by_id(&state.messages, id) else {
+                return Err(CommandError::from(format!(
+                    "in_reply_to '{id}' names no message on the bus; it may have been evicted, so send without in_reply_to or name a retained msg_id"
+                )));
+            };
+            inherit(&state.messages[idx]);
+        }
+        if let Some(tk) = t_key.as_ref().filter(|_| derive_hops) {
+            // Rows are in seq order, so the last one is where the thread stands; every row's
+            // ceiling counts, because the smallest one binds the whole thread.
+            let mut last = None;
+            for row in state
+                .messages
+                .iter()
+                .filter(|m| m.thread_key.as_deref() == Some(tk.as_str()))
+            {
+                if let Some(row_max) = row.max_hops.filter(|_| binds_ceiling(row)) {
+                    ceiling = ceiling.min(row_max.max(1));
+                }
+                last = Some(row);
+            }
+            if let Some(row) = last {
+                hop_floor = hop_floor.max(row.hop.unwrap_or(0).saturating_add(1));
+            }
+        }
+        let stored_hop = match origin {
+            MessageOrigin::Agent => hop.max(hop_floor).max(1),
+            MessageOrigin::Person | MessageOrigin::SystemSteward => hop,
+        };
+
         let seq = state.next_seq.saturating_add(1);
+        if seq > MAX_JSON_SAFE_SEQ {
+            return Err(CommandError::from(format!(
+                "the message sequence in {} is exhausted (it would pass {MAX_JSON_SAFE_SEQ}, the largest integer readers keep exactly); move messages.json aside by hand to start a fresh bus",
+                messages_path.display()
+            )));
+        }
         state.next_seq = seq;
         let created_at_ms = now_epoch_ms();
         let msg_id = caller_msg_id.unwrap_or_else(|| format!("msg-{seq}-{created_at_ms}"));
@@ -983,48 +1276,11 @@ pub fn post_peer_message(
             thread_key: t_key,
             msg_id: Some(msg_id),
             read_by: Vec::new(),
-            hop: Some(hop),
-            max_hops: Some(effective_max_hops),
+            hop: Some(stored_hop),
+            max_hops: Some(ceiling),
         };
         state.messages.push(msg.clone());
-        if state.messages.len() > MAX_BUS_MESSAGES {
-            let mut open_ask_seq_by_thread: HashMap<String, u64> = HashMap::new();
-            for existing in &state.messages {
-                let key = existing
-                    .thread_key
-                    .clone()
-                    .unwrap_or_else(|| format!("msg-{}", existing.seq));
-                if existing.kind == "ask" {
-                    open_ask_seq_by_thread.insert(key, existing.seq);
-                } else if matches!(
-                    existing.kind.as_str(),
-                    "reply" | "answer" | "withdraw" | "withdrawn"
-                ) {
-                    open_ask_seq_by_thread.remove(&key);
-                }
-            }
-            let mut pinned_vec: Vec<u64> = open_ask_seq_by_thread.into_values().collect();
-            pinned_vec.sort_unstable();
-            let pinned_seqs: BTreeSet<u64> = pinned_vec
-                .into_iter()
-                .rev()
-                .take(MAX_PINNED_OPEN_ASKS)
-                .collect();
-
-            while state.messages.len() > MAX_BUS_MESSAGES {
-                let evict_idx = state
-                    .messages
-                    .iter()
-                    .position(|m| !pinned_seqs.contains(&m.seq))
-                    .unwrap_or(0);
-                let dropped = state.messages.remove(evict_idx);
-                state.dropped_before_seq =
-                    state.dropped_before_seq.max(dropped.seq.saturating_add(1));
-            }
-        }
-
-        let bytes = serde_json::to_vec_pretty(&state)
-            .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))?;
+        let bytes = compact_messages_for_write(&mut state, &messages_path, Some(seq))?;
         devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
             CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
         })?;
@@ -1039,6 +1295,409 @@ pub fn post_peer_message(
     })
 }
 
+/// Reads `messages.json` for a path that cannot repair it. An over-cap or corrupt file is
+/// refused, and the error says the next write (a post or an acknowledgement) moves it aside.
+fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
+    read_json_bounded_hint(
+        path,
+        MESSAGES_FILE_CAP,
+        "; the next write repairs it (a post, or an acknowledgement that names a message): it moves it aside as messages.json.oversized-<unix> or messages.json.corrupt-<unix> (the two newest are kept, so up to twice the old file's size stays on disk) and starts a fresh bus whose seq continues above the old one, but the unread messages in the old file are not carried over. A read is not a write: send one gitpulse_agent_send without thread_key or in_reply_to to a registered peer in this repository",
+        "; it was written by a different GitPulse version and no write will repair it. Upgrade or reinstall the GitPulse binaries so every one on this machine is the same version, or move messages.json aside by hand (its unread messages are lost)",
+    )
+}
+
+/// How much of the head of `messages.json` is read to recover `next_seq` from a file that
+/// cannot be loaded.
+const MESSAGES_SEQ_PROBE_BYTES: usize = 4096;
+/// Most `messages.json.oversized-*` / `messages.json.corrupt-*` files left beside the bus.
+const MESSAGES_ASIDE_KEEP: usize = 2;
+const MESSAGES_REPAIR_TMP_PREFIX: &str = "messages.json.repair-";
+const MESSAGES_ASIDE_PREFIXES: [&str; 2] = ["messages.json.oversized-", "messages.json.corrupt-"];
+
+/// Largest seq the bus issues: 2^53 - 1, the largest integer JSON readers keep exactly.
+const MAX_JSON_SAFE_SEQ: u64 = (1 << 53) - 1;
+/// Headroom left under [`MAX_JSON_SAFE_SEQ`] when a seq is recovered from a damaged file, so the
+/// fresh bus can still issue about a million messages.
+const SEQ_RECOVERY_CEILING: u64 = MAX_JSON_SAFE_SEQ - (1 << 20);
+
+/// `next_seq` from the head of a `messages.json` that cannot be parsed, or `None`. Only the
+/// first key of the top-level object counts (that is where [`MessagesState`] writes it), and a
+/// number cut off by the end of the probe is not trusted.
+fn prefix_next_seq(head: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(head);
+    let rest = text.trim_start().strip_prefix('{')?.trim_start();
+    let rest = rest.strip_prefix("\"next_seq\"")?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits == rest.len() {
+        return None;
+    }
+    // Clamped to the largest integer a JSON reader keeps exactly; a longer run of digits is a
+    // number too big for u64, which is clamped the same way.
+    Some(
+        rest[..digits]
+            .parse()
+            .map_or(SEQ_RECOVERY_CEILING, |n: u64| n.min(SEQ_RECOVERY_CEILING)),
+    )
+}
+
+/// The aside files among `entries`, each keyed by (unix seconds, collision counter). Names are
+/// matched before the scan is bounded, so a directory full of other files cannot hide them.
+fn messages_asides(entries: fs::ReadDir) -> Vec<((u64, u64), PathBuf)> {
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rest = MESSAGES_ASIDE_PREFIXES
+                .iter()
+                .find_map(|prefix| name.strip_prefix(prefix))?;
+            let (secs, k) = rest.split_once('.').unwrap_or((rest, "0"));
+            Some(((secs.parse().ok()?, k.parse().ok()?), entry.path()))
+        })
+        .take(4096)
+        .collect()
+}
+
+/// The fresh bus that replaces an unusable one: nothing seen so far can be issued again.
+fn fresh_messages_state(prior_next_seq: Option<u64>) -> MessagesState {
+    let next_seq = prior_next_seq.unwrap_or(0).max(now_epoch_ms());
+    MessagesState {
+        next_seq,
+        dropped_before_seq: next_seq.saturating_add(1),
+        messages: Vec::new(),
+    }
+}
+
+/// Removes the oldest aside files beyond [`MESSAGES_ASIDE_KEEP`]. Best effort: a file that
+/// cannot be removed stays and is tried again at the next repair.
+fn prune_messages_aside(lanes_dir: &Path) {
+    let Ok(entries) = fs::read_dir(lanes_dir) else {
+        return;
+    };
+    let mut asides = messages_asides(entries);
+    asides.sort();
+    let excess = asides.len().saturating_sub(MESSAGES_ASIDE_KEEP);
+    for (_, path) in asides.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
+    }
+    // Every repair holds the bus lock and renames its temp file away before it prunes, so a
+    // `messages.json.repair-*` file seen here was left by a repair that died.
+    if let Ok(entries) = fs::read_dir(lanes_dir) {
+        for entry in entries.filter_map(Result::ok).take(4096) {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(MESSAGES_REPAIR_TMP_PREFIX)
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Loads `messages.json` for a write, under the bus lock. A file over
+/// [`MESSAGES_WRITE_CEILING`] or one that does not parse is moved aside
+/// (`messages.json.oversized-<unix>` / `.corrupt-<unix>`, two newest kept) and replaced by an
+/// empty bus whose `next_seq` is the larger of the old file's (when its first 4 KiB name it,
+/// capped at 2^53 - 1) and the clock in milliseconds, so a seq a reader already saw is never
+/// issued again. Only damage is repaired: valid JSON of another shape is refused and left in
+/// place. The replacement is written before this returns, and a missing file beside an aside
+/// file (a repair cut short) is seeded the same way.
+fn load_messages_for_write(
+    lanes_dir: &Path,
+    messages_path: &Path,
+) -> Result<MessagesState, CommandError> {
+    let file = match fs::File::open(messages_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No file beside an aside file means a repair was cut short after the old file was
+            // moved: the aside file still knows how far the seq had got.
+            let newest = fs::read_dir(lanes_dir)
+                .ok()
+                .and_then(|entries| messages_asides(entries).into_iter().max());
+            let Some((_, aside)) = newest else {
+                return Ok(MessagesState::default());
+            };
+            let mut head = Vec::new();
+            if let Ok(f) = fs::File::open(aside) {
+                let _ = f
+                    .take(MESSAGES_SEQ_PROBE_BYTES as u64)
+                    .read_to_end(&mut head);
+            }
+            return Ok(fresh_messages_state(prefix_next_seq(&head)));
+        }
+        Err(e) => {
+            return Err(CommandError::from(format!(
+                "cannot open {}: {e}",
+                messages_path.display()
+            )))
+        }
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| CommandError::from(format!("cannot stat {}: {e}", messages_path.display())))?
+        .len();
+    let read_err = |e: std::io::Error| {
+        CommandError::from(format!("cannot read {}: {e}", messages_path.display()))
+    };
+    let mut buf = Vec::new();
+    let (kind, head) = if len > MESSAGES_WRITE_CEILING {
+        let mut head = Vec::new();
+        file.take(MESSAGES_SEQ_PROBE_BYTES as u64)
+            .read_to_end(&mut head)
+            .map_err(read_err)?;
+        ("oversized", head)
+    } else {
+        file.take(MESSAGES_WRITE_CEILING + 1)
+            .read_to_end(&mut buf)
+            .map_err(read_err)?;
+        if buf.is_empty() {
+            return Ok(MessagesState::default());
+        }
+        match serde_json::from_slice::<MessagesState>(&buf) {
+            Ok(state) => return Ok(state),
+            Err(e) if matches!(e.classify(), serde_json::error::Category::Data) => {
+                // Valid JSON of another shape is another build's file, not damage: moving it
+                // aside would discard that build's bus, so refuse and leave it where it is.
+                return Err(CommandError::from(format!(
+                    "coordination state {} is valid JSON in a shape this build cannot read ({e}); it was left in place, not repaired",
+                    messages_path.display()
+                )));
+            }
+            Err(_) => {
+                buf.truncate(MESSAGES_SEQ_PROBE_BYTES);
+                ("corrupt", buf)
+            }
+        }
+    };
+
+    let secs = now_epoch_ms() / 1000;
+    let aside = (0..100u32)
+        .find_map(|k| {
+            let suffix = if k == 0 {
+                secs.to_string()
+            } else {
+                format!("{secs}.{k}")
+            };
+            let free = MESSAGES_ASIDE_PREFIXES
+                .iter()
+                .all(|prefix| !lanes_dir.join(format!("{prefix}{suffix}")).exists());
+            free.then(|| lanes_dir.join(format!("messages.json.{kind}-{suffix}")))
+        })
+        .ok_or_else(|| {
+            CommandError::from(format!(
+                "cannot name an aside file for {} in {}",
+                messages_path.display(),
+                lanes_dir.display()
+            ))
+        })?;
+    let state = fresh_messages_state(prefix_next_seq(&head));
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))?;
+    // `messages.json` is never absent: the unusable file gets a second name (a hard link, so an
+    // oversized file costs no I/O), then the fresh state is written to a temp file and renamed
+    // over it. A crash or a full disk at any step leaves either the old file, which the next
+    // write repairs again, or the new one, so the seq cannot restart at 1.
+    if fs::hard_link(messages_path, &aside).is_err() {
+        fs::copy(messages_path, &aside).map_err(|e| {
+            // A partial copy is not a usable aside file, and would be counted as one.
+            let _ = fs::remove_file(&aside);
+            CommandError::from(format!(
+                "cannot keep {} as {}: {e}",
+                messages_path.display(),
+                aside.display()
+            ))
+        })?;
+    }
+    let tmp = lanes_dir.join(format!(
+        "{MESSAGES_REPAIR_TMP_PREFIX}{}",
+        std::process::id()
+    ));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, messages_path)
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(CommandError::from(format!(
+            "cannot write {}: {e}",
+            messages_path.display()
+        )));
+    }
+    prune_messages_aside(lanes_dir);
+    Ok(state)
+}
+
+/// Seqs of the rows an eviction must keep while it can: open asks (newest
+/// `MAX_PINNED_OPEN_ASKS`) and unread direct messages younger than the mailbox's pending
+/// TTL (newest `MAX_PINNED_UNREAD_PER_RECIPIENT` per recipient, newest
+/// `MAX_PINNED_UNREAD_DIRECT` overall).
+fn pinned_message_seqs(messages: &[AgentBusMessage], now_ms: u64) -> BTreeSet<u64> {
+    let mut open_ask_seq_by_thread: HashMap<String, u64> = HashMap::new();
+    for existing in messages {
+        let key = existing
+            .thread_key
+            .clone()
+            .unwrap_or_else(|| format!("msg-{}", existing.seq));
+        if existing.kind == "ask" {
+            open_ask_seq_by_thread.insert(key, existing.seq);
+        } else if matches!(
+            existing.kind.as_str(),
+            "reply" | "answer" | "withdraw" | "withdrawn"
+        ) {
+            open_ask_seq_by_thread.remove(&key);
+        }
+    }
+    let mut open_asks: Vec<u64> = open_ask_seq_by_thread.into_values().collect();
+    open_asks.sort_unstable();
+    let mut pinned: BTreeSet<u64> = open_asks
+        .into_iter()
+        .rev()
+        .take(MAX_PINNED_OPEN_ASKS)
+        .collect();
+
+    let ttl_ms = u64::try_from(crate::agent_mailbox::PENDING_TTL.as_millis()).unwrap_or(u64::MAX);
+    let mut per_recipient: HashMap<&str, usize> = HashMap::new();
+    let mut unread: Vec<u64> = Vec::new();
+    for msg in messages.iter().rev() {
+        let Some(to) = msg.to_agent.as_deref() else {
+            continue;
+        };
+        if !msg.read_by.is_empty() || now_ms.saturating_sub(msg.created_at_ms) >= ttl_ms {
+            continue;
+        }
+        let taken = per_recipient.entry(to).or_insert(0);
+        if *taken < MAX_PINNED_UNREAD_PER_RECIPIENT {
+            *taken += 1;
+            unread.push(msg.seq);
+        }
+    }
+    // `unread` is newest first, so the overall cap keeps the newest.
+    pinned.extend(unread.into_iter().take(MAX_PINNED_UNREAD_DIRECT));
+    pinned
+}
+
+/// Seqs in the order rows are given up: every unpinned row oldest first, then pinned rows
+/// oldest first, so a pinned row only goes once nothing unpinned is left.
+fn eviction_order(messages: &[AgentBusMessage], now_ms: u64) -> Vec<u64> {
+    let pinned = pinned_message_seqs(messages, now_ms);
+    let (mut order, held): (Vec<u64>, Vec<u64>) = messages
+        .iter()
+        .map(|m| m.seq)
+        .partition(|seq| !pinned.contains(seq));
+    order.extend(held);
+    order
+}
+
+/// Removes the rows with these seqs and raises `dropped_before_seq` past each. `next_seq`
+/// is never touched, so a dropped seq is never reused.
+fn drop_message_seqs(state: &mut MessagesState, seqs: &[u64]) {
+    let gone: BTreeSet<u64> = seqs.iter().copied().collect();
+    state.messages.retain(|m| {
+        if gone.contains(&m.seq) {
+            state.dropped_before_seq = state.dropped_before_seq.max(m.seq.saturating_add(1));
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Trims `state` to the row cap, then to the file cap, and returns the bytes to write, so no
+/// write ever leaves `messages.json` over what a reader accepts. A file an older build left
+/// over the cap is healed here by dropping rows in eviction order.
+fn compact_messages_for_write(
+    state: &mut MessagesState,
+    messages_path: &Path,
+    keep_seq: Option<u64>,
+) -> Result<Vec<u8>, CommandError> {
+    let now_ms = now_epoch_ms();
+    // The row being posted is never a candidate: an Ok from a post means the message is on
+    // the bus, so a state that cannot hold it fails the post instead.
+    let order_for = |messages: &[AgentBusMessage]| {
+        let mut order = eviction_order(messages, now_ms);
+        order.retain(|seq| Some(*seq) != keep_seq);
+        order
+    };
+    if state.messages.len() > MAX_BUS_MESSAGES {
+        let excess = state.messages.len() - MAX_BUS_MESSAGES;
+        let order = order_for(&state.messages);
+        drop_message_seqs(state, &order[..excess.min(order.len())]);
+    }
+    let serialize = |state: &MessagesState| {
+        serde_json::to_vec_pretty(state)
+            .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))
+    };
+    let mut bytes = serialize(state)?;
+    if bytes.len() as u64 <= MESSAGES_FILE_CAP {
+        return Ok(bytes);
+    }
+
+    let rows_before = state.messages.len();
+    let order = order_for(&state.messages);
+    let row_bytes: HashMap<u64, usize> = state
+        .messages
+        .iter()
+        .map(|m| {
+            let len = serde_json::to_string_pretty(m).map_or(0, |s| s.len());
+            (m.seq, len)
+        })
+        .collect();
+    let mut next = 0usize;
+    while bytes.len() as u64 > MESSAGES_FILE_CAP {
+        let excess = bytes.len() - MESSAGES_FILE_CAP as usize;
+        let start = next;
+        let mut freed = 0usize;
+        while freed < excess && next < order.len() {
+            freed += row_bytes.get(&order[next]).copied().unwrap_or(0).max(1);
+            next += 1;
+        }
+        if next == start {
+            return Err(CommandError::from(match keep_seq {
+                Some(_) => format!(
+                    "the new message does not fit in {} under its {MESSAGES_FILE_CAP} byte cap even with every other message evicted",
+                    messages_path.display()
+                ),
+                None => format!(
+                    "cannot compact {} under its {MESSAGES_FILE_CAP} byte cap",
+                    messages_path.display()
+                ),
+            }));
+        }
+        drop_message_seqs(state, &order[start..next]);
+        bytes = serialize(state)?;
+    }
+    log::warn!(
+        target: "agent_bus",
+        "dropped {} of {rows_before} rows from {} to bring it under its {MESSAGES_FILE_CAP} byte cap",
+        rows_before - state.messages.len(),
+        messages_path.display()
+    );
+    Ok(bytes)
+}
+
+/// The one row an id names: the row whose `msg_id` is exactly `id`, else the legacy id-less
+/// row whose effective id `msg-<seq>` is `id`. A caller may choose "msg-5" as a real id, so an
+/// exact match always wins. Lookup and acknowledgement both resolve through here, so they
+/// cannot disagree about which row an id means.
+fn message_index_by_id(messages: &[AgentBusMessage], id: &str) -> Option<usize> {
+    messages
+        .iter()
+        .position(|m| m.msg_id.as_deref() == Some(id))
+        .or_else(|| {
+            messages
+                .iter()
+                .position(|m| m.msg_id.is_none() && id == format!("msg-{}", m.seq))
+        })
+}
+
 /// Looks up one message by `msg_id` (used to hydrate `> 6 KiB` mailbox pointer envelopes).
 pub fn get_message_by_id(
     repo_path: &str,
@@ -1047,12 +1706,8 @@ pub fn get_message_by_id(
     let clean_id = sanitize_token("msg_id", msg_id, 64)?;
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
-        Ok(state
-            .messages
-            .into_iter()
-            .find(|m| m.msg_id.as_deref() == Some(clean_id.as_str())))
+        let mut state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
+        Ok(message_index_by_id(&state.messages, &clean_id).map(|i| state.messages.swap_remove(i)))
     })
 }
 
@@ -1080,14 +1735,21 @@ pub fn ack_messages(
         if !messages_path.is_file() {
             return Ok(0);
         }
-        let mut state: MessagesState = read_json_bounded(&messages_path, 8 * 1024 * 1024)?;
+        let mut state = load_messages_for_write(&lanes_dir, &messages_path)?;
+        // Measured after the load, which may have replaced an unusable file with a fresh one.
+        let file_len = fs::metadata(&messages_path)
+            .map_err(|e| {
+                CommandError::from(format!("cannot stat {}: {e}", messages_path.display()))
+            })?
+            .len();
         let mut updated = 0usize;
-        for msg in &mut state.messages {
-            let eff_id = msg
-                .msg_id
-                .clone()
-                .unwrap_or_else(|| format!("msg-{}", msg.seq));
-            if wanted.contains(&eff_id)
+        // Each id marks exactly the row get_message_by_id returns for it, never two rows.
+        let targets: BTreeSet<usize> = wanted
+            .iter()
+            .filter_map(|id| message_index_by_id(&state.messages, id))
+            .collect();
+        for (idx, msg) in state.messages.iter_mut().enumerate() {
+            if targets.contains(&idx)
                 && !msg.read_by.contains(&reader)
                 && msg.read_by.len() < MAX_READ_BY_ENTRIES
             {
@@ -1095,9 +1757,17 @@ pub fn ack_messages(
                 updated += 1;
             }
         }
-        if updated > 0 {
-            let bytes = serde_json::to_vec_pretty(&state)
-                .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))?;
+        // Nothing acknowledged and nothing over a cap: serializing and rewriting the whole
+        // file would only burn I/O, so leave it alone. An over-cap file still heals below.
+        if updated == 0 && state.messages.len() <= MAX_BUS_MESSAGES && file_len <= MESSAGES_FILE_CAP
+        {
+            return Ok(0);
+        }
+        let rows_before = state.messages.len();
+        let bytes = compact_messages_for_write(&mut state, &messages_path, None)?;
+        // A file over the byte cap is unreadable even when it re-serializes under it (padding,
+        // fields serde drops), so it is rewritten whatever else changed.
+        if updated > 0 || state.messages.len() != rows_before || file_len > MESSAGES_FILE_CAP {
             devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
                 CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
             })?;
@@ -1143,10 +1813,9 @@ pub fn read_messages_for_peer(
     let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
-        let filtered = state
+        let filtered: Vec<AgentBusMessage> = state
             .messages
             .into_iter()
             .filter(|m| m.seq > since_seq)
@@ -1158,10 +1827,19 @@ pub fn read_messages_for_peer(
             .filter(|m| !unread_only || !m.read_by.iter().any(|r| aliases.contains(r)))
             .filter(|m| match &m.to_agent {
                 Some(to) => aliases.is_empty() || aliases.contains(to),
-                None => include_broadcasts,
+                None => {
+                    include_broadcasts
+                        || (m.from_agent == STEWARD_SENDER
+                            && m.kind == STEWARD_MESSAGE_KIND
+                            && m.hop == Some(0))
+                }
             })
             .collect();
         Ok(AgentInboxPage {
+            pinned_below_dropped_before_seq: seqs_below_dropped(
+                &filtered,
+                state.dropped_before_seq,
+            ),
             messages: filtered,
             latest_seq,
             dropped_before_seq: state.dropped_before_seq,
@@ -1235,7 +1913,20 @@ pub(crate) fn is_antigravity_presence_locked(homes: &[PathBuf], session_id: &str
 }
 
 /// Upserts a peer record in `<git-common-dir>/gitpulse/lanes/peers.json` under `.bus.lock`.
+///
+/// This applies no ownership check. It is the path of the hook, the app and managed sessions,
+/// where the caller is the session itself or the person, and also of `mcp/a2a.rs`, which passes
+/// the caller-supplied `auto_wake` through it; a caller the server cannot vouch for goes
+/// through [`upsert_peer_as`] instead.
 pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, CommandError> {
+    upsert_peer_checked(repo_path, update, None).map_err(PeerWriteError::into_command_error)
+}
+
+fn upsert_peer_checked(
+    repo_path: &str,
+    update: PeerUpsert,
+    writer: Option<&PeerWriter>,
+) -> Result<PeerRecord, PeerWriteError> {
     let provider = sanitize_token("provider", &canonical_provider(&update.provider), 32)?;
     let surface = sanitize_token("surface", &canonical_surface(&update.surface), 32)?;
     let worktree_clean = if update.worktree_path.trim().is_empty() {
@@ -1280,7 +1971,8 @@ pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, Co
             } else {
                 return Err(CommandError::from(
                     "peer registration requires peer_id, provider_session_id, terminal_session_id, or pid",
-                ));
+                )
+                .into());
             }
         }
     };
@@ -1291,6 +1983,11 @@ pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, Co
         .filter(|s| !s.is_empty())
         .map(|s| sanitize_token("role", s, 64))
         .transpose()?;
+    require_agent_sender(&provider)?;
+    require_agent_sender(&derived_peer_id)?;
+    if let Some(ref r) = role {
+        require_role_not_steward(r)?;
+    }
     let branch = update
         .branch
         .as_deref()
@@ -1313,19 +2010,42 @@ pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, Co
         .map(str::to_string);
 
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
-    with_bus_lock(&lanes_dir, true, || {
+    let outcome = with_bus_lock(&lanes_dir, true, || {
         let peers_path = lanes_dir.join(PEERS_FILE);
         let mut state: PeersState = read_json_bounded(&peers_path, 4 * 1024 * 1024)?;
         let now = now_epoch_ms();
 
-        let existing_idx = state.peers.iter().position(|p| {
+        let matches_update = |p: &PeerRecord| {
             p.peer_id == derived_peer_id
                 || (provider_sid.is_some() && p.provider_session_id == provider_sid)
                 || (term_sid.is_some()
                     && provider_sid.is_none()
                     && p.terminal_session_id == term_sid
                     && providers_match(&p.provider, &provider))
-        });
+        };
+        let existing_idx = state.peers.iter().position(matches_update);
+
+        if let Some(w) = writer {
+            // Every record the update matches by any key is checked, not just the one that is
+            // merged: a role record that sorts first must not shield a bound one.
+            let matched: Vec<&PeerRecord> =
+                state.peers.iter().filter(|p| matches_update(p)).collect();
+            let binds = PeerBinding {
+                session: provider_sid.is_some(),
+                terminal: term_sid.is_some(),
+                run: run_id.is_some(),
+                process: update.pid.is_some() || update.proc_start_ns.is_some(),
+            };
+            if let Some(refusal) = peer_write_refusal(
+                w,
+                &matched,
+                provider_sid.as_deref(),
+                binds,
+                update.auto_wake,
+            ) {
+                return Ok(Err(refusal));
+            }
+        }
 
         let record = if let Some(idx) = existing_idx {
             let prev = &state.peers[idx];
@@ -1393,8 +2113,127 @@ pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, Co
         devmap_query::write_atomic(&peers_path, &bytes).map_err(|e| {
             CommandError::from(format!("cannot write {}: {e}", peers_path.display()))
         })?;
-        Ok(record)
-    })
+        Ok(Ok(record))
+    })?;
+    outcome
+}
+
+/// Who is writing a peer record. See [`upsert_peer_as`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerWriter {
+    /// A person in the GitPulse UI: may write any record.
+    Person,
+    /// The agent session that holds `provider_session_id`: may write only its own record.
+    Session { provider_session_id: String },
+    /// A caller whose identity is not proven: may create a record or update one that no session
+    /// owns, and may never set `auto_wake`.
+    Unproven,
+}
+
+/// Why [`upsert_peer_as`] refused a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerWriteError {
+    OwnedByAnotherSession {
+        peer_id: String,
+    },
+    SessionMismatch,
+    UnprovenAutoWake,
+    /// An unproven caller tried to set a session, terminal, run or process binding.
+    UnprovenBinding,
+    Bus(CommandError),
+}
+
+impl PeerWriteError {
+    #[must_use]
+    pub fn into_command_error(self) -> CommandError {
+        match self {
+            Self::OwnedByAnotherSession { peer_id } => CommandError::from(format!(
+                "peer record {peer_id} is bound to another session; only that session or the person may change it"
+            )),
+            Self::SessionMismatch => CommandError::from(
+                "a session may only write the peer record for its own provider_session_id",
+            ),
+            Self::UnprovenBinding => CommandError::from(
+                "an unproven caller may not set provider_session_id, terminal_session_id, run_id or pid",
+            ),
+            Self::UnprovenAutoWake => CommandError::from(
+                "an unproven caller may not set auto_wake; the session itself or the person opts in",
+            ),
+            Self::Bus(e) => e,
+        }
+    }
+}
+
+impl From<CommandError> for PeerWriteError {
+    fn from(e: CommandError) -> Self {
+        Self::Bus(e)
+    }
+}
+
+/// Which identity-bearing fields an update sets.
+#[derive(Debug, Clone, Copy)]
+struct PeerBinding {
+    session: bool,
+    terminal: bool,
+    run: bool,
+    process: bool,
+}
+
+impl PeerBinding {
+    fn any(self) -> bool {
+        self.session || self.terminal || self.run || self.process
+    }
+}
+
+/// Why `writer` may not apply an update to the records it `matched` (every record any of its
+/// keys selects), or `None` when it may. A record bound to a `provider_session_id` belongs to
+/// that session: anyone else is refused outright, never merged into it. An unproven writer may
+/// not set a session, terminal, run or process binding at all, because that is how a record
+/// would be redirected to, or a session id squatted by, a caller nobody has identified.
+fn peer_write_refusal(
+    writer: &PeerWriter,
+    matched: &[&PeerRecord],
+    update_session_id: Option<&str>,
+    binds: PeerBinding,
+    auto_wake: Option<bool>,
+) -> Option<PeerWriteError> {
+    let foreign = |me: Option<&str>| {
+        matched.iter().find_map(|p| {
+            let owner = p.provider_session_id.as_deref()?;
+            (Some(owner) != me).then(|| PeerWriteError::OwnedByAnotherSession {
+                peer_id: p.peer_id.clone(),
+            })
+        })
+    };
+    match writer {
+        PeerWriter::Person => None,
+        PeerWriter::Session {
+            provider_session_id,
+        } => {
+            let me = provider_session_id.trim().to_ascii_lowercase();
+            if update_session_id.is_some_and(|s| s != me) {
+                return Some(PeerWriteError::SessionMismatch);
+            }
+            foreign(Some(&me))
+        }
+        PeerWriter::Unproven => foreign(None)
+            .or_else(|| binds.any().then_some(PeerWriteError::UnprovenBinding))
+            .or_else(|| (auto_wake == Some(true)).then_some(PeerWriteError::UnprovenAutoWake)),
+    }
+}
+
+/// [`upsert_peer`] for a caller whose identity the server knows. A record bound to
+/// `provider_session_id` S can have its pid, start, worktree, terminal binding and
+/// `auto_wake` changed only by `Session { S }` or `Person`; any other writer gets a typed
+/// refusal and the record is left as it was. `Unproven` may create a role-only record or update
+/// one no session owns, and may never set `auto_wake` or any session, terminal, run or process
+/// binding. Every record the update matches by any key is checked.
+pub fn upsert_peer_as(
+    repo_path: &str,
+    update: PeerUpsert,
+    writer: PeerWriter,
+) -> Result<PeerRecord, PeerWriteError> {
+    upsert_peer_checked(repo_path, update, Some(&writer))
 }
 
 /// Returns `provider_session_id` recorded in `peers.json` for `run_id` when present.
@@ -1475,16 +2314,65 @@ pub(crate) fn list_reconciled_peers_from_observation(
     alive_probe: &dyn Fn(u32, u128) -> crate::workbench::process_birth::Liveness,
     has_transcript: &dyn Fn(&str, &str) -> bool,
 ) -> Result<Vec<ReconciledPeer>, CommandError> {
-    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    let (repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    let repo_common = resolve_git_common_dir(&repo).ok();
     let stored: PeersState = with_bus_lock(&lanes_dir, false, || {
         read_json_bounded(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
     })?;
-    let worktrees = list_worktrees(repo_path).unwrap_or_default();
-    let wt_paths: Vec<String> = worktrees.iter().map(|w| w.path.clone()).collect();
-    let wt_branch_by_path: HashMap<String, Option<String>> = worktrees
-        .iter()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-        .collect();
+    let worktrees = list_worktrees_lite(repo_path).unwrap_or_default();
+    let mut wt_paths: Vec<String> = Vec::new();
+    let mut wt_seen: BTreeSet<String> = BTreeSet::new();
+    let mut wt_branch_by_path: HashMap<String, Option<String>> = HashMap::new();
+    for wt in &worktrees {
+        if wt_seen.insert(wt.path.clone()) {
+            wt_paths.push(wt.path.clone());
+        }
+        wt_branch_by_path.insert(wt.path.clone(), wt.branch.clone());
+    }
+    // When `git worktree list` is shed under `Tier::Severe`, discover the primary
+    // checkout and every registered linked worktree from `<common_dir>/worktrees/<entry>/gitdir`
+    // and `<private_git_dir>/HEAD` with zero subprocess spawns so active sessions in
+    // sibling linked worktrees are never invisible during critical pressure.
+    if wt_paths.is_empty() {
+        let fallback_checkouts = admit_worktree_pair(repo_path, repo_path)
+            .map(|pair| pair.best_effort_checkouts())
+            .unwrap_or_else(|_| vec![repo.clone()]);
+        // Recorded in the spelling `git worktree list` gives the same
+        // checkout, not the `\\?\` identity spelling Windows admission uses.
+        for checkout in fallback_checkouts {
+            let path_str = crate::engine::process::plain_path_text(&checkout.to_string_lossy());
+            if wt_seen.insert(path_str.clone()) {
+                wt_paths.push(path_str.clone());
+            }
+            wt_branch_by_path
+                .entry(path_str)
+                .or_insert_with(|| head_branch_from_metadata(&checkout));
+        }
+    }
+    // Also retain any stored peer checkout that belongs to this same common Git dir.
+    if let Some(ref common) = repo_common {
+        for peer in &stored.peers {
+            let candidate = Path::new(peer.worktree_path.trim());
+            let Ok(canonical) = fs::canonicalize(candidate) else {
+                continue;
+            };
+            if resolve_git_common_dir(&canonical).ok().as_ref() == Some(common) {
+                let path_str =
+                    crate::engine::process::plain_path_text(&canonical.to_string_lossy());
+                if wt_seen.insert(path_str.clone()) {
+                    wt_paths.push(path_str.clone());
+                }
+                wt_branch_by_path
+                    .entry(path_str)
+                    .or_insert_with(|| head_branch_from_metadata(&canonical));
+            }
+        }
+    }
+    if wt_paths.is_empty() {
+        wt_paths.push(crate::engine::process::plain_path_text(
+            &repo.to_string_lossy(),
+        ));
+    }
 
     let live_facet = crate::insights::live_sessions::attribute(live_obs, &wt_paths);
     let mut live_by_pid: HashMap<u32, (&crate::insights::LiveSession, &str)> = HashMap::new();
@@ -1652,6 +2540,25 @@ pub fn resolve_target_peer(
     resolve_target_from_list(&peers, target)
 }
 
+/// The `from_agent` of a message still on the bus that is exactly `target` (after trim), so a
+/// reply can reach a sender that never registered as a peer. Never a prefix or case match:
+/// a guessed identity would deliver to the wrong agent.
+pub fn find_bus_sender(repo_path: &str, target: &str) -> Result<Option<String>, CommandError> {
+    let clean = target.trim();
+    if clean.is_empty() {
+        return Ok(None);
+    }
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    with_bus_lock(&lanes_dir, false, || {
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
+        Ok(state
+            .messages
+            .iter()
+            .find(|m| m.from_agent == clean)
+            .map(|m| m.from_agent.clone()))
+    })
+}
+
 pub(crate) fn resolve_target_from_list(
     peers: &[ReconciledPeer],
     target: &str,
@@ -1778,10 +2685,9 @@ pub fn read_thread_messages(
     let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
-        let filtered = state
+        let filtered: Vec<AgentBusMessage> = state
             .messages
             .into_iter()
             .filter(|m| m.seq > since_seq)
@@ -1797,6 +2703,10 @@ pub fn read_thread_messages(
             .collect();
 
         Ok(AgentInboxPage {
+            pinned_below_dropped_before_seq: seqs_below_dropped(
+                &filtered,
+                state.dropped_before_seq,
+            ),
             messages: filtered,
             latest_seq,
             dropped_before_seq: state.dropped_before_seq,
@@ -1879,8 +2789,7 @@ pub fn list_inbox_threads(
         .filter(|s| !s.is_empty() && *s != "all");
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
 
         let mut thread_map: HashMap<String, Vec<AgentBusMessage>> = HashMap::new();
         for msg in state.messages {
@@ -3048,6 +3957,31 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_may_describe_itself_as_a_developer_but_never_as_the_steward() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let peer = |role: &str| PeerUpsert {
+            provider: "claude".into(),
+            surface: "terminal".into(),
+            provider_session_id: Some("0f0e0d0c-0b0a-4909-8807-060504030201".into()),
+            worktree_path: anchor.into(),
+            role: Some(role.into()),
+            ..Default::default()
+        };
+        let registered = upsert_peer(anchor, peer("developer")).unwrap();
+        assert_eq!(registered.role.as_deref(), Some("developer"));
+        for reserved in ["system-steward", "Manvi-Steward:worker"] {
+            assert!(
+                upsert_peer(anchor, peer(reserved)).is_err(),
+                "role {reserved} must be refused"
+            );
+        }
+        // The sender identity itself still may not be a person's name.
+        assert!(require_agent_sender("developer").is_err());
+    }
+
+    #[test]
     fn peer_registry_reconciles_antigravity_presence_flock_and_resumable_transcripts() {
         let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
         let anchor = anchor_dir.path().to_str().unwrap();
@@ -3081,7 +4015,14 @@ mod tests {
         }
 
         let homes = vec![agy_home.path().to_path_buf()];
-        assert!(is_antigravity_presence_locked(&homes, conv_live));
+        // Antigravity's presence is read from a held `flock`, which only unix
+        // has: elsewhere no presence is ever claimed, so a held lock reads as
+        // no session rather than as a guess.
+        assert_eq!(
+            is_antigravity_presence_locked(&homes, conv_live),
+            cfg!(unix),
+            "a held presence lock is seen on unix only"
+        );
         assert!(
             !is_antigravity_presence_locked(&homes, conv_stale),
             "unlocked 0-byte presence file must not report live"
@@ -3135,7 +4076,7 @@ mod tests {
             .iter()
             .find(|p| p.record.provider_session_id.as_deref() == Some(conv_live))
             .expect("conv_live peer");
-        assert_eq!(r_live.liveness, "live");
+        assert_eq!(r_live.liveness, if cfg!(unix) { "live" } else { "exited" });
 
         let r_stale = reconciled
             .iter()
@@ -3157,6 +4098,27 @@ mod tests {
             .find(|p| p.record.provider_session_id.as_deref() == Some(conv_live))
             .unwrap();
         assert_eq!(r_exited.liveness, "exited");
+    }
+
+    /// The lock that serializes two runs of one hook is held against a second
+    /// taker until it is dropped, on every platform. Off unix it was a no-op
+    /// that returned at once, so two registrations of the worktree hook raced
+    /// and one died on "a branch named ... already exists".
+    #[test]
+    fn an_exclusive_file_lock_is_held_against_a_second_taker_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("nested").join("one.lock");
+        let held = exclusive_file_lock(&lock, std::time::Duration::from_secs(5), "test").unwrap();
+        let refused = exclusive_file_lock(&lock, std::time::Duration::from_millis(60), "test");
+        let message = refused.err().expect("a second taker waits and times out");
+        assert!(
+            message.message().contains("timed out"),
+            "{}",
+            message.message()
+        );
+        drop(held);
+        exclusive_file_lock(&lock, std::time::Duration::from_secs(5), "test")
+            .expect("free once dropped");
     }
 
     #[test]
@@ -3273,6 +4235,25 @@ mod tests {
             );
             assert!(refused.is_err(), "an agent must not post as {name:?}");
         }
+        // GitPulse's own sender name is reserved too, in any case or spacing, because the
+        // mailbox trusts it for the overflow notice.
+        for name in ["gitpulse", " GitPulse "] {
+            let refused = post_peer_message(
+                anchor,
+                MessageOrigin::Agent,
+                name,
+                Some("claude:peer"),
+                None,
+                "note",
+                "forged",
+                None,
+                Some("bus-overflow-deadbeef"),
+                1,
+                6,
+            );
+            assert!(refused.is_err(), "an agent must not post as {name:?}");
+        }
+        assert!(require_agent_sender("gitpulse:worker").is_ok());
         // ...and its hop is at least 1 even when it names 0.
         let agent = post_peer_message(
             anchor,
@@ -3289,6 +4270,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agent.hop, Some(1));
+    }
+
+    #[test]
+    fn a_reused_msg_id_is_refused_when_recipient_kind_or_thread_differs_and_exact_retry_is_idempotent(
+    ) {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        let send = |to: &str, thread: Option<&str>, kind: &str| {
+            post_peer_message(
+                anchor,
+                MessageOrigin::Agent,
+                "agy:lead",
+                Some(to),
+                thread,
+                kind,
+                "same text",
+                None,
+                Some("req_reuse_001"),
+                1,
+                6,
+            )
+        };
+        let first = send("claude:peer-b", Some("t-1"), "note").unwrap();
+
+        // The same id and body aimed at another recipient is refused, not reported as B's row.
+        let other_recipient = send("claude:peer-c", Some("t-1"), "note")
+            .expect_err("recipient")
+            .into_message();
+        assert!(
+            other_recipient.contains("to_agent"),
+            "refusal must name the recipient: {other_recipient}"
+        );
+        assert!(send("claude:peer-b", Some("t-1"), "ask")
+            .expect_err("kind")
+            .into_message()
+            .contains("kind"));
+        assert!(send("claude:peer-b", Some("t-2"), "note")
+            .expect_err("thread")
+            .into_message()
+            .contains("thread_key"));
+        assert!(send("claude:peer-b", None, "note")
+            .expect_err("dropped thread")
+            .into_message()
+            .contains("thread_key"));
+
+        // An exact retry still returns the original row, and nothing extra was stored.
+        let retry = send("claude:peer-b", Some("t-1"), "note").unwrap();
+        assert_eq!(retry.seq, first.seq);
+        assert_eq!(read_messages(anchor, None, 0).unwrap().messages.len(), 1);
     }
 
     #[test]
@@ -3533,5 +4565,1186 @@ mod tests {
         assert_eq!(by_pid(88002).record.run_id.as_deref(), Some("r1"));
         assert_eq!(by_pid(88003).record.surface, "managed");
         assert_eq!(by_pid(88004).record.surface, "external_cli");
+    }
+
+    #[test]
+    fn reconcile_discovers_sibling_linked_worktree_sessions_under_severe_governor_without_git_spawns(
+    ) {
+        use crate::procguard::LockedSpawn;
+        use crate::sysload::{inject_governor_with_history, GovernorInput, Level};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(tmp.path()).unwrap();
+        let main_repo = root.join("main-repo");
+        let sibling_wt = root.join("sibling-lane");
+        fs::create_dir_all(&main_repo).unwrap();
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Bus Test"],
+            vec!["config", "user.email", "bus@example.com"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&main_repo)
+                .status_locked()
+                .unwrap()
+                .success());
+        }
+        assert!(std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/sibling",
+                sibling_wt.to_str().unwrap(),
+            ])
+            .current_dir(&main_repo)
+            .status_locked()
+            .unwrap()
+            .success());
+
+        // Also append an `[include]` stanza to `.git/config` so `metadata_checkouts()`
+        // returns `None`, exercising `best_effort_checkouts()`'s direct `<common>/worktrees/<entry>/gitdir`
+        // + `HEAD` fallback!
+        let cfg_path = main_repo.join(".git/config");
+        let mut cfg_text = fs::read_to_string(&cfg_path).unwrap();
+        cfg_text.push_str("\n[include]\n\tpath = nonexistent-optional.gitconfig\n");
+        fs::write(&cfg_path, cfg_text).unwrap();
+
+        crate::test_support::trust_repo(&main_repo);
+        crate::test_support::trust_repo(&sibling_wt);
+
+        // Inject a REAL Severe governor (`Level::Critical`) so `list_worktrees_lite` is shed!
+        let _gov = inject_governor_with_history(std::iter::repeat_n(
+            GovernorInput::test_pressure(Level::Critical),
+            10,
+        ));
+        assert!(
+            list_worktrees_lite(main_repo.to_str().unwrap()).is_err(),
+            "Severe governor must shed git worktree list subprocesses"
+        );
+
+        let sibling_str = sibling_wt.to_string_lossy().into_owned();
+        let obs = vec![crate::insights::live_sessions::KindObservation {
+            kind: "codex".into(),
+            ok: true,
+            live: vec![crate::insights::LiveSession {
+                kind: "codex".into(),
+                pid: 99123,
+                entrypoint: String::new(),
+                status: "working".into(),
+                cwd: sibling_str.clone(),
+                tree: None,
+                run_id: None,
+                parent_pid: None,
+                session_id: None,
+                proc_start: None,
+                registry_cwd: None,
+                start_us: None,
+                is_caller: false,
+                ide_hosted: false,
+                terminal_session_id: None,
+            }],
+            ..Default::default()
+        }];
+
+        let reconciled = list_reconciled_peers_from_observation(
+            main_repo.to_str().unwrap(),
+            &[],
+            &obs,
+            &|_, _| crate::workbench::process_birth::Liveness::Gone,
+            &|_, _| false,
+        )
+        .expect("reconcile succeeds with zero git spawns under Tier::Severe");
+
+        let found = reconciled
+            .iter()
+            .find(|p| p.record.pid == Some(99123))
+            .unwrap_or_else(|| panic!("missing sibling worktree session in {reconciled:?}"));
+        assert_eq!(found.liveness, "live");
+        assert_eq!(found.record.worktree_path, sibling_str);
+        assert_eq!(found.record.branch.as_deref(), Some("feat/sibling"));
+
+        // Also verify `best_effort_registered_checkouts()` discovers both `main_repo`
+        // and `sibling_wt` with zero git spawns under `Tier::Severe` (even with
+        // `[include]` in `.git/config`), while excluding an unregistered hand-written
+        // gitfile, AND `handle_agent_register` rejects reserved steward provider names
+        // before touching the worktree gate!
+        let forged_wt = tmp.path().join("forged-wt");
+        fs::create_dir_all(&forged_wt).unwrap();
+        let real_gitfile = fs::read_to_string(sibling_wt.join(".git")).unwrap();
+        fs::write(forged_wt.join(".git"), real_gitfile).unwrap();
+        crate::test_support::trust_repo(&forged_wt);
+        let canon_forged = crate::engine::process::canonicalize_plain(&forged_wt).unwrap();
+        let forged_pair = crate::engine::worktree::admit_worktree_pair(
+            forged_wt.to_str().unwrap(),
+            forged_wt.to_str().unwrap(),
+        )
+        .unwrap();
+        // The pair's checkouts are identity paths (`\\?\C:\...` on Windows);
+        // the plain spelling is what the test names them by.
+        let verified_checkouts: Vec<PathBuf> = forged_pair
+            .best_effort_registered_checkouts()
+            .iter()
+            .map(|p| {
+                PathBuf::from(crate::engine::process::plain_path_text(
+                    &p.to_string_lossy(),
+                ))
+            })
+            .collect();
+        assert!(
+            verified_checkouts
+                .iter()
+                .any(|p| p.to_string_lossy() == sibling_str),
+            "verified linked worktree must be discovered from <common>/worktrees/*/gitdir"
+        );
+        assert!(
+            !verified_checkouts.contains(&canon_forged),
+            "unregistered hand-written gitfile must NOT appear in best_effort_registered_checkouts"
+        );
+
+        let spoof_err = crate::mcp::parse::<crate::mcp::AgentRegisterArgs>(
+            "gitpulse_agent_register",
+            &serde_json::json!({
+                "repo_path": sibling_str,
+                "provider": "manvi-steward",
+                "role": "worker",
+            }),
+        )
+        .and_then(crate::mcp::a2a::handle_agent_register)
+        .expect_err(
+            "reserved steward provider must fail before guard_command even under Severe load",
+        );
+        assert!(
+            spoof_err.contains("Manvi system steward"),
+            "unexpected error: {spoof_err}"
+        );
+    }
+
+    fn bus_row(seq: u64, to: Option<&str>, created_at_ms: u64, body: String) -> AgentBusMessage {
+        AgentBusMessage {
+            seq,
+            from_agent: "agy:filler".to_string(),
+            to_agent: to.map(str::to_string),
+            kind: "note".to_string(),
+            body,
+            branch: None,
+            created_at_ms,
+            thread_key: None,
+            msg_id: Some(format!("seed-{seq}")),
+            read_by: Vec::new(),
+            hop: Some(1),
+            max_hops: Some(6),
+        }
+    }
+
+    /// A trusted repo whose `messages.json` already holds `rows`, as an older build or a busy
+    /// bus would have left it.
+    fn repo_with_seeded_bus(rows: Vec<AgentBusMessage>) -> tempfile::TempDir {
+        let dir = crate::codeintel::tests::repo_with_one_generation();
+        crate::test_support::trust_repo(dir.path());
+        let repo = dir.path().to_str().unwrap();
+        let state = MessagesState {
+            next_seq: rows.iter().map(|m| m.seq).max().unwrap_or(0),
+            dropped_before_seq: 0,
+            messages: rows,
+        };
+        fs::write(
+            lanes_messages_path(repo, true).unwrap(),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Posts one broadcast so the write path runs its eviction, and returns what is stored.
+    fn post_then_stored(dir: &tempfile::TempDir) -> MessagesState {
+        let repo = dir.path().to_str().unwrap();
+        post_thread_message(
+            repo,
+            MessageOrigin::Agent,
+            "agy:lead",
+            None,
+            None,
+            "note",
+            "trigger",
+            None,
+        )
+        .unwrap();
+        read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap()
+    }
+
+    fn stored_seqs(state: &MessagesState) -> BTreeSet<u64> {
+        state.messages.iter().map(|m| m.seq).collect()
+    }
+
+    /// `count` broadcast rows numbered from `first_seq`; broadcasts are never pinned.
+    fn broadcasts(first_seq: u64, count: u64, now: u64) -> Vec<AgentBusMessage> {
+        (first_seq..first_seq + count)
+            .map(|seq| bus_row(seq, None, now, "filler".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_chatty_recipient_keeps_only_its_newest_eight_unread_pinned_and_a_quiet_one_survives() {
+        let now = now_epoch_ms();
+        let mut rows = vec![bus_row(1, Some("claude:quiet"), now, "quiet".into())];
+        rows.extend((2..=10).map(|seq| bus_row(seq, Some("claude:chatty"), now, "chatty".into())));
+        rows.extend(broadcasts(11, 250, now));
+        let state = post_then_stored(&repo_with_seeded_bus(rows));
+        let kept = stored_seqs(&state);
+
+        assert_eq!(state.messages.len(), MAX_BUS_MESSAGES);
+        assert!(
+            kept.contains(&1),
+            "the quiet peer's only unread message must survive"
+        );
+        assert!(
+            (3..=10).all(|seq| kept.contains(&seq)),
+            "newest 8 of the chatty recipient are pinned"
+        );
+        assert!(
+            !kept.contains(&2),
+            "the ninth-newest unread is an ordinary row and goes first"
+        );
+    }
+
+    #[test]
+    fn at_most_sixty_four_unread_direct_messages_are_pinned_across_recipients() {
+        let now = now_epoch_ms();
+        // Nine recipients with eight unread messages each: 72 candidates for 64 pins.
+        let mut rows: Vec<AgentBusMessage> = (1..=72u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, "unread".into())
+            })
+            .collect();
+        rows.extend(broadcasts(73, 300, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(
+            (9..=72).all(|seq| kept.contains(&seq)),
+            "the newest 64 are pinned"
+        );
+        assert!(
+            (1..=8).all(|seq| !kept.contains(&seq)),
+            "the oldest beyond the cap are evicted"
+        );
+    }
+
+    #[test]
+    fn an_unread_direct_message_older_than_the_pending_ttl_is_not_pinned() {
+        let now = now_epoch_ms();
+        let stale =
+            now - u64::try_from(crate::agent_mailbox::PENDING_TTL.as_millis()).unwrap() - 1_000;
+        let mut rows = vec![
+            bus_row(1, Some("claude:late"), stale, "stale".into()),
+            bus_row(2, Some("claude:late"), now, "fresh".into()),
+        ];
+        rows.extend(broadcasts(3, 255, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(
+            !kept.contains(&1),
+            "an expired unread message is the oldest ordinary row"
+        );
+        assert!(kept.contains(&2), "a fresh unread message is pinned");
+        assert!(
+            !kept.contains(&3),
+            "the next oldest ordinary row goes after it"
+        );
+        assert!(kept.contains(&4));
+    }
+
+    #[test]
+    fn a_direct_message_somebody_has_read_is_not_pinned() {
+        let now = now_epoch_ms();
+        let mut read = bus_row(1, Some("claude:late"), now, "read".into());
+        read.read_by.push("claude:late".to_string());
+        let mut rows = vec![read, bus_row(2, Some("claude:late"), now, "unread".into())];
+        rows.extend(broadcasts(3, 255, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(!kept.contains(&1), "a read message is an ordinary row");
+        assert!(kept.contains(&2), "the unread one beside it is pinned");
+        assert!(!kept.contains(&3));
+    }
+
+    #[test]
+    fn size_healing_keeps_pinned_rows_while_unpinned_rows_can_pay_and_never_moves_next_seq() {
+        let now = now_epoch_ms();
+        // 256 rows of 40 KB is over the 8 MiB cap, as an older build could leave it.
+        let big = || "x".repeat(40_000);
+        let mut rows = vec![
+            bus_row(1, Some("claude:quiet"), now, big()),
+            bus_row(2, Some("claude:quiet"), now, big()),
+        ];
+        rows.extend((3..=256).map(|seq| bus_row(seq, None, now, big())));
+        let dir = repo_with_seeded_bus(rows);
+        let path = lanes_messages_path(dir.path().to_str().unwrap(), false).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MESSAGES_FILE_CAP);
+        let state = post_then_stored(&dir);
+        let kept = stored_seqs(&state);
+
+        assert!(fs::metadata(&path).unwrap().len() <= MESSAGES_FILE_CAP);
+        assert!(
+            kept.contains(&1) && kept.contains(&2),
+            "pinned rows outlast unpinned ones"
+        );
+        assert_eq!(state.next_seq, 257, "healing never moves next_seq");
+        assert!(state.dropped_before_seq > 3);
+        assert!(kept.contains(&257), "the new post is kept");
+    }
+
+    #[test]
+    fn a_post_into_an_over_cap_file_of_pinned_rows_keeps_the_new_row_or_fails() {
+        let now = now_epoch_ms();
+        let big = || "x".repeat(72_000);
+        // 64 unread directs and 64 open asks: every row is pinned and together they are over
+        // the cap, so the only unpinned row is the broadcast being posted.
+        let mut rows: Vec<AgentBusMessage> = (1..=64u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, big())
+            })
+            .collect();
+        rows.extend((65..=128u64).map(|seq| {
+            let mut ask = bus_row(seq, None, now, big());
+            ask.kind = "ask".to_string();
+            ask.thread_key = Some(format!("ask-{seq}"));
+            ask
+        }));
+        let state = post_then_stored(&repo_with_seeded_bus(rows));
+
+        assert!(
+            state.messages.iter().any(|m| m.body == "trigger"),
+            "the post returned Ok, so its row must be stored"
+        );
+        assert!(
+            state.messages.iter().all(|m| m.seq > 1) || state.dropped_before_seq > 1,
+            "the oldest pinned rows paid instead"
+        );
+    }
+
+    #[test]
+    fn a_state_that_cannot_hold_the_new_row_fails_the_post() {
+        let now = now_epoch_ms();
+        let mut state = MessagesState {
+            next_seq: 1,
+            dropped_before_seq: 0,
+            messages: vec![bus_row(
+                1,
+                None,
+                now,
+                "x".repeat(usize::try_from(MESSAGES_FILE_CAP).unwrap()),
+            )],
+        };
+        let err = compact_messages_for_write(&mut state, Path::new("messages.json"), Some(1))
+            .expect_err("a row larger than the cap cannot be kept");
+        assert!(err
+            .into_message()
+            .contains("even with every other message evicted"));
+    }
+
+    #[test]
+    fn size_healing_evicts_every_unpinned_row_before_any_pinned_one() {
+        let now = now_epoch_ms();
+        let big = || "x".repeat(72_000);
+        // 64 unread directs and 64 open asks, each large enough that together they alone
+        // exceed the cap, then 128 tiny ordinary rows.
+        let mut rows: Vec<AgentBusMessage> = (1..=64u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, big())
+            })
+            .collect();
+        rows.extend((65..=128u64).map(|seq| {
+            let mut ask = bus_row(seq, None, now, big());
+            ask.kind = "ask".to_string();
+            ask.thread_key = Some(format!("ask-{seq}"));
+            ask
+        }));
+        rows.extend(broadcasts(129, 128, now));
+        let dir = repo_with_seeded_bus(rows);
+        let state = post_then_stored(&dir);
+        let kept = stored_seqs(&state);
+
+        assert!(
+            (129..=256).all(|seq| !kept.contains(&seq)),
+            "every ordinary row goes before a pinned one is touched"
+        );
+        let survivors: Vec<u64> = (1..=128).filter(|seq| kept.contains(seq)).collect();
+        assert!(
+            survivors.len() < 128,
+            "pinned rows are the last resort and were needed"
+        );
+        let first = survivors[0];
+        assert!(first > 1, "the oldest pinned row goes first");
+        assert!(
+            survivors.iter().copied().eq(first..=128),
+            "pinned rows go oldest first"
+        );
+        assert_eq!(state.next_seq, 257);
+    }
+
+    #[test]
+    fn a_pinned_row_below_dropped_before_seq_is_listed_for_the_reader() {
+        let now = now_epoch_ms();
+        let mut rows = vec![bus_row(1, Some("claude:quiet"), now, "pinned".into())];
+        rows.extend(broadcasts(2, 300, now));
+        let dir = repo_with_seeded_bus(rows);
+        let stored = post_then_stored(&dir);
+        assert!(
+            stored_seqs(&stored).contains(&1),
+            "the unread direct row is pinned"
+        );
+        assert!(
+            stored.dropped_before_seq > 1,
+            "later rows were evicted past the pinned one"
+        );
+
+        let repo = dir.path().to_str().unwrap();
+        let page = read_messages(repo, Some("claude:quiet"), 0).unwrap();
+        assert!(page.messages.iter().any(|m| m.seq == 1));
+        assert_eq!(
+            page.pinned_below_dropped_before_seq,
+            vec![1],
+            "the reader is told which retained row sits below dropped_before_seq"
+        );
+        let past = read_messages(repo, Some("claude:quiet"), 1).unwrap();
+        assert!(past.pinned_below_dropped_before_seq.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_row_without_msg_id_resolves_by_its_effective_id() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(3, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let dir = repo_with_seeded_bus(vec![legacy]);
+        let repo = dir.path().to_str().unwrap();
+        let found = get_message_by_id(repo, "msg-3")
+            .unwrap()
+            .expect("msg-3 resolves");
+        assert_eq!(found.seq, 3);
+        assert!(get_message_by_id(repo, "msg-4").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_ack_that_changes_nothing_leaves_a_within_cap_file_untouched() {
+        let now = now_epoch_ms();
+        let dir = repo_with_seeded_bus(broadcasts(1, 5, now));
+        let repo = dir.path().to_str().unwrap();
+        let path = lanes_messages_path(repo, false).unwrap();
+        let bytes_before = fs::read(&path).unwrap();
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let acked = ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap();
+        assert_eq!(acked, 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before
+        );
+    }
+
+    #[test]
+    fn an_ack_that_changes_nothing_still_heals_an_over_cap_file() {
+        let now = now_epoch_ms();
+        let mut rows = broadcasts(1, 300, now);
+        rows.push(bus_row(301, None, now, "x".repeat(16)));
+        let dir = repo_with_seeded_bus(rows);
+        let repo = dir.path().to_str().unwrap();
+
+        assert_eq!(
+            ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap(),
+            0
+        );
+        let healed = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        assert_eq!(healed.messages.len(), MAX_BUS_MESSAGES);
+    }
+
+    #[test]
+    fn an_explicit_msg_id_that_looks_like_a_seq_id_wins_over_the_legacy_fallback() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let mut explicit = bus_row(6, Some("claude:quiet"), now, "explicit".into());
+        explicit.msg_id = Some("msg-5".to_string());
+        let dir = repo_with_seeded_bus(vec![legacy, explicit]);
+        let found = get_message_by_id(dir.path().to_str().unwrap(), "msg-5")
+            .unwrap()
+            .expect("msg-5 resolves");
+        assert_eq!(
+            found.seq, 6,
+            "the row that carries the id, not the legacy one"
+        );
+    }
+
+    #[test]
+    fn an_ack_by_id_marks_only_the_row_get_message_by_id_returns() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let mut explicit = bus_row(6, Some("claude:quiet"), now, "explicit".into());
+        explicit.msg_id = Some("msg-5".to_string());
+        let dir = repo_with_seeded_bus(vec![legacy, explicit]);
+        let repo = dir.path().to_str().unwrap();
+
+        let acked = ack_messages(repo, "claude:reader", &["msg-5".to_string()]).unwrap();
+        assert_eq!(acked, 1, "one id marks exactly one row");
+        let stored = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        let by_seq = |s: u64| stored.messages.iter().find(|m| m.seq == s).unwrap();
+        assert!(by_seq(5).read_by.is_empty(), "the legacy row stays unread");
+        assert_eq!(by_seq(6).read_by, vec!["claude:reader".to_string()]);
+    }
+
+    #[test]
+    fn an_explicit_msg_id_equal_to_a_retained_legacy_effective_id_is_refused() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let dir = repo_with_seeded_bus(vec![legacy]);
+        let repo = dir.path().to_str().unwrap();
+        let err = post_peer_message(
+            repo,
+            MessageOrigin::Agent,
+            "agy:11111111-2222-4333-8444-555555555555",
+            Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
+            None,
+            "peer_message",
+            "hello",
+            None,
+            Some("msg-5"),
+            1,
+            6,
+        )
+        .expect_err("msg-5 collides with the legacy row's effective id");
+        assert!(format!("{err:?}").contains("legacy"), "{err:?}");
+        let stored = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        assert_eq!(stored.messages.len(), 1, "nothing was written");
+    }
+
+    #[test]
+    fn an_ack_rewrites_a_file_that_is_over_the_byte_cap_but_serializes_under_it() {
+        let now = now_epoch_ms();
+        let dir = repo_with_seeded_bus(broadcasts(1, 3, now));
+        let repo = dir.path().to_str().unwrap();
+        let path = lanes_messages_path(repo, false).unwrap();
+        let mut padded = fs::read(&path).unwrap();
+        padded.resize(usize::try_from(MESSAGES_FILE_CAP).unwrap() + 1024, b' ');
+        fs::write(&path, &padded).unwrap();
+        read_messages(repo, None, 0).expect_err("the padded file is over the cap");
+
+        assert_eq!(
+            ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap(),
+            0
+        );
+        assert!(fs::metadata(&path).unwrap().len() <= MESSAGES_FILE_CAP);
+        assert_eq!(read_messages(repo, None, 0).unwrap().messages.len(), 3);
+    }
+
+    const S_A: &str = "0f0e0d0c-0b0a-4909-8807-060504030201";
+    const S_B: &str = "1f1e1d1c-1b1a-4919-8817-161514131211";
+
+    fn peer_update(anchor: &str, sid: Option<&str>) -> PeerUpsert {
+        PeerUpsert {
+            provider: "claude".into(),
+            surface: "terminal".into(),
+            provider_session_id: sid.map(str::to_string),
+            worktree_path: anchor.into(),
+            ..Default::default()
+        }
+    }
+
+    fn stored_peers(anchor: &str) -> Vec<PeerRecord> {
+        let (_repo, lanes_dir) = lanes_dir_for_repo(anchor).unwrap();
+        read_json_bounded::<PeersState>(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
+            .unwrap()
+            .peers
+    }
+
+    #[test]
+    fn peer_record_bound_to_a_session_is_writable_only_by_that_session_or_the_person() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let mut a = peer_update(anchor, Some(S_A));
+        a.pid = Some(std::process::id());
+        a.proc_start_ns = Some(7);
+        a.auto_wake = Some(false);
+        upsert_peer(anchor, a).unwrap();
+
+        let mut attack = peer_update("/tmp/evil-worktree", Some(S_A));
+        attack.pid = Some(1);
+        attack.proc_start_ns = Some(99);
+        attack.auto_wake = Some(true);
+        attack.terminal_session_id = Some("evil-terminal".into());
+        let refused = upsert_peer_as(
+            anchor,
+            attack.clone(),
+            PeerWriter::Session {
+                provider_session_id: S_B.into(),
+            },
+        );
+        assert!(
+            matches!(refused, Err(PeerWriteError::SessionMismatch)),
+            "a foreign session must be refused, got {refused:?}"
+        );
+        // Reaching the record by peer_id, without naming its session, is refused too.
+        let mut by_peer_id = attack.clone();
+        by_peer_id.provider_session_id = None;
+        by_peer_id.peer_id = Some(format!("claude:{S_A}"));
+        let refused = upsert_peer_as(
+            anchor,
+            by_peer_id,
+            PeerWriter::Session {
+                provider_session_id: S_B.into(),
+            },
+        );
+        assert!(
+            matches!(refused, Err(PeerWriteError::OwnedByAnotherSession { .. })),
+            "a foreign session must be refused, got {refused:?}"
+        );
+        let unproven = upsert_peer_as(anchor, attack.clone(), PeerWriter::Unproven);
+        assert!(matches!(
+            unproven,
+            Err(PeerWriteError::OwnedByAnotherSession { .. })
+        ));
+        let peers = stored_peers(anchor);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].worktree_path, anchor);
+        assert_eq!(peers[0].pid, Some(std::process::id()));
+        assert_eq!(peers[0].proc_start_ns, Some(7));
+        assert!(!peers[0].auto_wake);
+        assert!(peers[0].terminal_session_id.is_none());
+        assert!(!is_external_peer_auto_wake_opted_in(anchor, S_A));
+
+        // The owning session and the person may write it.
+        let mut own = peer_update(anchor, Some(S_A));
+        own.role = Some("reviewer".into());
+        let written = upsert_peer_as(
+            anchor,
+            own,
+            PeerWriter::Session {
+                provider_session_id: S_A.to_ascii_uppercase(),
+            },
+        )
+        .unwrap();
+        assert_eq!(written.role.as_deref(), Some("reviewer"));
+        let mut person = peer_update(anchor, Some(S_A));
+        person.auto_wake = Some(true);
+        assert!(
+            upsert_peer_as(anchor, person, PeerWriter::Person)
+                .unwrap()
+                .auto_wake
+        );
+
+        // A session may not write a record under another session's id.
+        let mismatch = upsert_peer_as(
+            anchor,
+            peer_update(anchor, Some(S_A)),
+            PeerWriter::Session {
+                provider_session_id: S_B.into(),
+            },
+        );
+        assert!(mismatch.is_err());
+    }
+
+    #[test]
+    fn unproven_writer_creates_or_updates_unowned_records_but_never_sets_auto_wake() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let mut role_only = peer_update(anchor, None);
+        role_only.peer_id = Some("claude:role-only".into());
+        role_only.role = Some("planner".into());
+        let created = upsert_peer_as(anchor, role_only.clone(), PeerWriter::Unproven).unwrap();
+        assert!(!created.auto_wake);
+        role_only.role = Some("lead".into());
+        let updated = upsert_peer_as(anchor, role_only.clone(), PeerWriter::Unproven).unwrap();
+        assert_eq!(updated.role.as_deref(), Some("lead"));
+        role_only.auto_wake = Some(true);
+        assert_eq!(
+            upsert_peer_as(anchor, role_only, PeerWriter::Unproven),
+            Err(PeerWriteError::UnprovenAutoWake)
+        );
+        let mut fresh = peer_update(anchor, Some(S_B));
+        fresh.auto_wake = Some(true);
+        assert!(upsert_peer_as(anchor, fresh, PeerWriter::Unproven).is_err());
+        assert!(stored_peers(anchor).iter().all(|p| !p.auto_wake));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn post_agent(
+        anchor: &str,
+        thread: Option<&str>,
+        msg_id: &str,
+        in_reply_to: Option<&str>,
+        hop: u32,
+        max_hops: u32,
+    ) -> AgentBusMessage {
+        post_peer_message_in_reply_to(
+            anchor,
+            MessageOrigin::Agent,
+            "claude:aaaaaaaa-1111-4222-8333-444444444444",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            thread,
+            "note",
+            &format!("body {msg_id}"),
+            None,
+            Some(msg_id),
+            in_reply_to,
+            hop,
+            max_hops,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_reply_can_never_raise_the_thread_max_hops_ceiling() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let first = post_agent(anchor, Some("t-ceiling"), "m-first", None, 1, 2);
+        assert_eq!(first.max_hops, Some(2));
+        let reply = post_agent(anchor, Some("t-ceiling"), "m-reply", None, 1, 32);
+        assert_eq!(reply.max_hops, Some(2));
+        assert_eq!(reply.hop, Some(2));
+        // Answering a row directly, without naming the thread, inherits that row's ceiling too.
+        let direct = post_agent(anchor, None, "m-direct", Some("m-first"), 1, 32);
+        assert_eq!(direct.max_hops, Some(2));
+        assert_eq!(direct.hop, Some(2));
+        // A reply may lower it.
+        let lower = post_agent(anchor, Some("t-ceiling"), "m-lower", None, 1, 1);
+        assert_eq!(lower.max_hops, Some(1));
+        // An out-of-range request is still clamped on a fresh thread.
+        assert_eq!(
+            post_agent(anchor, Some("t-fresh"), "m-fresh", None, 1, 500).max_hops,
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn a_reply_naming_no_retained_row_is_refused_under_the_lock() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let err = post_peer_message_in_reply_to(
+            anchor,
+            MessageOrigin::Agent,
+            "claude:aaaaaaaa-1111-4222-8333-444444444444",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            None,
+            "note",
+            "answer to a row that is gone",
+            None,
+            Some("m-orphan"),
+            Some("m-evicted"),
+            1,
+            6,
+        )
+        .expect_err("a reply to a row the bus no longer holds must not be stored at hop 1");
+        assert!(err.into_message().contains("names no message on the bus"));
+        assert!(get_message_by_id(anchor, "m-orphan").unwrap().is_none());
+    }
+
+    #[test]
+    fn stored_hop_is_derived_under_the_lock_and_never_below_the_thread() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let five = post_agent(anchor, Some("t-hop"), "m-five", None, 5, 32);
+        assert_eq!(five.hop, Some(5));
+        let zero = post_agent(anchor, Some("t-hop"), "m-zero", None, 0, 32);
+        assert_eq!(zero.hop, Some(6), "hop 0 must not restart the loop guard");
+        let reply = post_agent(anchor, None, "m-reply", Some("m-five"), 1, 32);
+        assert_eq!(reply.hop, Some(6));
+        // An exact retry returns the stored row unchanged.
+        let retry = post_agent(anchor, Some("t-hop"), "m-zero", None, 0, 32);
+        assert_eq!(retry, zero);
+        // A person's message stays hop 0.
+        let person = post_peer_message(
+            anchor,
+            MessageOrigin::Person,
+            "developer",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            Some("t-hop"),
+            "note",
+            "from a person",
+            None,
+            None,
+            0,
+            6,
+        )
+        .unwrap();
+        assert_eq!(person.hop, Some(0));
+    }
+
+    #[test]
+    fn concurrent_posts_on_one_thread_never_store_the_same_hop() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap().to_string();
+        crate::test_support::trust_repo(anchor_dir.path());
+        post_agent(&anchor, Some("t-race"), "m-seed", None, 1, 32);
+        let hops: Vec<u32> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..6)
+                .map(|i| {
+                    let anchor = anchor.clone();
+                    s.spawn(move || {
+                        (0..3)
+                            .map(|j| {
+                                post_agent(
+                                    &anchor,
+                                    Some("t-race"),
+                                    &format!("m-{i}-{j}"),
+                                    None,
+                                    1,
+                                    32,
+                                )
+                                .hop
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let unique: BTreeSet<u32> = hops.iter().copied().collect();
+        assert_eq!(unique.len(), hops.len(), "duplicate hops: {hops:?}");
+        assert_eq!(unique.iter().next_back(), Some(&19));
+    }
+
+    fn aside_files(anchor: &str) -> Vec<String> {
+        let (_repo, lanes_dir) = lanes_dir_for_repo(anchor).unwrap();
+        let mut names: Vec<String> = fs::read_dir(lanes_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("messages.json."))
+            .filter(|n| n.contains("oversized-") || n.contains("corrupt-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn post_one_result(anchor: &str, id: &str) -> Result<AgentBusMessage, CommandError> {
+        post_peer_message(
+            anchor,
+            MessageOrigin::Agent,
+            "claude:aaaaaaaa-1111-4222-8333-444444444444",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            None,
+            "note",
+            &format!("body {id}"),
+            None,
+            Some(id),
+            1,
+            6,
+        )
+    }
+
+    fn post_one(anchor: &str, id: &str) -> AgentBusMessage {
+        post_agent(anchor, None, id, None, 1, 6)
+    }
+
+    #[test]
+    fn a_write_moves_an_oversized_or_corrupt_messages_file_aside_without_rewinding_seq() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+
+        // Valid JSON, 33 MiB, next_seq 500.
+        let mut big = String::from("{\n  \"next_seq\": 500,\n  \"dropped_before_seq\": 0,\n  \"messages\": [],\n  \"pad\": \"");
+        big.push_str(&"x".repeat(33 * 1024 * 1024));
+        big.push_str("\"\n}\n");
+        fs::write(&path, &big).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MESSAGES_WRITE_CEILING);
+        let before_ms = now_epoch_ms();
+        let msg = post_one(anchor, "after-oversized");
+        assert!(msg.seq > 500, "seq {} rewound", msg.seq);
+        assert!(msg.seq > before_ms, "seq must also clear the clock floor");
+        let asides = aside_files(anchor);
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        assert!(asides[0].starts_with("messages.json.oversized-"));
+        assert!(fs::metadata(&path).unwrap().len() < MESSAGES_FILE_CAP);
+        let page = read_messages(anchor, None, 0).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert!(page.dropped_before_seq > 500);
+
+        // Corrupt file with a parseable next_seq prefix far above the clock.
+        fs::write(&path, "{\n  \"next_seq\": 99999999999999,\n  \"dropped_be").unwrap();
+        let second = post_one(anchor, "after-corrupt");
+        assert!(second.seq > 99_999_999_999_999);
+        assert_eq!(aside_files(anchor).len(), 2);
+        assert!(read_messages(anchor, None, 0).is_ok());
+
+        // Corrupt with no parseable next_seq: the clock floor still keeps seq above anything
+        // a previous build could have issued.
+        fs::write(&path, "not json at all").unwrap();
+        let third = post_one(anchor, "after-garbage");
+        assert!(third.seq > before_ms);
+        let asides = aside_files(anchor);
+        assert_eq!(asides.len(), 2, "at most two aside files: {asides:?}");
+        assert!(read_messages(anchor, None, 0).is_ok());
+    }
+
+    #[test]
+    fn an_acknowledgement_also_repairs_an_oversized_file() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        let mut big = String::from("{\n  \"next_seq\": 700,\n  \"dropped_before_seq\": 0,\n  \"messages\": [],\n  \"pad\": \"");
+        big.push_str(&"x".repeat(33 * 1024 * 1024));
+        big.push_str("\"\n}\n");
+        fs::write(&path, &big).unwrap();
+        let err = read_messages(anchor, None, 0).unwrap_err().into_message();
+        assert!(
+            err.contains("moves it aside"),
+            "hint must name the repair: {err}"
+        );
+        let marked = ack_messages(anchor, "claude:peer", &["msg-1".to_string()]);
+        assert!(marked.is_ok(), "{marked:?}");
+        assert_eq!(aside_files(anchor).len(), 1);
+        assert!(read_messages(anchor, None, 0).is_ok());
+    }
+
+    #[test]
+    fn a_missing_messages_file_beside_an_aside_never_rewinds_seq() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        let aside = path.with_file_name("messages.json.corrupt-1");
+        fs::write(&aside, "{\n  \"next_seq\": 99999999999999,\n  \"dropped_be").unwrap();
+        assert!(!path.exists(), "the crash left only the aside file");
+        let msg = post_one(anchor, "after-crash");
+        assert!(msg.seq > 99_999_999_999_999, "seq {} rewound", msg.seq);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn a_huge_next_seq_in_a_corrupt_prefix_is_capped_below_two_to_the_53() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        fs::write(
+            &path,
+            "{\n  \"next_seq\": 18446744073709551000,\n  \"dropped_be",
+        )
+        .unwrap();
+        let msg = post_one(anchor, "after-huge");
+        assert!(
+            msg.seq < 1 << 53,
+            "seq {} is not a JSON-safe integer",
+            msg.seq
+        );
+        assert!(
+            msg.seq <= SEQ_RECOVERY_CEILING + 1,
+            "a recovered seq must leave headroom, got {}",
+            msg.seq
+        );
+    }
+
+    #[test]
+    fn a_wrong_typed_messages_file_is_refused_and_left_in_place() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        let other_build = "{\"next_seq\":\"x\",\"dropped_before_seq\":0,\"messages\":[]}";
+        fs::write(&path, other_build).unwrap();
+        let posted = post_peer_message(
+            anchor,
+            MessageOrigin::Agent,
+            "claude:aaaaaaaa-1111-4222-8333-444444444444",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            None,
+            "note",
+            "body",
+            None,
+            None,
+            1,
+            6,
+        );
+        assert!(posted.is_err(), "a file of another shape must be refused");
+        assert_eq!(fs::read_to_string(&path).unwrap(), other_build);
+        assert!(aside_files(anchor).is_empty());
+    }
+
+    #[test]
+    fn the_thread_ceiling_counts_agent_rows_only() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let open = post_agent(anchor, Some("t-agent20"), "m-open", None, 1, 20);
+        assert_eq!(open.max_hops, Some(20));
+        post_peer_message(
+            anchor,
+            MessageOrigin::Person,
+            "developer",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            Some("t-agent20"),
+            "note",
+            "from a person",
+            None,
+            None,
+            0,
+            6,
+        )
+        .unwrap();
+        let reply = post_agent(anchor, Some("t-agent20"), "m-reply", None, 1, 32);
+        assert_eq!(
+            reply.max_hops,
+            Some(20),
+            "a person's default must not lower it"
+        );
+    }
+
+    #[test]
+    fn post_thread_message_does_not_climb_the_hop() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        for i in 0..5 {
+            let m = post_thread_message(
+                anchor,
+                MessageOrigin::Agent,
+                "claude:aaaaaaaa-1111-4222-8333-444444444444",
+                Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+                Some("t-flat"),
+                "note",
+                &format!("body {i}"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(m.hop, Some(1), "post {i} climbed");
+            assert_eq!(m.max_hops, Some(DEFAULT_MAX_HOPS));
+        }
+    }
+
+    #[test]
+    fn unproven_writer_cannot_bind_redirect_or_squat_a_session() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let mut role_only = peer_update(anchor, None);
+        role_only.peer_id = Some("claude:role-only".into());
+        role_only.role = Some("planner".into());
+        upsert_peer_as(anchor, role_only.clone(), PeerWriter::Unproven).unwrap();
+
+        // (a) Redirecting a role record to a session id.
+        let mut redirect = role_only.clone();
+        redirect.provider_session_id = Some(S_B.into());
+        assert!(upsert_peer_as(anchor, redirect, PeerWriter::Unproven).is_err());
+        for field in 0..3 {
+            let mut u = role_only.clone();
+            match field {
+                0 => u.terminal_session_id = Some("term-x".into()),
+                1 => u.run_id = Some("run-x".into()),
+                _ => u.pid = Some(4242),
+            }
+            assert!(
+                upsert_peer_as(anchor, u, PeerWriter::Unproven).is_err(),
+                "field {field}"
+            );
+        }
+
+        // (c) Squatting a session id nobody has registered yet.
+        assert!(
+            upsert_peer_as(anchor, peer_update(anchor, Some(S_B)), PeerWriter::Unproven).is_err()
+        );
+    }
+
+    #[test]
+    fn unproven_writer_cannot_reach_a_bound_record_through_an_earlier_sorting_role_record() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        // A role record that sorts before a bound one, matched by peer_id while the update
+        // names the bound record's session: every matching record is checked, not the first.
+        upsert_peer(anchor, peer_update(anchor, Some(S_A))).unwrap();
+        let mut zero = peer_update(anchor, None);
+        zero.peer_id = Some("claude:0".into());
+        upsert_peer_as(anchor, zero.clone(), PeerWriter::Unproven).unwrap();
+        let mut trick = peer_update(anchor, Some(S_A));
+        trick.peer_id = Some("claude:0".into());
+        trick.pid = Some(1);
+        let refused = upsert_peer_as(anchor, trick, PeerWriter::Unproven);
+        assert!(
+            matches!(refused, Err(PeerWriteError::OwnedByAnotherSession { .. })),
+            "{refused:?}"
+        );
+        let peers = stored_peers(anchor);
+        assert!(peers.iter().all(|p| p.pid.is_none()));
+        assert!(peers
+            .iter()
+            .filter(|p| p.provider_session_id.is_some())
+            .all(|p| p.provider_session_id.as_deref() == Some(S_A)));
+        assert!(!peers
+            .iter()
+            .any(|p| p.provider_session_id.as_deref() == Some(S_B)));
+    }
+
+    #[test]
+    fn the_reader_hint_for_a_wrong_typed_file_does_not_promise_a_write_repairs_it() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        fs::write(
+            &path,
+            "{\"next_seq\":\"x\",\"dropped_before_seq\":0,\"messages\":[]}",
+        )
+        .unwrap();
+        let err = read_messages(anchor, None, 0).unwrap_err().into_message();
+        assert!(!err.contains("next write repairs"), "{err}");
+        assert!(err.contains("different GitPulse version"), "{err}");
+        fs::write(&path, "{\"next_seq\": 4, \"dropp").unwrap();
+        let err = read_messages(anchor, None, 0).unwrap_err().into_message();
+        assert!(err.contains("next write repairs"), "{err}");
+    }
+
+    #[test]
+    fn the_bus_never_issues_a_seq_above_two_to_the_53_minus_one() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        let limit: u64 = (1 << 53) - 1;
+        let at_limit = format!("{{\"next_seq\":{limit},\"dropped_before_seq\":0,\"messages\":[]}}");
+        fs::write(&path, &at_limit).unwrap();
+        assert!(
+            post_one_result(anchor, "at-limit").is_err(),
+            "a post past the limit must be refused"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), at_limit);
+        let below = format!(
+            "{{\"next_seq\":{},\"dropped_before_seq\":0,\"messages\":[]}}",
+            limit - 1
+        );
+        fs::write(&path, below).unwrap();
+        assert_eq!(post_one(anchor, "last-one").seq, limit);
+    }
+
+    #[test]
+    fn a_repair_removes_repair_temp_files_a_dead_repair_left() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        let stale = path.with_file_name("messages.json.repair-99999");
+        fs::write(&stale, "half").unwrap();
+        fs::write(&path, "not json at all").unwrap();
+        post_one(anchor, "after-garbage");
+        assert!(!stale.exists(), "stale repair file survived");
     }
 }

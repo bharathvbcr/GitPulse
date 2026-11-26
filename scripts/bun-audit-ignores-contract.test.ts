@@ -51,7 +51,7 @@ describe("bun audit ignores", () => {
   it("still audits: the job runs bun audit and the ignore is the only relaxation", () => {
     const audits = workflow.split("\n").filter((l) => /^\s+run: bun audit\b/.test(l));
     expect(audits).toHaveLength(1);
-    expect(audits[0]).toMatch(/^\s+run: bun audit --ignore=GHSA-[0-9a-z-]+$/);
+    expect(audits[0]).toMatch(/^\s+run: bun audit(?: --ignore=GHSA-[0-9a-z-]+)+$/);
   });
 
   describe("the rule fails on the shapes it is for", () => {
@@ -61,6 +61,12 @@ describe("bun audit ignores", () => {
 
     it("accepts a named, dated ignore", () => {
       expect(ignoreProblems(withLine("bun audit --ignore=GHSA-gcqx-w48m-w2h4"), today)).toEqual([]);
+    });
+    it("accepts two named ignores when both are explained and fails when one is unexplained", () => {
+      const both = "      # revisit by 2027-01-15; GHSA-gcqx-w48m-w2h4 and GHSA-fc5q-39xc-vjpf are dev-only.";
+      const cmd = "bun audit --ignore=GHSA-gcqx-w48m-w2h4 --ignore=GHSA-fc5q-39xc-vjpf";
+      expect(ignoreProblems(withLine(cmd, both), today)).toEqual([]);
+      expect(ignoreProblems(withLine(cmd), today).join("\n")).toContain("never names GHSA-fc5q-39xc-vjpf");
     });
     it("an ignore with no review date", () => {
       expect(ignoreProblems(withLine("bun audit --ignore=GHSA-gcqx-w48m-w2h4", "      # dev-only GHSA-gcqx-w48m-w2h4"), today).join("\n")).toContain("no \"revisit by");

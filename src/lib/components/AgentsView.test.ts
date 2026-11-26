@@ -1,9 +1,21 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "svelte/server";
+import { get } from "svelte/store";
+import { agentDirectories } from "../agents/cwd";
+import { agentPlaneStore } from "../agents/store";
+import * as ipc from "../ipc/invoke";
+import { interfaceStore } from "../stores/interfaceStore";
+import { ledgerStatus } from "../ledger/types";
+import { sessionActivity, setSignalledAsksForReader } from "../terminal/sessionActivity";
+import { terminalSessions } from "../terminal/sessionRegistry";
+import { requestInboxFocus, takeInboxFocus } from "../agents/inboxFocus";
+import { agentsRepositoryScope, setAgentsRepositoryScope } from "../agents/scope";
+import AgentInbox from "./AgentInbox.svelte";
 import AgentsView from "./AgentsView.svelte";
+import MaviAgentsTable from "./mavi/MaviAgentsTable.svelte";
 
 const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "AgentsView.svelte"), "utf8");
 
@@ -36,6 +48,7 @@ describe("AgentsView", () => {
     expect(show).not.toContain("onReady");
     expect(show).not.toContain("openRepo");
     expect(source).not.toContain("reveal?.()");
+    expect(source).not.toContain("reveal()");
     // Starting an agent in a checkout is a launch, not a reveal: like the
     // Worktrees fork it waits for the opened tab's canonical path (`onReady`)
     // and hands the launch to that tab's dock.
@@ -103,6 +116,486 @@ describe("AgentsView", () => {
   it("wires onopenTask on the embedded AgentInbox to requestTaskOpen", () => {
     expect(source).toContain("requestTaskOpen");
     expect(source).toMatch(/<AgentInbox[^>]*onopenTask=\{openInboxTask\}/);
+  });
+});
+
+describe("AgentsView F11 attention UX and SSR rendering", () => {
+  const savedFilter = get(interfaceStore).agentsFilter;
+  const savedGroupMode = get(interfaceStore).agentsGroupByRepo;
+  const slots: ReturnType<typeof terminalSessions.reserve>[] = [];
+  const sessions: string[] = [];
+
+  function addTerminal(opts: {
+    key: string;
+    label: string;
+    launcher: "claude" | "agy";
+    title: string;
+    sessionId: string;
+    repoPath?: string;
+  }) {
+    sessions.push(opts.sessionId);
+    slots.push(
+      terminalSessions.reserve({
+        key: opts.key,
+        repoPath: opts.repoPath ?? "/repo/f11",
+        label: opts.label,
+        launcher: opts.launcher,
+        title: opts.title,
+        status: "running",
+        sessionId: opts.sessionId,
+        close: async () => {},
+      }),
+    );
+  }
+
+  afterEach(async () => {
+    setSignalledAsksForReader(false);
+    setAgentsRepositoryScope(null);
+    interfaceStore.setAgentsFilter(savedFilter);
+    interfaceStore.setAgentsGroupByRepo(savedGroupMode);
+    while (sessions.length > 0) sessionActivity.forget(sessions.pop()!);
+    while (slots.length > 0) slots.pop()?.release();
+    vi.restoreAllMocks();
+    await agentPlaneStore.refresh([]);
+  });
+
+  it("renders LauncherIcon badges, semantic gp-chip tones, inline detail previews, and timestamps", () => {
+    addTerminal({ key: "k-claude", label: "Claude Code", launcher: "claude", title: "claude-ask", sessionId: "s-claude-ask" });
+    addTerminal({ key: "k-agy", label: "Antigravity", launcher: "agy", title: "agy-done", sessionId: "s-agy-done" });
+    addTerminal({ key: "k-err", label: "Claude Code", launcher: "claude", title: "claude-err", sessionId: "s-claude-err" });
+    addTerminal({ key: "k-ok", label: "Antigravity", launcher: "agy", title: "agy-work", sessionId: "s-agy-work" });
+
+    sessionActivity.announce({
+      session: "s-claude-ask",
+      channel: "hook",
+      event: "permission_prompt",
+      detail: "Allow Bash: cargo test --locked",
+    });
+    sessionActivity.announce({
+      session: "s-agy-done",
+      channel: "hook",
+      event: "turn_finished",
+      detail: "Synthesized M3b implementation plan",
+    });
+    sessionActivity.announce({
+      session: "s-claude-err",
+      channel: "hook",
+      event: "error",
+      detail: "API rate limit exceeded",
+    });
+    sessionActivity.output("s-agy-work");
+
+    interfaceStore.setAgentsFilter("all");
+    const html = render(AgentsView).body;
+
+    expect(html).toContain('data-launcher-icon="claude"');
+    expect(html).toContain('data-launcher-icon="agy"');
+    expect(html).toContain('data-tone="warn"');
+    expect(html).toContain('data-tone="danger"');
+    expect(html).toContain('data-tone="info"');
+    expect(html).toContain('data-tone="accent"');
+    expect(html).toContain('data-testid="agents-running-indicator"');
+    expect(html).toContain("gp-live-dot");
+    expect(html).toContain("animate-spin");
+    expect(html).toContain("Allow Bash: cargo test --locked");
+    expect(html).toContain("Synthesized M3b implementation plan");
+    expect(html).toContain("API rate limit exceeded");
+    expect(html).toContain("Working");
+    expect(html).toMatch(/<time[^>]*>just now<\/time>/);
+  });
+
+  it("exposes Needs action, Notifications, and Gaps filters and separates blocking from informational rows", () => {
+    addTerminal({ key: "k-block", label: "Claude Code", launcher: "claude", title: "claude-blocking", sessionId: "s-block" });
+    addTerminal({ key: "k-idle", label: "Antigravity", launcher: "agy", title: "agy-idle-notice", sessionId: "s-idle" });
+
+    sessionActivity.announce({ session: "s-block", channel: "hook", event: "permission_prompt", detail: "Approve write" });
+    sessionActivity.announce({ session: "s-idle", channel: "hook", event: "idle_prompt", detail: "Ready when you are" });
+
+    interfaceStore.setAgentsFilter("attention");
+    const needsActionHtml = render(AgentsView).body;
+    expect(needsActionHtml).toContain('data-testid="agents-filter-attention"');
+    expect(needsActionHtml).toContain('data-testid="agents-filter-notifications"');
+    expect(needsActionHtml).toContain('data-testid="agents-filter-gaps"');
+    expect(needsActionHtml).toContain("claude-blocking");
+    expect(needsActionHtml).not.toContain("agy-idle-notice");
+
+    interfaceStore.setAgentsFilter("notifications");
+    const notificationsHtml = render(AgentsView).body;
+    expect(notificationsHtml).toContain("agy-idle-notice");
+    expect(notificationsHtml).toContain("Idle, waiting for input");
+    expect(notificationsHtml).not.toContain("claude-blocking");
+  });
+
+  it("renders Dismiss only on informational notification rows and clears the notice without removing the live row", () => {
+    addTerminal({ key: "k-block", label: "Claude Code", launcher: "claude", title: "claude-blocking", sessionId: "s-block-2" });
+    addTerminal({ key: "k-info", label: "Antigravity", launcher: "agy", title: "agy-completed", sessionId: "s-info-2" });
+
+    sessionActivity.announce({ session: "s-block-2", channel: "hook", event: "permission_prompt", detail: "Run migration" });
+    sessionActivity.announce({ session: "s-info-2", channel: "hook", event: "agent_completed", detail: "Finished verification" });
+
+    interfaceStore.setAgentsFilter("all");
+    const html = render(AgentsView).body;
+    expect(html).toContain('data-action="dismiss"');
+    expect(html).toContain('aria-label="Dismiss notification for agy-completed"');
+    expect(html).not.toContain('aria-label="Dismiss notification for claude-blocking"');
+
+    // Dismiss clears informational notice while keeping the live row intact.
+    expect(sessionActivity.dismiss("s-block-2")).toBe(false);
+    expect(sessionActivity.dismiss("s-info-2")).toBe(true);
+    const afterDismissHtml = render(AgentsView).body;
+    expect(afterDismissHtml).toContain("agy-completed");
+    expect(afterDismissHtml).not.toContain("Finished verification");
+    expect(afterDismissHtml).not.toContain('aria-label="Dismiss notification for agy-completed"');
+    expect(afterDismissHtml).toContain("Run migration");
+  });
+
+  it("renders a dirty checkout with suppressed bare BEL as neutral Uncommitted changes, not info", async () => {
+    setSignalledAsksForReader(false);
+    const worktreePath = "/repo/f11/.claude/worktrees/dirty-bel";
+    vi.spyOn(ipc, "invoke").mockImplementation((async (cmd: string) => {
+      if (cmd === "cmd_insights_snapshot") {
+        return {
+          repo_path: "/repo/f11",
+          branch: "main",
+          branch_ok: true,
+          deadline_expired: false,
+          duration_ms: 1,
+          worktrees: {
+            ok: true,
+            error: "",
+            count: 1,
+            scanned: 1,
+            dirty: 1,
+            dirty_unknown: 0,
+            blocked: 0,
+            blocked_unknown: 0,
+            truncated: false,
+            items: [
+              {
+                path: worktreePath,
+                name: "dirty-bel",
+                branch: "agent/dirty-bel",
+                is_detached: false,
+                is_main: false,
+                is_bare: false,
+                dirty_files: 2,
+                agent_kind: "claude",
+                session_slug: "dirty-bel",
+                operation_kind: "",
+                operation_ok: true,
+              },
+            ],
+          },
+          agents: {
+            ok: true,
+            sessions: 1,
+            kinds: [{ kind: "claude", sessions: 1 }],
+            truncated: false,
+            live: { ok: true, sessions: 0, kinds: [], worktrees: [] },
+          },
+          changes: {
+            ok: true,
+            error: "",
+            files: 0,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            conflicted: 0,
+            additions: 0,
+            deletions: 0,
+            churn_warnings: 0,
+            churn_overflowed: false,
+            truncated: false,
+          },
+          collisions: {
+            ok: true,
+            error: "",
+            overlapping_files: 0,
+            worktrees_involved: 0,
+            scanned_worktrees: 1,
+            unscanned_worktrees: 0,
+            failed_worktrees: 0,
+            truncated: false,
+            shared_worktree_files: 0,
+            shared_worktrees: [],
+            sessions_ok: true,
+            sessions_error: "",
+            items: [],
+          },
+          ledger: ledgerStatus({ recording: true, path: "", dropped: 0, error: "", error_code: "" }),
+          codeintel: { available: false, db_path: "" },
+        };
+      }
+      if (cmd === "cmd_terminal_context") {
+        return { process: "claude", busy: true, cwd: worktreePath, repo_dir: null };
+      }
+      return null;
+    }) as typeof ipc.invoke);
+
+    await agentPlaneStore.refresh([{ path: "/repo/f11", label: "f11" }]);
+    const stopDirs = agentDirectories.subscribe(() => {});
+    try {
+      addTerminal({
+        key: "k-dirty-bel",
+        label: "Claude Code",
+        launcher: "claude",
+        title: "dirty-bel-session",
+        sessionId: "s-dirty-bel",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      sessionActivity.announce({
+        session: "s-dirty-bel",
+        channel: "bell",
+        event: null,
+        detail: null,
+      });
+
+      interfaceStore.setAgentsFilter("all");
+      const html = render(AgentsView).body;
+      expect(html).toContain("Uncommitted changes");
+      expect(html).toContain('data-tone="neutral"');
+      expect(html).not.toContain('data-tone="info"');
+      expect(html).not.toContain('data-action="dismiss"');
+    } finally {
+      stopDirs();
+    }
+  });
+
+  it("does not crash when sessionActivity holds an attention timestamp beyond JS Date range (8.64e15)", () => {
+    addTerminal({
+      key: "k-overflow-ts",
+      label: "Claude Code",
+      launcher: "claude",
+      title: "claude-overflow-ts",
+      sessionId: "s-overflow-ts",
+    });
+
+    sessionActivity.announce({
+      session: "s-overflow-ts",
+      channel: "hook",
+      event: "permission_prompt",
+      detail: "Approve command",
+      at: 8_700_000_000_000_000,
+    });
+
+    interfaceStore.setAgentsFilter("all");
+    const html = render(AgentsView).body;
+    expect(html).toContain("claude-overflow-ts");
+    expect(html).toContain("Needs your permission");
+    expect(html).not.toContain("NaN");
+  });
+
+  it("routes focusAgentRequest('inbox:<thread_key>') via inboxFocus to Inbox view and selects the target thread", () => {
+    const appSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../App.svelte"), "utf8");
+    const inboxSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "./AgentInbox.svelte"), "utf8");
+
+    expect(appSource).toContain('if (id.startsWith("inbox:"))');
+    expect(appSource).toContain("requestInboxFocus(");
+    expect(source).not.toContain("gitpulse:inbox-changed");
+    expect(source).toContain("inboxFocus");
+    expect(source).toContain('activeView = "inbox"');
+    expect(inboxSource).toContain("focusThreadKey");
+    expect(inboxSource).toContain("selectedThreadKey");
+
+    // Verify inboxFocus store round-trip and AgentInbox rendering with focusThreadKey.
+    requestInboxFocus("ask-target", "/repo/bg");
+    const taken = takeInboxFocus();
+    expect(taken).toMatchObject({ threadKey: "ask-target", repoPath: "/repo/bg" });
+    expect(taken?.seq).toBeGreaterThan(0);
+    expect(takeInboxFocus()).toBeNull();
+
+    const { body } = render(AgentInbox, {
+      props: {
+        repoPath: "/repo/bg",
+        embedded: true,
+        focusThreadKey: "ask-target",
+        focusSeq: 1,
+        initialThreads: [
+          {
+            thread_key: "ask-first",
+            title: "First thread",
+            status: "open",
+            ask_type: "answer",
+            from_agent: "claude",
+            to_agent: "developer",
+            updated_at_ms: 1000,
+            latest_msg: { seq: 1, from_agent: "claude", to_agent: "developer", kind: "ask", body: "First?", branch: null, created_at_ms: 1000, thread_key: "ask-first" },
+            messages: [{ seq: 1, from_agent: "claude", to_agent: "developer", kind: "ask", body: "First?", branch: null, created_at_ms: 1000, thread_key: "ask-first" }],
+          },
+          {
+            thread_key: "ask-target",
+            title: "Target background ask",
+            status: "open",
+            ask_type: "answer",
+            from_agent: "agy",
+            to_agent: "developer",
+            updated_at_ms: 2000,
+            latest_msg: { seq: 2, from_agent: "agy", to_agent: "developer", kind: "ask", body: "Target body detail", branch: null, created_at_ms: 2000, thread_key: "ask-target" },
+            messages: [{ seq: 2, from_agent: "agy", to_agent: "developer", kind: "ask", body: "Target body detail", branch: null, created_at_ms: 2000, thread_key: "ask-target" }],
+          },
+        ],
+      },
+    });
+    expect(body).toContain("Target body detail");
+  });
+
+  it("clears stale agentsRepositoryScope when consuming an inboxFocusRequest with repoPath: null", () => {
+    setAgentsRepositoryScope("/repo/A");
+    expect(get(agentsRepositoryScope)).toBe("/repo/A");
+    requestInboxFocus("ask-B", null);
+    const req = takeInboxFocus();
+    expect(req).toMatchObject({ threadKey: "ask-B", repoPath: null });
+    expect(source).toContain("setAgentsRepositoryScope(req.repoPath ?? null)");
+    setAgentsRepositoryScope(req?.repoPath ?? null);
+    expect(get(agentsRepositoryScope)).toBeNull();
+  });
+
+  it("auto-groups by repository when no agent needs attention or is done, and renders RepoLogo and running chips", () => {
+    addTerminal({ key: "k-alpha", label: "Claude Code", launcher: "claude", title: "alpha-work", sessionId: "s-alpha-work", repoPath: "/repo/alpha" });
+    addTerminal({ key: "k-beta", label: "Antigravity", launcher: "agy", title: "beta-work", sessionId: "s-beta-work", repoPath: "/repo/beta" });
+    sessionActivity.output("s-alpha-work");
+    sessionActivity.output("s-beta-work");
+
+    interfaceStore.setAgentsGroupByRepo("auto");
+    const autoHtml = render(AgentsView).body;
+    expect(autoHtml).toContain('data-testid="agents-group-toggle"');
+    expect(autoHtml).toContain('aria-pressed="true"');
+    expect(autoHtml).toContain('data-testid="agents-groups-collapse-all"');
+    expect(autoHtml).toContain('data-testid="agents-repo-group"');
+    expect(autoHtml).toContain('data-repo-logo');
+    expect(autoHtml).toContain('data-testid="agents-repo-group-running"');
+    expect(autoHtml).toContain('data-testid="agents-repo-focus"');
+    // Clean running rows hide the attention tray.
+    expect(autoHtml).not.toContain('data-testid="agents-attention-tray"');
+    // Grouped rows omit redundant repository label in subtitle and avoid duplicate title spinner when Attention column is visible.
+    expect(autoHtml).not.toContain("Claude Code ·");
+
+    // Manual flat mode ungroups and shows RepoLogo beside each row's repository label.
+    interfaceStore.setAgentsGroupByRepo("flat");
+    const flatHtml = render(AgentsView).body;
+    expect(flatHtml).toContain('aria-pressed="false"');
+    expect(flatHtml).not.toContain('data-testid="agents-repo-group"');
+    expect(flatHtml).toContain('data-repo-logo');
+    expect(flatHtml).toContain("alpha");
+  });
+
+  it("keeps repository grouping active in auto mode with an Attention & Done tray above, and omits redundant row repo labels", () => {
+    addTerminal({ key: "k-done", label: "Antigravity", launcher: "agy", title: "agy-done-1", sessionId: "s-done-1", repoPath: "/repo/alpha" });
+    addTerminal({ key: "k-ask", label: "Claude Code", launcher: "claude", title: "claude-ask-1", sessionId: "s-ask-1", repoPath: "/repo/beta" });
+    sessionActivity.announce({ session: "s-done-1", channel: "hook", event: "turn_finished", detail: "Plan complete" });
+    sessionActivity.announce({ session: "s-ask-1", channel: "hook", event: "permission_prompt", detail: "Approve write" });
+
+    interfaceStore.setAgentsGroupByRepo("auto");
+    const html = render(AgentsView).body;
+    expect(html).toContain('data-testid="agents-attention-tray"');
+    expect(html).toContain("Needs attention &amp; finished");
+    expect(html).toContain('data-testid="agents-attention-item"');
+    expect(html).toContain('data-testid="agents-repo-group"');
+    expect(html).toContain('data-testid="agents-repo-group-attention"');
+    expect(html).toContain('data-testid="agents-repo-group-done"');
+    expect(html).toContain("1 needs attention");
+    expect(html).toContain("1 done");
+    expect(html).toContain('data-testid="agents-dismiss-all"');
+    expect(html).toContain('data-testid="agents-search"');
+    expect(html).toContain('data-testid="agents-columns-toggle"');
+
+    // Filtered Needs action / Notifications views render ungrouped without the tray.
+    interfaceStore.setAgentsFilter("attention");
+    const attentionHtml = render(AgentsView).body;
+    expect(attentionHtml).not.toContain('data-testid="agents-attention-tray"');
+    expect(attentionHtml).not.toContain('data-testid="agents-repo-group"');
+
+    interfaceStore.setAgentsFilter("notifications");
+    const notifHtml = render(AgentsView).body;
+    expect(notifHtml).not.toContain('data-testid="agents-attention-tray"');
+    expect(notifHtml).not.toContain('data-testid="agents-repo-group"');
+
+    // Reset filter and verify scoped view hides repo groups and tray, showing RepoLogo inside Only <repo> chip.
+    interfaceStore.setAgentsFilter("all");
+    setAgentsRepositoryScope("/repo/alpha");
+    const scopedHtml = render(AgentsView).body;
+    expect(scopedHtml).toContain('data-testid="agents-scope"');
+    expect(scopedHtml).toContain('data-repo-logo');
+    expect(scopedHtml).not.toContain('data-testid="agents-attention-tray"');
+    expect(scopedHtml).not.toContain("Antigravity ·");
+  });
+
+  it("wires search keyboard shortcuts, Columns popover, empty search recovery, and Enter primary action in AgentsView", () => {
+    expect(source).toContain('data-testid="agents-search"');
+    expect(source).toContain('placeholder="Search agents, repositories, branches…"');
+    expect(source).toContain('aria-label="Clear search"');
+    expect(source).toContain('event.key !== "/"');
+    expect(source).toContain('event.key === "Escape"');
+    expect(source).toContain('event.key === "ArrowDown"');
+    expect(source).toContain('data-testid="agents-search-count"');
+    expect(source).toContain('data-testid="agents-columns-toggle"');
+    expect(source).toContain('data-testid="agents-columns-menu"');
+    expect(source).toContain("Show all columns");
+    expect(source).toContain("Show all repositories");
+    expect(source).toContain('case "Enter":');
+    expect(source).toContain("No agents match");
+  });
+
+  it("renders RepoLogo on local Mavi rows, checkout fallback when Checkout hidden, and animated running indicator", () => {
+    const rows = [
+      {
+        key: "m-local",
+        title: "Local working thread",
+        where: "GitPulse",
+        root: "/code/GitPulse",
+        ssh: false,
+        live: true,
+        presence: "Working",
+        status: "working" as const,
+        attention: "",
+        needsAction: false,
+        edited: 1,
+        lastActivityAt: 1000,
+      },
+      {
+        key: "m-ssh",
+        title: "Remote idle thread",
+        where: "gpu:~/app",
+        root: null,
+        ssh: true,
+        live: false,
+        presence: "Not running",
+        status: "not_running" as const,
+        attention: "",
+        needsAction: false,
+        edited: null,
+        lastActivityAt: 500,
+      },
+    ];
+    const body = render(MaviAgentsTable, {
+      props: {
+        rows,
+        compact: false,
+        columnVisible: () => true,
+      },
+    }).body;
+    expect(body).toContain('data-repo-logo');
+    expect(body).toContain('data-testid="mavi-running-indicator"');
+    expect(body).toContain("animate-spin");
+
+    const noCheckoutBody = render(MaviAgentsTable, {
+      props: {
+        rows,
+        compact: false,
+        columnVisible: (key) => key !== "checkout",
+      },
+    }).body;
+    expect(noCheckoutBody).toContain("Mavi thread · GitPulse");
+    expect(noCheckoutBody).toContain("Mavi thread · SSH host · gpu:~/app");
+  });
+
+  it("persists and resets agentsGroupByRepo on interfaceStore", () => {
+    interfaceStore.setAgentsGroupByRepo("repo");
+    expect(get(interfaceStore).agentsGroupByRepo).toBe("repo");
+    interfaceStore.setAgentsGroupByRepo("flat");
+    expect(get(interfaceStore).agentsGroupByRepo).toBe("flat");
+    interfaceStore.setAgentsGroupByRepo("invalid" as never);
+    expect(get(interfaceStore).agentsGroupByRepo).toBe("auto");
   });
 });
 

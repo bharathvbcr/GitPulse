@@ -1125,7 +1125,10 @@ mod tests {
         commit_file(&repo, "theirs\n", theirs_exec, "theirs");
         crate::test_support::git_in(&repo, &["checkout", "main"]);
         commit_file(&repo, "ours\n", ours_exec, "ours");
-        assert!(git(&repo, &["merge", "incoming"]).is_err());
+        assert!(
+            crate::test_support::git_merge_in(&repo, &["merge", "incoming"]),
+            "the fixture merge did not conflict"
+        );
         temp
     }
 
@@ -1383,7 +1386,7 @@ mod tests {
         apply(theirs, "theirs\n", "theirs");
         crate::test_support::git_in(&repo, &["checkout", "main"]);
         apply(ours, "ours\n", "ours");
-        git(&repo, &["merge", "incoming"]).is_err().then_some(temp)
+        crate::test_support::git_merge_in(&repo, &["merge", "incoming"]).then_some(temp)
     }
 
     #[test]

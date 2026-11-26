@@ -10,6 +10,7 @@
 use crate::codeintel::{self, CodeintelFileSymbol};
 use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::GitReader;
+use crate::engine::process::read_cancel;
 use crate::engine::validate_repo;
 use crate::insights::{CollisionItem, CollisionParty};
 use crate::ipc_error::CommandError;
@@ -71,6 +72,9 @@ pub struct PartyFailure {
     pub reason: String,
     /// The index was built for another HEAD than this worktree's.
     pub stale: bool,
+    /// A read of this party was refused or killed because its asker left. That
+    /// says nothing about the party, so a verdict is never formed from it.
+    pub cancelled: bool,
 }
 
 impl PartyFailure {
@@ -78,6 +82,17 @@ impl PartyFailure {
         Self {
             reason: reason.into(),
             stale: false,
+            cancelled: false,
+        }
+    }
+
+    /// A failed read as a failure: a cancellation by its kind, anything else by
+    /// its words.
+    fn read(error: CommandError) -> Self {
+        let cancelled = read_cancel::is_cancelled_error(&error);
+        Self {
+            cancelled,
+            ..Self::other(error.into_message())
         }
     }
 }
@@ -474,6 +489,24 @@ pub fn classify_parties(
 /// Opens each party's own DevMap store and diffs that worktree against its
 /// own HEAD. Does not run inside [`super::collision_from_list`].
 pub fn classify_overlapping_path(item: &CollisionItem) -> EntityCollisionVerdict {
+    let (parties, failures) = gather_overlapping(item);
+    classify_parties(&item.path, &parties, &failures)
+}
+
+/// [`classify_overlapping_path`] for a caller that keeps what it gets: a verdict
+/// whose reads were cut short by the asker leaving is an error, not a
+/// `FileLevel` that says the file is untracked or a party unreadable.
+pub fn try_classify_overlapping_path(
+    item: &CollisionItem,
+) -> Result<EntityCollisionVerdict, CommandError> {
+    let (parties, failures) = gather_overlapping(item);
+    if failures.iter().any(|failure| failure.cancelled) {
+        return Err(read_cancel::cancelled());
+    }
+    Ok(classify_parties(&item.path, &parties, &failures))
+}
+
+fn gather_overlapping(item: &CollisionItem) -> (Vec<PartyEdits>, Vec<PartyFailure>) {
     let mut parties = Vec::new();
     let mut failures = Vec::new();
 
@@ -482,12 +515,11 @@ pub fn classify_overlapping_path(item: &CollisionItem) -> EntityCollisionVerdict
             Ok(edits) => parties.push(edits),
             Err(failure) => failures.push(PartyFailure {
                 reason: format!("{}: {}", short_party(party), failure.reason),
-                stale: failure.stale,
+                ..failure
             }),
         }
     }
-
-    classify_parties(&item.path, &parties, &failures)
+    (parties, failures)
 }
 
 fn short_party(party: &CollisionParty) -> String {
@@ -508,16 +540,31 @@ fn party_old_side_symbols(
     party: &CollisionParty,
     incoming: Option<&[String]>,
 ) -> Result<PartyEdits, PartyFailure> {
-    let repo = validate_repo(&party.path).map_err(|e| PartyFailure::other(e.into_message()))?;
+    let repo = validate_repo(&party.path).map_err(PartyFailure::read)?;
     let repo_str = repo.to_string_lossy();
 
-    if !GitReader::is_tracked(&repo_str, file_path).unwrap_or(false) {
-        return Err(PartyFailure::other(
-            "file is untracked (no HEAD blob for an old-side join)",
-        ));
+    // A read that failed is not "untracked": only a listing that came back
+    // without the path says that. A cancelled read in particular must reach
+    // the caller as a cancellation.
+    match GitReader::is_tracked(&repo_str, file_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(PartyFailure::other(
+                "file is untracked (no HEAD blob for an old-side join)",
+            ))
+        }
+        Err(error) if read_cancel::is_cancelled_error(&error) => {
+            return Err(PartyFailure::read(error))
+        }
+        Err(error) => {
+            return Err(PartyFailure::other(format!(
+                "could not tell whether the file is tracked: {}",
+                error.into_message()
+            )))
+        }
     }
 
-    let head = GitReader::head_id(&repo_str).map_err(|e| PartyFailure::other(e.into_message()))?;
+    let head = GitReader::head_id(&repo_str).map_err(PartyFailure::read)?;
     let spans = codeintel::symbols_for_file(&repo_str, file_path, &head);
     if !spans.available {
         return Err(PartyFailure::other(
@@ -533,6 +580,7 @@ fn party_old_side_symbols(
                 .reason
                 .unwrap_or_else(|| format!("index head_sha does not equal HEAD ({head})")),
             stale: true,
+            cancelled: false,
         });
     }
     if spans.items.iter().any(|s| s.span_start_line == 0) {
@@ -554,8 +602,7 @@ fn party_old_side_symbols(
         return Err(PartyFailure::other("no indexed symbols for path at HEAD"));
     }
 
-    let (mut hunks, head_diff) =
-        old_side_diff(&repo, file_path).map_err(|e| PartyFailure::other(e.into_message()))?;
+    let (mut hunks, head_diff) = old_side_diff(&repo, file_path).map_err(PartyFailure::read)?;
     if let Some(replaced) = incoming {
         let content = read_working_text(&repo, file_path).map_err(PartyFailure::other)?;
         for old in replaced {
@@ -813,7 +860,7 @@ pub fn classify_incoming(
             Ok(edits) => parties.push(edits),
             Err(failure) => failures.push(PartyFailure {
                 reason: format!("{}: {}", short_party(party), failure.reason),
-                stale: failure.stale,
+                ..failure
             }),
         }
     }
@@ -1603,6 +1650,7 @@ class C:
             &[PartyFailure {
                 reason: words.into(),
                 stale: true,
+                cancelled: false,
             }],
         );
         assert!(stale.index_stale());
@@ -1924,6 +1972,21 @@ class C:
             "glob*[x]?.rs",
             "dir/ünï/日本語.rs",
         ] {
+            // Windows cannot hold a file named with a control character or one
+            // of `<>:"|?*`: that is the file system's refusal, not a defect
+            // here, so the outcome asserted there is the refusal itself.
+            if cfg!(windows)
+                && name
+                    .chars()
+                    .any(|c| c.is_control() || "<>:\"|?*".contains(c))
+            {
+                let dir = tempfile::tempdir().unwrap();
+                assert!(
+                    std::fs::write(dir.path().join(name), "x").is_err(),
+                    "{name:?} was created where Windows refuses it"
+                );
+                continue;
+            }
             let syms: Vec<codeintel_tests::SeedSymbol<'_>> = vec![
                 ("foo", "x::foo", "Function", 16, 18),
                 ("bar", "x::bar", "Function", 20, 22),

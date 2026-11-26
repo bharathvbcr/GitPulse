@@ -278,6 +278,29 @@ impl Resolver {
                 trail.pop();
                 return answer;
             }
+            // Alias of a module-scope factory singleton (`const prefs = interfaceStore;`).
+            if let Some((declaring_file, shape)) = self.js_module_value_factory(file, target) {
+                if objects
+                    .family(value)
+                    .iter()
+                    .any(|name| objects.writes.contains_key(*name))
+                {
+                    return ObjectMember::Abstain;
+                }
+                if let Some((factory_file, factory_qname)) =
+                    self.resolve_factory_callee(LangFamily::JsTs, &declaring_file, None, &shape)
+                {
+                    trail.push(key);
+                    let answer = self.factory_object_member_walk(
+                        &factory_file,
+                        &factory_qname,
+                        member,
+                        trail,
+                    );
+                    trail.pop();
+                    return answer;
+                }
+            }
         }
 
         let mut steps: Vec<Step> = declaration
@@ -391,6 +414,214 @@ impl Resolver {
         }
     }
 
+    fn factory_has_readable_shape(&self, factory_file: &str, factory_qname: &str) -> bool {
+        if let Some(written) = self
+            .return_types
+            .get(&(factory_file.to_string(), factory_qname.to_string()))
+        {
+            if let Some(nominal) = Self::admissible_nominal_type(written) {
+                let names_indexed_nominal = self.symbol_index.get(&nominal).is_some_and(|hits| {
+                    hits.iter().any(|(_, kind, family, _)| {
+                        LangFamily::JsTs.admits(*family)
+                            && matches!(
+                                kind,
+                                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface
+                            )
+                    })
+                });
+                if names_indexed_nominal {
+                    return false;
+                }
+            }
+        }
+        let Some(bare) = factory_qname.rsplit("::").next() else {
+            return false;
+        };
+        let fact_name = format!("{bare}()");
+        self.js_objects
+            .get(factory_file)
+            .and_then(|objects| objects.declarations.get(&fact_name))
+            .is_some_and(|decls| decls.len() == 1)
+    }
+
+    /// Resolve `member` on the object literal returned by JS/TS factory
+    /// `(factory_file, factory_qname)`, whose shape was recorded under
+    /// `format!("{bare}()")` in `self.js_objects`.
+    ///
+    /// When the factory declares an explicit nominal return type that names an
+    /// indexed JS/TS class, struct, or interface (e.g. `function makeCtl(): Ctl`),
+    /// that written contract belongs to Rung 1 (`factory_return_type`), so this
+    /// structural object walk defers rather than bypassing a nominal ambiguity.
+    fn factory_object_member_walk(
+        &self,
+        factory_file: &str,
+        factory_qname: &str,
+        member: &str,
+        trail: &mut Vec<(String, String)>,
+    ) -> ObjectMember {
+        if !self.factory_has_readable_shape(factory_file, factory_qname) {
+            return ObjectMember::Absent;
+        }
+        let Some(bare) = factory_qname.rsplit("::").next() else {
+            return ObjectMember::Absent;
+        };
+        let fact_name = format!("{bare}()");
+        let key = (factory_file.to_string(), fact_name.clone());
+        if trail.len() >= Self::REEXPORT_CHAIN_MAX_DEPTH || trail.contains(&key) {
+            return ObjectMember::Abstain;
+        }
+        let Some(objects) = self.js_objects.get(factory_file) else {
+            return ObjectMember::Absent;
+        };
+        let Some([declaration]) = objects.declarations.get(&fact_name).map(Vec::as_slice) else {
+            return ObjectMember::Absent;
+        };
+        trail.push(key);
+        let answer = self.apply_factory_parts(
+            factory_file,
+            factory_qname,
+            member,
+            &declaration.parts,
+            declaration.start_byte,
+            trail,
+        );
+        trail.pop();
+        answer
+    }
+
+    fn apply_factory_parts(
+        &self,
+        factory_file: &str,
+        factory_qname: &str,
+        member: &str,
+        parts: &[JsObjectPart],
+        at: usize,
+        trail: &mut Vec<(String, String)>,
+    ) -> ObjectMember {
+        for part in parts.iter().rev() {
+            match part {
+                JsObjectPart::Inline(key) if key == member => {
+                    let qualified = format!("{factory_qname}.{member}");
+                    let declared = self.symbol_index.get(&qualified).and_then(|hits| {
+                        hits.iter().find(|(path, _, _, identity)| {
+                            path == factory_file && **identity == *qualified
+                        })
+                    });
+                    return match declared {
+                        Some(_) => ObjectMember::Bound(factory_file.to_string(), qualified),
+                        None => ObjectMember::Abstain,
+                    };
+                }
+                JsObjectPart::Forward {
+                    key,
+                    value: forwarded,
+                } if key == member => {
+                    // 1. Inner function/method declared inside the factory
+                    //    (e.g. `function add() {} ... return { add }`).
+                    if let Some(children) = self.scope_children.get(&(
+                        factory_file.to_string(),
+                        factory_qname.to_string(),
+                        forwarded.clone(),
+                    )) {
+                        let callables: Vec<&Arc<str>> = children
+                            .iter()
+                            .filter(|(kind, _)| {
+                                matches!(kind, SymbolKind::Function | SymbolKind::Method)
+                            })
+                            .map(|(_, id)| id)
+                            .collect();
+                        if let [only] = callables.as_slice() {
+                            return ObjectMember::Bound(factory_file.to_string(), only.to_string());
+                        }
+                        if !callables.is_empty() {
+                            return ObjectMember::Abstain;
+                        }
+                    }
+                    // 2. Local variable inside the factory (e.g. `const { subscribe } = writable()`):
+                    //    do not leak out to a module-level or imported namesake.
+                    if self.scope_declares_local(factory_file, factory_qname, forwarded) {
+                        return ObjectMember::Abstain;
+                    }
+                    // 3. Module-level or imported declaration in `factory_file`.
+                    return self.forwarded_declaration(factory_file, forwarded);
+                }
+                JsObjectPart::Opaque(key) if key == member => return ObjectMember::Abstain,
+                JsObjectPart::Spread(reference) => {
+                    if let Some(callee) = reference.strip_suffix("()") {
+                        let answer = match self.resolve_factory_callee(
+                            LangFamily::JsTs,
+                            factory_file,
+                            Some(factory_qname),
+                            callee,
+                        ) {
+                            Some((sub_file, sub_qname))
+                                if self.factory_has_readable_shape(&sub_file, &sub_qname) =>
+                            {
+                                self.factory_object_member_walk(
+                                    &sub_file, &sub_qname, member, trail,
+                                )
+                            }
+                            _ => ObjectMember::Abstain,
+                        };
+                        match answer {
+                            ObjectMember::Absent => continue,
+                            decided => return decided,
+                        }
+                    }
+                    let root = reference.split('.').next().unwrap_or(reference);
+                    if self.scope_declares_local(factory_file, factory_qname, root) {
+                        return ObjectMember::Abstain;
+                    }
+                    let answer = match self.object_ref(factory_file, reference) {
+                        ObjectRef::Object(source_file, source) => {
+                            let limit = (source_file == factory_file).then_some(at);
+                            self.object_member_walk(&source_file, &source, member, limit, trail)
+                        }
+                        ObjectRef::Namespace(module_file) => {
+                            match self.lookup_in_package(&module_file, member) {
+                                Some((found_file, symbol)) => {
+                                    ObjectMember::Bound(found_file, symbol)
+                                }
+                                None => ObjectMember::Abstain,
+                            }
+                        }
+                        ObjectRef::Unknown => {
+                            if let Some((declaring_file, shape)) =
+                                self.js_module_value_factory(factory_file, reference)
+                            {
+                                match self.resolve_factory_callee(
+                                    LangFamily::JsTs,
+                                    &declaring_file,
+                                    None,
+                                    &shape,
+                                ) {
+                                    Some((sub_file, sub_qname))
+                                        if self
+                                            .factory_has_readable_shape(&sub_file, &sub_qname) =>
+                                    {
+                                        self.factory_object_member_walk(
+                                            &sub_file, &sub_qname, member, trail,
+                                        )
+                                    }
+                                    _ => ObjectMember::Abstain,
+                                }
+                            } else {
+                                ObjectMember::Abstain
+                            }
+                        }
+                    };
+                    match answer {
+                        ObjectMember::Absent => {}
+                        decided => return decided,
+                    }
+                }
+                JsObjectPart::Unknown => return ObjectMember::Abstain,
+                _ => {}
+            }
+        }
+        ObjectMember::Absent
+    }
+
     /// What a call `receiver.member()` written in `file` reaches when
     /// `receiver` is a module-scope const object built in place, by spread, by
     /// `Object.assign` or as an alias, in this file or another. `use_at` is the
@@ -408,5 +639,74 @@ impl Resolver {
         };
         let limit = if object_file == file { use_at } else { None };
         self.object_member_walk(&object_file, &object, member, limit, &mut Vec::new())
+    }
+
+    /// Whether `ext` contains an inner call to `receiver` starting at the same
+    /// byte as `span` and ending strictly before it — i.e., `receiver(...).m`.
+    /// Distinguishes `createPanelTabCounts().report()` from a property lookup
+    /// on the function object itself (`createPanelTabCounts.report()`).
+    pub(super) fn is_chained_factory_receiver(
+        ext: &Extraction,
+        span: &devmap_extract::Span,
+        receiver: &str,
+    ) -> bool {
+        let (expected_recv, expected_callee) = match receiver.rsplit_once('.') {
+            Some((r, c)) => (Some(r), c),
+            None => (None, receiver),
+        };
+        ext.calls.iter().any(|inner| {
+            inner.span.start_byte == span.start_byte
+                && inner.span.end_byte < span.end_byte
+                && inner.callee_name == expected_callee
+                && inner.receiver_expr.as_deref() == expected_recv
+        })
+    }
+
+    /// What a call or member reference `receiver.member` written in `file`
+    /// reaches when `receiver` holds the object literal returned by a JS/TS
+    /// factory function:
+    ///
+    /// * a local binding `const counts = createPanelTabCounts(); counts.report()`
+    /// * a module-scope singleton (same-file or imported)
+    ///   `export const interfaceStore = createInterfaceStore(); interfaceStore.applyPreset(p)`
+    /// * a direct chained factory call `createPanelTabCounts().report()`
+    pub(super) fn factory_member_target(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        receiver: &str,
+        site_binding: Option<&devmap_extract::LocalBinding>,
+        chained_call: bool,
+        member: &str,
+    ) -> ObjectMember {
+        let resolved_factory = if let Some(binding) = site_binding {
+            // A local binding shadows module scope; only follow it when the
+            // binding names `receiver` itself and its initializer is a factory
+            // call.
+            if binding.name != receiver {
+                return ObjectMember::Absent;
+            }
+            binding.initializer.as_deref().and_then(|shape| {
+                self.resolve_factory_callee(LangFamily::JsTs, file, binding.scope.as_deref(), shape)
+            })
+        } else {
+            let first = receiver.split('.').next().unwrap_or(receiver);
+            if scope.is_some_and(|s| self.scope_declares_local(file, s, first)) {
+                return ObjectMember::Absent;
+            }
+            if let Some((declaring_file, shape)) = self.js_module_value_factory(file, receiver) {
+                self.resolve_factory_callee(LangFamily::JsTs, &declaring_file, None, &shape)
+            } else if chained_call {
+                // Direct chained call `createPanelTabCounts().report(...)`:
+                // `receiver_identity` records the callee name as the receiver.
+                self.resolve_factory_callee(LangFamily::JsTs, file, scope, receiver)
+            } else {
+                None
+            }
+        };
+        let Some((factory_file, factory_qname)) = resolved_factory else {
+            return ObjectMember::Absent;
+        };
+        self.factory_object_member_walk(&factory_file, &factory_qname, member, &mut Vec::new())
     }
 }

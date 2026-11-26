@@ -224,8 +224,28 @@ pub fn evidence_append(
 /// Lists evidence rows, newest first, optionally filtered by task.
 ///
 /// `truncated` is true when more than [`MAX_LIST_ROWS`] matched.
-pub fn evidence_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<EvidenceRow>, bool)> {
+/// Runs a list query optionally filtered by `?1` (`task_id`), capped at
+/// [`MAX_LIST_ROWS`] with `truncated` true when more matched. The SQL must
+/// filter `WHERE (?1 IS NULL OR task_id = ?1)` and bind `LIMIT ?2`.
+fn query_capped<T>(
+    conn: &Connection,
+    sql: &str,
+    task_id: Option<&str>,
+    map_row: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<(Vec<T>, bool)> {
     let limit = (MAX_LIST_ROWS + 1) as i64;
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt
+        .query_map(params![task_id, limit], map_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let truncated = rows.len() > MAX_LIST_ROWS;
+    if truncated {
+        rows.truncate(MAX_LIST_ROWS);
+    }
+    Ok((rows, truncated))
+}
+
+pub fn evidence_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<EvidenceRow>, bool)> {
     let map_row = |row: &rusqlite::Row<'_>| {
         Ok(EvidenceRow {
             id: row.get(0)?,
@@ -236,23 +256,15 @@ pub fn evidence_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<Ev
             data_json: row.get(5)?,
         })
     };
-    let rows: Vec<EvidenceRow> = if let Some(tid) = task_id {
-        let mut stmt = conn.prepare(
-            "SELECT id, type, task_id, requirement_id, acceptance_criterion_id, data_json
-             FROM evidence WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
-        stmt.query_map(params![tid, limit], map_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        let mut stmt = conn.prepare(
-            "SELECT id, type, task_id, requirement_id, acceptance_criterion_id, data_json
-             FROM evidence ORDER BY id DESC LIMIT ?1",
-        )?;
-        stmt.query_map(params![limit], map_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    let truncated = rows.len() > MAX_LIST_ROWS;
-    Ok((rows.into_iter().take(MAX_LIST_ROWS).collect(), truncated))
+    query_capped(
+        conn,
+        "SELECT id, type, task_id, requirement_id, acceptance_criterion_id, data_json
+         FROM evidence
+         WHERE (?1 IS NULL OR task_id = ?1)
+         ORDER BY id DESC LIMIT ?2",
+        task_id,
+        map_row,
+    )
 }
 
 /// Inserts or replaces one gap row.
@@ -575,7 +587,6 @@ pub fn gap_history_list(
     conn: &Connection,
     task_id: Option<&str>,
 ) -> Result<(Vec<GapHistoryRow>, bool)> {
-    let limit = (MAX_LIST_ROWS + 1) as i64;
     let map_row = |row: &rusqlite::Row<'_>| {
         Ok(GapHistoryRow {
             task_id: row.get(0)?,
@@ -587,30 +598,20 @@ pub fn gap_history_list(
             resurfaces: row.get(6)?,
         })
     };
-    const COLUMNS: &str = "task_id, gap_id, gap_type, first_seen_run, last_seen_run,
-                           occurrences, resurfaces";
-    let rows: Vec<GapHistoryRow> = if let Some(tid) = task_id {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM gap_history WHERE task_id = ?1
-             ORDER BY resurfaces DESC, gap_id LIMIT ?2"
-        ))?;
-        stmt.query_map(params![tid, limit], map_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM gap_history
-             ORDER BY resurfaces DESC, task_id, gap_id LIMIT ?1"
-        ))?;
-        stmt.query_map(params![limit], map_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    let truncated = rows.len() > MAX_LIST_ROWS;
-    Ok((rows.into_iter().take(MAX_LIST_ROWS).collect(), truncated))
+    query_capped(
+        conn,
+        "SELECT task_id, gap_id, gap_type, first_seen_run, last_seen_run,
+                occurrences, resurfaces
+         FROM gap_history
+         WHERE (?1 IS NULL OR task_id = ?1)
+         ORDER BY resurfaces DESC, task_id, gap_id LIMIT ?2",
+        task_id,
+        map_row,
+    )
 }
 
 /// Lists gaps, optionally filtered by task. Cap + truncate flag as evidence.
 pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow>, bool)> {
-    let limit = (MAX_LIST_ROWS + 1) as i64;
     // A read-only handle cannot add the two output columns a long-lived store
     // may lack, so a missing column reads as absent rather than failing the
     // whole list.
@@ -642,29 +643,20 @@ pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow
             stderr_path: row.get(15)?,
         })
     };
-    let rows: Vec<GapRow> = if let Some(tid) = task_id {
-        let mut stmt = conn.prepare(&format!(
+    query_capped(
+        conn,
+        &format!(
             "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                     recommended_fix, blocking, file, line, suggested_command,
                     acceptance_criterion_id, expected_verification_method,
                     {output_columns}
-             FROM gaps WHERE task_id = ?1 ORDER BY id LIMIT ?2"
-        ))?;
-        stmt.query_map(params![tid, limit], map_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
-                    recommended_fix, blocking, file, line, suggested_command,
-                    acceptance_criterion_id, expected_verification_method,
-                    {output_columns}
-             FROM gaps ORDER BY id LIMIT ?1"
-        ))?;
-        stmt.query_map(params![limit], map_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    let truncated = rows.len() > MAX_LIST_ROWS;
-    Ok((rows.into_iter().take(MAX_LIST_ROWS).collect(), truncated))
+             FROM gaps
+             WHERE (?1 IS NULL OR task_id = ?1)
+             ORDER BY id LIMIT ?2"
+        ),
+        task_id,
+        map_row,
+    )
 }
 
 /// Inserts or replaces a verification run.
@@ -739,34 +731,16 @@ pub fn run_get(conn: &Connection, id: &str) -> Result<Option<VerificationRun>> {
 ///
 /// `truncated` is true when more than [`MAX_LIST_ROWS`] matched.
 pub fn runs_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<VerificationRun>, bool)> {
-    let limit = (MAX_LIST_ROWS + 1) as i64;
-    let mut rows = match task_id {
-        Some(task) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, task_id, sandbox, environment_json, commands_json, status,
-                        started_at, finished_at
-                 FROM verification_runs WHERE task_id = ?1
-                 ORDER BY started_at DESC, id DESC LIMIT ?2",
-            )?;
-            stmt.query_map(params![task, limit], map_verification_run)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        }
-        None => {
-            let mut stmt = conn.prepare(
-                "SELECT id, task_id, sandbox, environment_json, commands_json, status,
-                        started_at, finished_at
-                 FROM verification_runs
-                 ORDER BY started_at DESC, id DESC LIMIT ?1",
-            )?;
-            stmt.query_map([limit], map_verification_run)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        }
-    };
-    let truncated = rows.len() > MAX_LIST_ROWS;
-    if truncated {
-        rows.truncate(MAX_LIST_ROWS);
-    }
-    Ok((rows, truncated))
+    query_capped(
+        conn,
+        "SELECT id, task_id, sandbox, environment_json, commands_json, status,
+                started_at, finished_at
+         FROM verification_runs
+         WHERE (?1 IS NULL OR task_id = ?1)
+         ORDER BY started_at DESC, id DESC LIMIT ?2",
+        task_id,
+        map_verification_run,
+    )
 }
 
 /// Inserts or replaces an agent handoff.

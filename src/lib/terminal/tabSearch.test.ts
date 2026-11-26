@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   crowdedTabStrip,
+  fieldSearchRank,
   filterLaunchers,
   filterSessionRecords,
   filterTerminalTabs,
@@ -8,6 +9,7 @@ import {
   normalizeTerminalSearchQuery,
   stepSearchIndex,
   TERMINAL_SEARCH_QUERY_LIMIT,
+  terminalSearchRank,
 } from "./tabSearch";
 import { createTab, LAUNCHERS, openTab, initialState, type TerminalTab } from "./tabs";
 import type { TerminalSessionRecord } from "./sessionRegistry";
@@ -47,6 +49,28 @@ describe("matchesTerminalSearch", () => {
     expect(matchesTerminalSearch("BLD", "Build logs")).toBe(true);
     expect(matchesTerminalSearch("世界", "repo 世界 café")).toBe(true);
     expect(matchesTerminalSearch("missing", "Build logs")).toBe(false);
+  });
+
+  it("matches multi-token queries across separate fields regardless of word order", () => {
+    expect(matchesTerminalSearch("devcouncil claude", "DevCouncil", "Claude")).toBe(true);
+    expect(matchesTerminalSearch("claude devcouncil", "DevCouncil", "Claude")).toBe(true);
+    expect(matchesTerminalSearch("gitpulse sidebar claude", "GitPulse", "fix-sidebar", "Claude")).toBe(true);
+    expect(matchesTerminalSearch("devcouncil codex", "DevCouncil", "Claude")).toBe(false);
+    expect(matchesTerminalSearch("devcouncil claude", "", null, undefined)).toBe(false);
+  });
+
+  it("ranks exact, prefix, word/initials, substring, and subsequence cleanly", () => {
+    expect(fieldSearchRank("claude", "Claude")).toBe(5);
+    expect(fieldSearchRank("cl", "Claude")).toBe(4);
+    expect(fieldSearchRank("dc", "DevCouncil")).toBe(3);
+    expect(fieldSearchRank("gp", "GitPulse")).toBe(3);
+    expect(fieldSearchRank("sidebar", "fix-sidebar")).toBe(3);
+    expect(fieldSearchRank("bar", "xbar-bar")).toBe(3);
+    expect(fieldSearchRank("ul", "GitPulse")).toBe(2);
+    expect(fieldSearchRank("cl", "DevCouncil")).toBe(1);
+    expect(fieldSearchRank("zz", "DevCouncil")).toBe(0);
+    expect(terminalSearchRank("cl", "Claude")).toBeGreaterThan(terminalSearchRank("cl", "DevCouncil"));
+    expect(terminalSearchRank("dc cl", "DevCouncil", "Claude")).toBe(3);
   });
 });
 

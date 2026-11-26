@@ -10,6 +10,8 @@ use std::collections::HashSet;
 /// any other out-of-range field. `menuContract.ts` mirrors it as
 /// `MENU_LIMITS.agentsWaiting`, and the renderer clamps to it before sending.
 pub const MAX_AGENTS_WAITING: u32 = 999;
+pub const MAX_MENU_AGENT_REQUESTS: usize = 8;
+pub const MAX_AGENT_REQUEST_ID_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MenuLabel {
@@ -26,6 +28,21 @@ pub struct MenuRepository {
     pub changed: Option<u32>,
     pub conflicts: Option<u32>,
     pub busy: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MenuAgentRequest {
+    pub id: String,
+    pub source: String,
+    pub provider: String,
+    pub agent_label: String,
+    pub repo_label: String,
+    pub repo_path: Option<String>,
+    pub urgency: String,
+    pub reason: String,
+    pub detail: Option<String>,
+    pub at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -103,6 +120,14 @@ pub struct MenuState {
     /// absent means nobody is waiting, not a frozen menu.
     #[serde(default)]
     pub agents_waiting: u32,
+    #[serde(default)]
+    pub agent_requests: Vec<MenuAgentRequest>,
+    #[serde(default)]
+    pub agent_requests_hidden: u32,
+    #[serde(default)]
+    pub agents_running: u32,
+    #[serde(default)]
+    pub agents_informational: u32,
     pub status: StatusCard,
 }
 
@@ -148,6 +173,10 @@ impl Default for MenuState {
             },
             tray_detail: String::new(),
             agents_waiting: 0,
+            agent_requests: vec![],
+            agent_requests_hidden: 0,
+            agents_running: 0,
+            agents_informational: 0,
             status: StatusCard::default(),
         }
     }
@@ -182,6 +211,9 @@ impl MenuState {
     pub fn enabled(&self, id: &str) -> bool {
         if let Some(path) = id.strip_prefix(actions::REPOSITORY_PREFIX) {
             return self.repositories.iter().any(|repo| repo.path == path);
+        }
+        if let Some(agent_id) = id.strip_prefix(actions::FOCUS_AGENT_PREFIX) {
+            return self.agent_requests.iter().any(|req| req.id == agent_id);
         }
         self.enabled.iter().any(|entry| entry == id)
     }
@@ -225,6 +257,10 @@ impl MenuState {
             || self.repositories.len() > 64
             || self.repositories_hidden > 1_000_000
             || (self.repositories_hidden > 0 && self.repositories.len() < 64)
+            || self.agent_requests.len() > MAX_MENU_AGENT_REQUESTS
+            || self.agent_requests_hidden > MAX_AGENTS_WAITING
+            || (self.agent_requests_hidden > 0
+                && self.agent_requests.len() < MAX_MENU_AGENT_REQUESTS)
         {
             return Err("Native menu state exceeds its entry limit".into());
         }
@@ -288,8 +324,45 @@ impl MenuState {
         {
             return Err("Native menu text exceeds its limit".into());
         }
-        if self.agents_waiting > MAX_AGENTS_WAITING {
+        if self.agents_waiting > MAX_AGENTS_WAITING
+            || self.agents_running > MAX_AGENTS_WAITING
+            || self.agents_informational > MAX_AGENTS_WAITING
+        {
             return Err("Native menu agent count exceeds its limit".into());
+        }
+        let mut request_ids = HashSet::new();
+        for req in &self.agent_requests {
+            let invalid_repo_path = match req.repo_path {
+                Some(ref path) => path.is_empty() || path.len() > 16384,
+                None => false,
+            };
+            let invalid_detail = match req.detail {
+                Some(ref text) => text.len() > 2048,
+                None => false,
+            };
+            if req.id.is_empty()
+                || req.id.len() > MAX_AGENT_REQUEST_ID_BYTES
+                || req.id.chars().any(char::is_control)
+                || !request_ids.insert(req.id.as_str())
+                || !matches!(
+                    req.source.as_str(),
+                    "terminal" | "managed" | "inbox" | "external"
+                )
+                || !matches!(
+                    req.provider.as_str(),
+                    "claude" | "agy" | "codex" | "manvi" | "grok" | "shell" | "other"
+                )
+                || !matches!(req.urgency.as_str(), "blocking" | "error" | "informational")
+                || req.agent_label.is_empty()
+                || req.agent_label.len() > 2048
+                || req.repo_label.len() > 2048
+                || invalid_repo_path
+                || req.reason.is_empty()
+                || req.reason.len() > 2048
+                || invalid_detail
+            {
+                return Err("Native menu state contains an invalid agent request".into());
+            }
         }
         Ok(())
     }
@@ -414,5 +487,134 @@ mod tests {
         let mut wire = serde_json::to_value(MenuState::default()).unwrap();
         wire["agentsWaiting"] = negative["agentsWaiting"].clone();
         assert!(serde_json::from_value::<MenuState>(wire).is_err());
+    }
+
+    fn sample_request(id: &str) -> MenuAgentRequest {
+        MenuAgentRequest {
+            id: id.into(),
+            source: "terminal".into(),
+            provider: "claude".into(),
+            agent_label: "Claude Code".into(),
+            repo_label: "GitPulse".into(),
+            repo_path: Some("/r/a".into()),
+            urgency: "blocking".into(),
+            reason: "Needs your permission".into(),
+            detail: Some("Run cargo test".into()),
+            at_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    #[test]
+    fn agent_request_fields_default_for_legacy_renderers_and_validate_bounds() {
+        let mut wire = serde_json::to_value(MenuState::default()).unwrap();
+        let obj = wire.as_object_mut().unwrap();
+        for key in [
+            "agentRequests",
+            "agentRequestsHidden",
+            "agentsRunning",
+            "agentsInformational",
+        ] {
+            assert!(obj.contains_key(key), "missing {key}");
+            obj.remove(key);
+        }
+        let legacy: MenuState = serde_json::from_value(wire).unwrap();
+        assert!(legacy.agent_requests.is_empty());
+        assert_eq!(legacy.agent_requests_hidden, 0);
+        assert_eq!(legacy.agents_running, 0);
+        assert_eq!(legacy.agents_informational, 0);
+        legacy.validate().unwrap();
+
+        let mut state = MenuState {
+            agent_requests: (0..MAX_MENU_AGENT_REQUESTS)
+                .map(|i| sample_request(&format!("term:{i}")))
+                .collect(),
+            agent_requests_hidden: 2,
+            agents_running: 4,
+            agents_informational: 1,
+            ..Default::default()
+        };
+        state.validate().unwrap();
+        assert!(state.enabled("focus-agent:term:0"));
+        assert!(!state.enabled("focus-agent:missing"));
+
+        // Hidden > 0 when fewer than MAX_MENU_AGENT_REQUESTS are shown is dishonest.
+        state.agent_requests.pop();
+        assert_eq!(
+            state.validate(),
+            Err("Native menu state exceeds its entry limit".into())
+        );
+
+        // Exceeding MAX_MENU_AGENT_REQUESTS is rejected.
+        state.agent_requests_hidden = 0;
+        state.agent_requests.push(sample_request("term:7"));
+        state.agent_requests.push(sample_request("term:8"));
+        assert_eq!(
+            state.validate(),
+            Err("Native menu state exceeds its entry limit".into())
+        );
+
+        // Agent count bounds.
+        state = MenuState::default();
+        state.agents_running = MAX_AGENTS_WAITING + 1;
+        assert_eq!(
+            state.validate(),
+            Err("Native menu agent count exceeds its limit".into())
+        );
+        state.agents_running = 0;
+        state.agents_informational = MAX_AGENTS_WAITING + 1;
+        assert_eq!(
+            state.validate(),
+            Err("Native menu agent count exceeds its limit".into())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_agent_requests() {
+        type RequestMutator = fn(&mut MenuAgentRequest);
+        let cases: Vec<(&str, RequestMutator)> = vec![
+            ("empty id", |r| r.id.clear()),
+            ("oversized id", |r| {
+                r.id = "x".repeat(MAX_AGENT_REQUEST_ID_BYTES + 1)
+            }),
+            ("control char id", |r| r.id = "term:1\n".into()),
+            ("unknown source", |r| r.source = "daemon".into()),
+            ("unknown provider", |r| r.provider = "unknown".into()),
+            ("legacy action_needed urgency", |r| {
+                r.urgency = "action_needed".into()
+            }),
+            ("empty agent label", |r| r.agent_label.clear()),
+            ("oversized agent label", |r| {
+                r.agent_label = "a".repeat(2049)
+            }),
+            ("oversized repo label", |r| r.repo_label = "r".repeat(2049)),
+            ("empty repo path", |r| r.repo_path = Some(String::new())),
+            ("oversized repo path", |r| {
+                r.repo_path = Some("p".repeat(16385))
+            }),
+            ("empty reason", |r| r.reason.clear()),
+            ("oversized reason", |r| r.reason = "q".repeat(2049)),
+            ("oversized detail", |r| r.detail = Some("d".repeat(2049))),
+        ];
+        for (name, mutate) in cases {
+            let mut req = sample_request("term:1");
+            mutate(&mut req);
+            let state = MenuState {
+                agent_requests: vec![req],
+                ..Default::default()
+            };
+            assert_eq!(
+                state.validate(),
+                Err("Native menu state contains an invalid agent request".into()),
+                "case {name}"
+            );
+        }
+        let dup = MenuState {
+            agent_requests: vec![sample_request("term:dup"), sample_request("term:dup")],
+            ..Default::default()
+        };
+        assert_eq!(
+            dup.validate(),
+            Err("Native menu state contains an invalid agent request".into())
+        );
     }
 }

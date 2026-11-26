@@ -554,10 +554,7 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
         fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
         for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     let mut c = config(&cleaner, &root);
@@ -747,10 +744,7 @@ fn policy_edits_inside_the_execution_gate_preserve_real_artifacts() {
     fs::write(cache.join("a.pyc"), "bytecode").unwrap();
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
     for path in [cache.clone(), cache.join("a.pyc")] {
-        fs::File::open(path)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        crate::test_support::set_modified(&path, old).unwrap();
     }
     let saved = cleaner.save(config(&cleaner, &root)).unwrap();
     cleaner
@@ -1080,10 +1074,7 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
         fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
         for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     let blocked = root.join("unread/.unreadable");
@@ -1269,10 +1260,7 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
         // non-bytecode content before it reads a stamp.
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
         for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     let blocked = root.join("unread/__pycache__/blocked");
@@ -1412,10 +1400,7 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
     fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 4096]).unwrap();
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
     for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-        fs::File::open(p)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        crate::test_support::set_modified(&p, old).unwrap();
     }
 
     // Enough artifact directories to push the report past its reporting cap,
@@ -1634,10 +1619,7 @@ fn aged_bytecode_repo(
         let file = cache.join("module.pyc");
         fs::write(&file, vec![b'x'; bytes]).unwrap();
         for p in [file, cache] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     r
@@ -1960,10 +1942,7 @@ fn every_reclaim_scope_is_off_by_default_and_absent_from_saved_state() {
 #[cfg(unix)]
 fn set_old(path: &std::path::Path) {
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
-    fs::File::open(path)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(old))
-        .unwrap();
+    crate::test_support::set_modified(path, old).unwrap();
 }
 
 /// A Cargo repository on `main` with one linked worktree under
@@ -2631,7 +2610,16 @@ fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
     // A save carrying the revision read before the bring-forward still lands.
     let mut open_page = cleaner.state().unwrap().config;
     open_page.next_run_at = later;
-    assert!(cleaner.save(open_page).is_ok());
+    if cfg!(unix) {
+        assert!(cleaner.save(open_page).is_ok());
+    } else {
+        // An enabled schedule is refused where there is no cleanup to run:
+        // the brought-forward schedule was set by the scheduler, not saved.
+        assert!(cleaner
+            .save(open_page)
+            .unwrap_err()
+            .contains("Scheduled cleanup is unavailable on this platform"));
+    }
     // Due now, and not asked again within the gap, whatever the cause.
     cleaner
         .update(|saved| {
@@ -3206,10 +3194,7 @@ fn old_cargo_target(dir: &std::path::Path) {
         dir.join("debug"),
         dir.to_path_buf(),
     ] {
-        fs::File::open(path)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(when))
-            .unwrap();
+        crate::test_support::set_modified(&path, when).unwrap();
     }
 }
 
@@ -3353,9 +3338,7 @@ fn agent_scratch_builds_are_previewed_then_removed_end_to_end() {
 fn quiet_session_folder(scratchpad: &std::path::Path) {
     let when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
     let set = |p: &std::path::Path| {
-        if let Ok(file) = fs::File::open(p) {
-            let _ = file.set_times(fs::FileTimes::new().set_modified(when));
-        }
+        let _ = crate::test_support::set_modified(p, when);
     };
     for entry in fs::read_dir(scratchpad).into_iter().flatten().flatten() {
         set(&entry.path());
@@ -3532,10 +3515,21 @@ fn the_long_lived_list_is_validated_when_saved() {
     assert!(save(vec![ok.to_string_lossy().into_owned()]).is_ok());
     for (path, why) in [
         ("relative", "absolute"),
-        ("/", "filesystem root"),
+        // This platform's own root: `/`, or the drive's root on Windows.
+        (
+            home.ancestors().last().unwrap().to_str().unwrap(),
+            "filesystem root",
+        ),
         (home.to_str().unwrap(), "home directory"),
         (root.to_str().unwrap(), "contains the repository root"),
-        ("/definitely/not/here", "cannot be read"),
+        (
+            home.join("definitely")
+                .join("not")
+                .join("here")
+                .to_str()
+                .unwrap(),
+            "cannot be read",
+        ),
     ] {
         let error = save(vec![path.to_string()]).expect_err(path);
         assert!(error.message().contains(why), "{path}: {}", error.message());
@@ -3703,6 +3697,22 @@ fn one_session_cleaner_with(
     (temp, cleaner, targets)
 }
 
+/// Where this platform has no reviewed removal, a run offers and judges as
+/// anywhere and then skips every folder whole, with the platform's text, and
+/// leaves each as it was: none completes, none is partly removed.
+fn assert_refused_by_platform(run: &CleanerRun, targets: &[std::path::PathBuf]) {
+    assert!(!run.items.is_empty(), "{run:?}");
+    for item in &run.items {
+        assert_eq!(item.status, "skipped", "{item:?}");
+        assert_eq!(item.message, super::super::tree::NO_REMOVAL, "{item:?}");
+    }
+    assert!(
+        targets.iter().all(|t| t.join("debug/app.o").exists()),
+        "{:?}",
+        run.items
+    );
+}
+
 /// Removing one target changes its parent folder's modification time. The
 /// recency guard is judged again for every candidate at delete time, so without
 /// the run knowing what it removed itself, the second target of the same
@@ -3714,6 +3724,9 @@ fn a_finished_session_with_two_targets_is_cleared_in_one_run() {
     let (_temp, cleaner, targets) = one_session_cleaner(&["target-a", "target-b"]);
     let saved = cleaner.state().unwrap().config;
     let run = run_now(&cleaner, &saved, "two-targets-run");
+    if !cfg!(unix) {
+        return assert_refused_by_platform(&run, &targets);
+    }
     let done = run.items.iter().filter(|i| i.status == "completed").count();
     assert_eq!(done, 2, "{:?}", run.items);
     assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
@@ -3735,6 +3748,10 @@ fn a_partly_removed_target_keeps_its_sibling_this_period() {
     TOUCH_AT_CALL.store(4, Ordering::SeqCst);
     let run = run_now(&cleaner, &saved, "partial-sibling-run");
     TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    if !cfg!(unix) {
+        // Nothing is unlinked, so nothing stops part way and no sibling waits.
+        return assert_refused_by_platform(&run, &targets);
+    }
     let row = |name: &str| {
         run.items
             .iter()
@@ -3763,10 +3780,7 @@ fn a_target_shaped_like_a_real_cargo_target_with_hard_links_is_completed() {
     let shape = |target: &std::path::Path| {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
         let set = |p: &std::path::Path| {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(p, old).unwrap();
         };
         for dir in ["debug/deps", "debug/incremental/crate-1", "debug/build/out"] {
             fs::create_dir_all(target.join(dir)).unwrap();
@@ -3825,6 +3839,9 @@ fn a_wrapper_with_two_children_is_cleared_in_one_run() {
     let (_temp, cleaner, targets) = one_session_cleaner(&["target-wrap/t0", "target-wrap/t1"]);
     let saved = cleaner.state().unwrap().config;
     let run = run_now(&cleaner, &saved, "wrapper-run");
+    if !cfg!(unix) {
+        return assert_refused_by_platform(&run, &targets);
+    }
     let done = run.items.iter().filter(|i| i.status == "completed").count();
     assert_eq!(done, 2, "{:?}", run.items);
     assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
@@ -3845,6 +3862,10 @@ fn a_partly_removed_candidate_is_charged_and_the_next_one_meets_the_cap() {
     // re-judgement and 4 the re-check right before its first unlink.
     TOUCH_AT_CALL.store(4, Ordering::SeqCst);
     let run = run_now(&cleaner, &saved, "partial-run");
+    if !cfg!(unix) {
+        // Nothing is unlinked, so nothing is charged against the cap.
+        return assert_refused_by_platform(&run, &targets);
+    }
     let session_rows: Vec<_> = run
         .items
         .iter()

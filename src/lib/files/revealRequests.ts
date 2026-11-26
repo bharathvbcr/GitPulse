@@ -120,7 +120,117 @@ export function goToLineTarget(value: unknown, lineCount: number): number | null
   return Math.min(line, lineCount);
 }
 
+/**
+ * Parses a go-to-line input string or number, allowing optional `:line` and
+ * `:line:col` (or `line:col`) notation, and distinguishes an empty field from
+ * an invalid one. Columns are 1-based; a zero column is rejected as invalid.
+ */
+export function parseGoToLineInput(
+  raw: unknown,
+  lineCount: number,
+): { target: number | null; column: number | null; empty: boolean; invalid: boolean } {
+  if (raw === null || raw === undefined) {
+    return { target: null, column: null, empty: true, invalid: false };
+  }
+  if (typeof raw === "number") {
+    const target = goToLineTarget(raw, lineCount);
+    return { target, column: null, empty: false, invalid: target === null };
+  }
+  if (typeof raw !== "string") {
+    return { target: null, column: null, empty: false, invalid: true };
+  }
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed === ":") {
+    return { target: null, column: null, empty: true, invalid: false };
+  }
+  const match = /^(?::)?(\d+)(?::(\d+))?$/.exec(trimmed);
+  if (!match) {
+    return { target: null, column: null, empty: false, invalid: true };
+  }
+  const target = goToLineTarget(match[1], lineCount);
+  if (target === null) {
+    return { target: null, column: null, empty: false, invalid: true };
+  }
+  let column: number | null = null;
+  if (match[2] !== undefined) {
+    const parsedCol = Number(match[2]);
+    if (!Number.isInteger(parsedCol) || parsedCol < 1 || parsedCol > MAX_REVEAL_LINE) {
+      return { target: null, column: null, empty: false, invalid: true };
+    }
+    column = parsedCol;
+  }
+  return { target, column, empty: false, invalid: false };
+}
+
+/**
+ * Recognizes `:42` or `:42:10` entered into Find as a line/column jump shorthand
+ * when regex mode is off and the file does not already contain matching literal text.
+ */
+export function parseColonLineJump(
+  query: string,
+  lineCount: number,
+  options: { regex?: boolean; hasMatches?: boolean } = {},
+): { line: number; column: number | null } | null {
+  if (options.regex || options.hasMatches) return null;
+  const trimmed = query.trim();
+  if (!trimmed.startsWith(":")) return null;
+  const parsed = parseGoToLineInput(trimmed, lineCount);
+  if (parsed.target === null) return null;
+  return { line: parsed.target, column: parsed.column };
+}
+
+/**
+ * Recognizes `:42` or `:42:10` entered into Find as a line-jump shorthand when
+ * regex mode is off and the file does not already contain matching literal text.
+ */
+export function colonLineJump(
+  query: string,
+  lineCount: number,
+  options: { regex?: boolean; hasMatches?: boolean } = {},
+): number | null {
+  return parseColonLineJump(query, lineCount, options)?.line ?? null;
+}
+
 /** Drops any pending request. For teardown and tests. */
 export function clearReveal(): void {
   pending.set(null);
+}
+
+/**
+ * A request to show a path in the file tree: expand down to it, then scroll it
+ * into view. Separate from the line request above, which lands inside a
+ * viewer; this one is for the tree, whichever trees are mounted (the Code
+ * page's and the sidebar's).
+ *
+ * `nonce` is a sequence number. A tree acts on a nonce it has not seen, so
+ * asking again for the path that was just revealed is a new request, which a
+ * bare path (or a selection that did not change) could not express. `at` lets
+ * a tree that mounts later ignore a request nobody was there to see.
+ */
+export interface TreeRevealRequest {
+  path: string;
+  nonce: number;
+  at: number;
+}
+
+let treeNonce = 0;
+const treePending = writable<TreeRevealRequest | null>(null);
+
+/** Subscribe-only view, for the components that hand it to a tree. */
+export const treeRevealRequest = { subscribe: treePending.subscribe };
+
+/**
+ * Asks the file trees to show `path`. Returns false for an unusable path, the
+ * same bound `requestReveal` applies.
+ */
+export function requestTreeReveal(path: string, now: number = Date.now()): boolean {
+  if (!path || path.length > MAX_REVEAL_PATH) return false;
+  treeNonce += 1;
+  treePending.set({ path, nonce: treeNonce, at: now });
+  return true;
+}
+
+/** Drops the pending tree request. For tests. */
+export function clearTreeReveal(): void {
+  treePending.set(null);
 }

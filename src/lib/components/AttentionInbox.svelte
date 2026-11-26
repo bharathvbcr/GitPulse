@@ -2,6 +2,7 @@
   import { onMount, untrack } from "svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import SendToAgent from "./SendToAgent.svelte";
+  import Logo from "./Logo.svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createLiveLoader, liveOnScreen } from "../workbench/liveLoader";
   import { formatRelativeTime } from "../format";
@@ -97,7 +98,10 @@
 
 <section class="inbox gp-glass bg-surface" aria-label="Inbox">
   <header>
-    <strong>Inbox</strong>
+    <div class="inbox-title">
+      <span class="inbox-logo" aria-hidden="true"><Logo size={16} variant="badge" /></span>
+      <strong>Inbox</strong>
+    </div>
     <div class="controls">
       <select class="gp-select" aria-label="Inbox filter" bind:value={filter}><option value="active">Active</option><option value="unread">Unread</option><option value="all">All</option></select>
       <button type="button" class="gp-btn" onclick={() => load()} disabled={busy}>Refresh</button>
@@ -152,6 +156,7 @@
 <style>
   .inbox{max-height:40vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:var(--gp-r-lg);font-size:var(--text-xs);color:rgb(var(--c-text))}
   header,.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}header{justify-content:space-between}
+  .inbox-title{display:inline-flex;align-items:center;gap:8px}.inbox-logo{display:inline-flex;flex-shrink:0}
   p{margin:6px 0;color:rgb(var(--c-text-muted))}
   /* Lips tuck under the card by its padding only, so the title never sits on another card. */
   .pile{position:relative;display:flex;flex-direction:column;gap:8px;margin-top:8px}
@@ -164,7 +169,7 @@
   .peek{position:absolute;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);bottom:calc((2 - var(--depth)) * 8px)}
   .pile + button{margin-top:8px}
   /* The summary takes the slack so the dismiss control sits at the row's end, after Open. */
-  .summary{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}
+  .summary{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0;overflow-wrap:anywhere}
   .summary strong{font-weight:500}
   .summary span{color:rgb(var(--c-text-muted))}
   details{margin:8px 0}

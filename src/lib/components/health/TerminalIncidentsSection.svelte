@@ -16,7 +16,10 @@
     reopenAllSessionLedgerOffers,
     reopenBannerHeading,
     reopenSessionLedgerOffer,
+    LEDGER_UNRECONCILED_TEXT,
+    offerRows,
     reopenableOffers,
+    topLevelOffers,
     sessionLedgerStore,
     subscribeSessionLedger,
     watchTerminalIncidents,
@@ -39,7 +42,8 @@
   let ledgerRowErrors = $state<Record<string, string>>({});
 
   const ledgerOffers = $derived($sessionLedgerStore.offers);
-  const ledgerReopenable = $derived(reopenableOffers(ledgerOffers));
+  const ledgerUnreconciled = $derived($sessionLedgerStore.reconcile_pending === true);
+  const ledgerReopenable = $derived(reopenableOffers(topLevelOffers(ledgerOffers)));
 
   function failureLine(verb: string, object: string, cause: unknown): string {
     const failure = describeFailure({ verb, object }, cause);
@@ -121,6 +125,9 @@
       <div class="min-w-0 flex-1">{loadError}</div>
     </div>
   {/if}
+  {#if ledgerUnreconciled}
+    <div class="gp-notice mb-3" data-tone="unknown" role="status" data-testid="health-ledger-unreconciled">{LEDGER_UNRECONCILED_TEXT}</div>
+  {/if}
   {#if ledgerOffers.length > 0}
     <div class="mb-3 space-y-2" data-testid="health-session-ledger">
       <div class="flex items-center justify-between gap-2 flex-wrap">
@@ -141,9 +148,9 @@
         {/if}
       </div>
       <ul class="space-y-1.5">
-        {#each previewSlice(ledgerOffers, ledgerExpanded, LIST_PREVIEW_ROWS) as offer (offer.row_id)}
+        {#each previewSlice(offerRows(ledgerOffers), ledgerExpanded, LIST_PREVIEW_ROWS) as { offer, child } (offer.row_id)}
           {@const rowErr = ledgerRowErrors[offer.row_id] ?? offer.last_error ?? (offer.end_state !== "unreadable" && offer.launcher !== "shell" && !offer.resumable ? offer.reason : null)}
-          <li class="rounded-xl border border-edge bg-surface px-3 py-2 text-meta" data-testid="health-ledger-row" data-end-state={offer.end_state}>
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2 text-meta" class:ml-4={child} data-child={child ? "true" : undefined} data-testid="health-ledger-row" data-end-state={offer.end_state}>
             <div class="flex items-start justify-between gap-2">
               <div class="min-w-0 flex-1 space-y-0.5">
                 <div class="flex items-center gap-1.5 flex-wrap">
@@ -227,7 +234,7 @@
       {/each}
     </ul>
     <ListPreviewToggle total={incidents.length} noun="incidents" bind:expanded />
-  {:else if loaded && !loadError && ledgerOffers.length === 0}
+  {:else if loaded && !loadError && ledgerOffers.length === 0 && !ledgerUnreconciled}
     <EmptyState
       icon={ShieldCheck}
       title="No terminal sessions ended from outside"

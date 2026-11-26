@@ -88,6 +88,17 @@ describe("RepoMapPanel", () => {
     expect(source).toContain("mapFailureMode");
   });
 
+  it("shows a status deferred under load as deferred, with the last good index, not as a missing tool", () => {
+    expect(source).toContain("isStatusDeferred(cliStatus)");
+    expect(source).toContain("deferredStripText(cliStatus.deferral)");
+    expect(source).toContain('data-testid="map-status-deferred"');
+    expect(source).toContain('data-testid="map-status-last-good"');
+    // The Setup notice and the Build block follow `cliKnownAbsent`, which a
+    // deferral does not set.
+    expect(source).toContain("{#if cliKnownAbsent}");
+    expect(source).toContain('case "deferred":');
+  });
+
   it("keys dead-symbol and path lists with an index so map duplicates cannot crash the pane", () => {
     // preferredDeadLists dedupes, and the template still suffixes `#${i}` —
     // either layer alone is enough; both stay so a regression in one cannot

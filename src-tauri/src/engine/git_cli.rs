@@ -309,10 +309,16 @@ fn refuse_nested_gitdir_below_capped(
     while let Some((dir, depth)) = pending.pop() {
         if is_git_directory(&dir) {
             let inside = dir.strip_prefix(abs).unwrap_or(Path::new(""));
-            let at = Path::new(path).join(inside);
+            // `path` is a repository path, which git spells with `/` on every
+            // platform; `Path::join` would append the platform's separator.
+            let below: Vec<_> = inside
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect();
             return Err(format!(
-                "{path} contains the git directory of a nested repository at {}",
-                at.display()
+                "{path} contains the git directory of a nested repository at {}/{}",
+                path.trim_end_matches('/'),
+                below.join("/")
             ));
         }
         let entries = std::fs::read_dir(&dir).map_err(|e| {
@@ -764,6 +770,14 @@ pub(crate) const PINNED_GIT_CONFIG: &[&str] = &[
     // status read, and `normal` collapses a new directory to `dir/`. Both make
     // a file another worktree is holding invisible to a collision check.
     "status.showUntrackedFiles=all",
+    // Apple Git's `fsmonitor--daemon` lacks `pthread_cond_timedwait` and hangs
+    // indefinitely in `_pthread_cond_wait` when FSEvents drops or delays cookie
+    // notifications under memory pressure; any git subcommand (`status`, `diff`,
+    // `ls-files`, `stash`, etc.) attaching to `.git/fsmonitor--daemon.ipc` then
+    // stalls for the full 90s timeout, and fsmonitor cookie files defeat macOS
+    // `PollSkip`. Pinning `core.fsmonitor=false` bypasses the IPC socket on all
+    // spawned git commands.
+    "core.fsmonitor=false",
 ];
 
 /// The one porcelain status read: NUL-separated records, raw UTF-8 paths, and
@@ -800,11 +814,42 @@ const TEXTCONV_SUBCOMMANDS: &[&str] = &["diff", "show", "log", "blame"];
 /// out of every bulk format string by a source-scan test.
 const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
 
+#[cfg(test)]
+thread_local! {
+    static TEST_GIT_PATH: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Current thread-local test `PATH` override for helpers that hop threads.
+#[cfg(test)]
+pub(crate) fn current_test_git_path() -> Option<std::ffi::OsString> {
+    TEST_GIT_PATH.with(|slot| slot.borrow().clone())
+}
+
+/// Overrides `PATH` for `git_command` on the current thread only, restoring on drop.
+#[cfg(test)]
+pub(crate) fn with_test_git_path<T>(path: &std::ffi::OsStr, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<std::ffi::OsString>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_GIT_PATH.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = TEST_GIT_PATH.with(|slot| slot.borrow_mut().replace(path.to_os_string()));
+    let _reset = Reset(prev);
+    f()
+}
+
 /// Reads `PATH`/`HOME` from the process and defers to
 /// [`git_command_with_env`], mirroring the [`capture_command`] /
 /// [`capture_command_with_env`] split so the environment stays injectable for
 /// tests instead of being read from under them.
 fn git_command(repo: Option<&Path>, args: &[&str]) -> Command {
+    #[cfg(test)]
+    let path_var = TEST_GIT_PATH
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| std::env::var_os("PATH"));
+    #[cfg(not(test))]
     let path_var = std::env::var_os("PATH");
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     git_command_with_env(repo, args, path_var.as_deref(), home.as_deref())
@@ -843,7 +888,11 @@ fn git_command_with_env(
     // The pinned config goes ahead of the caller's arguments, so a `-c` the
     // caller passes itself still wins; `--no-ext-diff` goes right after the
     // subcommand of a patch-printing command.
+    let is_config_cmd = subcommand_index(args).is_some_and(|at| args[at] == "config");
     for pin in PINNED_GIT_CONFIG {
+        if is_config_cmd && *pin == "core.fsmonitor=false" {
+            continue;
+        }
         cmd.args(["-c", pin]);
     }
     match subcommand_index(args) {

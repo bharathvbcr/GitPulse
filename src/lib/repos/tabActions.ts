@@ -113,7 +113,7 @@ export interface TabActionsDeps {
   hydration: Pick<
     ReturnType<typeof createHydrationController>,
     "resolvePath" | "resolvedFields" | "snapshotIsFresh" | "hydrate"
-  >;
+  > & Partial<Pick<ReturnType<typeof createHydrationController>, "cancelStatus">>;
   statusPoller: Pick<
     ReturnType<typeof createStatusPoller>,
     "ensure" | "stop" | "rearm" | "resetDuration"
@@ -256,6 +256,7 @@ export function createTabActions(deps: TabActionsDeps) {
   }
 
   async function releaseSession(id: string, path: string | null): Promise<void> {
+    hydration.cancelStatus?.(id);
     sessionBook.forget(id, path);
     if (path === null) return;
     const stillOpen = Object.values(deps.getInternal().sessions).some((other) =>
@@ -586,7 +587,7 @@ export function createTabActions(deps: TabActionsDeps) {
     }
     deps.syncFilterFromSession(session);
     const activation = deps.bumped(session);
-    deps.putSession({ ...activation, isLoading: !session.hasHydrated });
+    deps.putSession({ ...activation, isLoading: !session.hasHydrated, error: null });
     deps.publish();
     deps.revealGraph(activation);
     const refreshOwed = watchCoordinator.refreshOwedFor(session.path);

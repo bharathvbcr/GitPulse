@@ -14,7 +14,8 @@ use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
     acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
-    session_transcript, spawn_session, OutputSink, TerminalSessions, TranscriptRead, RING_BYTES,
+    session_transcript, spawn_session, KillOrigin, OutputSink, TerminalSessions, TranscriptRead,
+    RING_BYTES,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -22,6 +23,15 @@ use std::time::{Duration, Instant};
 use tauri::Listener;
 
 mod common;
+
+// Floods write 4 MiB+ through the shared ptyd host; serialize tests within this
+// integration binary so `--test-threads=8` does not contend on one PTY daemon.
+static SERIAL: Mutex<()> = Mutex::new(());
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
@@ -220,6 +230,7 @@ fn settled_count(counter: &AtomicUsize, hold: Duration, within: Duration) -> Opt
 /// "renderer did not acknowledge output" and this exit arrived.
 #[test]
 fn a_view_that_stops_acknowledging_does_not_end_the_session() {
+    let _serial = serial();
     let view = View::new(Duration::from_millis(200));
     let _cleanup = TerminalCleanup(view.state.clone());
     let dir = repo();
@@ -259,7 +270,7 @@ fn a_view_that_stops_acknowledging_does_not_end_the_session() {
         0,
         "with no detach, every acknowledgement is exact"
     );
-    kill_session(&view.state, &id).unwrap();
+    kill_session(&view.state, &id, KillOrigin::Unspecified).unwrap();
     let exit = view.exits.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(exit["id"], id.as_str());
     assert!(wait_until(Duration::from_secs(2), || !alive(pid)));
@@ -269,6 +280,7 @@ fn a_view_that_stops_acknowledging_does_not_end_the_session() {
 /// listed as detached; a new view takes it over and is delivered to again.
 #[test]
 fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
+    let _serial = serial();
     let view = View::new(Duration::from_millis(200));
     let _cleanup = TerminalCleanup(view.state.clone());
     let dir = repo();
@@ -321,7 +333,7 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
     assert!(detach_session(&view.state, &id).unwrap());
     assert!(detach_session(&view.state, &id).unwrap());
     assert!(!detach_session(&view.state, "term-missing").unwrap());
-    kill_session(&view.state, &id).unwrap();
+    kill_session(&view.state, &id, KillOrigin::Unspecified).unwrap();
     assert!(wait_until(Duration::from_secs(2), || !alive(pid)));
     assert!(!detach_session(&view.state, &id).unwrap());
 }
@@ -331,6 +343,7 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
 /// was not closed, and closing everything frees every slot.
 #[test]
 fn stalls_detaches_and_attaches_under_load_never_end_a_session() {
+    let _serial = serial();
     const SESSIONS: usize = 12;
     let view = View::new(Duration::from_millis(50));
     let _cleanup = TerminalCleanup(view.state.clone());
@@ -390,6 +403,7 @@ fn transcript_ends_with(state: &TerminalSessions, id: &str, suffix: &[u8]) -> bo
 /// notice.
 #[test]
 fn detached_non_repainting_output_under_ring_replays_exact_bytes_without_loss() {
+    let _serial = serial();
     const PAYLOAD_FILL: usize = 16 * 1024;
     let view = View::new(Duration::from_secs(2));
     let _cleanup = TerminalCleanup(view.state.clone());
@@ -474,7 +488,7 @@ fn detached_non_repainting_output_under_ring_replays_exact_bytes_without_loss() 
     );
     drop(losses);
 
-    kill_session(&view.state, &spawned.id).unwrap();
+    kill_session(&view.state, &spawned.id, KillOrigin::Unspecified).unwrap();
 }
 
 /// S2-11 (past RING_BYTES): when detached output overflows the ring, reattach
@@ -482,6 +496,7 @@ fn detached_non_repainting_output_under_ring_replays_exact_bytes_without_loss() 
 /// `"Output while detached was not kept"` `terminal-loss` event.
 #[test]
 fn detached_non_repainting_output_past_ring_replays_tail_and_emits_loss() {
+    let _serial = serial();
     let blocks = (RING_BYTES / 65_536) + 2;
     let view = View::new(Duration::from_secs(2));
     let _cleanup = TerminalCleanup(view.state.clone());
@@ -563,5 +578,5 @@ fn detached_non_repainting_output_past_ring_replays_tail_and_emits_loss() {
     assert_eq!(tail, marker);
     assert!(prefix.iter().all(|b| *b == b'x'));
 
-    kill_session(&view.state, &spawned.id).unwrap();
+    kill_session(&view.state, &spawned.id, KillOrigin::Unspecified).unwrap();
 }

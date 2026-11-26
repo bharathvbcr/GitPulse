@@ -1,6 +1,9 @@
 GitPulse
 Copyright (c) 2026 Bharath Chandra Vaddaram
 
+This software is dual-licensed under your option of either the MIT License
+(LICENSE-MIT) or the Apache License, Version 2.0 (LICENSE-APACHE).
+
 Third-Party Notices & Vendored Upstream Projects
 ------------------------------------------------
 GitPulse includes patched/vendored Rust framework crates under `src-tauri/framework/`
@@ -47,4 +50,4 @@ and builds on the following open-source projects:
    its upstream.
 
 The GitPulse name and logo are trademarks of Bharath Chandra Vaddaram and are not
-licensed under the MIT License. See TRADEMARKS.md.
+licensed under the MIT or Apache-2.0 licenses. See TRADEMARKS.md.

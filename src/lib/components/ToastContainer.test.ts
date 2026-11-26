@@ -54,6 +54,16 @@ describe("ToastContainer", () => {
     expect(pile).not.toContain("peek");
     expect(pile).toContain("Only notice");
   });
+
+  it("renders the current GitPulse badge Logo inside aria-hidden without trapping interactive buttons", () => {
+    toastStore.info("Build finished", { label: "Inspect", onClick: () => {} });
+    const { body } = render(ToastContainer);
+    const pile = body.slice(body.indexOf('data-testid="toast-pile"'));
+    expect(pile).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
+    expect(pile).toMatch(/<circle[^>]*cx="24\.04"[^>]*cy="9\.25"[^>]*r="2\.9"/);
+    expect(pile).toMatch(/id="gp-[a-z0-9]+-badge"/);
+    expect(pile).toMatch(/<div[^>]*aria-hidden="true"[^>]*>[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
+  });
 });
 
 describe("the live region exists before the content lands in it", () => {

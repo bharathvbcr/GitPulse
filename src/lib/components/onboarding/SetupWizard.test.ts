@@ -58,4 +58,10 @@ describe("SetupWizard dialog accessibility", () => {
     // Still gated on the ladder; SO-2 added "while any tool is installing" in front.
     expect(source).toMatch(/disabled=\{\$installing !== null \|\|\s+!\$ladder \|\|/);
   });
+
+  it("displays Manvi's BrandMark in the wizard header and manvi tool selector", () => {
+    expect(source).toContain('import BrandMark from "../BrandMark.svelte"');
+    expect(source).toMatch(/\{#if \$wizard\.tool === "manvi"\}\s*<BrandMark mark="manvi"/);
+    expect(source).toMatch(/\{#if t === "manvi"\}\s*<BrandMark mark="manvi"/);
+  });
 });

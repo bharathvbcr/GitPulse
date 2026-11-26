@@ -73,7 +73,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -477,7 +477,7 @@ const PROBE_FRESH: Duration = Duration::from_secs(2);
 /// Status probes in flight at once across every repository. A probe that hangs
 /// holds a thread for up to [`cli::STATUS_DEADLINE`]; this is what keeps a
 /// restore of many tabs from holding one each.
-const PROBE_LIMIT: usize = 4;
+pub(crate) const PROBE_LIMIT: usize = 4;
 
 /// What [`start_refresh`] knows about the `devmap status` probe of one repository.
 enum ProbeSlot {
@@ -609,6 +609,7 @@ fn run_probe(repo_path: &str, id: u64, answer: &mpsc::Sender<CliStatus>) {
                     lookup: None,
                     reason: Some("the devmap status probe thread panicked".into()),
                     status: None,
+                    deferral: None,
                 },
             );
             resume_unwind(payload);
@@ -960,6 +961,73 @@ pub struct LiveRefreshOutcome {
     pub artifacts_restored: bool,
 }
 
+/// What a live refresh amounted to for a caller that must say whether the
+/// index is now current: a stable, serialisable reading of
+/// [`LiveRefreshOutcome`], so a one-shot CLI or tool answers with one name
+/// instead of re-deriving it from `decision`, `build` and `facts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveRefreshKind {
+    /// A build ran and succeeded within its deadline.
+    Built,
+    /// The store was already current; nothing needed building.
+    Fresh,
+    /// The spawn gate shed the probe or the build under load, or the probe had
+    /// not answered: the index was not examined or not refreshed.
+    Deferred,
+    /// Automatic builds for this repository were paused (a cooldown or a
+    /// too-slow rest); nothing was built.
+    CooledDown,
+    /// Another build (or a daemon rebuild, or a background build still
+    /// running) owns the index; this ask built nothing.
+    Busy,
+    /// The build failed, timed out or could not run, or the index cannot be
+    /// brought current (no `devmap`, an outdated schema).
+    Failed,
+}
+
+impl LiveRefreshKind {
+    /// The wire name (`built`, `fresh`, `deferred`, `cooled_down`, `busy`,
+    /// `failed`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::Fresh => "fresh",
+            Self::Deferred => "deferred",
+            Self::CooledDown => "cooled_down",
+            Self::Busy => "busy",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether the index is known to match the tree after this refresh. Only
+    /// `Built` and `Fresh` are; every other kind leaves it possibly stale.
+    pub fn index_is_current(self) -> bool {
+        matches!(self, Self::Built | Self::Fresh)
+    }
+}
+
+impl LiveRefreshOutcome {
+    /// This outcome as a [`LiveRefreshKind`].
+    pub fn kind(&self) -> LiveRefreshKind {
+        match self.decision {
+            LiveRefreshDecision::Refresh => match &self.build {
+                Some(build) if build.ok && !build.timed_out => LiveRefreshKind::Built,
+                _ => LiveRefreshKind::Failed,
+            },
+            LiveRefreshDecision::SkipFresh => LiveRefreshKind::Fresh,
+            LiveRefreshDecision::SkipDeferred => LiveRefreshKind::Deferred,
+            LiveRefreshDecision::SkipCooldown => LiveRefreshKind::CooledDown,
+            LiveRefreshDecision::SkipBuilding
+            | LiveRefreshDecision::SkipDaemon
+            | LiveRefreshDecision::Started => LiveRefreshKind::Busy,
+            LiveRefreshDecision::SkipSchemaOutdated | LiveRefreshDecision::SkipUnavailable => {
+                LiveRefreshKind::Failed
+            }
+        }
+    }
+}
+
 /// Serde mirror of [`LiveRefreshFacts`] for the command boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveRefreshFactsDto {
@@ -1092,13 +1160,46 @@ pub fn start_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
 /// own build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeededRefresh {
-    /// A long-lived process (the app, `gitpulse-mcp`): the build runs on a
-    /// supervised background thread and this returns at once.
+    /// A long-lived process (the app, `gitpulse-mcp` serving): the build runs
+    /// on a supervised background thread and this returns at once.
+    ///
+    /// In a process that declared itself short-lived
+    /// ([`run_process_short_lived`]) this runs as [`SeededRefresh::Inline`]:
+    /// the one-shot `gitpulse-mcp call` reaches the same handlers as the
+    /// server, which ask for `Background`, and exits through `reap_all`,
+    /// which would kill the detached build or never let it start.
     Background,
-    /// A short-lived process (the `gitpulse-worktree` CLI), whose background
-    /// thread would die with it: the build runs here, within the build
-    /// deadline.
+    /// A short-lived process (the `gitpulse-worktree` CLI, a one-shot
+    /// `gitpulse-mcp` command), whose background thread would die with it:
+    /// the build runs here, within the build deadline.
     Inline,
+}
+
+/// Set once by a process that exits when its command returns.
+static SHORT_LIVED_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// Declares this process short-lived: it exits when its one command returns,
+/// taking any background thread and child with it. From then on
+/// [`refresh_seeded_worktree`] builds inline whatever its caller asked for, so
+/// a shared handler (an MCP tool) need not know which kind of process runs it.
+/// The server keeps `Background`; only the one-shot path calls this.
+pub fn run_process_short_lived() {
+    SHORT_LIVED_PROCESS.store(true, Ordering::Release);
+}
+
+/// Whether [`run_process_short_lived`] has been called in this process.
+pub fn process_is_short_lived() -> bool {
+    SHORT_LIVED_PROCESS.load(Ordering::Acquire)
+}
+
+/// What a seeding caller's request becomes in a process that is (or is not)
+/// short-lived: a background build would not outlive such a process.
+fn effective_seeded_run(run: SeededRefresh, short_lived: bool) -> SeededRefresh {
+    if short_lived {
+        SeededRefresh::Inline
+    } else {
+        run
+    }
 }
 
 /// Bring a worktree whose DevMap store was just seeded (cloned from its main
@@ -1116,7 +1217,13 @@ pub enum SeededRefresh {
 /// against ~7.6 s for the cold build a missing store costs). Every seeding
 /// path calls this rather than its own build.
 pub fn refresh_seeded_worktree(path: &str, run: SeededRefresh) -> LiveRefreshOutcome {
-    let outcome = match run {
+    refresh_seeded(path, run, SHORT_LIVED_PROCESS.load(Ordering::Acquire))
+}
+
+/// [`refresh_seeded_worktree`] with the process's lifetime given, so a test
+/// states it without flipping a flag every other test in the process reads.
+fn refresh_seeded(path: &str, run: SeededRefresh, short_lived: bool) -> LiveRefreshOutcome {
+    let outcome = match effective_seeded_run(run, short_lived) {
         SeededRefresh::Background => start_refresh(path, false),
         SeededRefresh::Inline => maybe_refresh(path, false),
     };
@@ -2131,6 +2238,7 @@ mod tests {
                 "schema_outdated": false,
                 "generation_id": 3,
             })),
+            deferral: None,
         };
         assert_eq!(freshness_from_cli_status(&status), (true, false, true));
 
@@ -2143,6 +2251,7 @@ mod tests {
                 "is_fresh": false,
                 "schema_outdated": true,
             })),
+            deferral: None,
         };
         assert_eq!(freshness_from_cli_status(&outdated), (true, false, false));
 
@@ -2152,6 +2261,7 @@ mod tests {
             lookup: None,
             reason: Some("no binary".into()),
             status: None,
+            deferral: None,
         };
         assert_eq!(freshness_from_cli_status(&missing), (false, false, false));
     }
@@ -2185,6 +2295,7 @@ mod tests {
                 lookup: None,
                 reason: None,
                 status: Some(payload.clone()),
+                deferral: None,
             };
             let (available, is_fresh, schema_ok) = freshness_from_cli_status(&status);
             assert!(
@@ -4164,6 +4275,41 @@ exit 2
         }
     }
 
+    /// A one-shot process exits when its command returns, so a seeded refresh
+    /// asked for in the background must run to completion before the call
+    /// returns (feat/mcp-cli review, finding 1). A long-lived process keeps
+    /// the background build.
+    #[test]
+    #[cfg(unix)]
+    fn a_short_lived_process_builds_a_seeded_refresh_inline() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(600);
+        // The stub finishes at once: the build is observable as done on return.
+        std::fs::write(fixture.stub_dir.path().join("release"), "").unwrap();
+        let outcome = refresh_seeded(
+            fixture.wt.to_str().unwrap(),
+            SeededRefresh::Background,
+            true,
+        );
+        assert_ne!(
+            outcome.decision,
+            LiveRefreshDecision::Started,
+            "a short-lived process must not detach the build: {outcome:?}"
+        );
+        assert!(
+            outcome.build.is_some(),
+            "the outcome must carry the finished build: {outcome:?}"
+        );
+        fixture.assert_idle();
+        assert_eq!(
+            effective_seeded_run(SeededRefresh::Background, false),
+            SeededRefresh::Background,
+            "a long-lived process keeps the background build"
+        );
+        fixture.finish();
+    }
+
     /// Removing a worktree moments after it was created used to race the
     /// seeded background refresh: the build kept writing `.devcouncil/` into
     /// the directory being deleted, and the delete failed "Directory not
@@ -4736,5 +4882,89 @@ exit 2
         );
         holder.release_and_reap();
         fixture.finish();
+    }
+
+    /// A refresh outcome is only "current" when it built or found the store
+    /// fresh; a deferral, cooldown, busy or failed refresh never is (card
+    /// ft-63446aee).
+    #[test]
+    fn a_refresh_outcome_is_current_only_when_it_built_or_was_fresh() {
+        let with = |decision, build: Option<cli::BuildOutcome>| LiveRefreshOutcome {
+            decision,
+            build,
+            ..skip_deferred_outcome(UNEXAMINED, "gate".into())
+        };
+        let build = |ok, timed_out| cli::BuildOutcome {
+            ok,
+            binary: "devmap".into(),
+            lookup: cli::DevmapLookup::TestOverride,
+            exit_code: Some(i32::from(!ok)),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out,
+            report: None,
+        };
+        let cases = [
+            (
+                with(LiveRefreshDecision::Refresh, Some(build(true, false))),
+                LiveRefreshKind::Built,
+            ),
+            (
+                with(LiveRefreshDecision::Refresh, Some(build(false, false))),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::Refresh, Some(build(true, true))),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::Refresh, None),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::SkipFresh, None),
+                LiveRefreshKind::Fresh,
+            ),
+            (
+                skip_deferred_outcome(UNEXAMINED, "shed".into()),
+                LiveRefreshKind::Deferred,
+            ),
+            (
+                skip_cooldown_outcome(Duration::from_secs(5), WaitKind::Echo),
+                LiveRefreshKind::CooledDown,
+            ),
+            (
+                with(LiveRefreshDecision::SkipBuilding, None),
+                LiveRefreshKind::Busy,
+            ),
+            (
+                with(LiveRefreshDecision::SkipDaemon, None),
+                LiveRefreshKind::Busy,
+            ),
+            (
+                with(LiveRefreshDecision::Started, None),
+                LiveRefreshKind::Busy,
+            ),
+            (
+                with(LiveRefreshDecision::SkipUnavailable, None),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::SkipSchemaOutdated, None),
+                LiveRefreshKind::Failed,
+            ),
+        ];
+        for (outcome, want) in cases {
+            assert_eq!(outcome.kind(), want, "{:?}", outcome.decision);
+            assert_eq!(
+                want.index_is_current(),
+                matches!(want, LiveRefreshKind::Built | LiveRefreshKind::Fresh)
+            );
+        }
+        assert_eq!(LiveRefreshKind::CooledDown.as_str(), "cooled_down");
+        assert_eq!(
+            serde_json::to_value(LiveRefreshKind::CooledDown).unwrap(),
+            serde_json::json!("cooled_down")
+        );
     }
 }

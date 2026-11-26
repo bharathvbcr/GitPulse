@@ -37,13 +37,21 @@ const DEADLINE_STRIDE: usize = 4096;
 pub(crate) fn collect(root: Node, source: &str) -> Vec<JsObjectFact> {
     let mut facts = Vec::new();
     let mut tracked: HashSet<String> = HashSet::new();
-    if !walk(root, |node| {
-        if node.kind() == "variable_declarator" {
+    if !walk(root, |node| match node.kind() {
+        "variable_declarator" => {
             if let Some(fact) = declaration_fact(node, source) {
                 tracked.insert(fact.name.clone());
                 facts.push(fact);
+            } else if let Some(fact) = const_factory_fact(node, source) {
+                facts.push(fact);
             }
         }
+        "function_declaration" | "generator_function_declaration" => {
+            if let Some(fact) = function_factory_fact(node, source) {
+                facts.push(fact);
+            }
+        }
+        _ => {}
     }) {
         return Vec::new();
     }
@@ -584,6 +592,316 @@ fn object_parts(object: Node, source: &str, owned: bool, depth: usize) -> Vec<Js
         }
     }
     parts
+}
+
+/// A module-level `function createStore() { ... return { ... }; }` or
+/// `function createStore() { const store = { ... }; return store; }`.
+///
+/// Recorded under `"<name>()"` (cannot collide with any JS identifier) only
+/// when the factory has a single unconditional return of one object literal (or
+/// one unmodified/tracked local `const` object literal), so multi-branch
+/// factories abstain soundly.
+fn function_factory_fact(function: Node, source: &str) -> Option<JsObjectFact> {
+    if !is_module_level(function) {
+        return None;
+    }
+    let name = function
+        .child_by_field_name("name")
+        .filter(|n| n.kind() == "identifier")?;
+    let body = function.child_by_field_name("body")?;
+    let parts = factory_body_parts(body, source)?;
+    Some(JsObjectFact {
+        name: format!("{}()", text(name, source)),
+        start_byte: function.start_byte(),
+        declaration: true,
+        in_callable: false,
+        conditional: false,
+        alias_of: None,
+        parts,
+    })
+}
+
+/// A module-level `const createStore = () => ({ ... })` or
+/// `const createStore = () => { return { ... }; }` (or `function() { ... }`).
+fn const_factory_fact(declarator: Node, source: &str) -> Option<JsObjectFact> {
+    if !is_module_level(declarator) {
+        return None;
+    }
+    let is_const = declarator
+        .parent()
+        .filter(|parent| parent.kind() == "lexical_declaration")
+        .and_then(|parent| parent.child(0))
+        .is_some_and(|keyword| keyword.kind() == "const");
+    if !is_const {
+        return None;
+    }
+    let name = declarator
+        .child_by_field_name("name")
+        .filter(|n| n.kind() == "identifier")?;
+    let value = unwrap(declarator.child_by_field_name("value")?);
+    if !matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    ) {
+        return None;
+    }
+    let body = value.child_by_field_name("body")?;
+    let parts = factory_body_parts(body, source)?;
+    Some(JsObjectFact {
+        name: format!("{}()", text(name, source)),
+        start_byte: declarator.start_byte(),
+        declaration: true,
+        in_callable: false,
+        conditional: false,
+        alias_of: None,
+        parts,
+    })
+}
+
+fn factory_body_parts(body: Node, source: &str) -> Option<Vec<JsObjectPart>> {
+    let unwrapped = unwrap(body);
+    if unwrapped.kind() == "object" {
+        return Some(object_parts(unwrapped, source, true, 0));
+    }
+    if unwrapped.kind() != "statement_block" {
+        return None;
+    }
+    // Collect every `return_statement` belonging directly to this factory (do
+    // not cross into nested functions, arrows, methods, or classes).
+    let mut returns = Vec::new();
+    let mut stack = vec![unwrapped];
+    while let Some(node) = stack.pop() {
+        if node.id() != unwrapped.id()
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "generator_function_declaration"
+                    | "function_expression"
+                    | "generator_function"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "class"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "return_statement" {
+            returns.push(node);
+            continue;
+        }
+        push_named_children(node, &mut stack);
+    }
+    let [ret_stmt] = returns.as_slice() else {
+        return None;
+    };
+    let ret_expr = unwrap(ret_stmt.named_child(0)?);
+    if ret_expr.kind() == "object" {
+        let mut parts = object_parts(ret_expr, source, true, 0);
+        rewrite_local_factory_spreads(unwrapped, &mut parts, ret_stmt.start_byte(), source);
+        return Some(parts);
+    }
+    if ret_expr.kind() != "identifier" {
+        return None;
+    }
+    let local_name = text(ret_expr, source);
+    // Find a unique direct `const <local_name> = { ... }` in `unwrapped`.
+    let mut cursor = unwrapped.walk();
+    let mut matching_decls = Vec::new();
+    for stmt in unwrapped.named_children(&mut cursor) {
+        if stmt.kind() != "lexical_declaration"
+            || !stmt.child(0).is_some_and(|kw| kw.kind() == "const")
+        {
+            continue;
+        }
+        let mut dcursor = stmt.walk();
+        for child in stmt.named_children(&mut dcursor) {
+            if child.kind() != "variable_declarator" {
+                continue;
+            }
+            if child
+                .child_by_field_name("name")
+                .is_some_and(|n| n.kind() == "identifier" && text(n, source) == local_name)
+            {
+                matching_decls.push(child);
+            }
+        }
+    }
+    let [decl] = matching_decls.as_slice() else {
+        return None;
+    };
+    if decl.start_byte() >= ret_stmt.start_byte() {
+        return None;
+    }
+    let init = unwrap(decl.child_by_field_name("value")?);
+    if init.kind() != "object" {
+        return None;
+    }
+    let decl_name_id = decl.child_by_field_name("name")?.id();
+    let ret_expr_id = ret_expr.id();
+    let mut parts = object_parts(init, source, true, 0);
+    rewrite_local_factory_spreads(unwrapped, &mut parts, init.start_byte(), source);
+    // Audit every other occurrence of `local_name` inside the factory body:
+    // member reads (`store.foo()`) are harmless, while writes (`store.k = v`,
+    // `Object.assign(store, ...)`) or escapes (`patch(store)`) are applied or
+    // conservatively turn uncertain keys opaque/unknown.
+    let mut writes: Vec<JsObjectFact> = Vec::new();
+    if !walk(unwrapped, |node| {
+        if matches!(node.kind(), "identifier" | "shorthand_property_identifier")
+            && node.id() != decl_name_id
+            && node.id() != ret_expr_id
+            && text(node, source) == local_name
+        {
+            if let Some(fact) = occurrence_fact(node, source) {
+                writes.push(fact);
+            }
+        }
+    }) {
+        return None;
+    }
+    writes.sort_by_key(|w| w.start_byte);
+    for write in writes {
+        // Any write inside a nested callable or conditional inside the factory
+        // could overwrite those keys at an unknown time.
+        let uncertain = write.conditional || write.start_byte > ret_stmt.start_byte() || {
+            // Check whether the occurrence sits inside a callable nested inside
+            // this factory (`unwrapped`).
+            let mut inside_nested = false;
+            let mut p = unwrapped
+                .descendant_for_byte_range(write.start_byte, write.start_byte)
+                .and_then(|n| n.parent());
+            while let Some(anc) = p {
+                if anc.id() == unwrapped.id() {
+                    break;
+                }
+                if matches!(
+                    anc.kind(),
+                    "function_declaration"
+                        | "function_expression"
+                        | "function"
+                        | "generator_function"
+                        | "generator_function_declaration"
+                        | "arrow_function"
+                        | "method_definition"
+                        | "class_static_block"
+                ) {
+                    inside_nested = true;
+                    break;
+                }
+                p = anc.parent();
+            }
+            inside_nested
+        };
+        if uncertain {
+            for part in write.parts {
+                parts.push(match part {
+                    JsObjectPart::Inline(k)
+                    | JsObjectPart::Forward { key: k, .. }
+                    | JsObjectPart::Opaque(k) => JsObjectPart::Opaque(k),
+                    JsObjectPart::Spread(_) | JsObjectPart::Unknown => JsObjectPart::Unknown,
+                });
+            }
+        } else {
+            parts.extend(write.parts);
+        }
+    }
+    Some(parts)
+}
+
+/// Rewrite `JsObjectPart::Spread(local)` inside a factory's returned object
+/// literal to `JsObjectPart::Spread("<callee>()")` when `local` is a unique
+/// unmodified direct `const <local> = <callee>(...)` in `block` declared before
+/// `before_byte` (e.g. `const tabActions = createTabActions(...); return { ...tabActions }`).
+///
+/// Any write or escape of `local` inside `block` (detected via
+/// [`occurrence_fact`]) keeps the original `Spread(local)` so the resolver
+/// abstains soundly.
+fn rewrite_local_factory_spreads(
+    block: Node,
+    parts: &mut [JsObjectPart],
+    before_byte: usize,
+    source: &str,
+) {
+    for part in parts.iter_mut() {
+        let JsObjectPart::Spread(local_ref) = part else {
+            continue;
+        };
+        if local_ref.contains('.') || local_ref.ends_with("()") {
+            continue;
+        }
+        // Find all direct declarations of `local_ref` in `block`; require one
+        // `const <local_ref> = <callee>(...)` before `before_byte`.
+        let mut cursor = block.walk();
+        let mut decls = Vec::new();
+        let mut has_non_const = false;
+        for stmt in block.named_children(&mut cursor) {
+            if !matches!(stmt.kind(), "lexical_declaration" | "variable_declaration") {
+                continue;
+            }
+            let is_const = stmt.kind() == "lexical_declaration"
+                && stmt.child(0).is_some_and(|kw| kw.kind() == "const");
+            let mut dcursor = stmt.walk();
+            for child in stmt.named_children(&mut dcursor) {
+                if child.kind() != "variable_declarator" {
+                    continue;
+                }
+                if child
+                    .child_by_field_name("name")
+                    .is_some_and(|n| n.kind() == "identifier" && text(n, source) == local_ref)
+                {
+                    if is_const {
+                        decls.push(child);
+                    } else {
+                        has_non_const = true;
+                    }
+                }
+            }
+        }
+        if has_non_const {
+            continue;
+        }
+        let [decl] = decls.as_slice() else {
+            continue;
+        };
+        if decl.start_byte() >= before_byte {
+            continue;
+        }
+        let Some(init) = decl.child_by_field_name("value").map(unwrap) else {
+            continue;
+        };
+        if init.kind() != "call_expression" {
+            continue;
+        }
+        let Some(callee_name) = init
+            .child_by_field_name("function")
+            .map(unwrap)
+            .and_then(|f| reference_text(f, source))
+        else {
+            continue;
+        };
+        let Some(decl_name_id) = decl.child_by_field_name("name").map(|n| n.id()) else {
+            continue;
+        };
+        // Reject if `local_ref` is mutated or escapes anywhere in `block`.
+        let mut tainted = false;
+        if !walk(block, |node| {
+            if tainted {
+                return;
+            }
+            if matches!(node.kind(), "identifier" | "shorthand_property_identifier")
+                && node.id() != decl_name_id
+                && text(node, source) == local_ref
+                && occurrence_fact(node, source).is_some()
+            {
+                tainted = true;
+            }
+        }) || tainted
+        {
+            continue;
+        }
+        *local_ref = format!("{callee_name}()");
+    }
 }
 
 /// The static name of a property key; `None` for a computed one.

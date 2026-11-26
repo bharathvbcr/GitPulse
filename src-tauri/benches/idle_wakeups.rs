@@ -53,7 +53,7 @@ mod imp {
     use super::common::fixture::{git, trust_repo};
     use super::common::{interleave, Case, Report, Sample};
     use gitpulse_lib::terminal::{
-        acknowledge_output, kill_session, shutdown_sessions, spawn_session,
+        acknowledge_output, kill_session, shutdown_sessions, spawn_session, KillOrigin,
     };
     use std::time::{Duration, Instant};
     use tauri::Listener;
@@ -163,7 +163,7 @@ mod imp {
             let elapsed = started.elapsed();
             let after = counters();
             for id in &ids {
-                let _ = kill_session(&state, id);
+                let _ = kill_session(&state, id, KillOrigin::Unspecified);
             }
             let secs = elapsed.as_secs_f64();
             Sample::default()
@@ -321,7 +321,41 @@ mod imp {
                 .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
                 .elapsed(elapsed)
         };
+        // One quiet child through the production wait loop (`capture_command` ->
+        // `run_observed`): a `sleep` that outlives the window, so what is
+        // counted is the thread that waits for it. Its difference from the
+        // 0-session floor is the cost of one waiting child.
+        let idle_child_wait = || -> Sample {
+            let lifetime = window + Duration::from_millis(1500);
+            let seconds = format!("{}", lifetime.as_secs() + 1);
+            let waiter = std::thread::spawn(move || {
+                gitpulse_lib::engine::process::capture_command(
+                    "sleep",
+                    &[seconds.as_str()],
+                    None,
+                    Duration::from_secs(120),
+                    &[],
+                )
+            });
+            // The spawn, the fine-backoff phase and any ramp settle first.
+            std::thread::sleep(Duration::from_millis(1200));
+            let (before, started) = (counters(), Instant::now());
+            std::thread::sleep(window);
+            let (elapsed, after) = (started.elapsed(), counters());
+            let run = waiter
+                .join()
+                .expect("waiter thread")
+                .unwrap_or_else(|error| panic!("sleep: {error}", error = error.message()));
+            assert!(run.success, "the waited child did not exit cleanly");
+            let secs = elapsed.as_secs_f64();
+            Sample::default()
+                .counter("children", 1)
+                .metric(NAMES.0, after.0.saturating_sub(before.0) as f64 / secs)
+                .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
+                .elapsed(elapsed)
+        };
         let mut cases = cases;
+        cases.push(Case::new("idle 1 child wait", idle_child_wait).ungated());
         cases.push(
             Case::new("idle external_changes (hidden)", move || {
                 idle_external(false)

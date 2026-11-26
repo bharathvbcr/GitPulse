@@ -34,8 +34,13 @@ export function createChecks() {
   const results: CheckRow[] = [];
 
   /** Evaluate `assertion` here, never at the call site: a throw is this
-   * check's failure, with the error kept beside its name. */
-  function check(name: string, assertion: () => unknown): void {
+   * check's failure, with the error kept beside its name. `detail`, read only
+   * when the check fails, says what was observed: callers (healthChecks.js
+   * passes one to 16 checks) had been handing it in while this took two
+   * arguments, so a failed "scans A once" said nothing about how many scans
+   * there were. A detail that itself throws is reported as such and never
+   * hides the failure it was explaining. */
+  function check(name: string, assertion: () => unknown, detail?: () => unknown): void {
     let pass = false;
     let threw = "";
     try {
@@ -43,9 +48,17 @@ export function createChecks() {
     } catch (error) {
       threw = ` — threw ${error}`;
     }
-    results.push({ name: `${name}${threw}`, pass });
+    let observed = "";
+    if (!pass && detail) {
+      try {
+        observed = ` — observed: ${String(detail())}`;
+      } catch (error) {
+        observed = ` — detail threw ${error}`;
+      }
+    }
+    results.push({ name: `${name}${threw}${observed}`, pass });
     reportProgress(results.length, name);
-    if (!pass) throw new CheckFailed(`${name}${threw}`);
+    if (!pass) throw new CheckFailed(`${name}${threw}${observed}`);
   }
 
   /** Close the run out after any throw — a failed check, or a helper that gave

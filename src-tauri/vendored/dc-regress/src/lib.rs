@@ -76,7 +76,9 @@ pub use blast::{
 };
 pub use blob::BlobReader;
 pub use budget::{Budget, Exhausted};
-pub use change::{ChangeRefusal, ChangeSet, ChangeStatus, ChangedRange, FileChange};
+pub use change::{
+    ChangeRefusal, ChangeSet, ChangeStatus, ChangedRange, FileChange, WHOLE_FILE_END_LINE,
+};
 pub use join::{attribute, Attribution, SymbolBlame};
 pub use rank::{rank, EvidenceClass, RankInputs, Suspect, TouchedSymbol};
 pub use suspects::{suspects, DEFAULT_CONE_DEPTH};
@@ -143,6 +145,10 @@ impl BlobIdentity {
     }
 }
 
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
 /// One reason a part of the analysis could not run.
 ///
 /// Every variant names what was being attempted and why it stopped, because
@@ -200,7 +206,17 @@ pub enum Unavailable {
     /// a confident wrong answer rather than a cautious one. Each range is
     /// listed individually in [`blast::BlastReport::unattributed`] with its
     /// own reason; this is the one-line summary that flips `complete`.
-    ChangeUnattributed { ranges: usize, lines: u64 },
+    ///
+    /// `lines` counts only ranges whose length is known. A whole-file range
+    /// whose file could not be read stays unbounded (`end_line` is `null` in
+    /// `unattributed`) and is counted in `lines_unknown_ranges` instead of
+    /// contributing a sentinel-sized number to `lines`.
+    ChangeUnattributed {
+        ranges: usize,
+        lines: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        lines_unknown_ranges: usize,
+    },
     /// The change spanned more files than one analysis reads.
     ChangedFilesCapped { considered: usize, cap: usize },
     /// The change touched more symbols than one walk is seeded with, so the
@@ -271,11 +287,22 @@ impl Unavailable {
             Unavailable::ChangeUnreadable { reason } => {
                 format!("the change could not be read: {reason}")
             }
-            Unavailable::ChangeUnattributed { ranges, lines } => format!(
-                "{lines} changed line(s) in {ranges} range(s) landed in no symbol the graph \
-                 declares — module-level code has no inbound edges to walk, so the impact \
-                 below is a lower bound"
-            ),
+            Unavailable::ChangeUnattributed {
+                ranges,
+                lines,
+                lines_unknown_ranges,
+            } => {
+                let unknown = if *lines_unknown_ranges > 0 {
+                    format!(" ({lines_unknown_ranges} of them to an unknown end of file)")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{lines} changed line(s) in {ranges} range(s){unknown} landed in no symbol \
+                     the graph declares — module-level code has no inbound edges to walk, so \
+                     the impact below is a lower bound"
+                )
+            }
             Unavailable::ChangedFilesCapped { considered, cap } => format!(
                 "the change spans more than {cap} files ({considered} seen); only the first \
                  {cap} were read"

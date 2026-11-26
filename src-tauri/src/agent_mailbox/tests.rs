@@ -825,7 +825,7 @@ fn mark_claimed_by_id_and_hop_filter_preserve_exact_delivery_invariants() {
 }
 
 #[test]
-fn a_waiter_claims_through_the_filter_it_peeked_with_so_a_hop_limited_message_stays_pending() {
+fn a_waiter_claims_through_its_filter_so_a_hop_limited_message_stays_pending() {
     let (_dir, mailbox) = mailbox();
     let now = SystemTime::now();
     let peer = |id: &str, hop: u32| EnvelopeProvenance::PeerAgent {
@@ -839,8 +839,8 @@ fn a_waiter_claims_through_the_filter_it_peeked_with_so_a_hop_limited_message_st
         truncated_in_bus: false,
         repo_root: "/tmp/repo".into(),
     };
-    // The oldest envelope has lost its sidecar, so the peek lets it through and the claim
-    // drops it; the next one is a peer message at its hop limit.
+    // The oldest envelope has lost its sidecar, so the claim drops it (an unreadable origin is
+    // not a refusal); the next one is a peer message at its hop limit.
     mailbox
         .deposit_with_provenance(SESSION, "lost-2", "no provenance", peer("lost-2", 1), now)
         .unwrap();
@@ -1176,5 +1176,524 @@ fn has_unclaimed_takes_no_lock_and_sees_only_pending_envelopes() {
     assert!(
         mailbox.has_unclaimed("not a session").is_err(),
         "an invalid session key is an error, not an empty mailbox"
+    );
+}
+
+#[test]
+fn system_steward_deposits_supersede_older_unclaimed_directives_without_filling_mailbox() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for tick in 0..(MAX_PENDING + 4) {
+        let req_id = format!("steward-tick-{tick}");
+        mailbox
+            .deposit_with_provenance(
+                SESSION,
+                &req_id,
+                &format!("directive #{tick}"),
+                EnvelopeProvenance::SystemSteward {
+                    msg_id: req_id.clone(),
+                    model: "claude-sonnet-4-6".into(),
+                    mode: "cloud".into(),
+                    tier: "severe".into(),
+                    binding: "memory_pressure".into(),
+                    repo_root: String::new(),
+                    bus_seq: tick as u64 + 1,
+                },
+                now + Duration::from_secs(tick as u64),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        mailbox.pending(SESSION),
+        1,
+        "only the latest unclaimed steward directive should remain pending"
+    );
+
+    // Human-confirmed and peer messages still fit cleanly alongside the steward slot.
+    for n in 0..(MAX_PENDING - 1) {
+        mailbox
+            .deposit(
+                SESSION,
+                &format!("human-{n}"),
+                &format!("user note {n}"),
+                now + Duration::from_secs(100 + n as u64),
+            )
+            .unwrap();
+    }
+    assert_eq!(mailbox.pending(SESSION), MAX_PENDING);
+
+    let claimed = mailbox
+        .try_claim_batch(SESSION, MAX_PENDING, now + Duration::from_secs(200))
+        .unwrap();
+    assert_eq!(
+        claimed[0].claim.text,
+        format!("directive #{}", MAX_PENDING + 3)
+    );
+}
+
+fn peer(msg_id: &str, repo: &str) -> EnvelopeProvenance {
+    EnvelopeProvenance::PeerAgent {
+        msg_id: msg_id.to_owned(),
+        from_peer: "claude:coder".into(),
+        provider: "claude".into(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop: 1,
+        max_hops: DEFAULT_MAX_HOPS,
+        truncated_in_bus: false,
+        repo_root: repo.to_owned(),
+    }
+}
+
+#[test]
+fn peer_envelopes_leave_the_last_slot_for_one_overflow_notice() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for i in 0..MAX_PEER_PENDING {
+        let id = format!("m{i}");
+        let kept = mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap();
+        assert!(matches!(kept, PeerDeposit::Deposited(_)), "{i}");
+    }
+    // Every further peer message overflows, and they all share the one notice.
+    for i in 0..3 {
+        let id = format!("extra{i}");
+        match mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap()
+        {
+            PeerDeposit::Overflowed { notice } => assert!(notice.is_ok(), "{notice:?}"),
+            other => panic!("expected overflow: {other:?}"),
+        }
+    }
+    assert_eq!(names(&mailbox, SESSION).len(), MAX_PENDING);
+    // A human message still has the full cap, so it is refused only at MAX_PENDING.
+    assert!(matches!(
+        mailbox.deposit(SESSION, "human", "hello", now),
+        Err(MailboxError::Full(_))
+    ));
+    let notice = mailbox.try_claim_batch(SESSION, MAX_PENDING, now).unwrap();
+    let text = &notice
+        .iter()
+        .find(|c| c.claim.text.contains("gitpulse_agent_inbox"))
+        .expect("the notice is pending")
+        .claim
+        .text;
+    assert!(text.contains("repo_path=/repo"), "{text}");
+    assert!(text.contains(&format!("for_peer={SESSION}")), "{text}");
+    assert!(text.contains("ack=true"), "{text}");
+    assert!(text.contains("since_seq"), "{text}");
+}
+
+#[test]
+fn a_claimed_overflow_notice_is_reissued_by_the_next_overflow() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for i in 0..=MAX_PEER_PENDING {
+        let id = format!("m{i}");
+        mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap();
+    }
+    let claimed = mailbox.try_claim_batch(SESSION, MAX_PENDING, now).unwrap();
+    assert!(claimed
+        .iter()
+        .any(|c| c.claim.text.contains("gitpulse_agent_inbox")));
+    for i in 0..=MAX_PEER_PENDING {
+        let id = format!("n{i}");
+        mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap();
+    }
+    let again = mailbox.try_claim_batch(SESSION, MAX_PENDING, now).unwrap();
+    assert!(
+        again
+            .iter()
+            .any(|c| c.claim.text.contains("gitpulse_agent_inbox")),
+        "the recipient was never told about the second overflow"
+    );
+}
+
+fn hop_filter(prov: &EnvelopeProvenance) -> bool {
+    !matches!(prov, EnvelopeProvenance::PeerAgent { hop, max_hops, .. } if *hop >= *max_hops)
+}
+
+#[test]
+fn two_waiters_on_one_session_leave_a_hop_limited_peer_message_pending_and_split_the_rest() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    // The acceptable message is the older one, so both waiters can reach it; the hop-limited
+    // one behind it must survive whichever waiter wins.
+    mailbox
+        .deposit(SESSION, "fine", "an acceptable message", now)
+        .unwrap();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes: Vec<EnvelopeWait> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    mailbox
+                        .wait_in_pool_filtered(
+                            SESSION,
+                            Duration::from_secs(3),
+                            WaitPool::Hosted,
+                            hop_filter,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let delivered: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            EnvelopeWait::Message(env) => Some(env.claim.request_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, ["fine"], "outcomes: {outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, EnvelopeWait::Declined(_))),
+        "the other waiter is told the hop-limited message is paused: {outcomes:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+    assert_eq!(mailbox.status(SESSION, "fine"), Delivery::Claimed);
+}
+
+// Needs a real lock: `AdvisoryLock` takes none off Unix.
+#[cfg(unix)]
+#[test]
+fn pruning_skips_a_session_whose_lock_is_held_and_still_expires_the_others() {
+    let (_dir, mailbox) = mailbox();
+    let busy = SESSION;
+    let idle = session_n(5);
+    let third = session_n(7);
+    let now = SystemTime::now();
+    mailbox.deposit(busy, "reused", "first life", now).unwrap();
+    mailbox.deposit(&idle, "idle", "never taken", now).unwrap();
+    let late = now + PENDING_TTL + Duration::from_secs(60);
+    // A deposit of the same request id holds the busy session's lock while it publishes.
+    let held = mailbox.lock_session(&session_key(busy).unwrap()).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let finished = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            mailbox.ensure_session(&third, late).unwrap();
+            let _ = done_tx.send(());
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // Releasing the lock lets a prune that blocked on it finish, so the scope can join.
+        drop(held);
+        finished
+    });
+    assert!(finished, "pruning blocked on a session whose lock was held");
+    assert_eq!(
+        mailbox.status(busy, "reused"),
+        Delivery::Pending,
+        "pruning removed an expired message from a session it could not lock"
+    );
+    let key = session_key(busy).unwrap();
+    assert!(
+        mailbox.read_provenance(&key, "reused").is_ok(),
+        "pruning removed the sidecar of a session it could not lock"
+    );
+    assert_eq!(mailbox.status(&idle, "idle"), Delivery::Absent);
+}
+
+#[test]
+fn a_claimed_file_keeps_its_window_from_the_claim_and_a_retry_does_not_redeliver() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit(SESSION, "slow", "pending for a long time", now)
+        .unwrap();
+    // Claimed with a minute of its pending window left.
+    let claimed_at = now + PENDING_TTL - Duration::from_secs(60);
+    let taken = mailbox.claim_next(SESSION, claimed_at).unwrap();
+    assert!(taken.is_some());
+    // Almost the whole claimed window later the claimed file is still there.
+    let retry_at = claimed_at + CLAIMED_TTL - Duration::from_secs(60);
+    assert_eq!(
+        mailbox
+            .deposit(SESSION, "slow", "pending for a long time", retry_at)
+            .map(|d| d.duplicate),
+        Ok(true),
+        "the retry was not recognised as a duplicate of the claimed message"
+    );
+    assert_eq!(mailbox.status(SESSION, "slow"), Delivery::Claimed);
+    assert_eq!(
+        mailbox.claim_next(SESSION, retry_at).unwrap(),
+        None,
+        "a retried request id was delivered a second time"
+    );
+    // And it is forgotten once the window counted from the claim has passed.
+    let after = claimed_at + CLAIMED_TTL + Duration::from_secs(60);
+    assert_eq!(mailbox.claim_next(SESSION, after).unwrap(), None);
+    assert_eq!(mailbox.status(SESSION, "slow"), Delivery::Absent);
+}
+#[test]
+fn a_waiter_looks_past_a_hop_limited_envelope_and_returns_the_first_acceptable_one() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now,
+        )
+        .unwrap();
+    mailbox
+        .deposit(
+            SESSION,
+            "human",
+            "a person's message",
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let outcome = mailbox
+        .wait_in_pool_filtered(
+            SESSION,
+            Duration::from_secs(2),
+            WaitPool::Hosted,
+            hop_filter,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, EnvelopeWait::Message(env) if env.claim.request_id == "human"),
+        "the waiter was held up by the hop-limited envelope ahead of it: {outcome:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+    // With nothing acceptable left, the waiter waits out its limit and then reports the
+    // refused envelope as paused.
+    let outcome = mailbox
+        .wait_in_pool_filtered(
+            SESSION,
+            Duration::from_millis(300),
+            WaitPool::Hosted,
+            hop_filter,
+        )
+        .unwrap();
+    assert!(matches!(outcome, EnvelopeWait::Declined(_)), "{outcome:?}");
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+}
+
+#[test]
+fn a_waiter_keeps_waiting_while_only_refused_envelopes_are_pending() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now,
+        )
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let outcome = mailbox.wait_in_pool_filtered(
+                SESSION,
+                Duration::from_secs(20),
+                WaitPool::Hosted,
+                hop_filter,
+            );
+            let _ = tx.send(outcome);
+        });
+        // Give the waiter time to poll with only the refused envelope pending.
+        std::thread::sleep(Duration::from_millis(200));
+        mailbox
+            .deposit(SESSION, "human", "a person's message", SystemTime::now())
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(15))
+    });
+    let outcome = outcome
+        .expect("the waiter did not return")
+        .expect("the wait failed");
+    assert!(
+        matches!(&outcome, EnvelopeWait::Message(env) if env.claim.request_id == "human"),
+        "the waiter left instead of waiting for an acceptable envelope: {outcome:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+}
+
+#[test]
+fn stamps_follow_publish_order_even_when_the_callers_clocks_do_not() {
+    let (_dir, mailbox) = mailbox();
+    let t0 = SystemTime::now();
+    // The first publisher's clock reads later than the second's, as when one process stamped
+    // before waiting on the lock, or the clock stepped back.
+    let first = mailbox
+        .deposit(
+            SESSION,
+            "req-late-clock",
+            "published first",
+            t0 + Duration::from_millis(5_000),
+        )
+        .unwrap();
+    let second = mailbox
+        .deposit(SESSION, "req-early-clock", "published second", t0)
+        .unwrap();
+    assert!(
+        second.created_at_ms > first.created_at_ms,
+        "a reader that saw {} must not find a later publish at {}",
+        first.created_at_ms,
+        second.created_at_ms
+    );
+    // Even after the first is claimed away, the next stamp still climbs.
+    mailbox.claim_next(SESSION, t0).unwrap();
+    let third = mailbox.deposit(SESSION, "req-third", "third", t0).unwrap();
+    assert!(third.created_at_ms > second.created_at_ms);
+}
+
+#[test]
+fn the_high_water_mark_survives_every_file_being_gone() {
+    let (_dir, mailbox) = mailbox();
+    let t0 = SystemTime::now();
+    let first = mailbox
+        .deposit(SESSION, "hw-a", "a", t0 + Duration::from_millis(9_000))
+        .unwrap();
+    for name in names(&mailbox, SESSION) {
+        std::fs::remove_file(mailbox.root.join(SESSION).join(name)).unwrap();
+    }
+    assert!(names(&mailbox, SESSION).is_empty());
+    let next = mailbox.deposit(SESSION, "hw-b", "b", t0).unwrap();
+    assert!(
+        next.created_at_ms > first.created_at_ms,
+        "{} must be above {}",
+        next.created_at_ms,
+        first.created_at_ms
+    );
+}
+
+#[test]
+fn a_corrupt_high_water_mark_falls_back_to_the_stamps_present_never_to_zero() {
+    let (_dir, mailbox) = mailbox();
+    let t0 = SystemTime::now();
+    let first = mailbox
+        .deposit(SESSION, "hw-c", "c", t0 + Duration::from_millis(9_000))
+        .unwrap();
+    std::fs::write(mailbox.root.join(".hw").join(SESSION), b"not a number").unwrap();
+    let next = mailbox.deposit(SESSION, "hw-d", "d", t0).unwrap();
+    assert!(next.created_at_ms > first.created_at_ms);
+    // The mark was rewritten, so it now holds a number again.
+    let healed = std::fs::read_to_string(mailbox.root.join(".hw").join(SESSION)).unwrap();
+    assert_eq!(healed.trim().parse::<u64>().unwrap(), next.created_at_ms);
+}
+
+#[test]
+fn a_stamp_that_would_not_fit_a_file_name_is_refused_not_minted() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit(SESSION, "hw-e", "e", SystemTime::now())
+        .unwrap();
+    std::fs::write(
+        mailbox.root.join(".hw").join(SESSION),
+        MAX_STAMP.to_string(),
+    )
+    .unwrap();
+    let refused = mailbox.deposit(SESSION, "hw-f", "f", SystemTime::now());
+    assert!(
+        matches!(refused, Err(MailboxError::Invalid(_))),
+        "{refused:?}"
+    );
+    assert!(
+        names(&mailbox, SESSION).iter().all(|n| !n.contains("hw-f")),
+        "no file may be published for a refused stamp"
+    );
+}
+
+#[test]
+fn a_symlinked_high_water_mark_is_refused() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit(SESSION, "hw-g", "g", SystemTime::now())
+        .unwrap();
+    #[cfg(unix)]
+    {
+        let mark = mailbox.root.join(".hw").join(SESSION);
+        let decoy = mailbox.root.join("decoy");
+        std::fs::write(&decoy, "1").unwrap();
+        std::fs::remove_file(&mark).unwrap();
+        std::os::unix::fs::symlink(&decoy, &mark).unwrap();
+        assert!(mailbox
+            .deposit(SESSION, "hw-h", "h", SystemTime::now())
+            .is_err());
+    }
+}
+
+#[test]
+fn pruning_removes_stale_counter_temporaries_but_not_fresh_ones() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit(SESSION, "hw-i", "i", SystemTime::now())
+        .unwrap();
+    let hw = mailbox.root.join(".hw");
+    let stale = hw.join(".tmp-1-00000001");
+    let fresh = hw.join(".tmp-2-00000002");
+    std::fs::write(&stale, "1").unwrap();
+    std::fs::write(&fresh, "1").unwrap();
+    restamp(&stale, SystemTime::now() - Duration::from_secs(3_600));
+    mailbox.prune_sessions(SystemTime::now());
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+}
+
+#[test]
+fn the_overflow_notice_names_the_paging_arguments_that_lose_nothing() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    let peer = |id: &str| EnvelopeProvenance::PeerAgent {
+        msg_id: id.to_string(),
+        from_peer: "claude:a".into(),
+        provider: "claude".into(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop: 1,
+        max_hops: DEFAULT_MAX_HOPS,
+        truncated_in_bus: false,
+        repo_root: "/repo".into(),
+    };
+    for i in 0..MAX_PEER_PENDING {
+        let id = format!("peer-{i}");
+        mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "hello", peer(&id), now)
+            .unwrap();
+    }
+    let over = mailbox
+        .deposit_peer_or_overflow(SESSION, "peer-over", "hello", peer("peer-over"), now)
+        .unwrap();
+    assert!(matches!(over, PeerDeposit::Overflowed { .. }));
+    let notice = mailbox
+        .peek_pending(SESSION, MAX_PENDING, now)
+        .unwrap()
+        .into_iter()
+        .find(|env| env.claim.text.contains("More peer messages"))
+        .expect("an overflow notice");
+    assert!(
+        notice.claim.text.contains("next_since_seq"),
+        "{}",
+        notice.claim.text
+    );
+    assert!(
+        notice.claim.text.contains("since_mailbox_ms"),
+        "{}",
+        notice.claim.text
     );
 }

@@ -41,6 +41,7 @@ use crate::blob::BlobReader;
 use crate::budget::Budget;
 use crate::change::{
     changes_between_with_program, ChangeSet, ChangeStatus, ChangedRange, FileChange,
+    WHOLE_FILE_END_LINE,
 };
 use crate::history;
 use crate::{BlobIdentity, CodeGraph, ConeEntry, GraphSymbol, Unavailable};
@@ -181,6 +182,8 @@ impl UnattributedReason {
 pub struct UnattributedChange {
     pub path: String,
     pub start_line: u32,
+    /// `null` in JSON means "to the end of the file".
+    #[serde(with = "crate::change::whole_file_end")]
     pub end_line: u32,
     pub reason: UnattributedReason,
 }
@@ -417,7 +420,11 @@ pub fn blast_bounded<G: CodeGraph>(
             )
         }
     };
-    blast_change_bounded(program, repo, graph, &change, &label, until, depth, budget)
+    // A range between two revisions comes from git and never exceeds its file,
+    // so no blob is read just to learn a length.
+    blast_change_inner(
+        program, repo, graph, &change, &label, until, depth, budget, false,
+    )
 }
 
 /// The analysis proper, over a change set already in hand.
@@ -461,6 +468,29 @@ pub fn blast_change_bounded<G: CodeGraph>(
     depth: u32,
     budget: &Budget,
 ) -> BlastReport {
+    // A change set in hand is a caller's own (`--at`, the hook): its ranges
+    // may name lines the file does not have, so they are checked.
+    blast_change_inner(
+        program, repo, graph, change, label, until, depth, budget, true,
+    )
+}
+
+/// The body of [`blast_change_bounded`]. `verify_extent` is whether an
+/// unindexed file's blob is read to check a range's extent: true for a
+/// caller-typed range, false for git's own ranges (a read per unindexed file
+/// would spend the shared history deadline for nothing).
+#[allow(clippy::too_many_arguments)]
+fn blast_change_inner<G: CodeGraph>(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    graph: &G,
+    change: &ChangeSet,
+    label: &str,
+    until: &str,
+    depth: u32,
+    budget: &Budget,
+    verify_extent: bool,
+) -> BlastReport {
     // One config listing per repository for the whole analysis, not one per read.
     let _config = dc_proc::config_scope();
     // One reader for the whole change: the graph's own when it reads this
@@ -475,9 +505,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
         }
     };
     let mut unavailable: Vec<Unavailable> = Vec::new();
-    let mut unattributed: Vec<UnattributedChange> = Vec::new();
-    // qualified name -> (file, span lines, changed lines, deletion-only so far)
-    let mut seeds: BTreeMap<String, SeedSymbol> = BTreeMap::new();
+    let mut placement = Placement::default();
 
     if change.capped {
         unavailable.push(Unavailable::ChangedFilesCapped {
@@ -497,7 +525,20 @@ pub fn blast_change_bounded<G: CodeGraph>(
             exhausted = true;
             break;
         }
-        place_file(blobs, graph, file, until, &mut seeds, &mut unattributed);
+        place_file(blobs, graph, file, until, &mut placement, verify_extent);
+    }
+    let Placement {
+        seeds,
+        unattributed,
+        mut reported_ranges,
+    } = placement;
+    // The report names the file's real extent, not an end line the caller
+    // typed. A whole-file range stays open-ended (`null`) on purpose.
+    let mut changed_files = change.files.clone();
+    for file in &mut changed_files {
+        if let Some(ranges) = reported_ranges.remove(&file.path) {
+            file.ranges = ranges;
+        }
     }
 
     // Every unattributed range means the walk started from fewer places than
@@ -505,7 +546,17 @@ pub fn blast_change_bounded<G: CodeGraph>(
     // once with the total rather than once per range, because a formatting
     // sweep would otherwise fill the ledger with a thousand identical rows.
     if !unattributed.is_empty() {
-        let lines: u64 = unattributed
+        // A range still ending at the whole-file sentinel is one whose file
+        // length was never learned (not indexed, unreadable, basis mismatch).
+        // It is counted apart rather than summed: its length is unknown, and
+        // `u32::MAX - start + 1` is not a count of anything.
+        // A range past the end of the file holds no lines at all, so it adds
+        // nothing to either count.
+        let (unbounded, bounded): (Vec<_>, Vec<_>) = unattributed
+            .iter()
+            .filter(|entry| !matches!(entry.reason, UnattributedReason::BeyondEndOfFile { .. }))
+            .partition(|entry| entry.end_line == WHOLE_FILE_END_LINE);
+        let lines: u64 = bounded
             .iter()
             // Widened before the arithmetic — see `ChangeSet::touched_lines`
             // for why `end - start + 1` in `u32` is a debug panic waiting on
@@ -515,6 +566,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
         unavailable.push(Unavailable::ChangeUnattributed {
             ranges: unattributed.len(),
             lines,
+            lines_unknown_ranges: unbounded.len(),
         });
     }
 
@@ -602,7 +654,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
 
     BlastReport::new(
         label.to_string(),
-        change.files.clone(),
+        changed_files,
         ordered,
         unattributed,
         impacted,
@@ -614,15 +666,31 @@ pub fn blast_change_bounded<G: CodeGraph>(
     )
 }
 
+/// What placing every changed file accumulates: the seed symbols, the
+/// changes that could not be placed, and the clamped ranges to report.
+#[derive(Default)]
+struct Placement {
+    /// qualified name -> (file, span lines, changed lines, deletion-only so far)
+    seeds: BTreeMap<String, SeedSymbol>,
+    unattributed: Vec<UnattributedChange>,
+    /// path -> the clamped ranges the report names for that file.
+    reported_ranges: BTreeMap<String, Vec<ChangedRange>>,
+}
+
 /// Place one file's changed ranges into the symbols that span them.
 fn place_file<G: CodeGraph>(
     blobs: &BlobReader,
     graph: &G,
     file: &FileChange,
     until: &str,
-    seeds: &mut BTreeMap<String, SeedSymbol>,
-    unattributed: &mut Vec<UnattributedChange>,
+    out: &mut Placement,
+    verify_extent: bool,
 ) {
+    let Placement {
+        seeds,
+        unattributed,
+        reported_ranges,
+    } = out;
     // A file with no post-image lines cannot be intersected with anything. Its
     // ranges are empty by construction, so there is nothing to mark
     // unattributed either — but the file is still reported as changed, and
@@ -660,14 +728,34 @@ fn place_file<G: CodeGraph>(
         return;
     }
 
+    let mut ranges = file.ranges.clone();
     let (symbols, spans_basis) = graph.symbols_in(&file.path);
     if symbols.is_empty() {
-        push_all(
-            unattributed,
-            &file.path,
-            &file.ranges,
-            UnattributedReason::FileNotIndexed,
-        );
+        // The length is only worth a read when a range is open-ended or was
+        // typed by the caller; git's own ranges never exceed the file.
+        let mut last_line = None;
+        let open_ended = ranges.iter().any(|r| r.end_line == WHOLE_FILE_END_LINE);
+        if !(verify_extent || open_ended) {
+            // nothing to check
+        } else if let Ok(resolved) = blobs.read(until, &file.path) {
+            resolve_ranges(&mut ranges, &resolved.content);
+            last_line = Some(last_line_of(&resolved.content));
+            note_reported(reported_ranges, file, &ranges);
+        }
+        for range in &ranges {
+            let reason = match last_line {
+                Some(last_line) if range.start_line > last_line => {
+                    UnattributedReason::BeyondEndOfFile { last_line }
+                }
+                _ => UnattributedReason::FileNotIndexed,
+            };
+            push_all(
+                unattributed,
+                &file.path,
+                std::slice::from_ref(range),
+                reason,
+            );
+        }
         return;
     }
 
@@ -677,7 +765,7 @@ fn place_file<G: CodeGraph>(
         push_all(
             unattributed,
             &file.path,
-            &file.ranges,
+            &ranges,
             UnattributedReason::ContentUnavailable {
                 reason: reason.clone(),
             },
@@ -691,7 +779,7 @@ fn place_file<G: CodeGraph>(
             push_all(
                 unattributed,
                 &file.path,
-                &file.ranges,
+                &ranges,
                 UnattributedReason::ContentUnavailable {
                     reason: refusal.describe(),
                 },
@@ -703,7 +791,7 @@ fn place_file<G: CodeGraph>(
         push_all(
             unattributed,
             &file.path,
-            &file.ranges,
+            &ranges,
             UnattributedReason::BasisMismatch {
                 spans_taken_against: spans_basis.describe(),
                 lines_built_from: resolved.identity.describe(),
@@ -712,11 +800,10 @@ fn place_file<G: CodeGraph>(
         return;
     }
 
+    resolve_ranges(&mut ranges, &resolved.content);
+    note_reported(reported_ranges, file, &ranges);
     let index = LineIndex::new(&resolved.content);
-    // One past the newline count is the phantom final line a span ending at
-    // EOF lands on — the same convention `join` documents, so a symbol that
-    // ends at EOF is not judged to be past the end of its own file.
-    let last_line = resolved.content.matches('\n').count() as u32 + 1;
+    let last_line = last_line_of(&resolved.content);
 
     let placed: Vec<(u32, u32, &GraphSymbol)> = symbols
         .iter()
@@ -737,7 +824,7 @@ fn place_file<G: CodeGraph>(
         })
         .collect();
 
-    for range in &file.ranges {
+    for range in &ranges {
         if range.start_line > last_line {
             unattributed.push(UnattributedChange {
                 path: file.path.clone(),
@@ -786,6 +873,56 @@ fn place_file<G: CodeGraph>(
                 },
             });
         }
+    }
+}
+
+/// One past the newline count is the phantom final line a span ending at EOF
+/// lands on — the same convention `join` documents, so a symbol that ends at
+/// EOF is not judged to be past the end of its own file.
+fn last_line_of(content: &str) -> u32 {
+    u32::try_from(content.matches('\n').count())
+        .unwrap_or(u32::MAX - 2)
+        .saturating_add(1)
+}
+
+/// Record the clamped ranges for the report, keeping a whole-file range
+/// open-ended (it is `null` in JSON, and must not become a number).
+fn note_reported(
+    reported: &mut BTreeMap<String, Vec<ChangedRange>>,
+    file: &FileChange,
+    resolved: &[ChangedRange],
+) {
+    let ranges = file
+        .ranges
+        .iter()
+        .zip(resolved)
+        .map(|(original, clamped)| {
+            if original.end_line == WHOLE_FILE_END_LINE {
+                original.clone()
+            } else {
+                clamped.clone()
+            }
+        })
+        .collect();
+    reported.insert(file.path.clone(), ranges);
+}
+
+/// Clamp every range's end to the file's real last line, now that the content
+/// is in hand, so nothing downstream counts lines from a sentinel or from an
+/// end the caller typed. A whole-file range is the special case of an end that
+/// is past every file.
+///
+/// The real count is the newline count, plus one when the last line is
+/// unterminated. An empty file has no lines; its range is clamped to its own
+/// start so it stays a valid one-line range rather than an inverted one. A
+/// range that starts past the end keeps its start and gets `end = start`; the
+/// caller reports it as beyond the end of the file.
+fn resolve_ranges(ranges: &mut [ChangedRange], content: &str) {
+    let newlines = content.matches('\n').count();
+    let unterminated = !content.is_empty() && !content.ends_with('\n');
+    let real_lines = u32::try_from(newlines + usize::from(unterminated)).unwrap_or(u32::MAX - 1);
+    for range in ranges.iter_mut().filter(|r| r.end_line > real_lines) {
+        range.end_line = real_lines.max(range.start_line);
     }
 }
 
@@ -1165,6 +1302,31 @@ pub fn owners_for_paths_with_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn range(start: u32, end: u32) -> ChangedRange {
+        ChangedRange {
+            start_line: start,
+            end_line: end,
+            deletion_only: false,
+        }
+    }
+
+    /// An end the caller typed is clamped to the file's real length exactly as
+    /// the whole-file sentinel is; a start past the end keeps its start.
+    #[test]
+    fn every_range_end_is_clamped_to_the_real_length() {
+        let content = "one\ntwo\n";
+        let mut ranges = [
+            range(1, WHOLE_FILE_END_LINE),
+            range(1, u32::MAX - 1),
+            range(2, 2),
+            range(5, u32::MAX - 1),
+        ];
+        resolve_ranges(&mut ranges, content);
+        let ends: Vec<_> = ranges.iter().map(|r| (r.start_line, r.end_line)).collect();
+        assert_eq!(ends, vec![(1, 2), (1, 2), (2, 2), (5, 5)]);
+        assert_eq!(last_line_of(content), 3);
+    }
 
     #[test]
     fn a_module_is_the_files_directory() {

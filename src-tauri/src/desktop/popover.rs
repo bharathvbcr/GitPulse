@@ -425,7 +425,8 @@ fn is_status_allowed(id: &str) -> bool {
                     | NativeAction::ToggleTheme
                     | NativeAction::Shortcuts
                     | NativeAction::Diagnostics
-                    | NativeAction::ActivateRepo(_),
+                    | NativeAction::ActivateRepo(_)
+                    | NativeAction::FocusAgent(_),
             )
         )
 }
@@ -447,7 +448,8 @@ fn validate_action(state: &MenuState, id: &str, repo_path: Option<&str>) -> Resu
             | "toggle-theme"
             | "shortcuts"
             | "diagnostics"
-    ) || id.starts_with(super::actions::REPOSITORY_PREFIX);
+    ) || id.starts_with(super::actions::REPOSITORY_PREFIX)
+        || id.starts_with(super::actions::FOCUS_AGENT_PREFIX);
     if !workspace && state.active_path.as_deref() != repo_path {
         return Err("Repository changed. Review the current status and try again.".into());
     }
@@ -603,6 +605,27 @@ mod tests {
         assert!(keeps_popover("refresh"));
         assert!(!keeps_popover("section:work:overview"));
         assert!(!keeps_popover("reveal-repo"));
+        assert!(!keeps_popover("focus-agent:term-1"));
+
+        state
+            .agent_requests
+            .push(super::super::state::MenuAgentRequest {
+                id: "term-1".into(),
+                source: "terminal".into(),
+                provider: "claude".into(),
+                agent_label: "Claude".into(),
+                repo_label: "other".into(),
+                repo_path: Some("/other".into()),
+                urgency: "blocking".into(),
+                reason: "Needs your permission".into(),
+                detail: None,
+                at_ms: None,
+            });
+        // Workspace-scoped: focusing an agent in another repository succeeds even when repo_path differs.
+        assert!(validate_action(&state, "focus-agent:term-1", Some("/b")).is_ok());
+        assert!(validate_action(&state, "focus-agent:term-1", None).is_ok());
+        assert!(validate_action(&state, "focus-agent:missing", Some("/a")).is_err());
+        assert!(validate_action(&state, "focus-agent:", Some("/a")).is_err());
     }
 }
 

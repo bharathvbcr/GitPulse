@@ -359,40 +359,63 @@ pub(super) fn extract_node(
                     });
                 }
             }
-            // `handle = () => this.get(k)` in a class body and `remove: () => …`
-            // in an object literal bound to a module-level `const`: a function
-            // stored in a member is a method of its owner, and a call written
-            // `owner.handle()` names it. Without the symbol the arrow's own calls
-            // were attributed to the file and its callers had nothing to reach.
+            // `handle = () => this.get(k)` in a class body, `remove: () => …`
+            // in an object literal bound to a module-level `const`, in a
+            // factory-returned object literal (`return { applyPreset: () => … }`
+            // or `const store = { … }; return store;`), or in `export default { … }`:
+            // a function stored in a member is a method of its owner, and a call
+            // written `owner.handle()` names it. Without the symbol the arrow's
+            // own calls were attributed to the enclosing scope and its callers
+            // had nothing to reach.
             "public_field_definition" | "field_definition" | "pair" => {
-                let value = node.child_by_field_name("value");
+                let value = node.child_by_field_name("value").map(js_unwrap_value);
                 let function = value.filter(|value| {
-                    matches!(value.kind(), "arrow_function" | "function_expression")
+                    matches!(
+                        value.kind(),
+                        "arrow_function" | "function_expression" | "generator_function"
+                    )
                 });
                 if let Some(function) = function {
-                    let member = js_function_valued_member(function, source);
-                    let owner = if kind == "pair" {
-                        js_object_member_owner(function)
-                            .and_then(|declarator| get_child_text(declarator, "name", source))
-                            .map(|object| format!("{}::{}", file_symbol_name, object))
-                    } else {
-                        enclosing_type_name(node, source)
-                            .map(|type_name| format!("{}::{}", file_symbol_name, type_name))
-                    };
-                    if let (Some(name), Some(owner)) = (member, owner) {
-                        symbols.push(ExtractedSymbol {
-                            qualified_name: format!("{owner}.{name}"),
-                            name,
-                            kind: SymbolKind::Method,
-                            span,
-                            is_exported: js_symbol_is_exported(node, source),
-                            docstring: None,
-                            signature: None,
-                            parent_symbol: Some(owner),
-                            body_signature: None,
-                            declaration_hash: None,
-                            return_type: None,
-                        });
+                    if let Some(name) = js_function_valued_member(function, source) {
+                        let resolved = if kind == "pair" {
+                            if let Some(owner) = js_object_member_owner(function)
+                                .and_then(|declarator| get_child_text(declarator, "name", source))
+                                .map(|object| format!("{}::{}", file_symbol_name, object))
+                            {
+                                Some((format!("{owner}.{name}"), owner))
+                            } else if js_factory_returned_object_member(function, source).is_some()
+                            {
+                                enclosing_callable_qualified(node, source, file_symbol_name)
+                                    .map(|owner| (format!("{owner}.{name}"), owner))
+                            } else if js_default_export_object_member(function) {
+                                Some((
+                                    format!("{file_symbol_name}::{name}"),
+                                    file_symbol_name.to_string(),
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            enclosing_type_name(node, source).map(|type_name| {
+                                let owner = format!("{}::{}", file_symbol_name, type_name);
+                                (format!("{owner}.{name}"), owner)
+                            })
+                        };
+                        if let Some((qualified_name, owner)) = resolved {
+                            symbols.push(ExtractedSymbol {
+                                qualified_name,
+                                name,
+                                kind: SymbolKind::Method,
+                                span,
+                                is_exported: js_symbol_is_exported(node, source),
+                                docstring: None,
+                                signature: None,
+                                parent_symbol: Some(owner),
+                                body_signature: None,
+                                declaration_hash: None,
+                                return_type: None,
+                            });
+                        }
                     }
                 }
             }

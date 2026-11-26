@@ -251,3 +251,82 @@ fn a_nested_guard_gives_the_outer_files_swift_refusal_counts_back() {
         vec!["swift: refused 1 member reference(s) the grammar read off a bare cast".to_string()]
     );
 }
+
+#[test]
+fn post_walk_passes_honor_expired_deadline() {
+    let (_, rust_lang) = grammar_for("rust").expect("the Rust grammar is linked");
+    let mut parser = Parser::new();
+    parser.set_language(&rust_lang).expect("loads");
+    let text = "pub(crate) fn f() -> u8 { 1 }";
+    let tree = parser.parse(text, None).unwrap();
+    let root = tree.root_node();
+    let symbols = vec![ExtractedSymbol {
+        name: "f".to_string(),
+        qualified_name: "test.rs::f".to_string(),
+        kind: SymbolKind::Function,
+        span: Span {
+            start_byte: 0,
+            end_byte: text.len(),
+        },
+        is_exported: true,
+        docstring: None,
+        signature: None,
+        parent_symbol: None,
+        body_signature: None,
+        declaration_hash: None,
+        return_type: None,
+    }];
+
+    // 1. rust_crate_private_scopes stops and latches WALK_OVERRAN when deadline expired
+    {
+        let _armed = BudgetGuard::arm(Instant::now());
+        let mut wiring = Vec::new();
+        rust_crate_private_scopes(root, text, &symbols, &mut wiring);
+        assert!(
+            walk_overran(),
+            "rust_crate_private_scopes must latch walk_overran"
+        );
+    }
+
+    // 2. ts_ambient_exemptions stops and latches WALK_OVERRAN
+    {
+        let (_, ts_lang) = grammar_for("typescript").expect("the TS grammar is linked");
+        let mut ts_parser = Parser::new();
+        ts_parser.set_language(&ts_lang).expect("loads");
+        let ts_tree = ts_parser
+            .parse("declare module 'foo' { export interface Bar {} }", None)
+            .unwrap();
+        let _armed = BudgetGuard::arm(Instant::now());
+        let mut wiring = Vec::new();
+        ts_ambient_exemptions("foo.ts", ts_tree.root_node(), &symbols, &mut wiring);
+        assert!(
+            walk_overran(),
+            "ts_ambient_exemptions must latch walk_overran"
+        );
+    }
+
+    // 3. clonesig stamps stop and latch WALK_OVERRAN
+    {
+        let _armed = BudgetGuard::arm(Instant::now());
+        let mut syms = symbols.clone();
+        crate::clonesig::stamp_signatures(&mut syms, root, text);
+        assert!(walk_overran(), "stamp_signatures must latch walk_overran");
+    }
+    {
+        let _armed = BudgetGuard::arm(Instant::now());
+        let mut syms = symbols.clone();
+        crate::clonesig::stamp_declaration_hashes(&mut syms, root, text);
+        assert!(
+            walk_overran(),
+            "stamp_declaration_hashes must latch walk_overran"
+        );
+    }
+
+    // 4. returns::stamp_return_types stops and latches WALK_OVERRAN
+    {
+        let _armed = BudgetGuard::arm(Instant::now());
+        let mut syms = symbols.clone();
+        crate::returns::stamp_return_types(&mut syms, root, text);
+        assert!(walk_overran(), "stamp_return_types must latch walk_overran");
+    }
+}

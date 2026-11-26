@@ -1234,7 +1234,7 @@ fn read_frame(reader: &mut impl BufRead) -> Incoming {
 
 impl<'cancel> LspClient<'cancel> {
     /// A client nobody cancels, for the tests that drive one directly.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn spawn(
         spec: &LspServerSpec,
         binary: &subprocess::Resolved,

@@ -12,7 +12,9 @@
  *       surface), unless it is explicitly listed in ORPHAN_ALLOWLIST, or
  *   (c) an invoke whose command name cannot be statically resolved (dynamic
  *       call site): reported as manual-review and failed loudly instead of
- *       silently passing an unverified seam.
+ *       silently passing an unverified seam, or
+ *   (d) an invoked, registered command that src-tauri/capabilities/default.json
+ *       does not grant (`allow-cmd-*`): Tauri refuses it for the main window.
  *
  * Exit codes: 0 contract holds · 1 contract violation · 2 internal error.
  *
@@ -45,6 +47,51 @@ function repoRelative(target) {
 }
 export const DEFAULT_LIB_RS = path.join(REPO_ROOT, "src-tauri", "src", "lib.rs");
 export const DEFAULT_SRC_DIR = path.join(REPO_ROOT, "src");
+
+/**
+ * The main window's capability file, beside `src/` in the crate. build.rs puts
+ * every `generate_handler!` command into the ACL, so a command the frontend
+ * invokes is refused at runtime unless this file grants `allow-<command>`.
+ *
+ * @param {string} libPath
+ */
+export function capabilitiesPathFor(libPath) {
+  return path.resolve(path.dirname(libPath), "..", "capabilities", "default.json");
+}
+
+/**
+ * Tauri's generated permission for a command: `cmd_foo_bar` -> `allow-cmd-foo-bar`.
+ *
+ * @param {string} command
+ */
+export function allowPermissionFor(command) {
+  return `allow-${command.replace(/_/g, "-")}`;
+}
+
+/**
+ * Invoked, registered commands that the capability file does not grant.
+ * Returns null when there is no capability file to read, so a caller can say
+ * the grant check did not run rather than report it as passed.
+ *
+ * @param {string} capabilitiesPath
+ * @param {Map<string, unknown>} registered
+ * @param {Map<string, unknown>} invoked
+ * @returns {string[] | null}
+ */
+export function ungrantedCommands(capabilitiesPath, registered, invoked) {
+  if (!existsSync(capabilitiesPath)) return null;
+  const capability = JSON.parse(readFileSync(capabilitiesPath, "utf8"));
+  const permissions = Array.isArray(capability?.permissions) ? capability.permissions : [];
+  /** @type {Set<string>} */
+  const granted = new Set();
+  for (const entry of permissions) {
+    if (typeof entry === "string") granted.add(entry);
+    else if (entry && typeof entry.identifier === "string") granted.add(entry.identifier);
+  }
+  return [...invoked.keys()]
+    .filter((name) => registered.has(name) && !granted.has(allowPermissionFor(name)))
+    .sort();
+}
 
 /**
  * Registered handlers intentionally kept Rust-only today. Every entry needs a
@@ -466,9 +513,10 @@ export function compareContract(registered, invoked) {
  * @param {{
  *   libPath: string,
  *   srcDirs: string[],
+ *   capabilitiesPath?: string,
  * }} input
  */
-export function runContractCheck({ libPath, srcDirs }) {
+export function runContractCheck({ libPath, srcDirs, capabilitiesPath = capabilitiesPathFor(libPath) }) {
   const libSource = readFileSync(libPath, "utf8");
   const { handlers: registered, errors } = parseRegisteredHandlers(libSource);
   // The Rust crate root is lib.rs's directory: scan it for annotated commands
@@ -506,6 +554,18 @@ export function runContractCheck({ libPath, srcDirs }) {
   for (const name of staleAllowlist) {
     violations.push(`allowlist: "${name}" is listed in ORPHAN_ALLOWLIST but not registered`);
   }
+  const ungranted = ungrantedCommands(capabilitiesPath, registered, invoked);
+  for (const name of ungranted ?? []) {
+    const sites = invoked.get(name) ?? [];
+    violations.push(
+      `ungranted: "${name}" is invoked at ${sites.map((s) => `${s.file}:${s.line}`).join(", ")} but ${repoRelative(capabilitiesPath)} has no "${allowPermissionFor(name)}", so Tauri refuses it`,
+    );
+  }
+  // The real crate always has a capability file; not finding it there is a
+  // check that could not run, not one that passed.
+  if (ungranted === null && path.resolve(libPath) === DEFAULT_LIB_RS) {
+    violations.push(`capabilities: ${repoRelative(capabilitiesPath)} is missing, so command grants could not be checked`);
+  }
   for (const review of manualReviews) {
     violations.push(`manual-review needed: ${review.file}:${review.line} ${review.detail}`);
   }
@@ -521,6 +581,7 @@ export function runContractCheck({ libPath, srcDirs }) {
     orphans,
     allowedOrphans,
     staleAllowlist,
+    ungranted,
     manualReviews,
     violations,
     ok: violations.length === 0,
@@ -561,6 +622,11 @@ export function formatReport(result, libLabel) {
         note: "#[tauri::command] functions found in the Rust crate",
       },
       {
+        label: "ungranted commands",
+        value: result.ungranted === null || result.ungranted === undefined ? "not checked" : String(result.ungranted.length),
+        note: result.ungranted === null || result.ungranted === undefined ? "no capability file to read" : "invoked, but no allow-* in capabilities/default.json",
+      },
+      {
         label: "manual-review sites",
         value: String(result.manualReviews.length),
         note: "dynamic call sites needing human eyes",
@@ -578,6 +644,7 @@ export function formatReport(result, libLabel) {
   };
   detail("missing commands", result.missing);
   detail("orphaned handlers", result.orphans);
+  detail("ungranted commands", result.ungranted ?? []);
   detail("manual-review sites", result.manualReviews.map((r) => `${r.file}:${r.line} ${r.detail}`));
   detail("annotated but never registered", result.unregistered ?? []);
   // Anything else the check objected to. Without this a failing run printed
@@ -586,7 +653,7 @@ export function formatReport(result, libLabel) {
   detail(
     "other violations",
     (result.violations ?? []).filter(
-      (v) => !/^(missing|orphan|unregistered):/.test(v),
+      (v) => !/^(missing|orphan|unregistered|ungranted):/.test(v),
     ),
   );
   lines.push("", result.ok ? "OK: IPC contract holds." : "FAIL: IPC contract violated.");

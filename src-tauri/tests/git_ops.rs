@@ -22,7 +22,7 @@ fn shared_fixture_can_commit_without_global_identity() {
     let dir = tempfile::TempDir::new().unwrap();
     run_git(dir.path(), &["init", "-b", "main"]);
     // Not the hermetic config: that one carries an identity of its own
-    // (`HERMETIC_IDENTITY`), and with it this commit would succeed even if
+    // (`GIT_IDENTITY_PIN`), and with it this commit would succeed even if
     // `run_git` stopped persisting the repository's. Written through
     // `write_git_config` so it keeps the maintenance pin.
     let globals = tempfile::TempDir::new().unwrap();

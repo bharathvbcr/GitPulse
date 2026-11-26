@@ -344,6 +344,7 @@ fn env_with(version: (u32, u32, u32)) -> GitEnv {
     GitEnv {
         version: Some(version),
         fsmonitor_measured: true,
+        is_apple_git: false,
     }
 }
 
@@ -369,6 +370,7 @@ fn adv_fsmonitor_boolean_is_refused_on_git_before_2_36() {
     let unknown = GitEnv {
         version: None,
         fsmonitor_measured: true,
+        is_apple_git: false,
     };
     assert!(plan_apply(&report, unknown, "/x", &[TuningChange::Fsmonitor]).is_err());
     assert!(plan_apply(

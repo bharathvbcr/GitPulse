@@ -45,14 +45,28 @@
     shown?: boolean;
   } = $props();
 
-  let currentBranch = $derived($repoStore.currentBranch || "HEAD");
+  // Field stores rather than the whole store: each notifies only when its own value is
+  // replaced, so a publish that touches none of what the bar renders (a file
+  // click, another tab's poll) re-runs none of the derivations below. The
+  // counts come from the projection, which takes them once per statuses array.
+  const currentBranchStore = repoStore.currentBranch;
+  const branchesStore = repoStore.branches;
+  const statusesStore = repoStore.statuses;
+  const stagedCountStore = repoStore.stagedCount;
+  const conflictedCountStore = repoStore.conflictedCount;
+  const watchStore = repoStore.watch;
+  const operationStore = repoStore.operation;
+  const statusUnavailableSinceStore = repoStore.statusUnavailableSince;
+  const isLoadingStore = repoStore.isLoading;
+
+  let currentBranch = $derived($currentBranchStore || "HEAD");
   let branchInfo = $derived(
-    $repoStore.branches.find((b) => b.is_current || b.name === currentBranch)
+    $branchesStore.find((b) => b.is_current || b.name === currentBranch)
   );
 
-  let dirtyCount = $derived($repoStore.statuses.length);
-  let stagedCount = $derived($repoStore.statuses.filter((s) => s.is_staged).length);
-  let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
+  let dirtyCount = $derived($statusesStore.length);
+  let stagedCount = $derived($stagedCountStore);
+  let conflictedCount = $derived($conflictedCountStore);
 
   let aheadCount = $derived(branchInfo?.ahead_count ?? 0);
   let behindCount = $derived(branchInfo?.behind_count ?? 0);
@@ -69,8 +83,8 @@
    * usual" notice, not an error — but leaving it unsaid is what makes a stale
    * branch name look current.
    */
-  let watchState = $derived($repoStore.watch);
-  let statusUnavailableSince = $derived($repoStore.statusUnavailableSince ?? null);
+  let watchState = $derived($watchStore);
+  let statusUnavailableSince = $derived($statusUnavailableSinceStore ?? null);
 
   onMount(() => {
     startHostLoad();
@@ -84,7 +98,7 @@
   });
   let watchLabel = $derived(watchMarker(watchState));
 
-  let operationState = $derived($repoStore.operation);
+  let operationState = $derived($operationStore);
   let operationMarker = $derived(tabMarker(operationState));
   let operationTip = $derived(tabTooltip(operationState));
 
@@ -291,10 +305,10 @@
     <!-- Cadence reads the commits already loaded for the graph, so it costs
          no additional fetch. Hidden while syncing, when the window would be
          drawn from a partially loaded history. -->
-    {#if detail === "full" && !$repoStore.isLoading && $graphStore.commits.length > 0}
+    {#if detail === "full" && !$isLoadingStore && $graphStore.commits.length > 0}
       <CommitCadence commits={$graphStore.commits} days={30} />
     {/if}
-    {#if $repoStore.isLoading}
+    {#if $isLoadingStore}
       <div class="flex items-center gap-1.5 text-accent font-medium" role="status">
         <RefreshCw size={10} class="animate-spin shrink-0" />
         <span>Syncing…</span>

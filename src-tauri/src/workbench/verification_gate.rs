@@ -16,9 +16,24 @@
 //! works with the sidecar down.
 //!
 //! The gate fails closed. Everything short of a settled `passed` record whose
-//! head is still the head of the worktree it was taken in is a hold, and a
-//! check that could not run (unreadable store, unreadable head, unparseable
-//! record) is a hold that says so, never a quiet pass.
+//! head is still the head of the worktree it was taken in, or whose head has
+//! landed on the default branch, is a hold, and a check that could not run
+//! (unreadable store, unreadable head, unparseable record, unreadable
+//! ancestry) is a hold that says so, never a quiet pass.
+//!
+//! Landed work. A lane's commit M is merged and the lane's worktree moves on
+//! or is removed: the worktree no longer answers for M. A settled `passed`
+//! record for this task and repository whose head M is an ancestor of (or is)
+//! the default branch's tip still counts. The default branch and its tip are
+//! read from the card's own repository (the checkout its identity names),
+//! never from the record's worktree, which may be gone. If the default branch
+//! cannot be resolved, M is unknown to the repository, or git fails, the card
+//! is held and the message says which.
+//!
+//! What a claim verifies. The target of a claim is the `repo_path` the agent
+//! passed to `gitpulse_complete_task`: that checkout, at its HEAD when the
+//! claim was made. Pass the lane's own worktree, not the repository's main
+//! checkout, or the commit judged is the main checkout's tip.
 
 pub(crate) mod memo;
 pub(crate) use memo::Memo;
@@ -137,13 +152,32 @@ fn parse_record(data: &str) -> Result<Record, String> {
 /// while the store has not changed). The caller names the memo: a caller that
 /// carries a backend asks the backend's, so a test can give each run its own,
 /// and one with none asks [`Memo::shared`].
-pub(crate) fn check(memo: &Memo, store: &Store, item_id: &str, repository_identity: &str) -> Gate {
+///
+/// `claimant_head` is the commit the caller claims done for: the claim's head
+/// for the driver, the checkout's HEAD for a claim made through
+/// `complete_task`. `None` is a head that could not be read. It matters only
+/// to the landed path: a pass whose worktree no longer answers for it counts
+/// only when it is for exactly the claimed commit.
+pub(crate) fn check(
+    memo: &Memo,
+    store: &Store,
+    item_id: &str,
+    repository_identity: &str,
+    claimant_head: Option<&str>,
+) -> Gate {
     match memo.latest(store, item_id) {
         Err(reason) => Gate::Held(reason),
         Ok(None) => Gate::Held(
             "no verification record exists for this task: Manvi's work.verify.task has not judged it".into(),
         ),
-        Ok(Some(record)) => judge(&record, item_id, repository_identity, &current_head),
+        Ok(Some(record)) => judge(
+            &record,
+            item_id,
+            repository_identity,
+            &current_head,
+            &landed_on_default,
+            claimant_head,
+        ),
     }
 }
 
@@ -169,11 +203,72 @@ pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
     .map(|head| head.trim().to_owned())
 }
 
-fn judge(
+/// What the spawn-gate report calls the launches [`landed_on_default`] makes.
+pub(crate) const LANDED_SOURCE: &str = "verification_gate.landed_on_default";
+
+/// A full, lowercase commit id: 40 hex digits (SHA-1) or 64 (SHA-256), exactly.
+pub(crate) fn is_full_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64)
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The local checkout a repository identity (`local:<git dir>`) names, when it
+/// is a directory on this machine.
+pub(crate) fn checkout_of(repository_identity: &str) -> Option<String> {
+    repository_identity
+        .strip_prefix("local:")
+        .and_then(|git_dir| git_dir.strip_suffix("/.git").or(Some(git_dir)))
+        .filter(|path| Path::new(path).is_dir())
+        .map(str::to_owned)
+}
+
+/// Whether `commit` is the tip of, or an ancestor of, the default branch of the
+/// repository `repository_identity` names. `Err` says what could not be read:
+/// that is not a "no".
+pub(crate) fn landed_on_default(repository_identity: &str, commit: &str) -> Result<bool, String> {
+    if !is_full_commit_id(commit) {
+        return Err(format!("{commit:?} is not a full commit id"));
+    }
+    let checkout = checkout_of(repository_identity)
+        .ok_or_else(|| "the task's repository has no local checkout to read".to_owned())?;
+    let checkout = Path::new(&checkout);
+    let tip = crate::engine::git_reader::default_base(checkout)
+        .checked()
+        .map_err(|e| format!("the default branch could not be read: {}", e.message()))?
+        .base
+        .map(|(_, oid)| oid)
+        .ok_or_else(|| "the repository has no default branch".to_owned())?;
+    // A name that is shaped like an id (a tag, a branch) resolves to whatever
+    // it names; only the id itself, byte for byte, is the verified commit.
+    let spec = format!("{commit}^{{commit}}");
+    let resolved = crate::engine::process::with_spawn_source(LANDED_SOURCE, || {
+        crate::engine::git_cli::git_text(
+            checkout,
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        )
+    })
+    .map_err(|e| format!("the verified commit could not be resolved: {}", e.message()))?;
+    if resolved.trim() != commit {
+        return Err(format!(
+            "the verified head {commit:?} does not resolve to itself (it resolves to {:?})",
+            resolved.trim()
+        ));
+    }
+    crate::engine::process::with_spawn_source(LANDED_SOURCE, || {
+        crate::harness::review::contains(checkout, &tip, commit)
+    })
+    .map_err(|e| e.message().to_owned())
+}
+
+pub(crate) fn judge(
     record: &Record,
     item_id: &str,
     repository_identity: &str,
     head_of: &dyn Fn(&str) -> Result<String, CommandError>,
+    landed: &dyn Fn(&str, &str) -> Result<bool, String>,
+    claimant_head: Option<&str>,
 ) -> Gate {
     let verdict = summarize(record);
     if record.item_id != item_id {
@@ -205,31 +300,63 @@ fn judge(
                 .into(),
         );
     }
-    match resolve(&record.worktree) {
-        Ok(local) if local.identity == repository_identity => {}
-        Ok(_) => {
+    // Why the worktree no longer answers for the verified commit. Everything
+    // short of "it is still at that head" lands here, and only landed work
+    // can still be a pass.
+    let moved = match resolve(&record.worktree) {
+        Ok(local) if local.identity != repository_identity => {
             return Gate::Held(format!(
                 "the verified worktree {:?} belongs to another repository",
                 record.worktree
             ))
         }
-        Err(error) => {
+        Ok(_) => match head_of(&record.worktree) {
+            Err(error) => format!(
+                "the head of the verified worktree could not be read, so the verdict cannot be tied to the work: {error}", error = error.message()
+            ),
+            Ok(head) if head != record.head => format!(
+                "verification passed for {} but the worktree is now at {}; the work changed after it was verified. Verify again",
+                short(&record.head),
+                short(&head)
+            ),
+            Ok(_) => return Gate::Passed(verdict),
+        },
+        Err(error) => format!(
+            "the verified worktree {:?} could not be resolved: {}",
+            record.worktree, error.message
+        ),
+    };
+    // Landed work is a pass only for the commit it was verified at: commits
+    // that landed on top of it were never judged.
+    match claimant_head {
+        None => {
             return Gate::Held(format!(
-                "the verified worktree {:?} could not be resolved: {}",
-                record.worktree, error.message
+                "{moved}; the head the claim is for could not be read, so the verified commit {} cannot be tied to it",
+                short(&record.head)
             ))
         }
+        Some(claimed) if claimed != record.head => {
+            return Gate::Held(format!(
+                "{moved}; the claim is for {} but the verified commit is {}. Verify again",
+                short(claimed),
+                short(&record.head)
+            ))
+        }
+        Some(_) => {}
     }
-    match head_of(&record.worktree) {
-        Err(error) => Gate::Held(format!(
-            "the head of the verified worktree could not be read, so the verdict cannot be tied to the work: {error}", error = error.message()
+    match landed(repository_identity, &record.head) {
+        Ok(true) => Gate::Passed(format!(
+            "{verdict}\nThe verified commit {} is on the default branch.",
+            short(&record.head)
         )),
-        Ok(head) if head != record.head => Gate::Held(format!(
-            "verification passed for {} but the worktree is now at {}; the work changed after it was verified. Verify again",
-            short(&record.head),
-            short(&head)
+        Ok(false) => Gate::Held(format!(
+            "{moved}; the verified commit {} is not on the default branch either",
+            short(&record.head)
         )),
-        Ok(_) => Gate::Passed(verdict),
+        Err(why) => Gate::Held(format!(
+            "{moved}; whether the verified commit {} reached the default branch could not be read: {why}",
+            short(&record.head)
+        )),
     }
 }
 

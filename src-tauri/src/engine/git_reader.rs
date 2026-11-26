@@ -1224,10 +1224,10 @@ impl GitReader {
         })
     }
 
-    /// Porcelain status. This argv does not set `core.fsmonitor=false`.
-    /// Hygiene walks do, because a repository hook must not run there. A
-    /// status refresh should use the fsmonitor daemon when the repository
-    /// already has one, so `status` does not walk `target/` itself.
+    /// Porcelain status. `PINNED_GIT_CONFIG` sets `core.fsmonitor=false` on
+    /// every spawned git command so a deadlocked `fsmonitor--daemon` socket
+    /// cannot hang reads, and `worktree::status_cell` uses in-process `gix`
+    /// status by default before falling back to this argv.
     pub const STATUS_ARGV: &'static [&'static str] = crate::engine::git_cli::STATUS_ARGV;
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, CommandError> {
@@ -1512,9 +1512,11 @@ impl GitReader {
     /// Lists every path the file explorer may show: tracked files plus
     /// untracked-but-not-ignored working-tree files.
     ///
-    /// Returns working-tree file paths using `dcgrep` + `.git/index` when a
-    /// compatible `dcgrep` binary is available, falling back to `git ls-files
-    /// -z --cached --others --exclude-standard`.
+    /// Returns working-tree file paths from `git ls-files -z --cached --others
+    /// --exclude-standard`. This deliberately does not go through `dcgrep
+    /// files`: on a 4,000-file repository `scripts/bench-dcgrep.mjs` measured
+    /// it 2.2-2.5x slower than `git ls-files` (dcgrep search is the faster arm
+    /// and stays on dcgrep).
     ///
     /// `--cached --others --exclude-standard` is deliberately the same
     /// enumeration [`GitReader::get_repo_language_stats`] uses: `--cached`
@@ -1527,10 +1529,6 @@ impl GitReader {
     /// quotes, glob characters, and non-ASCII names survive verbatim.
     pub fn list_repo_files(repo_path: &str) -> Result<Vec<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
-        if let Some(files) = crate::engine::dcgrep::list_working_tree_files(&repo, MAX_REPO_FILES)?
-        {
-            return Ok(files);
-        }
         let stdout = git_text(
             &repo,
             &[
@@ -2042,12 +2040,19 @@ impl GitReader {
         };
 
         let lang = LanguageDetector::detect_from_bytes(file_path, &bytes);
-        let is_image = lang.name == "Image";
-        let is_binary = is_image || bytes.contains(&0);
-        let mime = if is_image {
+        let has_nul = bytes.contains(&0);
+        let is_image_lang = lang.name == "Image";
+        let mime = if is_image_lang {
             mime_from_path(file_path)
         } else {
             "application/octet-stream".into()
+        };
+        let is_svg = mime == "image/svg+xml";
+        let is_image = if is_svg { !has_nul } else { is_image_lang };
+        let is_binary = if is_svg {
+            has_nul
+        } else {
+            is_image_lang || has_nul
         };
 
         Ok(FileBlob {
@@ -6184,7 +6189,7 @@ impl UntrackedScan {
             return UntrackedLines::Counted(0);
         }
 
-        let identity = ScanIdentity::of(&meta);
+        let identity = ScanIdentity::of_path(full_path, &meta);
         // Only trust cache if identity has a valid, non-zero file identifier.
         if identity.inode != 0 {
             if let Some(known) = self.previous.get(full_path) {
@@ -7595,12 +7600,13 @@ impl ScanIdentity {
                 .map(|(secs, ns)| UNIX_EPOCH + Duration::new(secs, ns));
             (meta.ino(), changed)
         };
+        // Windows' creation time is a nonzero stand-in here; a write does not
+        // move it, so it is not a change stamp. [`ScanIdentity::of_path`]
+        // replaces it with NTFS's `ChangeTime`.
         #[cfg(windows)]
         let (inode, changed) = {
             use std::os::windows::fs::MetadataExt;
-            let creation_ns = meta.creation_time();
-            let changed = meta.created().ok();
-            (creation_ns, changed)
+            (meta.creation_time(), None)
         };
         #[cfg(all(not(unix), not(windows)))]
         let (inode, changed) = (0, None);
@@ -7609,6 +7615,36 @@ impl ScanIdentity {
             inode,
             modified: meta.modified().ok(),
             changed,
+        }
+    }
+
+    /// [`Self::of`] for a file at `path`. Windows has no ctime in `Metadata`, so
+    /// the change stamp is read from the file; when it cannot be, the identity
+    /// is zero and the file is never remembered, because an mtime and a size
+    /// alone do not show a same-size rewrite that put the old mtime back.
+    fn of_path(path: &Path, meta: &std::fs::Metadata) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut identity = Self::of(meta);
+            // FILE_READ_ATTRIBUTES, shared with every other handle, and no
+            // reparse point followed.
+            let changed = std::fs::OpenOptions::new()
+                .access_mode(0x80)
+                .share_mode(7)
+                .custom_flags(0x0020_0000)
+                .open(path)
+                .and_then(|file| crate::fs_entry::windows_change_time(&file));
+            match changed {
+                Ok(changed) => identity.changed = Some(changed),
+                Err(_) => identity.inode = 0,
+            }
+            identity
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Self::of(meta)
         }
     }
 
@@ -7774,7 +7810,7 @@ fn scan_one(
     if !meta.is_file() {
         return ScanOutcome::Unreadable;
     }
-    let identity = ScanIdentity::of(&meta);
+    let identity = ScanIdentity::of_path(&path, &meta);
     if let Some(entry) = previous.get(rel_path) {
         if entry.identity == identity && entry.path_info == path_info {
             return ScanOutcome::Remembered(entry.tally);
@@ -8272,13 +8308,11 @@ mod tests {
     }
 
     #[test]
-    fn status_keeps_an_already_running_fsmonitor_daemon() {
+    fn pinned_git_config_disables_fsmonitor() {
         assert!(
-            !GitReader::STATUS_ARGV
-                .iter()
-                .any(|arg| arg.contains("fsmonitor")),
-            "status must not disable core.fsmonitor: {:?}",
-            GitReader::STATUS_ARGV
+            crate::engine::git_cli::PINNED_GIT_CONFIG.contains(&"core.fsmonitor=false"),
+            "PINNED_GIT_CONFIG must pin core.fsmonitor=false: {:?}",
+            crate::engine::git_cli::PINNED_GIT_CONFIG
         );
     }
 
@@ -9048,7 +9082,10 @@ mod tests {
         let mut command = std::process::Command::new("git");
         crate::test_support::pin_git(&mut command);
         command
-            .args(args)
+            .args(
+                args.iter()
+                    .map(|arg| crate::test_support::plain_git_arg(arg)),
+            )
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "Test User")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
@@ -14225,7 +14262,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         .unwrap();
         crate::test_support::env::write_git_config(
             &home.join(".gitconfig"),
-            &format!("[mailmap]\n\tfile = {}\n", mailmap.display()),
+            &format!(
+                "[mailmap]\n\tfile = {}\n",
+                crate::test_support::env::git_config_value(&mailmap.to_string_lossy())
+            ),
         )
         .unwrap();
         mailmap
@@ -15441,19 +15481,24 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
-        let names = [
+        // Windows cannot hold `glob*.txt` or `:colon.txt`; the pathspec reading
+        // of those two is pinned by the pure-function test above.
+        let names: Vec<&str> = [
             "glob*.txt",
             "glob_decoy.txt",
             ":colon.txt",
             "src/routes/[id]/+page.svelte",
-        ];
-        for name in names {
+        ]
+        .into_iter()
+        .filter(|name| crate::test_support::platform_can_hold(name))
+        .collect();
+        for &name in &names {
             std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
             std::fs::write(root.join(name), "a\n").unwrap();
         }
         crate::test_support::git_in(&root, &["add", "."]);
         crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
-        for name in names {
+        for &name in &names {
             std::fs::write(root.join(name), "a\nb\n").unwrap();
         }
         let (limited, whole, spawned) = status_both_ways(&root);
@@ -17622,7 +17667,16 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         text
     }
 
-    const ADV_NAMES: &[&str] = &[
+    /// The awkward names, less the ones this platform cannot hold.
+    fn adv_names() -> Vec<&'static str> {
+        ADV_NAMES_ALL
+            .iter()
+            .copied()
+            .filter(|name| crate::test_support::platform_can_hold(name))
+            .collect()
+    }
+
+    const ADV_NAMES_ALL: &[&str] = &[
         "a.txt",
         "b c.txt",
         "d b/e.txt",
@@ -17638,17 +17692,18 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     ];
 
     fn adv_pick_new(rng: &mut AdvRng, taken: &[String]) -> String {
+        let names = adv_names();
         loop {
             let dirs = ["", "pkg/", "pkg2/"];
             let name = format!(
                 "{}{}",
                 dirs[rng.below(dirs.len())],
-                ADV_NAMES[rng.below(ADV_NAMES.len())]
+                names[rng.below(names.len())]
             );
             if !taken.contains(&name) {
                 return name;
             }
-            if taken.len() > ADV_NAMES.len() * 3 - 2 {
+            if taken.len() > names.len() * 3 - 2 {
                 return format!("overflow{}.txt", taken.len());
             }
         }
@@ -17834,7 +17889,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
     #[test]
     fn adv_awkward_names_agree_as_rename_target_and_copy_source() {
         let mut problems = Vec::new();
-        for name in ADV_NAMES {
+        for name in adv_names() {
             let rename = init_repo_with_remotes(&[], "main");
             let path = rename.path().to_str().unwrap();
             let oid = merge_with_second_parent(
@@ -17906,7 +17961,18 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
     fn adv_directory_rename_of_thousands_of_files_opens() {
         let dir = init_repo_with_remotes(&[], "main");
         let path = dir.path().to_str().unwrap();
-        let long = "n".repeat(200);
+        // 200 bytes a name, as long as the path may be. Git for Windows refuses a
+        // path past MAX_PATH (260) unless `core.longpaths` is set, and an `add`
+        // that refuses leaves an empty commit, so there the name takes what the
+        // temp directory leaves of 240.
+        let name_len = if cfg!(windows) {
+            240usize
+                .saturating_sub(path.len() + "/pkg2/".len() + "00000.txt".len())
+                .min(200)
+        } else {
+            200
+        };
+        let long = "n".repeat(name_len);
         for i in 0..6000 {
             adv_write(
                 dir.path(),
@@ -18222,19 +18288,23 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 for n in 0..130 {
                     write(dir.path(), &format!("src/c{n:03}.rs"), "fn cold() {}\n");
                 }
-                let hot = [
+                // Windows cannot hold the newline and tab names; the rest stay.
+                let hot: Vec<&str> = [
                     "src/zz new\nline.rs",
                     "src/zz\ttab.rs",
                     "src/zz space name.rs",
                     "src/-zz dash.rs",
                     "src/zz \u{e9}.rs",
-                ];
-                for name in hot {
+                ]
+                .into_iter()
+                .filter(|name| crate::test_support::platform_can_hold(name))
+                .collect();
+                for &name in &hot {
                     write(dir.path(), name, "fn hot() {}\n");
                 }
                 commit_as(dir.path(), "feat: seed", "A <a@example.com>");
                 for round in 0..3 {
-                    for name in hot {
+                    for &name in &hot {
                         write(dir.path(), name, &lines(60, &format!("r{round}")));
                     }
                     commit_as(dir.path(), "feat: churn", "A <a@example.com>");
@@ -18242,7 +18312,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 let root = dir.path().canonicalize().unwrap();
                 let path = root.to_str().unwrap();
                 let report = GitReader::knowledge_report(path, None).expect("report");
-                assert_eq!(report.candidate_files, 135);
+                assert_eq!(report.candidate_files, 130 + hot.len());
                 assert_eq!(report.scanned_files, 128, "{report:?}");
                 assert_eq!(
                     report.scanned_lines,
@@ -18663,6 +18733,18 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 );
                 let root = dir.path().canonicalize().unwrap();
                 let path = root.to_str().unwrap();
+                if cfg!(windows) {
+                    // Git for Windows has no `~user` expansion and refuses the
+                    // setting outright, so there is no report to keep.
+                    let refused = GitReader::knowledge_report(path, None)
+                        .expect_err("git refuses a ~user mailmap path on Windows");
+                    assert!(
+                        refused.message().contains("failed to expand user dir"),
+                        "{}",
+                        refused.message()
+                    );
+                    return;
+                }
                 GitReader::knowledge_report(path, None).expect("first");
                 let cold = blame_spawns(&root);
                 GitReader::knowledge_report(path, None).expect("second");
@@ -19705,6 +19787,38 @@ mod relocated_cli_cycle_tests {
         let raw = dir.path().to_string_lossy().into_owned();
         let blob = crate::engine::GitReader::get_file_blob(&raw, "data.bin", None).unwrap();
         assert!(blob.is_binary);
+        assert_eq!((blob.invalid_utf8_bytes, blob.eol), (0, None));
+    }
+
+    #[test]
+    fn get_file_blob_returns_text_shape_and_image_mime_for_svg() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\">\r\n  <circle cx=\"8\" cy=\"8\" r=\"6\"/>\r\n</svg>\r\n";
+        std::fs::write(dir.path().join("icon.svg"), svg.as_bytes()).unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "icon.svg", None).unwrap();
+        assert!(blob.is_image);
+        assert!(!blob.is_binary);
+        assert_eq!(blob.mime, "image/svg+xml");
+        assert_eq!(blob.text.as_deref(), Some(svg));
+        assert_eq!(blob.base64, None);
+        assert_eq!(blob.invalid_utf8_bytes, 0);
+        assert_eq!(blob.eol, Some(crate::engine::text_shape::LineEnding::Crlf));
+        assert!(blob.disk_base.is_some());
+    }
+
+    #[test]
+    fn get_file_blob_treats_nul_containing_svg_as_binary_not_image() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("broken.svg"), b"<svg>\x00</svg>").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "broken.svg", None).unwrap();
+        assert!(blob.is_binary);
+        assert!(!blob.is_image);
+        assert_eq!(blob.text, None);
+        assert!(blob.base64.is_some());
         assert_eq!((blob.invalid_utf8_bytes, blob.eol), (0, None));
     }
 

@@ -106,18 +106,26 @@ const skillNames = (dir: string): string[] => {
     ),
   ].sort();
 };
-const bundledSkills = [...skillNames(".agents/skills"), ...skillNames("plugins/gitpulse/skills")];
+const pluginSkills = skillNames("plugins/gitpulse/skills");
+const bundledSkills = [...skillNames(".agents/skills"), ...pluginSkills];
 /**
  * Host-bound skills that require a live GitPulse PTY (`GITPULSE_SESSION_TOKEN`)
  * rather than the lane-neutral brief shared with headless Manvi runs and
  * external clipboard copies (`dc-store`'s vendored `agent_guidance.md`).
  * Until `dc-store` names them directly, the terminal launch lane
  * (`terminal_command.rs`) must name every one of them explicitly.
- * `gitpulse-load` and `gitpulse-merge-train` are here for the second reason,
+ * `load`, `merge-train`, `commit-and-merge`, `merge-prs` and `wrap-up` are here for the second reason,
  * not the first: `dc-store`'s brief is owned there, and a launched agent still
  * has to be told the skill exists.
  */
-const TERMINAL_HOST_SKILLS = new Set(["gitpulse-terminal", "gitpulse-load", "gitpulse-merge-train"]);
+const TERMINAL_HOST_SKILLS = new Set([
+  "terminal",
+  "load",
+  "merge-train",
+  "commit-and-merge",
+  "merge-prs",
+  "wrap-up",
+]);
 const terminalLaunchSource = readFileSync(
   new URL("../src-tauri/src/workbench/terminal_command.rs", import.meta.url),
   "utf8",
@@ -125,19 +133,32 @@ const terminalLaunchSource = readFileSync(
 /** "devmap" must match on its own, not inside "devmap-impact". */
 const namesWhole = (haystack: string, needle: string): boolean =>
   new RegExp(`(?<![\\w-])${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`).test(haystack);
+/**
+ * The host namespaces a plugin's skills by the plugin's name, so the plugin's
+ * `insights` is `gitpulse:insights`; the bare name would match ordinary prose
+ * ("load", "tasks"). dc-store's vendored brief is owned by DevCouncil and still
+ * spells them the way they were named before the prefix was dropped
+ * (`gitpulse-insights`); either spelling names the skill.
+ */
+const namesSkill = (haystack: string, skill: string): boolean =>
+  pluginSkills.includes(skill)
+    ? namesWhole(haystack, `gitpulse:${skill}`) || namesWhole(haystack, `gitpulse-${skill}`)
+    : namesWhole(haystack, skill);
 
 describe("the agent guidance every task handoff carries", () => {
   it("names every bundled GitPulse and DevMap skill", () => {
     // Non-vacuity: an empty read would make every assertion below trivially true.
     expect(bundledSkills.length).toBeGreaterThanOrEqual(6);
     for (const skill of bundledSkills) {
-      if (TERMINAL_HOST_SKILLS.has(skill) && !namesWhole(GUIDANCE, skill)) {
+      if (TERMINAL_HOST_SKILLS.has(skill) && !namesSkill(GUIDANCE, skill)) {
+        // GitPulse owns the launch prompt; it spells each skill for the agent
+        // it launches (agy_plugin::skill_reference, tested in Rust).
         expect(
-          namesWhole(terminalLaunchSource, skill),
+          namesWhole(terminalLaunchSource, `skill("${skill}")`),
           `neither preamble nor terminal launch prompt names ${skill}`,
         ).toBe(true);
       } else {
-        expect(namesWhole(GUIDANCE, skill), `preamble omits ${skill}`).toBe(true);
+        expect(namesSkill(GUIDANCE, skill), `preamble omits ${skill}`).toBe(true);
       }
     }
   });

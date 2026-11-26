@@ -18,6 +18,7 @@ const state = vi.hoisted(() => ({
   conflicted: false,
   parked: false,
   probeFailed: false,
+  isBare: false,
   retained: 0,
   verdict: null as null | "blocked" | "allowed",
 }));
@@ -49,6 +50,7 @@ vi.mock("../stores/repoStore", async (importOriginal) => {
           run({
             ...value,
             currentPath: "/repo",
+            isBare: state.isBare,
             statuses: conflictedStatuses(),
             conflictedCount: state.conflicted ? 1 : 0,
             operation: {
@@ -107,7 +109,7 @@ const OVERVIEW = 'aria-label="Overview"';
 const DRAFTS = 'data-testid="work-retained-drafts"';
 
 afterEach(() => {
-  Object.assign(state, { conflicted: false, parked: false, probeFailed: false, retained: 0, verdict: null });
+  Object.assign(state, { conflicted: false, parked: false, probeFailed: false, isBare: false, retained: 0, verdict: null });
 });
 
 describe("WorkOverviewPane", () => {
@@ -181,6 +183,55 @@ describe("WorkOverviewPane", () => {
     const own = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "WorkOverviewPane.svelte"), "utf8");
     expect(own).toContain("document.getElementById(WORK_CONFLICTS_ID)");
   });
+
+  it("exposes accessible Conflicts and Resolve triggers in Overview even when clean or draft-only", () => {
+    const clean = pane();
+    expect(clean).toContain('data-testid="overview-conflicts-btn"');
+    expect(clean).toContain('data-testid="overview-repo-conflicts-btn"');
+    expect(clean).not.toContain('data-testid="work-conflicts-bar"');
+
+    state.retained = 2;
+    const withDrafts = pane();
+    expect(withDrafts).toContain('data-testid="overview-conflicts-btn"');
+    expect(withDrafts).toContain('data-testid="overview-repo-conflicts-btn"');
+    expect(withDrafts).toContain('Conflicts (2 saved drafts)');
+  });
+
+  it("renders the pane navigation bar above the scroller without Hide while live", () => {
+    for (const setup of [{ conflicted: true }, { parked: true }, { probeFailed: true }] as const) {
+      Object.assign(state, { conflicted: false, parked: false, probeFailed: false, ...setup });
+      const body = pane();
+      const barStart = body.indexOf('data-testid="work-conflicts-bar"');
+      const scrollerStart = body.indexOf('data-overview-layout="with-conflicts"');
+      expect(barStart).toBeGreaterThan(-1);
+      expect(scrollerStart).toBeGreaterThan(barStart);
+      const bar = body.slice(barStart, scrollerStart);
+      expect(bar).toContain("Conflicts");
+      expect(bar).toContain("Overview");
+      expect(bar).not.toContain("Hide");
+    }
+  });
+
+  it("stays on Overview without draft rows, editor, or Resolve triggers on bare repositories with retained drafts", () => {
+    Object.assign(state, { isBare: true, retained: 3 });
+    const body = pane();
+    expect(body).toContain('data-overview-layout="overview"');
+    expect(body).not.toContain('data-overview-layout="with-conflicts"');
+    expect(body).not.toContain(DRAFTS);
+    expect(body).not.toContain('id="work-conflicts"');
+    expect(body).not.toContain('data-testid="overview-repo-conflicts-btn"');
+  });
+
+  it("stays on Overview without pinning the editor or Resolve buttons when bare and probeFailed", () => {
+    Object.assign(state, { isBare: true, probeFailed: true });
+    const body = pane();
+    expect(body).toContain('data-overview-layout="overview"');
+    expect(body).not.toContain('data-overview-layout="with-conflicts"');
+    expect(body).not.toContain('id="work-conflicts"');
+    expect(body).not.toContain('data-testid="overview-repo-conflicts-btn"');
+    expect(body).not.toContain('data-testid="overview-probe-failed-conflicts-btn"');
+    expect(body).toContain("Couldn't check for a parked merge or rebase here");
+  });
 });
 
 describe("WorkOverviewPane source", () => {
@@ -201,5 +252,24 @@ describe("WorkOverviewPane source", () => {
     expect(source).not.toMatch(/\$repoStore\.statuses/);
     expect(source).toContain("const { conflictedCount, statuses } = repoStore;");
     expect(source).toContain("$conflictedCount > 0");
+  });
+
+  it("handles reveal requests with bare-repo guard, clears manual reveal on repo switch/live/bare, and refreshes retained drafts immediately", () => {
+    const effect = source.slice(source.indexOf("if (!$conflictsFocusRequest) return;"));
+    expect(effect).toContain("const reveal = takeConflictsReveal();");
+    expect(effect).toContain("if (reveal && !live && !isBare) manualOpen = true;");
+    expect(effect.indexOf("if (reveal && !live && !isBare) manualOpen = true;")).toBeLessThan(effect.indexOf("if (!showEditor) return;"));
+
+    expect(source).toContain("setConflictsPanelOpen(showEditor);");
+    expect(source).toContain("if (prevRepo !== undefined && repo !== prevRepo)");
+    expect(source).toContain("if (live || isBare)");
+    expect(source).toContain("void $conflictDraftProbe;");
+    expect(source).toContain("bumpConflictDraftProbe();");
+    expect(source).toContain("const showEditor = $derived(!isBare && (live || manualOpen));");
+    expect(source).toContain("focusConflictsSection();");
+    expect(source).toContain('[data-testid="overview-conflicts-btn"]');
+    expect(source).toContain("overviewSection?.focus({ preventScroll: true });");
+    const barTag = source.slice(source.lastIndexOf("<div", source.indexOf('data-testid="work-conflicts-bar"')), source.indexOf(">", source.indexOf('data-testid="work-conflicts-bar"')) + 1);
+    expect(barTag).not.toMatch(/\bbg-surface(Hover)?\b/);
   });
 });

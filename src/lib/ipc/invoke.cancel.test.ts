@@ -146,12 +146,27 @@ describe("a call without a signal, or to a read that cannot be stopped, is sent 
   it("adds no id to a read outside the list, and never cancels it", async () => {
     const b = backend();
     const click = new AbortController();
-    void b.invoke("cmd_get_status", { repoPath: "/r" }, { signal: click.signal }).catch(() => undefined);
+    void b.invoke("cmd_list_tags", { repoPath: "/r" }, { signal: click.signal }).catch(() => undefined);
     await settle();
     expect(b.pending[0].args).toEqual({ repoPath: "/r" });
     click.abort();
     await settle();
     expect(b.cancels()).toHaveLength(0);
+  });
+
+  it("attaches requestId to cmd_get_status and cancels on abort", async () => {
+    const b = backend();
+    const click = new AbortController();
+    void b.invoke("cmd_get_status", { repoPath: "/r" }, { signal: click.signal }).catch(() => undefined);
+    await settle();
+    const read = b.pending[0];
+    expect(read.args).toMatchObject({ repoPath: "/r" });
+    const id = read.args?.requestId;
+    expect(typeof id).toBe("string");
+    click.abort();
+    await settle();
+    expect(b.cancels()).toHaveLength(1);
+    expect(b.cancels()[0].args).toEqual({ requestId: id });
   });
 
   it("adds no id in a window that registers no cancellable reads", async () => {

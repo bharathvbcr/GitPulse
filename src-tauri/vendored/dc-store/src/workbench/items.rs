@@ -375,10 +375,7 @@ pub(super) fn open_blockers(
 }
 
 /// Live non-done tasks that `task_id` blocks via outbound `'blocks'` links.
-fn open_blocking(
-    conn: &rusqlite::Connection,
-    task_id: &str,
-) -> Result<Vec<LinkedTaskSummary>> {
+fn open_blocking(conn: &rusqlite::Connection, task_id: &str) -> Result<Vec<LinkedTaskSummary>> {
     query_linked_tasks(
         conn,
         "SELECT target.id, target.title, target.status
@@ -529,9 +526,10 @@ pub(super) fn readiness(input: &Input<'_>) -> Result<String> {
              ) sel JOIN work_items t ON t.id=sel.id WHERE t.deleted=0
              ORDER BY t.position, t.id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![ws, i64::try_from(MAX_READINESS_SCOPED + 1).unwrap_or(501)], |r| {
-            r.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(
+            params![ws, i64::try_from(MAX_READINESS_SCOPED + 1).unwrap_or(501)],
+            |r| r.get::<_, String>(0),
+        )?;
         for row in rows {
             if target_ids.len() >= MAX_READINESS_SCOPED {
                 truncated = true;
@@ -546,9 +544,10 @@ pub(super) fn readiness(input: &Input<'_>) -> Result<String> {
              WHERE ir.repository_id=?1 AND t.deleted=0
              ORDER BY t.position, t.id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![repo, i64::try_from(MAX_READINESS_SCOPED + 1).unwrap_or(501)], |r| {
-            r.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(
+            params![repo, i64::try_from(MAX_READINESS_SCOPED + 1).unwrap_or(501)],
+            |r| r.get::<_, String>(0),
+        )?;
         for row in rows {
             if target_ids.len() >= MAX_READINESS_SCOPED {
                 truncated = true;

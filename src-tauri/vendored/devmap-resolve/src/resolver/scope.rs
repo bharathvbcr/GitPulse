@@ -154,11 +154,9 @@ impl Resolver {
     /// this list. Two file-level functions with different identities abstain;
     /// the same identity repeated (one `#[cfg]` pair) is one function.
     pub(super) fn rust_file_level_function(&self, file: &str, name: &str) -> Option<String> {
-        let hits = self.scope_children.get(&(
-            file.to_string(),
-            file.to_string(),
-            name.to_string(),
-        ))?;
+        let hits =
+            self.scope_children
+                .get(&(file.to_string(), file.to_string(), name.to_string()))?;
         let mut found: Option<&str> = None;
         for (kind, identity) in hits {
             if *kind != SymbolKind::Function {

@@ -21,11 +21,23 @@ pub struct Stamp {
 }
 
 impl Stamp {
-    fn read(meta: &fs::Metadata) -> Result<Self, String> {
+    fn read(path: &Path, meta: &fs::Metadata) -> Result<Self, String> {
         #[cfg(unix)]
-        let (identity, changed) = ((meta.dev(), meta.ino()), (meta.ctime(), meta.ctime_nsec()));
-        #[cfg(not(unix))]
-        let (identity, changed) = ((0, 0), (0, 0));
+        let (identity, changed) = {
+            let _ = path;
+            ((meta.dev(), meta.ino()), (meta.ctime(), meta.ctime_nsec()))
+        };
+        // Size and modification time alone cannot tell a file rewritten in
+        // place with its time put back, or replaced by another of the same
+        // size and time, from the one that was reviewed.
+        #[cfg(windows)]
+        let (identity, changed) = windows_stamp::read(path)
+            .map_err(|e| format!("{}: cannot read its identity: {e}", path.display()))?;
+        #[cfg(not(any(unix, windows)))]
+        let (identity, changed) = {
+            let _ = path;
+            ((0, 0), (0, 0))
+        };
         Ok(Self {
             directory: meta.is_dir(),
             len: meta.len(),
@@ -38,6 +50,46 @@ impl Stamp {
                 .map_err(|e| e.to_string())?
                 .as_nanos(),
         })
+    }
+}
+
+/// A Windows entry's identity and last change, read from a handle to the entry
+/// itself: what `dev`, `ino` and `ctime` are to a Unix stamp.
+#[cfg(windows)]
+mod windows_stamp {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    /// `((volume, file id), (seconds, nanoseconds of the change time))` of the
+    /// entry at `path`, a reparse point not followed. The file id is 128 bits
+    /// on ReFS and 64 on NTFS; folded to 64, which tells two files apart for
+    /// every purpose a stamp has. The change time moves with any write and
+    /// with a restored modification time, which is what a rewrite hides; it is
+    /// read through `fs_entry::windows_change_time`, the one owner of that call.
+    pub(super) fn read(path: &Path) -> std::io::Result<((u64, u64), (i64, i64))> {
+        let file = std::fs::OpenOptions::new()
+            // FILE_READ_ATTRIBUTES: no data access, so no sharing conflict.
+            .access_mode(0x80)
+            .share_mode(1 | 2 | 4)
+            // FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS (a
+            // directory opens only with the latter).
+            .custom_flags(0x0020_0000 | 0x0200_0000)
+            .open(path)?;
+        let (volume, id) = crate::fs_entry::windows_file_identity(&file)?;
+        let low = u64::from_le_bytes(id[..8].try_into().unwrap_or_default());
+        let high = u64::from_le_bytes(id[8..].try_into().unwrap_or_default());
+        let changed = crate::fs_entry::windows_change_time(&file)?;
+        let changed = match changed.duration_since(std::time::UNIX_EPOCH) {
+            Ok(after) => (after.as_secs() as i64, i64::from(after.subsec_nanos())),
+            Err(before) => {
+                let before = before.duration();
+                (
+                    -(before.as_secs() as i64),
+                    -i64::from(before.subsec_nanos()),
+                )
+            }
+        };
+        Ok(((volume, low ^ high.rotate_left(32)), changed))
     }
 }
 
@@ -318,7 +370,7 @@ fn walk(
             ));
         }
     }
-    let stamp = Stamp::read(&meta)?;
+    let stamp = Stamp::read(&path, &meta)?;
     result.newest = result.newest.max(stamp.modified);
     if meta.is_file() {
         #[cfg(unix)]
@@ -517,7 +569,7 @@ mod unix {
             .entries
             .get(Path::new(""))
             .ok_or("Missing reviewed directory")?;
-        if Stamp::read(&held.metadata().map_err(|e| e.to_string())?)? != *first {
+        if Stamp::read(root, &held.metadata().map_err(|e| e.to_string())?)? != *first {
             return Err("Directory changed after preview".into());
         }
         // 60 seconds, and 1 more for every 5,000 reviewed entries: a build
@@ -658,6 +710,12 @@ mod unix {
     }
 }
 
+/// What a removal answers where this platform has no reviewed removal: the
+/// cleaner there offers and judges, and refuses every deletion by design.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) const NO_REMOVAL: &str =
+    "Local artifact cleanup is unavailable on this platform; use the native build tool";
+
 /// A removal that stopped before it finished: why, and what it had already
 /// unlinked. The bytes are real and gone whatever the error, so a caller that
 /// budgets a run charges them.
@@ -685,9 +743,7 @@ pub fn remove_reviewed_counted(
     {
         let _ = (root, expected, cancel);
         Err(PartialRemoval {
-            error:
-                "Local artifact cleanup is unavailable on this platform; use the native build tool"
-                    .into(),
+            error: NO_REMOVAL.into(),
             entries: 0,
             bytes: 0,
         })
@@ -799,8 +855,15 @@ mod tests {
         let target = root.join("x-target");
         cargo_layout(&target, true);
         let reviewed = walk(&target).unwrap();
-        remove_reviewed(&target, &reviewed, &AtomicBool::new(false)).unwrap();
-        assert!(!target.exists());
+        let removed = remove_reviewed(&target, &reviewed, &AtomicBool::new(false));
+        if cfg!(unix) {
+            removed.unwrap();
+            assert!(!target.exists());
+        } else {
+            // Reviewed whole, then refused whole, by design.
+            assert_eq!(removed, Err(super::NO_REMOVAL.to_string()));
+            assert!(target.join("tmp").is_dir());
+        }
     }
 
     fn stamp(dev: u64) -> super::Stamp {

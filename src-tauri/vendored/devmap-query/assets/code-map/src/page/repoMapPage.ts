@@ -117,7 +117,7 @@ export function mountRepoMapPage(root: HTMLElement, DATA: Record<string, unknown
     onSelect: (id) => { map.focusNode(subsystemNodeId(id)); },
   });
 
-  const unplaced = unplacedText(model.unresolvedTotal);
+  const unplaced = unplacedText(model.unresolvedTotal, model.unresolved.length);
   const head = model.generatedHead ? `HEAD ${model.generatedHead.slice(0, 10)}` : "working tree (no HEAD recorded)";
   // Beside the repo map the code graph is a sibling file; over HTTP it is a sibling route.
   const graphHref = location.protocol === "http:" || location.protocol === "https:" ? "code_graph.html" : model.graphHtml;

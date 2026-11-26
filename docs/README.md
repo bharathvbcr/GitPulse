@@ -30,6 +30,7 @@ local-first desktop workspace with 11 specialized sections across 5 views. This 
 | [Mavi](MAVI.md) | Agent conversations: the timeline, approvals, live per-turn changes, SSH hosts, and how it is kept safe |
 | [Terminal](TERMINAL.md) · [Terminal host](TERMINAL_HOST.md) | Sessions, split panes, search, export, `gitpulse-ptyd` host & crash survival |
 | [Coverage](COVERAGE.md) | Report formats, generation, missing toolchains, diagnostics |
+| [Cloud, SSH and Remote Control sessions](CLOUD_SESSIONS.md) | What works off-Mac, DevMap setup script, what is unavailable |
 | [Repository hygiene](REPOSITORY_HYGIENE.md) | Storage scopes, cleanup previews, scheduling |
 | [Native menus and status icon](MACOS_MENUS.md) | Desktop menus, contextual actions, macOS status popover |
 | [macOS appearance](MACOS_APPEARANCE.md) | Glass surfaces, theme presets, saved themes, window wallpapers, accessibility fallbacks |

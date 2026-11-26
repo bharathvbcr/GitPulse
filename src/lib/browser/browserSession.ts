@@ -49,11 +49,33 @@ export interface BrowserElementPick {
 }
 
 /** What a session's page did, as `src-tauri/src/browser` reports it. */
+export interface LocalServerInfo {
+  url: string;
+  port: number;
+  label: string;
+  source: "portless" | "lsof" | "run_script" | string;
+  pid: number | null;
+  process: string | null;
+  hostname: string | null;
+}
+
+export interface RunScriptInfo {
+  path: string;
+  preview_url: string | null;
+  preview_listening: boolean;
+}
+
+export interface LocalServerDiscovery {
+  servers: LocalServerInfo[];
+  run_script: RunScriptInfo | null;
+}
+
 export type PageEvent =
   | { id: string; kind: "loading"; url: string }
   | { id: string; kind: "loaded"; url: string }
   | { id: string; kind: "title"; title: string }
-  | { id: string; kind: "refused"; url: string };
+  | { id: string; kind: "refused"; url: string }
+  | { id: string; kind: "terminated" };
 
 export type HistoryStep = "back" | "forward" | "reload";
 
@@ -73,6 +95,10 @@ export const browserIpc = {
       y,
       viewportWidth,
       viewportHeight,
+    }),
+  discoverLocalServers: (repoPath?: string | null) =>
+    invoke<LocalServerDiscovery>("cmd_browser_discover_local_servers", {
+      repoPath: repoPath ?? null,
     }),
 };
 
@@ -100,6 +126,8 @@ export function parsePageEvent(payload: unknown): PageEvent | null {
       const title = text(raw.title);
       return title === null ? null : { id, kind: "title", title };
     }
+    case "terminated":
+      return { id, kind: "terminated" };
     default:
       return null;
   }

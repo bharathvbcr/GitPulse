@@ -48,22 +48,40 @@ fn farm(count: usize, contended: bool) -> Farm {
     }
 }
 
-fn marks(farm: &Farm) -> Vec<usize> {
-    farm.dirs.iter().map(|dir| spawns_in(dir).len()).collect()
+fn marks(farm: &Farm) -> Vec<(usize, usize)> {
+    use crate::engine::worktree::status_reads;
+    farm.dirs
+        .iter()
+        .map(|dir| (spawns_in(dir).len(), status_reads::in_dir(dir).len()))
+        .collect()
 }
 
-/// `(worktree list, status)` git children started in the farm since `marks`.
-fn spawned(farm: &Farm, marks: &[usize]) -> (usize, usize) {
+/// `(worktree list, status)` reads started in the farm since `marks` —
+/// counting both git CLI spawns and in-process `gix` status reads without
+/// double-counting CLI fallbacks.
+fn spawned(farm: &Farm, marks: &[(usize, usize)]) -> (usize, usize) {
+    use crate::engine::worktree::status_reads::{self, StatusBackend};
     let argvs: Vec<Vec<String>> = farm
         .dirs
         .iter()
         .zip(marks)
-        .flat_map(|(dir, mark)| spawns_in(dir)[*mark..].to_vec())
+        .flat_map(|(dir, (spawn_mark, _))| spawns_in(dir)[*spawn_mark..].to_vec())
         .collect();
+    let gix_statuses: usize = farm
+        .dirs
+        .iter()
+        .zip(marks)
+        .map(|(dir, (_, read_mark))| {
+            status_reads::in_dir(dir)[*read_mark..]
+                .iter()
+                .filter(|(backend, _)| *backend == StatusBackend::Gix)
+                .count()
+        })
+        .sum();
     let has = |argv: &[String], word: &str| argv.iter().any(|arg| arg == word);
     (
         argvs.iter().filter(|a| has(a, "worktree")).count(),
-        argvs.iter().filter(|a| has(a, "status")).count(),
+        argvs.iter().filter(|a| has(a, "status")).count() + gix_statuses,
     )
 }
 
@@ -563,13 +581,11 @@ fn a_repository_asked_for_through_a_link_is_read_at_its_canonical_path() {
     let mark = marks(&farm);
     let answer = serve(&link.to_string_lossy()).expect("trusted through the link");
     assert_eq!(answer.repo, farm.repo);
-    let reads: usize = farm
-        .dirs
-        .iter()
-        .zip(&mark)
-        .map(|(dir, mark)| spawns_in(dir).len() - mark)
-        .sum();
-    assert!(reads > 0, "no read was made in the repository itself");
+    let (listings, statuses) = spawned(&farm, &mark);
+    assert!(
+        listings + statuses > 0,
+        "no read was made in the repository itself"
+    );
 }
 
 /// The app runs an agent's read in the class the agent's own scan runs in
@@ -577,23 +593,126 @@ fn a_repository_asked_for_through_a_link_is_read_at_its_canonical_path() {
 #[test]
 fn the_apps_reads_for_an_mcp_process_run_in_the_background_class() {
     use crate::engine::process::spawn_log::classed_spawns_in;
+    use crate::engine::worktree::status_reads::{self, StatusBackend};
     let farm = farm(2, false);
     let answer = serve(&farm.repo).expect("the app reads");
     assert!(answer.worktrees.is_some());
-    let classes: Vec<_> = farm
+    let worktree_classes: Vec<_> = farm
         .dirs
         .iter()
         .flat_map(|dir| classed_spawns_in(dir))
-        .filter(|(argv, _)| argv.iter().any(|arg| arg == "status" || arg == "worktree"))
+        .filter(|(argv, _)| argv.iter().any(|arg| arg == "worktree"))
         .collect();
-    assert!(!classes.is_empty(), "no read was recorded");
-    for (argv, class) in classes {
+    assert!(
+        !worktree_classes.is_empty(),
+        "no worktree listing was recorded"
+    );
+    for (argv, class) in worktree_classes {
         assert_eq!(
             class,
             crate::engine::process::Admission::Background,
             "{argv:?} ran at the UI's priority"
         );
     }
+    let status_spawns: Vec<_> = farm
+        .dirs
+        .iter()
+        .flat_map(|dir| classed_spawns_in(dir))
+        .filter(|(argv, _)| argv.iter().any(|arg| arg == "status"))
+        .collect();
+    assert!(
+        status_spawns.is_empty(),
+        "happy path must use in-process gix status: {status_spawns:?}"
+    );
+    let in_process: Vec<_> = farm
+        .dirs
+        .iter()
+        .flat_map(|dir| status_reads::in_dir(dir))
+        .collect();
+    assert!(
+        !in_process.is_empty(),
+        "no in-process status read was recorded"
+    );
+    for (backend, class) in in_process {
+        assert_eq!(backend, StatusBackend::Gix);
+        assert_eq!(
+            class,
+            crate::engine::process::Admission::Background,
+            "in-process status read ran at the UI's priority"
+        );
+    }
+}
+
+/// Status reads (subprocesses or in-process `gix`) started anywhere in the
+/// farm, on any thread: both logs are process-wide and keyed by directory.
+fn statuses_started(farm: &Farm) -> Vec<(std::path::PathBuf, String)> {
+    use crate::engine::worktree::status_reads;
+    let mut started: Vec<(std::path::PathBuf, String)> = farm
+        .dirs
+        .iter()
+        .flat_map(|dir| {
+            spawns_in(dir)
+                .into_iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "status"))
+                .map(|argv| (dir.clone(), format!("cli:{argv:?}")))
+        })
+        .collect();
+    started.extend(farm.dirs.iter().flat_map(|dir| {
+        status_reads::in_dir(dir)
+            .into_iter()
+            .map(|(backend, _)| (dir.clone(), format!("{backend:?}")))
+    }));
+    started
+}
+
+/// Runs `ask` as a request whose asker leaves the moment the first status read
+/// of the farm is about to start: the flag is set there, so any worker that
+/// does not run under it spawns, and one that does is refused before it can.
+fn ask_whose_asker_leaves_at_the_first_status<T>(farm: &Farm, ask: impl FnOnce() -> T) -> T {
+    use crate::engine::process::read_cancel::{enter, ReadCancel};
+    let cancel = ReadCancel::new();
+    let leaves = cancel.clone();
+    crate::engine::worktree::status_probes::with_probe(
+        &farm.dirs,
+        move |_| leaves.cancel(),
+        || {
+            let _scope = enter(Some(&cancel));
+            ask()
+        },
+    )
+}
+
+/// The asker of a collision scan that leaves mid-scan stops the scan on the
+/// pool's threads too: the scope is thread-local, and the scan fans out over
+/// rayon.
+#[test]
+fn a_collision_scan_whose_asker_left_starts_no_status_on_any_thread() {
+    let farm = farm(10, true);
+    assert!(statuses_started(&farm).is_empty(), "a fresh farm");
+    ask_whose_asker_leaves_at_the_first_status(&farm, || {
+        crate::insights::collision_for_path_memoized(&farm.repo, "seed.txt")
+    });
+    let started = statuses_started(&farm);
+    assert!(
+        started.is_empty(),
+        "{} status children started after the asker left: {started:?}",
+        started.len()
+    );
+}
+
+/// The same for an insights read, which runs on a thread of its own and then
+/// scans the worktrees on scoped threads and rayon's pool.
+#[test]
+fn an_insights_read_whose_asker_left_starts_no_status_on_any_thread() {
+    let farm = farm(10, true);
+    assert!(statuses_started(&farm).is_empty(), "a fresh farm");
+    let _ = ask_whose_asker_leaves_at_the_first_status(&farm, || serve(&farm.repo));
+    let started = statuses_started(&farm);
+    assert!(
+        started.is_empty(),
+        "{} status children started after the asker left: {started:?}",
+        started.len()
+    );
 }
 
 /// An answer that is partial is not one the asker may build a snapshot on.
@@ -615,4 +734,156 @@ fn a_partial_answer_is_not_a_snapshot() {
             .expect_err("a partial answer was believed");
         assert!(refused.contains("partial"), "{refused}");
     }
+}
+
+/// One uncancelled scan of the contended file, on a memo of its own: the verdict
+/// the farm really has, for the cancelled runs below to be read against.
+fn baseline_collision(farm: &Farm) -> crate::insights::MemoizedCollision {
+    let answer = CollisionMemo::new(MEMO_TTL).risk_for_path(
+        &farm.repo,
+        "seed.txt",
+        &crate::insights::live_sessions::observe(),
+    );
+    assert!(answer.risk.ok, "{:?}", answer.risk.error);
+    assert_eq!(answer.risk.failed_worktrees, 0);
+    assert_eq!(answer.risk.scanned_worktrees as usize, farm.dirs.len());
+    let words = serde_json::to_string(&answer.risk).expect("encodes");
+    assert!(
+        !words.contains("cancelled") && !words.contains("untracked"),
+        "the baseline already says it: {words}"
+    );
+    answer
+}
+
+fn seed_verdict(
+    answer: &crate::insights::MemoizedCollision,
+) -> Option<crate::insights::EntityCollisionVerdict> {
+    answer
+        .risk
+        .items
+        .iter()
+        .find(|item| item.path == "seed.txt")
+        .and_then(|item| item.entity.clone())
+}
+
+fn ls_files_started(farm: &Farm) -> usize {
+    farm.dirs
+        .iter()
+        .map(|dir| {
+            spawns_in(dir)
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "ls-files"))
+                .count()
+        })
+        .sum()
+}
+
+/// Asker B is whole and says what an uncancelled scan says, whatever happened
+/// to asker A, and nothing cancelled was kept for the next caller.
+fn assert_b_is_unaffected(
+    farm: &Farm,
+    memo: &CollisionMemo,
+    baseline: &crate::insights::MemoizedCollision,
+    b: &crate::insights::MemoizedCollision,
+) {
+    let expected = seed_verdict(baseline).expect("the baseline classified the file");
+    assert!(b.risk.ok, "{:?}", b.risk.error);
+    assert_eq!(b.risk.failed_worktrees, 0, "{:?}", b.risk.error);
+    assert_eq!(b.risk.scanned_worktrees as usize, farm.dirs.len());
+    assert_eq!(seed_verdict(b).as_ref(), Some(&expected));
+    let words = serde_json::to_string(&b.risk).expect("encodes");
+    assert!(
+        !words.contains("cancelled") && !words.contains("untracked"),
+        "B was handed what A's cancellation left: {words}"
+    );
+    let later = memo.risk_for_path(
+        &farm.repo,
+        "seed.txt",
+        &crate::insights::live_sessions::observe(),
+    );
+    assert_eq!(
+        seed_verdict(&later).as_ref(),
+        Some(&expected),
+        "a later caller within the TTL was served a cancelled verdict"
+    );
+}
+
+/// Runs asker A (under `cancel`) and asker B (under no scope) at once against
+/// one memo, and gives B's answer. `release_b` is set by whatever cancels A.
+fn two_askers(
+    farm: &Farm,
+    memo: &CollisionMemo,
+    cancel: &crate::engine::process::read_cancel::ReadCancel,
+    release_b: &std::sync::atomic::AtomicBool,
+) -> crate::insights::MemoizedCollision {
+    use std::sync::atomic::Ordering;
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _asker = crate::engine::process::read_cancel::enter(Some(cancel));
+            memo.risk_for_path(
+                &farm.repo,
+                "seed.txt",
+                &crate::insights::live_sessions::observe(),
+            )
+        });
+        scope
+            .spawn(|| {
+                let _ = crate::test_support::env::wait_until(Duration::from_secs(30), || {
+                    release_b.load(Ordering::Acquire)
+                });
+                memo.risk_for_path(
+                    &farm.repo,
+                    "seed.txt",
+                    &crate::insights::live_sessions::observe(),
+                )
+            })
+            .join()
+            .expect("B answers")
+    })
+}
+
+/// A asks and leaves at the first status read it makes. B asks for the same file and is
+/// answered from the repository, not from what A's cancelled reads left.
+#[test]
+fn an_asker_that_leaves_at_its_first_status_read_leaves_another_ask_whole() {
+    let farm = farm(3, true);
+    let baseline = baseline_collision(&farm);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let cancel = crate::engine::process::read_cancel::ReadCancel::new();
+    let release_b = std::sync::atomic::AtomicBool::new(true);
+    let leaves = cancel.clone();
+    let b = crate::engine::worktree::status_probes::with_probe(
+        &farm.dirs,
+        move |_| leaves.cancel(),
+        || two_askers(&farm, &memo, &cancel, &release_b),
+    );
+    assert_b_is_unaffected(&farm, &memo, &baseline, &b);
+}
+
+/// A asks and leaves while its verdict is being classified (its first
+/// `ls-files` is the mark). B, which arrives then, must not be served the
+/// verdict A's refused reads formed.
+#[test]
+fn an_asker_that_leaves_while_the_verdict_is_classified_leaves_another_ask_whole() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let farm = farm(3, true);
+    let baseline = baseline_collision(&farm);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let cancel = crate::engine::process::read_cancel::ReadCancel::new();
+    let release_b = AtomicBool::new(false);
+    let seen = ls_files_started(&farm);
+    let done = AtomicBool::new(false);
+    let b = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = crate::test_support::env::wait_until(Duration::from_secs(30), || {
+                ls_files_started(&farm) > seen
+            });
+            cancel.cancel();
+            release_b.store(true, Ordering::Release);
+            done.store(true, Ordering::Release);
+        });
+        two_askers(&farm, &memo, &cancel, &release_b)
+    });
+    assert!(done.load(Ordering::Acquire), "A never reached its verdict");
+    assert_b_is_unaffected(&farm, &memo, &baseline, &b);
 }

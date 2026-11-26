@@ -54,7 +54,7 @@ pub(crate) use env::{
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use env::{
     default_child_path_with_env, gui_launch_fallback_dirs, restrict_env_to_allowlist,
-    restrict_env_to_allowlist_plus, spawn_candidate_names, MAX_INHERITED_PATH_BYTES,
+    restrict_env_to_allowlist_plus, spawn_candidate_names, HOME_ENV_VAR, MAX_INHERITED_PATH_BYTES,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use env::{developer_dirs, past_xcrun_git_shim, REAL_GIT_DIRS};
@@ -66,10 +66,15 @@ pub(crate) use gate::with_disk_only_answer;
 #[cfg(any(not(unix), test))]
 pub(in crate::engine::process) use gate::SpawnPermit;
 pub(crate) use gate::{
-    background_deferral_cause, current_admission, grant_post_action_credit_now,
-    is_deferred_under_load, is_slot_wait_timeout, mark_user_action, production_spawn_rate,
-    run_command_scope, with_admission, with_background_processes, with_disk_relief,
-    with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
+    background_deferral_cause, check_in_process_admission, current_admission,
+    deferred_under_load_error, grant_post_action_credit_now, is_deferred_under_load,
+    is_slot_wait_timeout, mark_user_action, production_spawn_rate, run_command_scope,
+    with_admission, with_background_processes, with_disk_relief, with_spawn_source,
+    with_unmetered_spawn_rate, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
+};
+pub use gate::{
+    carry_admission, current_admission_name, run_as_user_action, run_process_as_background,
+    run_process_awaiting_background_budget, run_process_with_unlimited_spawn_rate,
 };
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]
@@ -80,15 +85,11 @@ pub(in crate::engine::process) use gate::{
     CANCELLED_BEFORE_SPAWN, POST_ACTION_CREDIT_REPOS, POST_ACTION_CREDIT_WINDOW,
     UNATTRIBUTED_SOURCE,
 };
-pub use gate::{
-    current_admission_name, run_process_as_background, run_process_awaiting_background_budget,
-    run_process_with_unlimited_spawn_rate,
-};
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(crate) use gate::{
-    frozen_gate, leak_gate, refusal_message, rev_parse_launches_from, spawn_log,
-    take_post_action_credit, with_background_budget_wait, Refusal, SpawnGate,
+    frozen_gate, leak_gate, refusal_message, rev_parse_launches_from, spawn_log, spent_gate,
+    take_post_action_credit, with_background_budget_wait, with_gate_for_test, Refusal, SpawnGate,
     POST_ACTION_CREDIT_SPAWNS, SLOT_WAIT_SUFFIX,
 };
 
@@ -131,6 +132,7 @@ pub(in crate::engine::process) use runner::{
 };
 pub(in crate::engine::process) use runner::{observe_output, Drained, Stop};
 
+pub use shared_budget::{exhaust_per_user_record, EXHAUST_RECORD_MARKER};
 pub(crate) use shared_read::run_read_shared;
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]

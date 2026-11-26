@@ -47,6 +47,7 @@ use self::hits::{
     scope_report_from_narrowing, skeleton_symbol_tokens, LITERAL_PAGE_CAP,
 };
 pub use self::hits::{EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH};
+#[cfg(all(test, feature = "parse"))]
 use self::trace::shortest_path;
 pub(crate) use self::trace::PathSearch;
 use self::traversal::{
@@ -348,10 +349,13 @@ impl<'a> StoreQueryEngine<'a> {
             // That trade is about fan-outs. This is a count, one limited select and
             // one row — so the exact answer is affordable here, and an exact answer
             // beats a disclosed approximation whenever it can be had.
-            let Some(snapshot) = self.keyword_page(&req.query, pool, filter)? else {
-                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                    reason: "no persisted generation is available".to_string(),
-                }));
+            let snapshot = match self.keyword_page(&req.query, pool, filter)?.into_page() {
+                Ok(page) => page,
+                Err(reason) => {
+                    return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                        reason,
+                    }));
+                }
             };
             let total = snapshot.total;
             let rows = snapshot.rows;
@@ -432,6 +436,10 @@ impl<'a> StoreQueryEngine<'a> {
 
     /// One keyword page, pinned to the generation the filter was checked against.
     ///
+    /// A page is not the only answer: the store may hold no generation at all,
+    /// or the one the filter was checked against may be pruned before the page
+    /// is read. Those are different states and the caller says so.
+    ///
     /// No filter calls [`Store::search_page`], whose SQL stays the unfiltered
     /// plan. A filter resolves path and language against that generation's
     /// files, then asks the store for a page whose count and rows both already
@@ -441,23 +449,27 @@ impl<'a> StoreQueryEngine<'a> {
         query: &str,
         pool: usize,
         filter: Option<&crate::scope::NameQueryFilter>,
-    ) -> anyhow::Result<Option<devmap_store::SearchPage>> {
+    ) -> anyhow::Result<KeywordRead> {
         if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
-            return stacked.keyword_page(query, pool, filter);
+            return Ok(KeywordRead::from_page(
+                stacked.keyword_page(query, pool, filter)?,
+            ));
         }
         let wt_root = self
             .stacked
             .map(|s| s.worktree_root().to_string_lossy().into_owned());
         let Some(filter) = filter else {
-            return Ok(self.store.search_page(query, pool)?.map(|mut page| {
-                if let Some(root) = wt_root {
-                    page.repo_root = Some(root);
-                }
-                page
-            }));
+            return Ok(KeywordRead::from_page(
+                self.store.search_page(query, pool)?.map(|mut page| {
+                    if let Some(root) = wt_root {
+                        page.repo_root = Some(root);
+                    }
+                    page
+                }),
+            ));
         };
         let Some((generation, root, files)) = self.latest_scope_inputs()? else {
-            return Ok(None);
+            return Ok(KeywordRead::NoGeneration);
         };
         let (paths, languages) = match filter.symbol_scope()? {
             Some(scope) => {
@@ -471,15 +483,22 @@ impl<'a> StoreQueryEngine<'a> {
             languages,
             kinds: filter.kinds().to_vec(),
         };
-        Ok(self
-            .store
-            .search_page_in(generation, query, pool, Some(&narrowing))?
-            .map(|mut page| {
-                if let Some(root) = wt_root {
-                    page.repo_root = Some(root);
+        Ok(
+            match self
+                .store
+                .search_page_in(generation, query, pool, Some(&narrowing))?
+            {
+                Some(mut page) => {
+                    if let Some(root) = wt_root {
+                        page.repo_root = Some(root);
+                    }
+                    KeywordRead::Page(Box::new(page))
                 }
-                page
-            }))
+                // The filter was checked against `generation`, so one existed a
+                // moment ago: this is a prune landing in between.
+                None => KeywordRead::Pruned(generation),
+            },
+        )
     }
 
     pub fn dependencies(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
@@ -617,12 +636,21 @@ impl<'a> StoreQueryEngine<'a> {
             .chain(inbound_starts.iter())
             .cloned()
             .collect();
-        if matches!(
+        let pure_scoped_symbol = matches!(
             crate::query_match::classify(target),
-            crate::query_match::StartQuery::Symbol(_)
-        ) {
+            crate::query_match::StartQuery::Qualified { .. }
+        ) && !named.iter().any(|(sym, file)| {
+            crate::query_match::qualified_file_or_module_matches(target, sym, file)
+        });
+        if pure_scoped_symbol
+            || matches!(
+                crate::query_match::classify(target),
+                crate::query_match::StartQuery::Symbol(_)
+            )
+        {
             // One side may hold a namesake the other does not: a callee-only
-            // `run` and a called-only `run` are two symbols.
+            // `run` and a called-only `run` are two symbols. The same rule
+            // applies to a pure `Type::method` that matched no file/module.
             traversal::refuse_ambiguous(target, &named.iter().cloned().collect::<Vec<_>>())?;
         }
         if named.is_empty() {
@@ -1138,20 +1166,6 @@ impl<'a> StoreQueryEngine<'a> {
             let (from, to) = req.query;
             let from = from.trim();
             let to = to.trim();
-            // "No indexed path" is a claim about the graph only where both
-            // endpoints' calls were looked for (P2.7a). Bare-name endpoints name no
-            // file and are not checked here; a qualified or path endpoint is.
-            let coverage_gap = devmap_analyze::combine_reasons(
-                analysis_coverage_gap(index.analysis()),
-                self.call_blind_starts(query_file(from).into_iter().chain(query_file(to)))?
-                    .reason(),
-            );
-            let unavailable = |reason: String| {
-                let mut response =
-                    unavailable_response(ResolutionAvailability::Unavailable { reason });
-                response.walk_incomplete = coverage_gap.clone();
-                response
-            };
             if from.is_empty() || to.is_empty() {
                 return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                     reason: "scoped trace endpoints must not be empty".to_string(),
@@ -1172,14 +1186,60 @@ impl<'a> StoreQueryEngine<'a> {
                 }));
             }
             let edges = self.resolved_edges(&index, req.min_confidence)?;
-            let path = match shortest_path(
+            let (search, mut walked) = trace::shortest_path_walked(
                 &edges,
                 from,
                 to,
                 req.max_depth.min(MAX_TRAVERSAL_DEPTH),
                 5_000,
                 &self.cancel,
-            )? {
+            )?;
+            // If `from` had no resolved outbound edges, still check unbound calls
+            // inside `from` itself so a leaf whose only calls went unbound says so.
+            let mut radius_side = RadiusSide::Callees;
+            if walked.is_empty() {
+                let inbound = indexed_traversal_starts(&index, from, true, 0.0, &self.cancel)?;
+                walked.extend(inbound);
+                if walked.is_empty() {
+                    match crate::query_match::classify(from) {
+                        crate::query_match::StartQuery::Qualified { file, .. } => {
+                            walked.insert((from.to_string(), file.to_string()));
+                        }
+                        crate::query_match::StartQuery::Path(path) => {
+                            radius_side = RadiusSide::FileCallees;
+                            walked.insert((path.to_string(), path.to_string()));
+                        }
+                        crate::query_match::StartQuery::Symbol(_)
+                        | crate::query_match::StartQuery::Nothing => {}
+                    }
+                }
+            }
+            // Corpus parse-coverage half + per-walk attribution gap (only unbound
+            // calls inside nodes this trace actually walked, matching `impact`,
+            // `trace`, `affected`, and `neighbors`) + call-blind endpoint check.
+            let attribution = self.radius_attribution_gap(
+                index.generation(),
+                index.analysis(),
+                &walked,
+                radius_side,
+            )?;
+            let call_blind = self.call_blind_starts(
+                query_file(from)
+                    .into_iter()
+                    .chain(query_file(to))
+                    .chain(walked.iter().map(|(_, file)| file.as_str())),
+            )?;
+            let coverage_gap = devmap_analyze::combine_reasons(
+                devmap_analyze::combine_reasons(analysis_status_gap(index.analysis()), attribution),
+                call_blind.reason(),
+            );
+            let unavailable = |reason: String| {
+                let mut response =
+                    unavailable_response(ResolutionAvailability::Unavailable { reason });
+                response.walk_incomplete = coverage_gap.clone();
+                response
+            };
+            let path = match search {
                 PathSearch::Found(path) => path,
                 // The only outcome that is a claim about the graph.
                 PathSearch::NoPath => {
@@ -1457,7 +1517,11 @@ impl<'a> StoreQueryEngine<'a> {
             let (name, families) = match crate::query_match::classify(target.trim()) {
                 crate::query_match::StartQuery::Qualified { file, symbol } => (
                     bare_callee_name(symbol),
-                    BTreeSet::from([family_of_path(file)]),
+                    if crate::query_match::looks_like_path(file) {
+                        BTreeSet::from([family_of_path(file)])
+                    } else {
+                        BTreeSet::new()
+                    },
                 ),
                 crate::query_match::StartQuery::Symbol(name) => {
                     (bare_callee_name(name), BTreeSet::new())
@@ -1502,12 +1566,20 @@ impl<'a> StoreQueryEngine<'a> {
                     namesakes.other_language_sites += 1;
                     continue;
                 }
+                let withheld = devmap_extract::secret::is_secret_path(&row.source_file)
+                    .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
+                // Same rule as the hit builders: the key stays, the text goes.
+                let receiver = match (&withheld, row.receiver) {
+                    (Some(_), Some(_)) => Some(String::new()),
+                    (_, receiver) => receiver,
+                };
                 namesakes.sites.push(UnresolvedSite {
                     source_file: row.source_file,
                     source_symbol: row.source_symbol,
                     callee_name: name.clone(),
-                    receiver: row.receiver,
+                    receiver,
                     classification: row.classification,
+                    withheld,
                 });
             }
             namesakes.names.push(name);
@@ -1591,37 +1663,6 @@ impl<'a> StoreQueryEngine<'a> {
         };
         let start: Vec<String> = starts.iter().map(|(symbol, _)| symbol.clone()).collect();
         if start.is_empty() {
-            // A symbol whose every call went unbound has no outbound edge, so
-            // it is no start for a walk toward callees — and its unbound calls
-            // are exactly what this answer cannot show. Ask about the target
-            // itself. (Toward callers, `attach_unresolved_namesakes` asks.)
-            let coverage_gap = if reverse {
-                coverage_gap
-            } else {
-                let named = match crate::query_match::classify(target) {
-                    crate::query_match::StartQuery::Qualified { file, .. } => {
-                        Some((RadiusSide::Callees, (target.to_string(), file.to_string())))
-                    }
-                    crate::query_match::StartQuery::Path(path) => Some((
-                        RadiusSide::FileCallees,
-                        (path.to_string(), path.to_string()),
-                    )),
-                    crate::query_match::StartQuery::Symbol(_)
-                    | crate::query_match::StartQuery::Nothing => None,
-                };
-                match named {
-                    Some((side, key)) => devmap_analyze::combine_reasons(
-                        coverage_gap,
-                        self.radius_attribution_gap(
-                            index.generation(),
-                            index.analysis(),
-                            &BTreeSet::from([key]),
-                            side,
-                        )?,
-                    ),
-                    None => coverage_gap,
-                }
-            };
             // An indexed symbol with no edge on this side is a leaf, not a
             // miss. `neighbors seed_for_repeat` answered its callees
             // `Unavailable: no indexed traversal start` for a function the
@@ -1644,6 +1685,44 @@ impl<'a> StoreQueryEngine<'a> {
                 indexed_traversal_starts(index, target, !reverse, 0.0, &self.cancel)?
             } else {
                 Vec::new()
+            };
+            // A symbol whose every call went unbound has no outbound edge, so
+            // it is no start for a walk toward callees — and its unbound calls
+            // are exactly what this answer cannot show. Ask about the resolved
+            // symbol(s) when known, falling back to the query text. (Toward
+            // callers, `attach_unresolved_namesakes` asks.)
+            let coverage_gap = if reverse {
+                coverage_gap
+            } else {
+                let named: Option<(RadiusSide, BTreeSet<(String, String)>)> =
+                    if !indexed_in.is_empty() {
+                        Some((RadiusSide::Callees, indexed_in.iter().cloned().collect()))
+                    } else {
+                        match crate::query_match::classify(target) {
+                            crate::query_match::StartQuery::Qualified { file, .. } => Some((
+                                RadiusSide::Callees,
+                                BTreeSet::from([(target.to_string(), file.to_string())]),
+                            )),
+                            crate::query_match::StartQuery::Path(path) => Some((
+                                RadiusSide::FileCallees,
+                                BTreeSet::from([(path.to_string(), path.to_string())]),
+                            )),
+                            crate::query_match::StartQuery::Symbol(_)
+                            | crate::query_match::StartQuery::Nothing => None,
+                        }
+                    };
+                match named {
+                    Some((side, keys)) => devmap_analyze::combine_reasons(
+                        coverage_gap,
+                        self.radius_attribution_gap(
+                            index.generation(),
+                            index.analysis(),
+                            &keys,
+                            side,
+                        )?,
+                    ),
+                    None => coverage_gap,
+                }
             };
             let files: BTreeSet<&str> = indexed_in.iter().map(|(_, file)| file.as_str()).collect();
             // The files `call_blind` already read, when the target named its
@@ -1941,8 +2020,9 @@ impl<'a> StoreQueryEngine<'a> {
 
         let page = budget_page_size(budget.definitions);
         let pool = search_rank_pool_size(budget.definitions);
-        let Some(snapshot) = self.keyword_page(query, pool, filter)? else {
-            return Ok(empty("no persisted generation is available".to_string()));
+        let snapshot = match self.keyword_page(query, pool, filter)?.into_page() {
+            Ok(page) => page,
+            Err(reason) => return Ok(empty(reason)),
         };
         let total = snapshot.total;
         let scope = snapshot
@@ -4240,9 +4320,53 @@ fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
     })
 }
 
+/// What a keyword read found.
+enum KeywordRead {
+    Page(Box<devmap_store::SearchPage>),
+    /// The store holds no generation.
+    NoGeneration,
+    /// A generation was pinned and was pruned before its page was read.
+    Pruned(u32),
+}
+
+impl KeywordRead {
+    fn from_page(page: Option<devmap_store::SearchPage>) -> Self {
+        page.map_or(Self::NoGeneration, |page| Self::Page(Box::new(page)))
+    }
+
+    /// The page, or why there is none. A pruned generation is not an empty or
+    /// unbuilt store: the index is there and a retry reads its newer generation.
+    fn into_page(self) -> Result<devmap_store::SearchPage, String> {
+        match self {
+            Self::Page(page) => Ok(*page),
+            Self::NoGeneration => Err("no persisted generation is available".to_string()),
+            Self::Pruned(generation) => Err(format!(
+                "generation {generation}, the one this query was reading, was pruned while the \
+                 query ran — the index is not empty or unbuilt; retry the query"
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "engine/tests/attribution_disclosure_tests.rs"]
 mod attribution_disclosure_tests;
+
+#[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/pruned_generation_namesake.rs"]
+mod pruned_generation_namesake;
+
+#[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/pruned_keyword_page.rs"]
+mod pruned_keyword_page;
+
+#[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/charged_scope_pairing.rs"]
+mod charged_scope_pairing;
+
+#[cfg(test)]
+#[path = "engine/tests/radius_key_bounds.rs"]
+mod radius_key_bounds;
 
 #[cfg(all(test, feature = "parse"))]
 #[path = "engine/tests/tests.rs"]

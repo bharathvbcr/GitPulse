@@ -14,6 +14,7 @@ import { interfaceStore } from "./lib/stores/interfaceStore";
 import { repoStore } from "./lib/stores/repoStore";
 import { configureReadCancellation, configureSharedReads } from "./lib/ipc/invoke";
 import { cancelRead, CANCELLABLE_READ_COMMANDS, SHARED_READ_COMMANDS } from "./lib/ipc/sharedReads";
+import { registerBootListenersPromise } from "./lib/runtime/idleShedderWiring";
 
 applyPlatformClass();
 
@@ -90,6 +91,7 @@ if (isTauri()) {
     console.warn("[terminal] agent kickoff session requests are not being heard:", error);
     return null;
   });
+  registerBootListenersPromise(Promise.all([stopBrowseRequests, stopKickoffRequests]));
   import.meta.hot?.dispose(() => {
     void stopBrowseRequests.then((stop) => stop?.());
     void stopKickoffRequests.then((stop) => stop?.());

@@ -29,6 +29,13 @@ anywhere enables it everywhere, and reviewing from one repository satisfies the
 week for all of them. It is measurement only; nothing is removed without a
 preview you accept.
 
+The same list shows the **workbench profile backups** the profile store writes
+beside the profile before a schema upgrade (`workbench.sqlite.pre-schema-<N>.bak`
+and the other `workbench.sqlite.<stamp>.bak` copies), with size and age. They
+are the only way back from an upgrade, so they are removed only through a
+`backup:<file name>` preview you confirm: no retention age, scheduled hygiene run
+or agent-driven cleanup selects them.
+
 Settings written by an earlier build were a single flat record per repository.
 Each one is adopted the next time its repository is opened: a retention that
 differed from the old hardcoded 30 days becomes that repository's override, a
@@ -66,7 +73,7 @@ before closing to avoid transient forked descriptors retaining ownership.
 
 Optional **Also run when GitPulse is closed** is available in an installed macOS
 application bundle. It registers the current user's
-`~/Library/LaunchAgents/com.gitpulse.hygiene.plist`, with a 60-second interval and
+`~/Library/LaunchAgents/dev.vbcr.gitpulse.hygiene.plist` (builds before the VBCR Dev rename used `com.gitpulse.hygiene`; the first launch of a newer build replaces that agent with this one), with a 60-second interval and
 explicit `--cleaner-due` arguments. The worker checks the same policy without
 creating a window. Registration first commits disabled authority; only successful
 setup enables it. A crash, unavailable launchd or failed recovery write cannot

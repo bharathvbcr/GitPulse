@@ -159,7 +159,7 @@ pub(crate) fn selection_for(status: &UseStatus) -> Result<ModelSelection, String
     }
 }
 
-fn is_claude_model(model: &str) -> bool {
+pub(crate) fn is_claude_model(model: &str) -> bool {
     model.strip_prefix("claude-").is_some_and(|rest| {
         !rest.is_empty()
             && rest.len() <= 120
@@ -235,6 +235,40 @@ pub(crate) fn present(status: &UseStatus) -> ManviStatus {
     }
 }
 
+/// Whether `status` represents Manvi's built-in default cloud mode
+/// (`provider_from == "default"`, `mode == "cloud"`).
+pub(crate) fn is_default_cloud(status: &ManviStatus) -> bool {
+    status.state == "not_chosen"
+        && status.mode == "cloud"
+        && status.provider_from == PROVIDER_FROM_DEFAULT
+}
+
+/// Promotes Manvi's built-in default cloud status into a `ready` Claude
+/// selection for callers (such as `harness::steward`) that verified a valid
+/// `~/.anthropic-accounts` account or GitPulse Keychain Claude key.
+pub(crate) fn promote_default_cloud(
+    mut status: ManviStatus,
+    credential_detail: String,
+) -> ManviStatus {
+    let model = status.model.trim().to_string();
+    if !is_claude_model(&model) {
+        status.state = "ready".into();
+        status.detail.clear();
+        status.unsupported =
+            format!("Manvi's cloud model `{model}` is not a Claude model id GitPulse can use.");
+        status.selection = None;
+        status.typed = None;
+        return status;
+    }
+    let sel = ModelSelection::Claude { model };
+    status.selection = Some(selection_wire(&sel));
+    status.typed = Some(sel);
+    status.state = "ready".into();
+    status.unsupported.clear();
+    status.detail = credential_detail;
+    status
+}
+
 /// What Manvi reported, as shown; no state, selection or verdict.
 fn fields(status: &UseStatus) -> ManviStatus {
     ManviStatus {
@@ -285,7 +319,7 @@ pub(crate) fn interpret(run: UseRun) -> ManviStatus {
     }
 }
 
-fn run_use(binary: &str, args: &[&str]) -> Result<UseRun, String> {
+fn run_use_checked(binary: &str, args: &[&str]) -> Result<UseRun, crate::ipc_error::CommandError> {
     let probe = manvi_probe_command(binary, args);
     let run = crate::engine::process::run_bounded_capped(
         probe,
@@ -293,8 +327,7 @@ fn run_use(binary: &str, args: &[&str]) -> Result<UseRun, String> {
         USE_TIMEOUT,
         None,
         USE_OUTPUT_CAP,
-    )
-    .map_err(|e| e.message().to_string())?;
+    )?;
     // Output past the cap is a prefix, never a status.
     let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
     if run.incomplete.is_some() {
@@ -309,6 +342,23 @@ fn run_use(binary: &str, args: &[&str]) -> Result<UseRun, String> {
         stdout: run.stdout,
         stderr,
     })
+}
+
+fn run_use(binary: &str, args: &[&str]) -> Result<UseRun, String> {
+    run_use_checked(binary, args).map_err(|e| e.message().to_string())
+}
+
+/// Reads Manvi's choice, preserving typed spawn-gate errors (such as
+/// [`crate::ipc_error::IpcErrorKind::DeferredUnderLoad`]) so callers like the
+/// Manvi steward never mistake a load-deferred probe for an unconfigured Manvi.
+pub(crate) fn try_read() -> Result<ManviStatus, crate::ipc_error::CommandError> {
+    match resolve_binary() {
+        None => Ok(ManviStatus::unavailable(
+            "not_installed",
+            "Manvi is not installed, so its model choice cannot be read.",
+        )),
+        Some(binary) => run_use_checked(&binary, &["use", "--json"]).map(interpret),
+    }
 }
 
 /// Reads Manvi's choice with the binary GitPulse resolves.

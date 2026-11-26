@@ -497,6 +497,12 @@ export interface LinkBufferRow {
    * ends up under the wrong text.
    */
   columns: number[];
+  /**
+   * Optional display cell width (`1` for narrow, `2` for wide) for each index
+   * in `text`. Populated by xterm's buffer reader so cell hit-testing knows
+   * exact glyph spans even at the last cell of a row.
+   */
+  widths?: number[];
 }
 
 /** Random access to the buffer by 1-based absolute row. */

@@ -240,6 +240,7 @@ const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("hook_gate_app.rs", "no git spawn: desktop::instance claim and hooks::serve_gate resolve paths through find_git_root, which reads the filesystem"),
     ("hook_gate_bench.rs", "no git spawn: desktop::instance claim and hooks::serve_gate resolve paths through find_git_root, which reads the filesystem"),
     ("hook_load_gate.rs", "subprocess-only: drives gitpulse-hook; the library supplies the sysload snapshot writer and types and LockedSpawn, and nothing here reaches the metered git gate"),
+    ("hook_scratch_exit.rs", "subprocess-only: drives gitpulse-hook against a fake manvi; the library supplies logging::LOG_DIR_ENV and LockedSpawn, and nothing here reaches the metered git gate"),
     ("host_load_soak.rs", "no git spawn: samples host load (sysload)"),
     ("lane_solver_fuzz.rs", "no git spawn: graph::LaneSolver over synthetic commits"),
     ("lane_solver_stress.rs", "no git spawn: graph::LaneSolver over synthetic commits"),
@@ -265,6 +266,7 @@ const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("signal_teardown.rs", "subprocess-only: signal teardown of child processes; procguard only"),
     ("spawn_budget_isolation.rs", "builds the gate once from its first spawn and must stay off the shared record; lifting the cap would defeat it"),
     ("updates_integration.rs", "no spawn: updates::{evaluate, latest_stable_tag} parse text handed to them"),
+    ("windows_runtime.rs", "no git spawn: the Windows WebView2/Win32 runtime smoke test, parallel to gtk_runtime.rs; the library supplies desktop::{install_menu, set_recent_menu, DesktopState}, and on other targets main only prints that it does not apply"),
 ];
 
 /// The statements in `source` that lift the spawn rate cap for the process:

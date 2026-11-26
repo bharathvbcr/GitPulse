@@ -148,4 +148,13 @@ describe("MarkDevViewer", () => {
       /\bmin-[hw]-0\b/,
     );
   });
+
+  it("provides inline search and go-to-line in rendered markdown mode", () => {
+    expect(source).toContain("import FindField from \"../FindField.svelte\"");
+    expect(source).toContain("applyDomHighlights");
+    expect(source).toContain("mdFindFieldRef");
+    expect(source).toContain("handleMarkDevKeydown");
+    expect(source).toContain("ongotoline={handleRenderedGoToLine}");
+    expect(source).toContain('goToShortcut={shortcutTextLabel("⌘G", $hostPlatform.os)}');
+  });
 });

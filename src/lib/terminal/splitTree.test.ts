@@ -20,6 +20,10 @@ import {
   visiblePaneIds,
   minimumSplitHeight,
   MIN_PANE_HEIGHT_PX,
+  normalizeSplitGroups,
+  remapSplitTree,
+  upsertSplitGroup,
+  type SplitNode,
 } from "./splitTree";
 
 describe("minimumSplitHeight", () => {
@@ -891,5 +895,152 @@ describe("pair join targets", () => {
     }
     const full = mod.upsertSplitGroup([], tree, { groupId: "pair-1" });
     expect(mod.pairJoinTargets(full, "solo")).toEqual([]);
+  });
+});
+
+describe("split runs: equalize, resize and branch identity", () => {
+  /** `count` panes split one way, nested to the right (A | (B | C)) or to the left ((A | B) | C). */
+  function run(count: number, direction: "row" | "col", nest: "right" | "left"): SplitNode {
+    let root: SplitNode | null = null;
+    for (let i = 2; i <= count; i += 1) {
+      const target = nest === "right" ? `p${i - 1}` : "p1";
+      root = splitPane(root, target, `p${i}`, direction, nest === "right" ? "after" : "before");
+    }
+    if (!root) throw new Error("no split");
+    return root;
+  }
+
+  const extent = (root: SplitNode, direction: "row" | "col") => {
+    const panes = computeSplitLayout(root, null).panes;
+    return Object.fromEntries(
+      Object.entries(panes).map(([id, box]) => [id, direction === "row" ? box.width : box.height]),
+    );
+  };
+
+  const branchIds = (node: SplitNode): string[] =>
+    node.kind === "leaf" ? [] : [node.id, ...branchIds(node.a), ...branchIds(node.b)];
+
+  it("gives three side-by-side panes a third each, not 50/25/25", () => {
+    const root = run(3, "row", "right");
+    const equalized = equalizeSplits(root);
+    expect(equalized).not.toBe(root);
+    for (const width of Object.values(extent(equalized!, "row"))) expect(width).toBeCloseTo(1 / 3, 6);
+  });
+
+  it.each([2, 3, 4, 5, 6])("equalizes a run of %i panes either way, nested either side", (count) => {
+    for (const direction of ["row", "col"] as const) {
+      for (const nest of ["right", "left"] as const) {
+        const sizes = Object.values(extent(equalizeSplits(run(count, direction, nest))!, direction));
+        expect(sizes).toHaveLength(count);
+        for (const size of sizes) expect(size).toBeCloseTo(1 / count, 6);
+      }
+    }
+  });
+
+  it("keeps a mixed A | (B / C) at halves on both axes", () => {
+    let root = splitPane(null, "a", "b", "row") as SplitNode;
+    root = splitPane(root, "b", "c", "col") as SplitNode;
+    const skewed = resizeBranch(resizeBranch(root, branchIds(root)[0], 0.3)!, branchIds(root)[1], 0.7)!;
+    const panes = computeSplitLayout(equalizeSplits(skewed), null).panes;
+    expect(panes.a.width).toBeCloseTo(0.5, 6);
+    expect(panes.b.width).toBeCloseTo(0.5, 6);
+    expect(panes.b.height).toBeCloseTo(0.5, 6);
+    expect(panes.c.height).toBeCloseTo(0.5, 6);
+  });
+
+  it("returns the same tree when everything is already equal", () => {
+    const equalized = equalizeSplits(run(3, "row", "right"))!;
+    expect(equalizeSplits(equalized)).toBe(equalized);
+  });
+
+  it("equalizes the whole run from any one of its sashes (double-click, Enter, Home)", () => {
+    const root = run(3, "row", "right");
+    const [outer, inner] = branchIds(root);
+    for (const sash of [outer, inner]) {
+      const skewed = resizeBranch(root, outer, 0.7)!;
+      for (const width of Object.values(extent(equalizeSplits(skewed, sash)!, "row"))) {
+        expect(width).toBeCloseTo(1 / 3, 6);
+      }
+    }
+  });
+
+  it("dragging one sash of a run moves only the two panes beside it", () => {
+    const root = equalizeSplits(run(3, "row", "right"))!;
+    const [outer, inner] = branchIds(root);
+    const before = extent(root, "row");
+
+    const outerDragged = extent(resizeBranch(root, outer, 0.5)!, "row");
+    expect(outerDragged.p1).toBeCloseTo(0.5, 6);
+    expect(outerDragged.p3).toBeCloseTo(before.p3, 6);
+    expect(outerDragged.p2).toBeCloseTo(1 - 0.5 - before.p3, 6);
+
+    const innerDragged = extent(resizeBranch(root, inner, 0.25)!, "row");
+    expect(innerDragged.p1).toBeCloseTo(before.p1, 6);
+    expect(innerDragged.p2).toBeCloseTo((2 / 3) * 0.25, 6);
+  });
+
+  it("stops a drag at the neighbour's minimum without moving the far pane", () => {
+    const root = equalizeSplits(run(3, "row", "right"))!;
+    const [outer] = branchIds(root);
+    const dragged = extent(resizeBranch(root, outer, 0.99)!, "row");
+    expect(dragged.p2).toBeCloseTo(SPLIT_RATIO_MIN, 6);
+    expect(dragged.p3).toBeCloseTo(1 / 3, 6);
+  });
+
+  it("never snaps a pane that is already under the minimum", () => {
+    // Outer 0.5, inner 0.15: B is 7.5% of the run, under the outer branch's 15%.
+    const base = run(3, "row", "right");
+    const [outer, inner] = branchIds(base);
+    const root = resizeBranch(base, inner, 0.15)!;
+    const before = extent(root, "row");
+    expect(before.p2).toBeCloseTo(0.075, 6);
+    // Shrinking B further is refused outright rather than snapping it.
+    expect(resizeBranch(root, outer, 0.9)).toBe(root);
+    // Growing it is allowed, and C stays put.
+    const grown = extent(resizeBranch(root, outer, 0.4)!, "row");
+    expect(grown.p2).toBeGreaterThan(before.p2);
+    expect(grown.p3).toBeCloseTo(before.p3, 6);
+  });
+
+  it("pushes the far pane only as far as a nested clamp forces, and the sash still follows", () => {
+    // Outer 0.5, inner 0.85: C is already at its least share of B|C, so moving
+    // the A|B sash left grows C just enough to keep that share.
+    const base = run(3, "row", "right");
+    const [outer, inner] = branchIds(base);
+    const root = resizeBranch(base, inner, 0.85)!;
+    const before = extent(root, "row");
+    const dragged = resizeBranch(root, outer, 0.3)!;
+    expect(dragged.kind === "branch" && dragged.ratio).toBeCloseTo(0.3, 9);
+    expect(dragged.kind === "branch" && dragged.b.kind === "branch" && dragged.b.ratio).toBe(SPLIT_RATIO_MAX);
+    const after = extent(dragged, "row");
+    expect(after.p3).toBeCloseTo(0.7 * (1 - SPLIT_RATIO_MAX), 6);
+    expect(after.p3).toBeGreaterThan(before.p3);
+  });
+
+  it("keeps branch ids through group writes, so a drag's sash stays addressable", () => {
+    const root = run(3, "row", "right");
+    const ids = branchIds(root);
+    const written = upsertSplitGroup([], root, { groupId: "g1" });
+    expect(branchIds(written[0].tree)).toEqual(ids);
+    expect(branchIds(normalizeSplitGroups(written)[0].tree)).toEqual(ids);
+
+    // Two moves in a row both land, as successive pointermoves of one drag do.
+    const first = resizeBranch(normalizeSplitGroups(written)[0].tree, ids[0], 0.4)!;
+    const second = resizeBranch(normalizeSplitGroups(upsertSplitGroup(written, first, { groupId: "g1" }))[0].tree, ids[0], 0.45)!;
+    expect(second.kind === "branch" && second.ratio).toBeCloseTo(0.45, 6);
+  });
+
+  it("mints a fresh id when a tree repeats one, so ids stay unique within a tree", () => {
+    const shared: SplitNode = {
+      kind: "branch",
+      id: "dup",
+      direction: "row",
+      ratio: 0.5,
+      a: { kind: "leaf", paneId: "a" },
+      b: { kind: "branch", id: "dup", direction: "row", ratio: 0.5, a: { kind: "leaf", paneId: "b" }, b: { kind: "leaf", paneId: "c" } },
+    };
+    const map = new Map(["a", "b", "c"].map((id) => [id, id]));
+    const ids = branchIds(remapSplitTree(shared, map)!);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });

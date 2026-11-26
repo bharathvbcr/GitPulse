@@ -10,6 +10,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use super::{ids, with_conn, write_tx, LedgerError};
 
@@ -120,6 +121,7 @@ impl Freshness {
 
 /// One persisted pass as read back.
 struct StateRow {
+    worktree_key: String,
     completed_at: Option<String>,
     truncated: i64,
     recorded: i64,
@@ -135,6 +137,14 @@ struct StateRow {
 ///
 /// The clock is a parameter so a test can set it, including backwards.
 pub(super) fn read(conn: &Connection, now_ms: u64) -> Result<Freshness, LedgerError> {
+    read_with_members(conn, now_ms, None)
+}
+
+fn read_with_members(
+    conn: &Connection,
+    now_ms: u64,
+    active_keys: Option<&HashSet<String>>,
+) -> Result<Freshness, LedgerError> {
     let failed = |e: rusqlite::Error| LedgerError::new("freshness_failed", e.to_string());
     let as_of: Option<String> = conn
         .query_row(
@@ -147,7 +157,7 @@ pub(super) fn read(conn: &Connection, now_ms: u64) -> Result<Freshness, LedgerEr
     let rows = if super::has_table(conn, "catch_up_state")? {
         let mut stmt = conn
             .prepare(
-                "SELECT completed_at, COALESCE(truncated, 0), COALESCE(recorded, 0),
+                "SELECT worktree_key, completed_at, COALESCE(truncated, 0), COALESCE(recorded, 0),
                         COALESCE(transcripts, 0), COALESCE(transcripts_listed, 0),
                         COALESCE(transcripts_unlisted, 0), COALESCE(skipped_lines, 0),
                         COALESCE(failed_records, 0), COALESCE(error, '')
@@ -157,15 +167,16 @@ pub(super) fn read(conn: &Connection, now_ms: u64) -> Result<Freshness, LedgerEr
         let mapped = stmt
             .query_map([], |row| {
                 Ok(StateRow {
-                    completed_at: row.get(0)?,
-                    truncated: row.get(1)?,
-                    recorded: row.get(2)?,
-                    transcripts: row.get(3)?,
-                    listed: row.get(4)?,
-                    unlisted: row.get(5)?,
-                    skipped: row.get(6)?,
-                    failed: row.get(7)?,
-                    error: row.get(8)?,
+                    worktree_key: row.get(0)?,
+                    completed_at: row.get(1)?,
+                    truncated: row.get(2)?,
+                    recorded: row.get(3)?,
+                    transcripts: row.get(4)?,
+                    listed: row.get(5)?,
+                    unlisted: row.get(6)?,
+                    skipped: row.get(7)?,
+                    failed: row.get(8)?,
+                    error: row.get(9)?,
                 })
             })
             .map_err(failed)?;
@@ -173,10 +184,15 @@ pub(super) fn read(conn: &Connection, now_ms: u64) -> Result<Freshness, LedgerEr
     } else {
         Vec::new()
     };
-    Ok(assess(as_of, rows, now_ms))
+    Ok(assess(as_of, rows, now_ms, active_keys))
 }
 
-fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness {
+fn assess(
+    as_of: Option<String>,
+    rows: Vec<StateRow>,
+    now_ms: u64,
+    active_keys: Option<&HashSet<String>>,
+) -> Freshness {
     // A timestamp that is not in the ledger's shape is not evidence of anything.
     let well_formed = |ts: &Option<String>| {
         ts.as_deref()
@@ -190,9 +206,14 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
     // Each row is one worktree's newest pass. A pass dated in the future is
     // flagged and left out of every figure below: it has no age, and it may not
     // veto another row's genuine freshness. A pass that completed longer ago
-    // than the stale window belongs to a worktree that is idle or gone; it is
-    // counted, not summed, so its day-old failure is not today's coverage.
-    // A row with no completion (an attempt that did not finish) is current.
+    // than the stale window — or belongs to a worktree that is no longer a
+    // member of the repository's authenticated worktree family — is counted as
+    // dormant rather than summed, so a removed or idle worktree's old failure
+    // cannot permanently poison current coverage. An active worktree with no
+    // completion (an attempt that did not finish) remains current so gaps fail
+    // closed.
+    let is_removed =
+        |row: &StateRow| active_keys.is_some_and(|keys| !keys.contains(&row.worktree_key));
     enum Kind {
         Current,
         Dormant,
@@ -201,9 +222,10 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
     let kind = |row: &StateRow| match well_formed(&row.completed_at)
         .and_then(|ts| ids::parse_event_time(&ts))
     {
+        None if is_removed(row) => Kind::Dormant,
         None => Kind::Current,
         Some(at) if at > future_after => Kind::Future,
-        Some(at) if now_ms.saturating_sub(at) > window => Kind::Dormant,
+        Some(at) if is_removed(row) || now_ms.saturating_sub(at) > window => Kind::Dormant,
         Some(_) => Kind::Current,
     };
     let mut future_dated = 0i64;
@@ -305,7 +327,7 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
     // still says why (it drops out of the summary, not out of the reason). A
     // pass that finished with only unlisted transcripts keeps an error too; it
     // is not a failed attempt.
-    let stale_reason = match unfinished_attempt(&rows, future_after) {
+    let stale_reason = match unfinished_attempt(&rows, future_after, active_keys) {
         Some(why) if stale => {
             format!("{stale_reason}; the newest catch-up attempt did not finish: {why}")
         }
@@ -327,12 +349,18 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
 /// The longest an attempt's error runs in a stale reason.
 const MAX_REASON_ERROR_CHARS: usize = 240;
 
-/// The error of the first row whose newest attempt did not finish, bounded.
-/// A row dated in the future is skipped, as everywhere else in `assess`.
-fn unfinished_attempt(rows: &[StateRow], future_after: u64) -> Option<String> {
+/// The error of the first active row whose newest attempt did not finish,
+/// bounded. Rows dated in the future or belonging to removed worktrees are
+/// skipped, as everywhere else in `assess`.
+fn unfinished_attempt(
+    rows: &[StateRow],
+    future_after: u64,
+    active_keys: Option<&HashSet<String>>,
+) -> Option<String> {
     rows.iter()
         .filter(|row| {
-            well_formed_time(&row.completed_at).is_none_or(|at| at <= future_after)
+            active_keys.is_none_or(|keys| keys.contains(&row.worktree_key))
+                && well_formed_time(&row.completed_at).is_none_or(|at| at <= future_after)
                 && !row.error.is_empty()
                 && !crate::ingest::is_unlisted_only_error(&row.error)
         })
@@ -361,6 +389,30 @@ pub fn freshness_readonly_at(repo_path: &str, now_ms: u64) -> Freshness {
         Ok(freshness) => freshness,
         Err(error) => Freshness::unavailable(error.to_string()),
     }
+}
+
+/// [`freshness_readonly_at`] scoped to the repository's currently authenticated
+/// worktree keys so removed worktrees whose catch-up never completed are
+/// counted as dormant (`stale_worktrees`) instead of permanently keeping
+/// `catch_up.truncated` true.
+pub(crate) fn freshness_readonly_for_members_at(
+    repo_path: &str,
+    now_ms: u64,
+    active_keys: &HashSet<String>,
+) -> Freshness {
+    let opened = super::open_readonly_initialised(&super::ledger_path(repo_path));
+    match opened.and_then(|conn| read_with_members(&conn, now_ms, Some(active_keys))) {
+        Ok(freshness) => freshness,
+        Err(error) => Freshness::unavailable(error.to_string()),
+    }
+}
+
+/// [`freshness_readonly_for_members_at`] at the wall clock.
+pub(crate) fn freshness_readonly_for_members(
+    repo_path: &str,
+    active_keys: &HashSet<String>,
+) -> Freshness {
+    freshness_readonly_for_members_at(repo_path, ids::now_millis(), active_keys)
 }
 
 /// [`freshness_readonly_at`] at the wall clock.

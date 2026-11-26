@@ -41,11 +41,13 @@ pub async fn cmd_get_status(
     watcher: State<'_, WatcherState>,
     repo_path: String,
     skip_if_unchanged: Option<bool>,
+    request_id: Option<String>,
 ) -> Result<Vec<FileStatus>, IpcError> {
     get_status_through_watch(
         watcher.inner().clone(),
         repo_path,
         skip_if_unchanged.unwrap_or(false),
+        request_id,
     )
     .await
 }
@@ -54,8 +56,11 @@ pub(crate) async fn get_status_through_watch(
     watcher: WatcherState,
     repo_path: String,
     may_reuse: bool,
+    request_id: Option<String>,
 ) -> Result<Vec<FileStatus>, IpcError> {
+    let read = ReadScope::open(request_id.as_deref());
     off_thread_for("cmd_get_status", move || {
+        let _cancellable = read.enter();
         crate::watcher::status_through_watch(&watcher, &repo_path, may_reuse, || {
             GitReader::get_status(&repo_path)
         })

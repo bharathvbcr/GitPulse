@@ -2,6 +2,15 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 
+/**
+ * After closing the Manvi host's stdin, `close` waits this long for it to
+ * leave, then sends SIGTERM, then SIGKILL. The preview's own shutdown can
+ * therefore take up to `HOST_CLOSE_KILL_MS` for this step alone; callers that
+ * wait for the preview to exit derive their deadline from it.
+ */
+export const HOST_CLOSE_TERM_MS = 5500;
+export const HOST_CLOSE_KILL_MS = 6500;
+
 /** @param {string} binary @param {string} storeBinary @param {string} root @param {string} database */
 export async function previewWorker(binary, storeBinary, root, database) {
   const model = createServer(async (req, res) => {
@@ -78,8 +87,8 @@ export async function previewWorker(binary, storeBinary, root, database) {
   async function close() {
     const closed = new Promise(resolve => { if (!child.pid || child.exitCode !== null || child.signalCode !== null) resolve(undefined); else child.once("exit", () => resolve(undefined)); });
     child.stdin.end();
-    const terminate = setTimeout(() => child.kill("SIGTERM"), 5500);
-    const kill = setTimeout(() => child.kill("SIGKILL"), 6500);
+    const terminate = setTimeout(() => child.kill("SIGTERM"), HOST_CLOSE_TERM_MS);
+    const kill = setTimeout(() => child.kill("SIGKILL"), HOST_CLOSE_KILL_MS);
     await closed; clearTimeout(terminate); clearTimeout(kill);
     model.closeAllConnections(); await new Promise(resolve => model.close(resolve));
   }

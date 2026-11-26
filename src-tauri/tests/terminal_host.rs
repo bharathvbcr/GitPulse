@@ -12,8 +12,8 @@ use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::host::client::HostConfig;
 use gitpulse_lib::terminal::{
-    attach_session, kill_session, list_sessions, spawn_session, write_to_session, OutputSink,
-    TerminalSessions,
+    attach_session, kill_session, list_sessions, spawn_session, write_to_session, KillOrigin,
+    OutputSink, TerminalSessions,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -264,7 +264,7 @@ fn the_host_socket_and_its_directory_are_the_users_alone() {
         mode(&dir.path().join(format!("receipts/{id}.jsonl"))),
         0o600
     );
-    kill_session(&app.state, &id).unwrap();
+    kill_session(&app.state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// The child half of the crash tests: an app that starts sessions in the host,
@@ -413,7 +413,7 @@ fn sessions_outlive_a_sigkilled_app_and_the_next_app_takes_them_over() {
         app.losses.lock().unwrap().is_empty(),
         "nothing was lost: the ring held it all"
     );
-    kill_session(&app.state, &talker).unwrap();
+    kill_session(&app.state, &talker, KillOrigin::Unspecified).unwrap();
     assert!(list_sessions(&app.state).unwrap().is_empty());
 }
 

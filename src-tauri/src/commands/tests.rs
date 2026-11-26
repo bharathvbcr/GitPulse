@@ -201,6 +201,7 @@ fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
         WatcherState::default(),
         root,
         false,
+        None,
     ))
     .expect_err("the read is shed");
     assert_eq!(
@@ -942,6 +943,7 @@ fn commit_graph_payload_round_trips_warnings() {
         mainline_name: Some("main".to_string()),
         graph_token: None,
         unchanged: false,
+        window_unchanged: false,
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(

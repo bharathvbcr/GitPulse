@@ -36,6 +36,7 @@ fn adv_l5_a_send_that_panics_is_not_counted_as_a_missed_reply() {
         // Far longer than the worker takes to die: a deadline cannot be what
         // ended the wait.
         Some(Duration::from_secs(30)),
+        INJECTED_TRANSPORT,
     )
     .expect_err("a worker that died did not deliver");
     assert_eq!(
@@ -109,6 +110,7 @@ fn adv_l5_a_silent_host_is_counted_for_every_event_not_only_session_end() {
             notify_send,
             &drops,
             None,
+            notify_outcome::TRANSPORT_AVAILABLE,
         )
         .expect_err("a host that never answers did not deliver");
         if drops.snapshot().dropped != before + 1 {

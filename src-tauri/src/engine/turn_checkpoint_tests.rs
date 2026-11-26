@@ -379,7 +379,7 @@ fn a_parked_merge_is_skipped_and_the_conflicted_file_is_not_staged_by_the_captur
     std::fs::write(root.join("tracked.txt"), "main\n").unwrap();
     git_ok(root, &["commit", "-q", "-am", "main"]);
     assert!(
-        !git(root, &["merge", "other"]).status.success(),
+        crate::test_support::git_merge_in(root, &["merge", "other"]),
         "a conflict is the point"
     );
     let index_before = std::fs::read(root.join(".git/index")).unwrap();
@@ -707,8 +707,11 @@ fn labels_are_redacted_one_line_and_bounded() {
     assert_eq!(long.chars().count(), MAX_LABEL_CHARS);
     let multibyte = sanitize_label(&"\u{e9}".repeat(100_000));
     assert_eq!(multibyte.chars().count(), MAX_LABEL_CHARS);
-    let with_secret = sanitize_label(&format!("use {} now", secret()));
-    assert!(!with_secret.contains(&secret()), "{with_secret}");
+    let redacted_label = sanitize_label(&format!("use {} now", secret()));
+    assert!(
+        !redacted_label.contains(&secret()),
+        "secret token was not redacted from label"
+    );
 }
 
 #[test]
@@ -743,7 +746,10 @@ fn a_hostile_label_and_session_cannot_forge_a_trailer() {
     assert_eq!(entry.event.as_deref(), Some("turn_start"));
     assert_eq!(entry.omissions.untracked_found, 0);
     let session = entry.session_id.clone().unwrap();
-    assert!(!session.contains('\n'), "{session}");
+    assert!(
+        !session.contains('\n'),
+        "sanitized session id must not contain a newline"
+    );
     let message = git_ok(
         dir.path(),
         &["log", "-1", "--format=%B", &result.commit.unwrap()],

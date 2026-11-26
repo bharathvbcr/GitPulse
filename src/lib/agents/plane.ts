@@ -42,7 +42,7 @@ import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { agentKind } from "../work/agentWorktree";
 import { nearestContaining } from "./cwd";
 import { plural } from "../format";
-import { asksForReader } from "../terminal/sessionActivity";
+import { asksForReader, type SessionAttentionUrgency } from "../terminal/sessionActivity";
 
 /** Repositories one sweep will read. The rest are reported as skipped. */
 export const MAX_AGENT_REPOS = 64;
@@ -59,19 +59,26 @@ export const AGENT_COLUMNS = [
 
 export type AgentColumnKey = (typeof AGENT_COLUMNS)[number]["key"];
 
-export type AgentFilter = "all" | "attention" | "parallel" | "live";
+export type AgentFilter = "all" | "attention" | "notifications" | "gaps" | "live" | "parallel";
 
 export function isAgentFilter(value: unknown): value is AgentFilter {
-  return value === "all" || value === "attention" || value === "parallel" || value === "live";
+  return (
+    value === "all" ||
+    value === "attention" ||
+    value === "notifications" ||
+    value === "gaps" ||
+    value === "live" ||
+    value === "parallel"
+  );
 }
 
 /**
  * Why a row is on the reader's plate, most urgent first when stored on a row.
  *
- * `dirty` is a change, not a request. The attention filter leaves it out so
- * a checkout with uncommitted work does not shout over one that asked a
- * question. Unknown measurements stay in the filter: an unread count is not
- * a zero.
+ * `dirty` is a change, not a request. Informational notifications (`idle-waiting`,
+ * `finished`, `notice`) stay out of `FILTER_ATTENTION` so passive notices do not
+ * masquerade as blocking asks. Unknown measurements stay in the attention
+ * filter: an unread count is not a zero.
  */
 export const ATTENTION_REASONS = [
   "needs-you",
@@ -82,7 +89,9 @@ export const ATTENTION_REASONS = [
   "disconnected",
   "unstarted",
   "signalled",
+  "idle-waiting",
   "finished",
+  "notice",
   "unscanned",
   "unprobed",
   "unmeasured",
@@ -93,7 +102,7 @@ export type AttentionReason = (typeof ATTENTION_REASONS)[number];
 
 const ATTENTION_RANK = new Map(ATTENTION_REASONS.map((reason, index) => [reason, index]));
 
-/** Reasons that put a row in the attention filter. `dirty` is not one. */
+/** Reasons that put a row in the attention filter (`needing` + `unread`). */
 const FILTER_ATTENTION = new Set<AttentionReason>([
   "needs-you",
   "error",
@@ -103,10 +112,16 @@ const FILTER_ATTENTION = new Set<AttentionReason>([
   "disconnected",
   "unstarted",
   "signalled",
-  "finished",
   "unscanned",
   "unprobed",
   "unmeasured",
+]);
+
+/** Informational notification reasons separated from blocking action asks. */
+export const NOTIFICATION_REASONS = new Set<AttentionReason>([
+  "idle-waiting",
+  "finished",
+  "notice",
 ]);
 
 const REASON_LABEL: Record<AttentionReason, string> = {
@@ -118,7 +133,9 @@ const REASON_LABEL: Record<AttentionReason, string> = {
   disconnected: "Running, not shown in this window",
   unstarted: "Prepared, not started",
   signalled: "Asked for attention",
-  finished: "Finished, waiting for you",
+  "idle-waiting": "Idle, waiting for input",
+  finished: "Turn finished",
+  notice: "Notification",
   unscanned: "Collisions not fully read",
   unprobed: "Parked operation not read",
   unmeasured: "Changes not read",
@@ -163,6 +180,7 @@ export interface PlaneTerminal {
   key: string;
   repoPath: string;
   label: string;
+  launcher?: string | null;
   title: string;
   status: string;
   sessionId: string;
@@ -171,6 +189,14 @@ export interface PlaneTerminal {
   /** Unknown is null. It is not the repository root. */
   cwd: string | null;
   attention: "needs-you" | "error" | "signalled" | "finished" | null;
+  attentionUrgency?: SessionAttentionUrgency | null;
+  attentionEvent?: string | null;
+  attentionChannel?: string | null;
+  attentionLabel?: string | null;
+  attentionDetail?: string | null;
+  attentionAt?: number | null;
+  fullyIdle?: boolean;
+  providerSessionId?: string | null;
 }
 
 export interface PlaneTask {
@@ -256,6 +282,15 @@ export interface AgentRow {
   attention: AttentionReason[];
   /** Primary sentence for the attention cell. */
   attentionLabel: string;
+  attentionUrgency: SessionAttentionUrgency | null;
+  attentionEvent: string | null;
+  attentionChannel: string | null;
+  attentionDetail: string | null;
+  attentionAt: number | null;
+  launcher: string | null;
+  sessionId: string | null;
+  fullyIdle: boolean;
+  providerSessionId: string | null;
   parallelCount: number;
   /** True when the count is a floor, from a cap or an unread agent summary. */
   parallelFloor: boolean;
@@ -311,6 +346,8 @@ export interface AgentPlane {
    * Their sum is what `applyAgentFilter(rows, "attention")` keeps.
    */
   attention: { needing: number; unread: number };
+  /** Rows carrying an informational notification (`finished`, `idle-waiting`, `notice`). */
+  notifications: number;
   requested: number;
   read: number;
   failed: number;
@@ -321,6 +358,7 @@ interface Draft {
   repoPath: string;
   repoLabel: string;
   kind: string;
+  launcher: string | null;
   session: string;
   checkout: string;
   worktreePath: string;
@@ -329,6 +367,15 @@ interface Draft {
   presence: AgentPresence;
   presenceDetail: string;
   attention: Set<AttentionReason>;
+  terminalPrimaryReason: AttentionReason | null;
+  attentionUrgency: SessionAttentionUrgency | null;
+  attentionEvent: string | null;
+  attentionChannel: string | null;
+  attentionLabel: string | null;
+  attentionDetail: string | null;
+  attentionAt: number | null;
+  fullyIdle: boolean;
+  providerSessionId: string | null;
   liveKey: string | null;
   taskRunId: string | null;
   dirtyFiles: number | null;
@@ -366,7 +413,7 @@ const LIVE_DETAIL = "A process this window started.";
 const EXITED_DETAIL = "A process this window started. It has exited.";
 
 /** Reasons that say a reading is missing, not that anyone asked for anything. */
-const UNREAD_REASONS = new Set<AttentionReason>(["unscanned", "unprobed", "unmeasured"]);
+export const UNREAD_REASONS = new Set<AttentionReason>(["unscanned", "unprobed", "unmeasured"]);
 
 function clean(value: string, max = MAX_TEXT): string {
   const text = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
@@ -447,10 +494,24 @@ function orderReasons(reasons: Set<AttentionReason>): AttentionReason[] {
   return [...reasons].sort((a, b) => (ATTENTION_RANK.get(a) ?? 99) - (ATTENTION_RANK.get(b) ?? 99));
 }
 
+const TERMINAL_EVENT_REASONS = new Set<AttentionReason>(["needs-you", "error", "finished"]);
+
 function attentionText(reasons: readonly AttentionReason[]): string {
   if (reasons.length === 0) return "";
   const [first, ...rest] = reasons;
   const label = REASON_LABEL[first];
+  return rest.length === 0 ? label : `${label} · +${rest.length}`;
+}
+
+function rowAttentionLabel(reasons: readonly AttentionReason[], draft: Draft): string {
+  if (reasons.length === 0) return "";
+  const [first, ...rest] = reasons;
+  const label =
+    TERMINAL_EVENT_REASONS.has(first) &&
+    first === draft.terminalPrimaryReason &&
+    draft.attentionLabel
+      ? draft.attentionLabel
+      : REASON_LABEL[first];
   return rest.length === 0 ? label : `${label} · +${rest.length}`;
 }
 
@@ -464,12 +525,11 @@ function asksForAttention(reasons: readonly AttentionReason[]): boolean {
 }
 
 function urgentRank(reasons: readonly AttentionReason[]): number {
-  if (reasons.length === 0) return 3;
-  if (wantsAttention(reasons)) {
-    const top = ATTENTION_RANK.get(reasons[0]) ?? 99;
-    return top <= ATTENTION_RANK.get("signalled")! ? 0 : 1;
-  }
-  return 2;
+  if (reasons.length === 0) return 4;
+  if (asksForAttention(reasons)) return 0;
+  if (reasons.some((reason) => NOTIFICATION_REASONS.has(reason))) return 1;
+  if (reasons.some((reason) => UNREAD_REASONS.has(reason))) return 2;
+  return 3;
 }
 
 /** 2 = a worktree list was read, 1 = a read was attempted, 0 = never started. */
@@ -525,13 +585,29 @@ function checkoutReasons(item: WorktreeSummary, collisions: Set<string> | null, 
 }
 
 function terminalReasons(terminal: PlaneTerminal): AttentionReason[] {
-  if (terminal.attention === "needs-you") return ["needs-you"];
+  if (terminal.attention === "needs-you") {
+    if (terminal.attentionUrgency === "informational" || terminal.attentionEvent === "idle_prompt") {
+      return ["idle-waiting"];
+    }
+    return ["needs-you"];
+  }
   if (terminal.attention === "error") return ["error"];
   // A bell is an ask only while the setting that counts it is on, the same
-  // rule the tray, the board and the task pane count by.
-  if (terminal.attention === "signalled") return asksForReader("signalled") ? ["signalled"] : [];
-  // A live agent that finished is waiting for its next instruction.
-  if (terminal.attention === "finished") return ["finished"];
+  // rule the tray, the board and the task pane count by. Non-bell OSC notices
+  // or signals carrying detail surface as informational notices.
+  if (terminal.attention === "signalled") {
+    if (asksForReader("signalled")) return ["signalled"];
+    const channel = terminal.attentionChannel?.toLowerCase();
+    if ((channel && channel !== "bell") || Boolean(terminal.attentionDetail)) {
+      return ["notice"];
+    }
+    return [];
+  }
+  // A live agent that finished or idled (`idle_prompt`) surfaces in
+  // Notifications rather than blocking action asks.
+  if (terminal.attention === "finished") {
+    return terminal.attentionEvent === "idle_prompt" ? ["idle-waiting"] : ["finished"];
+  }
   return [];
 }
 
@@ -554,9 +630,23 @@ function taskReasons(task: PlaneTask): AttentionReason[] {
 function keepTerminal(terminal: PlaneTerminal): boolean {
   if (!terminal.key) return false;
   if (LIVE_STATUS.has(terminal.status)) return true;
-  // An exited process that finished has said its last word and is waiting
-  // for nothing; one that still asks, or failed, has something to say.
-  return terminalReasons(terminal).some((reason) => reason !== "finished");
+  // An exited process whose only news is an informational notice has said its
+  // last word; one that still asks, or failed, has something to say.
+  return terminalReasons(terminal).some((reason) => !NOTIFICATION_REASONS.has(reason));
+}
+
+function deriveTerminalUrgency(terminal: PlaneTerminal): SessionAttentionUrgency | null {
+  if (terminal.attention === "signalled" && asksForReader("signalled")) return "blocking";
+  if (terminal.attentionUrgency) return terminal.attentionUrgency;
+  if (terminal.attentionEvent === "idle_prompt") return "informational";
+  if (terminal.attention === "needs-you") return "blocking";
+  if (terminal.attention === "error") return "error";
+  if (terminal.attention === "finished") return "informational";
+  if (terminal.attention === "signalled") {
+    const channel = terminal.attentionChannel?.toLowerCase();
+    if ((channel && channel !== "bell") || Boolean(terminal.attentionDetail)) return "informational";
+  }
+  return null;
 }
 
 function attach(draft: Draft, terminal: PlaneTerminal): void {
@@ -565,6 +655,8 @@ function attach(draft: Draft, terminal: PlaneTerminal): void {
   draft.presenceDetail = live ? LIVE_DETAIL : EXITED_DETAIL;
   draft.liveKey = terminal.key;
   draft.sessionId = terminal.sessionId || null;
+  if (terminal.launcher) draft.launcher = clean(terminal.launcher, 40) || draft.launcher;
+  else if (!draft.launcher && terminal.label) draft.launcher = clean(terminal.label, 40) || null;
   if (terminal.taskRunId) {
     draft.taskRunId = terminal.taskRunId;
     draft.runRole = "attempt";
@@ -572,17 +664,37 @@ function attach(draft: Draft, terminal: PlaneTerminal): void {
     if (!draft.taskRunId) draft.taskRunId = terminal.continuesRunId;
     draft.runRole = "continuation";
   }
-  for (const reason of terminalReasons(terminal)) draft.attention.add(reason);
+  const reasons = terminalReasons(terminal);
+  for (const reason of reasons) draft.attention.add(reason);
+  draft.terminalPrimaryReason = reasons[0] ?? null;
+  if (reasons.length > 0) {
+    draft.attentionUrgency = deriveTerminalUrgency(terminal);
+    draft.attentionEvent = terminal.attentionEvent ?? null;
+    draft.attentionChannel = terminal.attentionChannel ?? null;
+    draft.attentionLabel = terminal.attentionLabel ? clean(terminal.attentionLabel, 80) : null;
+    draft.attentionDetail = terminal.attentionDetail ? clean(terminal.attentionDetail, 240) : null;
+    draft.attentionAt =
+      typeof terminal.attentionAt === "number" &&
+      Number.isFinite(terminal.attentionAt) &&
+      terminal.attentionAt > 0 &&
+      terminal.attentionAt <= 8.64e15
+        ? terminal.attentionAt
+        : null;
+  }
+  draft.fullyIdle = Boolean(terminal.fullyIdle);
+  draft.providerSessionId = terminal.providerSessionId ?? null;
   const title = clean(terminal.title || terminal.label, 80);
   if (title && draft.session === draft.kind) draft.session = title;
   else if (title && !draft.session) draft.session = title;
 }
 
 function fromCheckout(family: Family, item: WorktreeSummary, collisions: Set<string> | null, paths: PathIdentityOptions): Draft {
+  const kind = clean(item.agent_kind, 40);
   return {
     repoPath: family.repoPath,
     repoLabel: family.repoLabel,
-    kind: clean(item.agent_kind, 40),
+    kind,
+    launcher: kind || null,
     // A worktree at the layout's container has no slug. It is still a
     // checkout an agent layout holds; the row falls back to its kind.
     session: clean(item.session_slug, 80),
@@ -593,6 +705,15 @@ function fromCheckout(family: Family, item: WorktreeSummary, collisions: Set<str
     presence: "on-disk",
     presenceDetail: "A checkout on disk. This does not say a process is running.",
     attention: checkoutReasons(item, collisions, paths),
+    terminalPrimaryReason: null,
+    attentionUrgency: null,
+    attentionEvent: null,
+    attentionChannel: null,
+    attentionLabel: null,
+    attentionDetail: null,
+    attentionAt: null,
+    fullyIdle: false,
+    providerSessionId: null,
     liveKey: null,
     taskRunId: null,
     dirtyFiles: item.dirty_files,
@@ -619,10 +740,12 @@ function fromTerminal(terminal: PlaneTerminal, cwd: string | null, places: Reado
       : cwd
         ? "Outside the repositories read"
         : "Main worktree";
+  const resolvedKind = clean(kind || terminal.label, 40);
   return {
     repoPath: family?.repoPath || terminal.repoPath,
     repoLabel: family?.repoLabel || clean(terminal.repoPath, 80),
-    kind: clean(kind || terminal.label, 40),
+    kind: resolvedKind,
+    launcher: clean(terminal.launcher ?? resolvedKind, 40) || null,
     session: clean(terminal.title || terminal.label, 80),
     checkout,
     worktreePath: where,
@@ -631,6 +754,15 @@ function fromTerminal(terminal: PlaneTerminal, cwd: string | null, places: Reado
     presence: "live",
     presenceDetail: LIVE_DETAIL,
     attention: new Set(),
+    terminalPrimaryReason: null,
+    attentionUrgency: null,
+    attentionEvent: null,
+    attentionChannel: null,
+    attentionLabel: null,
+    attentionDetail: null,
+    attentionAt: null,
+    fullyIdle: false,
+    providerSessionId: null,
     liveKey: null,
     taskRunId: null,
     dirtyFiles: null,
@@ -655,11 +787,15 @@ function fromTerminal(terminal: PlaneTerminal, cwd: string | null, places: Reado
 function foldTask(draft: Draft, task: PlaneTask): void {
   draft.taskRunId = task.runId;
   const provider = clean(task.provider, 40);
-  if (provider) draft.kind = provider;
+  if (provider) {
+    draft.kind = provider;
+    if (!draft.launcher) draft.launcher = provider;
+  }
   const title = clean(task.title, 80);
   if (title) draft.session = title;
   for (const reason of taskReasons(task)) {
     if (reason === "disconnected" && draft.liveKey !== null) continue;
+    if (reason === "finished" && draft.liveKey !== null && draft.attention.has("idle-waiting")) continue;
     draft.attention.add(reason);
   }
 }
@@ -668,10 +804,12 @@ function fromTask(task: PlaneTask, places: ReadonlyMap<string, Place>, paths: Pa
   const family = nearestContaining(places, task.repoPath, paths)?.family
     ?? nearestContaining(places, task.cwd, paths)?.family;
   const repoPath = family?.repoPath || task.repoPath;
+  const kind = clean(task.provider, 40);
   return {
     repoPath,
     repoLabel: family?.repoLabel || (repoPath ? clean(repoPath, 80) : "Repository not resolved"),
-    kind: clean(task.provider, 40),
+    kind,
+    launcher: kind || null,
     session: clean(task.title, 80),
     checkout: clean(task.cwd, 80),
     worktreePath: task.cwd,
@@ -680,6 +818,15 @@ function fromTask(task: PlaneTask, places: ReadonlyMap<string, Place>, paths: Pa
     presence: "missing",
     presenceDetail: "The workbench has this run, and no terminal in this window is attached to it.",
     attention: new Set(taskReasons(task)),
+    terminalPrimaryReason: null,
+    attentionUrgency: null,
+    attentionEvent: null,
+    attentionChannel: null,
+    attentionLabel: null,
+    attentionDetail: null,
+    attentionAt: null,
+    fullyIdle: false,
+    providerSessionId: null,
     liveKey: null,
     taskRunId: task.runId,
     dirtyFiles: null,
@@ -856,6 +1003,7 @@ function countOutsideSessions(
 
 function childSessionRow(id: string, process: LiveProcess, above: AgentRow): AgentRow {
   const status = clean(process.status, 40);
+  const kind = clean(process.kind, 40) || "agent";
   return {
     id,
     parentId: above.id,
@@ -864,7 +1012,8 @@ function childSessionRow(id: string, process: LiveProcess, above: AgentRow): Age
     attentionObserved: false,
     repoPath: above.repoPath,
     repoLabel: above.repoLabel,
-    kind: clean(process.kind, 40) || "agent",
+    kind,
+    launcher: kind,
     session: `Child session · pid ${process.pid}`,
     checkout: above.checkout,
     worktreePath: process.cwd,
@@ -874,6 +1023,14 @@ function childSessionRow(id: string, process: LiveProcess, above: AgentRow): Age
     presenceDetail: `A child agent process the process table shows under this session. This window did not start it.${status ? ` The agent reports it as ${status}.` : ""}`,
     attention: [],
     attentionLabel: "",
+    attentionUrgency: null,
+    attentionEvent: null,
+    attentionChannel: null,
+    attentionDetail: null,
+    attentionAt: null,
+    sessionId: null,
+    fullyIdle: false,
+    providerSessionId: null,
     parallelCount: above.parallelCount,
     parallelFloor: above.parallelFloor,
     dirtyFiles: null,
@@ -1062,6 +1219,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     }
   }
 
+  const checkoutAttention = new Map<Draft, ReadonlySet<AttentionReason>>();
   let live = 0;
   for (const terminal of chosen.values()) {
     if (LIVE_STATUS.has(terminal.status)) live += 1;
@@ -1070,11 +1228,30 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     // process in `/tmp` used to land in the agent checkout it was opened from.
     const host = nearestContaining(checkouts, cwd ?? terminal.repoPath, paths);
     if (host && host.liveKey === null) {
+      checkoutAttention.set(host, new Set(host.attention));
       attach(host, terminal);
       continue;
     }
     const draft: Draft = host
-      ? { ...host, origin: "terminal", attention: new Set(host.attention), liveKey: null, taskRunId: null, sessionId: null, runRole: null, parent: null }
+      ? {
+          ...host,
+          origin: "terminal",
+          attention: new Set(checkoutAttention.get(host) ?? host.attention),
+          terminalPrimaryReason: null,
+          attentionUrgency: null,
+          attentionEvent: null,
+          attentionChannel: null,
+          attentionLabel: null,
+          attentionDetail: null,
+          attentionAt: null,
+          fullyIdle: false,
+          providerSessionId: null,
+          liveKey: null,
+          taskRunId: null,
+          sessionId: null,
+          runRole: null,
+          parent: null,
+        }
       : fromTerminal(terminal, cwd, places, paths);
     attach(draft, terminal);
     // A second process in a checkout is its own row, not a rewrite of the first.
@@ -1184,6 +1361,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
   const rowOf = new Map<Draft, AgentRow>();
   let needing = 0;
   let unread = 0;
+  let notifications = 0;
   drafts.forEach((draft, index) => {
     const group = groups.get(groupKeys[index])!;
     const parallelFloor = group.floor || (group.disk !== null && group.disk > group.size);
@@ -1192,6 +1370,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     const attention = orderReasons(draft.attention);
     if (asksForAttention(attention)) needing += 1;
     else if (wantsAttention(attention)) unread += 1;
+    if (attention.some((reason) => NOTIFICATION_REASONS.has(reason))) notifications += 1;
     const id = uniqueRowId(
       [keyOf(draft.repoPath, paths), keyOf(draft.worktreePath, paths), draft.liveKey ?? "", draft.taskRunId ?? ""].join("|"),
       used,
@@ -1206,6 +1385,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       repoPath: draft.repoPath,
       repoLabel: draft.repoLabel || clean(draft.repoPath, 80),
       kind: draft.kind || "agent",
+      launcher: draft.launcher,
       session: draft.session || draft.kind || "agent",
       checkout: draft.checkout,
       worktreePath: draft.worktreePath,
@@ -1214,7 +1394,15 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       presence: draft.presence,
       presenceDetail: draft.presenceDetail,
       attention,
-      attentionLabel: attentionText(attention),
+      attentionLabel: rowAttentionLabel(attention, draft),
+      attentionUrgency: draft.attentionUrgency,
+      attentionEvent: draft.attentionEvent,
+      attentionChannel: draft.attentionChannel,
+      attentionDetail: draft.attentionDetail,
+      attentionAt: draft.attentionAt,
+      sessionId: draft.sessionId,
+      fullyIdle: draft.fullyIdle,
+      providerSessionId: draft.providerSessionId,
       parallelCount,
       parallelFloor,
       dirtyFiles: draft.dirtyKnown ? draft.dirtyFiles : null,
@@ -1282,6 +1470,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     tasksWatched: input.tasks !== null,
     tasksFloor,
     attention: { needing, unread },
+    notifications,
     requested: probes.length,
     read,
     failed,
@@ -1289,11 +1478,26 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
   };
 }
 
+function matchesAgentFilter(row: AgentRow, filter: AgentFilter): boolean {
+  switch (filter) {
+    case "all":
+      return true;
+    case "live":
+      return row.presence === "live";
+    case "parallel":
+      return row.parallelCount > 1 || row.parallelFloor;
+    case "notifications":
+      return row.attention.some((reason) => NOTIFICATION_REASONS.has(reason));
+    case "gaps":
+      return row.attention.some((reason) => UNREAD_REASONS.has(reason));
+    case "attention":
+      return wantsAttention(row.attention);
+  }
+}
+
 export function applyAgentFilter(rows: readonly AgentRow[], filter: AgentFilter): AgentRow[] {
   if (filter === "all") return [...rows];
-  if (filter === "live") return rows.filter((row) => row.presence === "live");
-  if (filter === "parallel") return rows.filter((row) => row.parallelCount > 1 || row.parallelFloor);
-  return rows.filter((row) => wantsAttention(row.attention));
+  return rows.filter((row) => matchesAgentFilter(row, filter));
 }
 
 /**
@@ -1304,13 +1508,7 @@ export function applyAgentFilter(rows: readonly AgentRow[], filter: AgentFilter)
  */
 export function applyAgentTree(roots: readonly AgentRow[], filter: AgentFilter): AgentRow[] {
   if (filter === "all") return [...roots];
-  const matches = (row: AgentRow): boolean =>
-    filter === "live"
-      ? row.presence === "live"
-      : filter === "parallel"
-        ? row.parallelCount > 1 || row.parallelFloor
-        : wantsAttention(row.attention);
-  const keeps = (row: AgentRow): boolean => matches(row) || row.children.some(keeps);
+  const keeps = (row: AgentRow): boolean => matchesAgentFilter(row, filter) || row.children.some(keeps);
   return roots.filter(keeps);
 }
 
@@ -1411,6 +1609,7 @@ export function planeHeadline(plane: AgentPlane, visible: number): string {
   }
   if (plane.childSessions > 0) parts.push(plural(plane.childSessions, "child session", "child sessions"));
   parts.push(`${plane.attention.needing} need attention`);
+  if (plane.notifications > 0) parts.push(plural(plane.notifications, "notification", "notifications"));
   if (plane.attention.unread > 0) parts.push(`${plane.attention.unread} not fully read`);
   // Rows past the cap are not hidden by the filter. `visible` counts how many
   // of the returned rows the caller kept.

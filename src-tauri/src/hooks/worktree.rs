@@ -683,19 +683,23 @@ fn is_ready(target: &Path, common: &Path) -> bool {
 /// The registry entry (`<common>/worktrees/<id>`) that [`is_ready`] matches to
 /// `target`, or `None` when there is none.
 fn registered_gitdir(target: &Path, common: &Path) -> Option<PathBuf> {
-    let canonical = target.canonicalize().ok()?;
+    // The plain spelling throughout: on Windows `canonicalize` answers `\\?\C:\...`,
+    // which is never equal to the `C:\...` the plan names, so every worktree git
+    // had just made read as "not a ready worktree".
+    let plain = |path: &Path| crate::engine::process::canonicalize_plain(path).ok();
+    let canonical = plain(target)?;
     if canonical != target {
         return None;
     }
     let gitfile = std::fs::read_to_string(target.join(".git")).ok()?;
     let gitdir = gitfile.trim().strip_prefix("gitdir:")?.trim();
-    let gitdir = target.join(gitdir).canonicalize().ok()?;
-    let registry = common.join("worktrees").canonicalize().ok()?;
+    let gitdir = plain(&target.join(gitdir))?;
+    let registry = plain(&common.join("worktrees"))?;
     if gitdir.parent() != Some(registry.as_path()) || !gitdir.join("HEAD").is_file() {
         return None;
     }
     let back = std::fs::read_to_string(gitdir.join("gitdir")).ok()?;
-    let back = Path::new(back.trim()).parent()?.canonicalize().ok()?;
+    let back = plain(Path::new(back.trim()).parent()?)?;
     (back == canonical).then_some(gitdir)
 }
 

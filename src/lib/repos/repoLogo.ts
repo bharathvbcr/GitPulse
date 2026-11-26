@@ -180,6 +180,7 @@ export function scoreLogoPath(path: string, options: { anyImage?: boolean } = {}
   else if (/^(app[-_]?)?icon([-_.]?\d+(x\d+)?)?(@\dx)?$/.test(stem)) base = 80;
   else if (/^\d{2,4}x\d{2,4}(@\dx)?$/.test(stem) && dirs[dirs.length - 1] === "icons") base = 78; // Tauri's icons/128x128.png
   else if (stem === "apple-touch-icon" || /^android-chrome-\d+/.test(stem)) base = 72;
+  else if (/(^|[-_.])mark([-_.]?\d+)?$/.test(stem)) base = 72; // published brand marks (e.g. assets/manvi-mark.svg)
   else if (dirPath.endsWith(".appiconset")) base = 70; // an Xcode AppIcon set
   else if (stem === "ic_launcher") base = 66;
   else if (stem === "ic_launcher_round") base = 62;

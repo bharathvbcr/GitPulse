@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { Bot, Bug, MessagesSquare, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
+import { Bot, Bug, MessagesSquare, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, SquareArrowOutUpRight, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
 import { repoStore, type MutationTarget, type RepoState } from "../stores/repoStore";
 import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
@@ -8,6 +8,7 @@ import { promptQuickCommit } from "../commit/quickCommit";
 import { VIEW_REGISTRY, describeDestination } from "../views/viewRegistry";
 import { openSuspectsFor } from "../codeintel/openSuspects";
 import { setEditorLens, showExplorerRail } from "../files/explorerLens";
+import { requestTreeReveal } from "../files/revealRequests";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
 import { openSetupWizard } from "../tools/onboardingStore";
 import { SESSION_TYPES } from "../terminal/tabs";
@@ -22,6 +23,10 @@ import { maviStore } from "../mavi/store.svelte";
 import { composeMaviThread, showMaviThread } from "../mavi/navigate";
 import { STATUS_LABEL, STATUS_PRIORITY, targetLabel } from "../mavi/threads";
 import { harnessStore } from "../stores/harnessStore";
+import { activeSelection } from "../terminal/activeSelection";
+import { trayFor, trayProblem, trayText } from "../terminal/contextTray";
+import { sendToAgentFromPage } from "../terminal/sendFromPage";
+import { openInPreferredEditor } from "../desktop/openInEditor";
 
 /** The most Mavi threads the palette lists by name. */
 const MAX_PALETTE_THREADS = 12;
@@ -31,6 +36,7 @@ const icons = { work: GitBranch, mavi: MessagesSquare, code: FileCode, history: 
 const MANVI_PALETTE_LABELS: Readonly<Record<ManviFocusId, string>> = {
   harness: "Open Manvi policy settings — connection and capability boundary",
   model: "Open local model servers — the models Manvi and agents can use",
+  steward: "Open Manvi system steward — periodic host checks, critical slowdown and cleanup",
   activity: "Open policy activity — Manvi verdicts, grants and the agent journal",
   cleanup: "Open branch and tag cleanup — merged branches and tags safe to delete",
 };
@@ -61,6 +67,96 @@ export function worktreeUnavailable(state: RepoState): string | undefined {
 export interface PaletteHostActions {
   onClone?: () => void;
   onRebase?: () => void;
+}
+
+/**
+ * The line the viewer has selected in `file`, or undefined: a selection in a
+ * different file says nothing about where to land in this one. Compared as
+ * repository paths, folding case where the file system does.
+ */
+function lineInEditor(file: string): number | undefined {
+  const selection = activeSelection();
+  return selection && sameRepo(selection.path, file, { caseInsensitive: isCaseInsensitiveFs() }) ? selection.startLine : undefined;
+}
+
+/** The palette's doors to sending code to an agent and to the open file. */
+function agentSendCommands(state: RepoState, unavailable: string | undefined, checkOrigin: () => void): PaletteItem[] {
+  const selection = activeSelection();
+  const noSelection = "Select lines in an open file first: click a line number, shift-click to extend.";
+  const range = selection ? `${selection.path} L${selection.startLine}${selection.endLine !== selection.startLine ? `–${selection.endLine}` : ""}` : null;
+  const tray = state.currentPath ? trayFor(state.currentPath) : [];
+  const file = state.selectedFilePath;
+  const noFile = "Open a file in Explorer first.";
+  return [
+    {
+      id: "agent-send-selection", label: "Send selection to agent — @file#Lx-Ly into the recipient session",
+      description: range ? `Inserts a reference to ${range}, unsubmitted.` : "Inserts a reference to the selected lines, unsubmitted.",
+      keywords: "agent terminal send reference mention selection lines claude codex", category: "Workspace", icon: Bot,
+      disabledReason: unavailable ?? (selection ? undefined : noSelection),
+      action: () => { checkOrigin(); selection?.sendReference(); },
+    },
+    {
+      id: "agent-send-selection-content", label: "Send selection content to agent — the lines in a code block",
+      description: range ? `Inserts ${range} as a fenced block, unsubmitted, at most 8 KiB with any cut stated.` : "Inserts the selected lines as a fenced block, unsubmitted.",
+      keywords: "agent terminal send code content snippet selection lines claude codex", category: "Workspace", icon: Bot,
+      disabledReason: unavailable ?? (selection ? undefined : noSelection),
+      action: () => { checkOrigin(); selection?.sendContent(); },
+    },
+    {
+      id: "agent-insert-tray", label: "Insert context tray — every set-aside range, as references",
+      description: tray.length ? `Inserts ${tray.length} ${tray.length === 1 ? "reference" : "references"}, unsubmitted.` : "Set ranges aside with Add to tray in a file viewer, then insert them together.",
+      keywords: "agent terminal context tray references insert all ranges", category: "Workspace", icon: Bot,
+      disabledReason: unavailable ?? trayProblem(tray) ?? undefined,
+      action: async () => { checkOrigin(); await sendToAgentFromPage(trayText(tray)); },
+    },
+    {
+      id: "file-open-in-terminal-split", label: "Open active file in terminal split — beside the sessions",
+      description: file ? `Opens ${file} in a pane of the terminal dock.` : "Opens the file Explorer has open in a pane of the terminal dock.",
+      keywords: "file terminal split pane open dock", category: "Workspace", icon: Terminal,
+      disabledReason: unavailable ?? (file ? undefined : noFile),
+      action: async () => {
+        checkOrigin();
+        const path = get(repoStore).currentPath;
+        if (!path || !file) throw Error(noFile);
+        // Request first, then show the dock, as the session launchers do.
+        const opened = terminalLaunchRequests.requestFile(path, file, null, null, undefined, { mode: "split", focus: true });
+        repoStore.setTerminalOpen(true);
+        await opened;
+      },
+    },
+    {
+      id: "file-open-in-editor", label: "Open active file in editor — your external editor, at the selected line",
+      description: file
+        ? `Opens ${file}${lineInEditor(file) ? ` at line ${lineInEditor(file)}` : ""} in the editor chosen in Settings (VS Code, Antigravity IDE, Cursor or Zed).`
+        : "Opens the file Explorer has open in the external editor chosen in Settings, at the selected line when the viewer has one.",
+      keywords: "file open external editor ide vscode vs code antigravity cursor zed line goto launch", category: "Workspace", icon: SquareArrowOutUpRight,
+      disabledReason: unavailable ?? (file ? undefined : noFile),
+      action: async () => {
+        checkOrigin();
+        // `checkOrigin` proved the active repository is still the one this palette was built for.
+        const path = state.currentPath;
+        if (!path || !file) throw Error(noFile);
+        // Read again now: the selection may have moved since the palette was built.
+        await openInPreferredEditor(path, file, { line: lineInEditor(file) });
+      },
+    },
+    {
+      id: "file-reveal-in-explorer", label: "Reveal active file in explorer — in the file tree",
+      description: file ? `Shows ${file} in the Code page's file tree.` : "Shows the file Explorer has open in the Code page's file tree.",
+      keywords: "file reveal explorer tree locate code page", category: "Workspace", icon: FileCode,
+      disabledReason: unavailable ?? (file ? undefined : noFile),
+      action: async () => {
+        checkOrigin();
+        if (!file) throw Error(noFile);
+        interfaceStore.setGlobalSurface("repository");
+        repoStore.setActiveTab("code");
+        showExplorerRail("files");
+        // The file is already the selection, so the trees' own reveal-on-selection
+        // would not fire. Ask them directly; the selection is left alone.
+        requestTreeReveal(file);
+      },
+    },
+  ];
 }
 
 export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) => void, host: PaletteHostActions = {}): PaletteItem[] {
@@ -138,10 +234,10 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     // that answers it rather than on nothing.
     ...(view.id === "work" ? [
       {
-        id: "work:conflicts", label: "Resolve conflicts — finish a parked merge or rebase",
-        description: "Work → Overview · The conflict editor leads Overview while a merge, rebase or cherry-pick is parked.",
-        keywords: "Work Overview Resolve conflicts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work,
-        disabledReason: unavailable ?? (state.operation.operation || state.operation.probeFailed || state.statuses.some(file => file.is_conflicted) ? undefined : "No merge, rebase or cherry-pick is waiting on you."),
+        id: "work:conflicts", label: "Resolve conflicts — open the conflict editor or finish a parked merge",
+        description: "Work → Overview · Open the conflict editor, review saved drafts, or finish a parked merge, rebase or cherry-pick.",
+        keywords: "Work Overview Resolve conflicts editor drafts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work,
+        disabledReason: unavailable ?? (state.isBare ? "This bare repository has no working tree." : undefined),
         action: () => {
           interfaceStore.setGlobalSurface("repository");
           openConflicts();
@@ -241,6 +337,9 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
         await launched;
       },
     })),
+    // Sending code to an agent. Each is listed with its reason when it cannot run
+    // now (no line selected, nothing in the tray, no open file) rather than hidden.
+    ...agentSendCommands(state, unavailable, checkOrigin),
     { id: "refresh", label: "Refresh repository status", category: "Repository", icon: RefreshCw, shortcut: "⌘R", disabledReason: unavailable, action: () => repoStore.refresh() },
     { id: "quick_commit", label: "Quick commit…", description: "Stage all changes and commit with a message", category: "Git actions", icon: GitCommit, shortcut: "⌘Enter", closeBefore: true, disabledReason: worktree ?? (state.statuses.length ? undefined : "Nothing to commit."), action: () => promptQuickCommit() },
     { id: "new_branch", label: "Create branch…", category: "Git actions", icon: Plus, closeBefore: true, disabledReason: worktree, action: async () => {

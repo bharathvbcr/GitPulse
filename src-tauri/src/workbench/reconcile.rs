@@ -32,6 +32,8 @@ use super::process_birth::{self, Liveness};
 use super::{query, WorkbenchError, WorkbenchState};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The states the store counts as holding a checkout, apart from `prepared`
@@ -225,6 +227,143 @@ fn abandonment(run: &Value) -> String {
     }
 }
 
+/// The profile worker if one is live. Never builds one: telling a worker that
+/// a run ended is no reason to start a Manvi.
+fn live_worker(state: &WorkbenchState) -> Option<Arc<crate::harness::sidecar::ProfileConnection>> {
+    crate::supervisor::lock_or_recover(&state.0.worker)
+        .as_ref()
+        .map(|(_, worker)| Arc::clone(worker))
+}
+
+/// A managed run the store no longer counts as live (ended, or released here)
+/// stops counting as hosted by the worker's Manvi. Only a `managed.stop` the
+/// child answered used to say so, which a run that ends on its own never gets,
+/// and a child that "hosts" a run that is over is never replaced when it wedges.
+fn note_ended(state: &WorkbenchState, run: &Value) {
+    let Some(id) = run["id"].as_str().filter(|_| run["kind"] == "managed") else {
+        return;
+    };
+    if run["state"].as_str().is_some_and(is_terminal) {
+        if let Some(worker) = live_worker(state) {
+            worker.runs_ended(&[id.to_owned()]);
+        }
+    }
+}
+
+/// The states no lifecycle method leaves (`vendored/dc-store/src/workbench/runs.rs`
+/// `TERMINAL`). Named, not inferred from "not held": a state this build does
+/// not know is not proof a run is over.
+const TERMINAL: [&str; 3] = ["exited", "failed", "cancelled"];
+
+fn is_terminal(state: &str) -> bool {
+    TERMINAL.contains(&state)
+}
+
+/// How many hosted runs one pass reads. A child hosts a handful; past this the
+/// rest wait for the next pass and the log says so.
+const MAX_HOSTED_READS: usize = 256;
+
+/// Tells `worker` which of the `hosted` runs `read` shows are over: terminal,
+/// or unknown to the store. A run that is live, or whose read failed for any
+/// other reason, stays hosted; failures are logged, never skipped quietly.
+fn forget_ended_hosted(
+    worker: &crate::harness::sidecar::ProfileConnection,
+    hosted: Vec<String>,
+    read: impl Fn(&str) -> Result<Value, WorkbenchError>,
+) {
+    if hosted.len() > MAX_HOSTED_READS {
+        log::warn!(target: "workbench", "{} runs are hosted; only the first {MAX_HOSTED_READS} were checked this pass", hosted.len());
+    }
+    let mut ended = Vec::new();
+    for id in hosted.iter().take(MAX_HOSTED_READS) {
+        match read(id) {
+            Ok(saved) => match saved["item"]["state"].as_str() {
+                Some(state) if is_terminal(state) => ended.push(id.clone()),
+                Some(state) if state == "prepared" || HELD.contains(&state) => {}
+                Some(state) => {
+                    log::warn!(target: "workbench", "run {id} is in state {state:?}, which this build does not know; it stays counted as hosted");
+                }
+                None => {
+                    log::warn!(target: "workbench", "run {id} has no readable state; it stays counted as hosted");
+                }
+            },
+            Err(error) if error.code == "not_found" => ended.push(id.clone()),
+            Err(error) => {
+                log::warn!(target: "workbench", "could not read hosted run {id}: {}: {}; it stays counted as hosted", error.code, error.message);
+            }
+        }
+    }
+    worker.runs_ended(&ended);
+}
+
+/// Has `worker` tell this host when a replaced child took runs with it, and
+/// answers with one reconcile pass on a thread of its own: the runs are over
+/// the moment their Manvi is, and should be recorded then, not at the next
+/// capacity refusal. Passes started by a burst of losses coalesce.
+pub(super) fn watch_lost_runs(
+    state: &WorkbenchState,
+    worker: &crate::harness::sidecar::ProfileConnection,
+) {
+    watch_lost_runs_with(state, worker, Arc::new(|state| sweep(state).map(|_| ())));
+}
+
+/// One reconcile pass over the store, as the lost-runs watcher runs it.
+type LostRunsPass = Arc<dyn Fn(&WorkbenchState) -> Result<(), WorkbenchError> + Send + Sync>;
+
+/// [`watch_lost_runs`] with the pass given, so a test can make one panic.
+fn watch_lost_runs_with(
+    state: &WorkbenchState,
+    worker: &crate::harness::sidecar::ProfileConnection,
+    pass: LostRunsPass,
+) {
+    let inner = Arc::downgrade(&state.0);
+    // `running`: a pass is in flight. `again`: a loss came in while it was, so
+    // it runs once more when it ends. At most one pass at a time.
+    let running = Arc::new(AtomicBool::new(false));
+    let again = Arc::new(AtomicBool::new(false));
+    worker.on_runs_lost(Arc::new(move |runs| {
+        log::warn!(target: "workbench", "the agent runtime was replaced after it stopped answering; run(s) it may have hosted: {}", runs.join(", "));
+        again.store(true, Ordering::Release);
+        if running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (inner, running_flag, again_flag, pass) =
+            (inner.clone(), running.clone(), again.clone(), pass.clone());
+        let started = crate::supervisor::spawn_one_of_many(
+            "workbench-lost-runs",
+            "lost run reconciliation",
+            move || loop {
+                again_flag.store(false, Ordering::Release);
+                if let Some(inner) = inner.upgrade() {
+                    // A panic in a pass must not leave `running` set: every
+                    // later loss would then see a pass in flight and return.
+                    let state = WorkbenchState(inner);
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass(&state))) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            log::warn!(target: "workbench", "reconciling runs lost with their Manvi failed: {}: {}", error.code, error.message);
+                        }
+                        Err(_) => {
+                            log::error!(target: "workbench", "reconciling runs lost with their Manvi panicked");
+                        }
+                    }
+                }
+                running_flag.store(false, Ordering::Release);
+                // A loss that arrived after the pass read the store asks for
+                // another; take the right to run it unless a new thread has.
+                if !again_flag.load(Ordering::Acquire) || running_flag.swap(true, Ordering::AcqRel)
+                {
+                    break;
+                }
+            },
+        );
+        if let Err(error) = started {
+            running.store(false, Ordering::Release);
+            log::warn!(target: "workbench", "could not start reconciling runs lost with their Manvi: {error}");
+        }
+    }));
+}
+
 /// One identity per reconciling write, never equal to any launch owner.
 fn reconciler() -> String {
     let nanos = SystemTime::now()
@@ -408,6 +547,9 @@ fn settle(
         let run = state
             .with_store(|store| query(store, "runs.get", &json!({"id":id}).to_string()))?["item"]
             .clone();
+        // A run the store already records as over: the hosting Manvi's job for
+        // it is over too, whatever it did or did not answer.
+        note_ended(state, &run);
         let verdict = observe(state, &run, views);
         let Verdict::Release(reason) = &verdict else {
             return Ok((verdict, run));
@@ -421,7 +563,10 @@ fn settle(
             "reason": reason,
         });
         match state.with_store(|store| query(store, "runs.reconcile", &input.to_string())) {
-            Ok(saved) => return Ok((verdict, saved["item"].clone())),
+            Ok(saved) => {
+                note_ended(state, &saved["item"]);
+                return Ok((verdict, saved["item"].clone()));
+            }
             Err(error) if error.code == "revision_conflict" => continue,
             Err(error) => return Err(error),
         }
@@ -664,9 +809,34 @@ pub(super) fn sweep(state: &WorkbenchState) -> Result<Swept, WorkbenchError> {
 }
 
 fn sweep_pages(state: &WorkbenchState, max_pages: usize) -> Result<Swept, WorkbenchError> {
+    sweep_pages_with(state, max_pages, || {})
+}
+
+/// [`sweep_pages`] with `between` run after the hosted runs are read and before
+/// any is judged, so a test can move a run where the old decision, made from a
+/// walk, would have lost it.
+fn sweep_pages_with(
+    state: &WorkbenchState,
+    max_pages: usize,
+    between: impl FnOnce(),
+) -> Result<Swept, WorkbenchError> {
     // Receipts that storage refused when their runs ended are stored first,
     // so a recorded exit code is never overwritten by `outcome_uncertain`.
     super::receipts::replay(state, None);
+    // Read before any run is judged, so a run prepared while this pass works
+    // is never one it decides about.
+    let worker = live_worker(state);
+    let hosted_before = worker.as_ref().and_then(|w| w.hosted_runs());
+    between();
+    // A hosted run the store records as over ended without any `managed.stop`.
+    // Each is read and judged on its own state, now: a run that moved from
+    // prepared to starting while this pass walked is live, and absence from a
+    // walk (that may have been cut, or run before the move) proves nothing.
+    if let (Some(worker), Some(hosted)) = (&worker, hosted_before) {
+        forget_ended_hosted(worker, hosted, |id| {
+            state.with_store(|store| query(store, "runs.get", &json!({"id": id}).to_string()))
+        });
+    }
     let mut ids = Vec::new();
     let mut complete = true;
     for held in HELD {

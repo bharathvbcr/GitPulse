@@ -30,11 +30,14 @@ pub(super) fn callable_binding_name(node: Node, source: &str) -> Option<String> 
             | "function_item"
             | "method_declaration"
             | "generator_function_declaration"
-            | "generator_function"
     ) {
         return get_child_text(node, "name", source);
     }
-    if !matches!(node.kind(), "arrow_function" | "function_expression") {
+    if node.kind() == "generator_function" {
+        if let Some(name) = get_child_text(node, "name", source) {
+            return Some(name);
+        }
+    } else if !matches!(node.kind(), "arrow_function" | "function_expression") {
         return None;
     }
     // Name a function *expression* by the binding it is assigned to, never by
@@ -52,8 +55,9 @@ pub(super) fn callable_binding_name(node: Node, source: &str) -> Option<String> 
     if parent.kind() == "variable_declarator" {
         return get_child_text(parent, "name", source);
     }
-    // `handle = () => …` in a class body, and `remove: () => …` in an object
-    // literal bound to a module-level `const`: the member is the binding, and
+    // `handle = () => …` in a class body, `remove: () => …` in an object
+    // literal bound to a module-level `const`, in a factory-returned object
+    // literal, or in `export default { … }`: the member is the binding, and
     // the symbol emitter names it the same way.
     if let Some(member) = js_function_valued_member(node, source) {
         return Some(member);
@@ -96,35 +100,93 @@ pub(super) const JS_FUNCTION_WRAPPERS: &[&str] = &[
 /// How many wrappers deep `memo(forwardRef(() => …))` is followed.
 pub(super) const JS_WRAPPER_NESTING: usize = 3;
 
+/// Unwrap transparent JS/TS expression wrappers (`as T`, `satisfies T`,
+/// `(…)`, `x!`, `<T>x`) to the underlying value node.
+pub(super) fn js_unwrap_value(mut node: Node) -> Node {
+    while matches!(
+        node.kind(),
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
+            | "type_assertion"
+    ) {
+        let inner = if node.kind() == "type_assertion" {
+            node.named_child(node.named_child_count().saturating_sub(1))
+        } else {
+            node.named_child(0)
+        };
+        match inner {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    node
+}
+
+/// Walk up past transparent JS/TS expression wrappers to the outermost wrapper.
+pub(super) fn js_outermost_wrapper(mut node: Node) -> Node {
+    while let Some(parent) = bounded_parent(node) {
+        if matches!(
+            parent.kind(),
+            "as_expression"
+                | "satisfies_expression"
+                | "parenthesized_expression"
+                | "non_null_expression"
+                | "type_assertion"
+        ) {
+            node = parent;
+        } else {
+            break;
+        }
+    }
+    node
+}
+
 /// The member name a function-valued class field or object-literal pair gives
 /// its function: `handle` for `handle = () => …`, `remove` for
 /// `remove: () => …`. `None` when `function` is neither.
 ///
-/// A pair counts only when its object is a module-level `const`'s value
-/// ([`js_object_member_owner`]); the same object passed as an argument names no
-/// binding a call could be attributed to.
+/// A pair counts when its object is:
+/// - a module-level `const`'s value ([`js_object_member_owner`]),
+/// - the object literal returned by a module-level or class-method factory
+///   ([`js_factory_returned_object_member`]), or
+/// - a module-level `export default { … }` ([`js_default_export_object_member`]).
+///
+/// An object passed as an argument names no binding a call could be attributed
+/// to and stays `None`.
 pub(super) fn js_function_valued_member(function: Node, source: &str) -> Option<String> {
-    if !matches!(function.kind(), "arrow_function" | "function_expression") {
+    if !matches!(
+        function.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    ) {
         return None;
     }
-    let parent = bounded_parent(function)?;
+    let wrapped = js_outermost_wrapper(function);
+    let parent = bounded_parent(wrapped)?;
     match parent.kind() {
         "public_field_definition" | "field_definition" => {
             let value = parent.child_by_field_name("value")?;
-            if value.id() != function.id() {
+            if value.id() != wrapped.id() {
                 return None;
             }
             js_field_name(parent, source)
         }
         "pair" => {
-            js_object_member_owner(function)?;
-            js_pair_key(parent, source)
+            if js_object_member_owner(function).is_some()
+                || js_factory_returned_object_member(function, source).is_some()
+                || js_default_export_object_member(function)
+            {
+                js_pair_key(parent, source)
+            } else {
+                None
+            }
         }
         // `exports.helper = function helper() { … }`: the function is the
         // export, named the way the symbol emitter names it.
         "assignment_expression" => {
             let (exported, value) = js_cjs_export_assignment(parent, source)?;
-            if value.id() != function.id() {
+            if value.id() != wrapped.id() {
                 return None;
             }
             js_cjs_function_name(exported.as_deref(), function, source)
@@ -426,6 +488,28 @@ pub(super) fn js_pair_key(pair: Node, source: &str) -> Option<String> {
     matches!(key.kind(), "property_identifier" | "identifier").then(|| get_node_text(key, source))
 }
 
+/// The `object` node that directly holds `node`, when `node` is a
+/// `method_definition`, a `pair`, or the function value of a `pair`.
+fn js_member_object(node: Node) -> Option<Node> {
+    let object = match node.kind() {
+        "method_definition" | "pair" => bounded_parent(node)?,
+        "arrow_function" | "function_expression" | "generator_function" => {
+            let wrapped = js_outermost_wrapper(node);
+            let pair = bounded_parent(wrapped)?;
+            if pair.kind() != "pair"
+                || pair
+                    .child_by_field_name("value")
+                    .is_none_or(|value| value.id() != wrapped.id())
+            {
+                return None;
+            }
+            bounded_parent(pair)?
+        }
+        _ => return None,
+    };
+    (object.kind() == "object").then_some(object)
+}
+
 /// The module-level `variable_declarator` an object-literal member belongs to,
 /// when `node` is a member of the object that declarator initialises:
 /// `method() {}` (a `method_definition`) or the function of `name: () => {}`.
@@ -435,38 +519,11 @@ pub(super) fn js_pair_key(pair: Node, source: &str) -> Option<String> {
 /// so it is a symbol qualified by the object, exactly as a method is qualified
 /// by its class. A member of an object that is returned, passed or nested is
 /// not: nothing names the object, and the factory case already owns its own
-/// shape ([`js_returned_object_method`]).
+/// shape ([`js_factory_returned_object_member`]).
 pub(super) fn js_object_member_owner(node: Node) -> Option<Node> {
-    let object = match node.kind() {
-        "method_definition" => bounded_parent(node)?,
-        "arrow_function" | "function_expression" => {
-            let pair = bounded_parent(node)?;
-            if pair.kind() != "pair"
-                || pair
-                    .child_by_field_name("value")
-                    .is_none_or(|value| value.id() != node.id())
-            {
-                return None;
-            }
-            bounded_parent(pair)?
-        }
-        _ => return None,
-    };
-    if object.kind() != "object" {
-        return None;
-    }
-    let mut child = object;
-    let mut parent = bounded_parent(object)?;
-    while matches!(
-        parent.kind(),
-        "as_expression"
-            | "satisfies_expression"
-            | "parenthesized_expression"
-            | "non_null_expression"
-    ) {
-        child = parent;
-        parent = bounded_parent(parent)?;
-    }
+    let object = js_member_object(node)?;
+    let child = js_outermost_wrapper(object);
+    let parent = bounded_parent(child)?;
     (parent.kind() == "variable_declarator"
         && parent
             .child_by_field_name("value")
@@ -476,6 +533,128 @@ pub(super) fn js_object_member_owner(node: Node) -> Option<Node> {
             .is_some_and(|name| name.kind() == "identifier")
         && is_module_level(parent))
     .then_some(parent)
+}
+
+/// Whether `object` is the direct expression of a module-level
+/// `export default { … }`.
+pub(super) fn js_default_export_object_member(node: Node) -> bool {
+    let Some(object) = js_member_object(node) else {
+        return false;
+    };
+    let child = js_outermost_wrapper(object);
+    let Some(parent) = bounded_parent(child) else {
+        return false;
+    };
+    parent.kind() == "export_statement"
+        && is_module_level(parent)
+        && parent
+            .children(&mut parent.walk())
+            .any(|token| token.kind() == "default")
+}
+
+/// Whether `callable` is a module-level named factory or a named class method
+/// whose returned object literal's function-valued pairs should be extracted as
+/// methods of `callable`.
+fn is_named_factory_callable(callable: Node, source: &str) -> bool {
+    let is_callable = matches!(
+        callable.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "arrow_function"
+            | "function_expression"
+            | "generator_function"
+            | "method_definition"
+    );
+    if !is_callable {
+        return false;
+    }
+    let allowed_scope = if callable.kind() == "method_definition" {
+        enclosing_type_name(callable, source).is_some()
+    } else {
+        is_module_level(callable)
+    };
+    if !allowed_scope {
+        return false;
+    }
+    callable_binding_name(callable, source).is_some()
+}
+
+/// Find the enclosing named factory callable that returns `object` — either
+/// directly (`return { … }`, `const mk = () => ({ … })`) or via a local
+/// `const store = { … }; return store;` in the factory's top-level body.
+pub(super) fn js_factory_returned_object<'tree>(
+    object: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if object.kind() != "object" {
+        return None;
+    }
+    let wrapped = js_outermost_wrapper(object);
+    let parent = bounded_parent(wrapped)?;
+    match parent.kind() {
+        // Concise arrow factory: `const createStore = () => ({ applyPreset: () => {} })`
+        "arrow_function"
+            if parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.id() == wrapped.id()) =>
+        {
+            is_named_factory_callable(parent, source).then_some(parent)
+        }
+        // Direct return inside a factory body: `function createStore() { return { … }; }`
+        "return_statement" => {
+            let mut ancestor = bounded_parent(parent);
+            while let Some(node) = ancestor {
+                if is_callable_node(node) {
+                    return is_named_factory_callable(node, source).then_some(node);
+                }
+                ancestor = bounded_parent(node);
+            }
+            None
+        }
+        // Local `const store = { … }; return store;` in the factory's body.
+        "variable_declarator"
+            if parent
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == wrapped.id())
+                && js_declaration_is_const(parent) =>
+        {
+            let name_node = parent
+                .child_by_field_name("name")
+                .filter(|name| name.kind() == "identifier")?;
+            let local_name = get_node_text(name_node, source);
+            let decl = bounded_parent(parent)?;
+            let block = bounded_parent(decl)?;
+            if block.kind() != "statement_block" {
+                return None;
+            }
+            let factory = bounded_parent(block)?;
+            if !is_named_factory_callable(factory, source) {
+                return None;
+            }
+            let mut cursor = block.walk();
+            let returned = block.named_children(&mut cursor).any(|stmt| {
+                stmt.kind() == "return_statement"
+                    && stmt
+                        .named_child(0)
+                        .map(js_unwrap_value)
+                        .is_some_and(|expr| {
+                            expr.kind() == "identifier" && get_node_text(expr, source) == local_name
+                        })
+            });
+            returned.then_some(factory)
+        }
+        _ => None,
+    }
+}
+
+/// The factory callable owning `node`, when `node` is a `method_definition`, a
+/// `pair`, or a function-valued `pair`'s value on a factory-returned object.
+pub(super) fn js_factory_returned_object_member<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let object = js_member_object(node)?;
+    js_factory_returned_object(object, source)
 }
 
 /// The function a wrapper call binds, when `value` is one: the first argument
@@ -1199,9 +1378,10 @@ pub(super) fn ast_root(node: Node) -> Node {
 /// - `bounded_parent(variable_declarator)` is the `lexical_declaration`; the export
 ///   statement wraps that, not the declarator.
 pub(super) fn js_symbol_is_exported(node: Node, source: &str) -> bool {
-    // One hop only: skip the factory that returns `{ method() {} }`, then
-    // resume. Skipping every enclosing function would publish methods of an
-    // unused helper nested inside an exported function.
+    // One hop only: skip the factory that returns `{ method() {} }` or
+    // `{ method: () => {} }`, then resume. Skipping every enclosing function
+    // would publish methods of an unused helper nested inside an exported
+    // function.
     let skip_one_factory = js_returned_object_method(node);
     let mut skipped_factory = false;
     let mut ancestor = bounded_parent(node);
@@ -1242,14 +1422,17 @@ pub(super) fn js_symbol_is_exported(node: Node, source: &str) -> bool {
     false
 }
 
-/// A method on an object that is the (possibly nested / parenthesized) operand
-/// of a `return`, or the implicit return of an arrow.
+/// A method (or function-valued pair) on an object that is the (possibly
+/// nested / parenthesized / type-asserted) operand of a `return`, or the
+/// implicit return of an arrow.
 ///
 /// Nested functions stay private: `export function outer() { function inner() {}
 /// return inner; }` is not this shape. An object passed as an argument is not
-/// this shape either — `return foo({ get() {} })` stops at `arguments`.
+/// this shape either — `return foo({ get() {} })` stops at `arguments`. Bound
+/// then returned (`const x = { get() {} }; return x;`) stays unexported here
+/// so dead-code analysis keeps checking whether it is reached.
 pub(super) fn js_returned_object_method(node: Node) -> bool {
-    if node.kind() != "method_definition" {
+    if !matches!(node.kind(), "method_definition" | "pair") {
         return false;
     }
     let mut ancestor = bounded_parent(node);
@@ -1260,7 +1443,13 @@ pub(super) fn js_returned_object_method(node: Node) -> bool {
                 saw_object = true;
                 ancestor = bounded_parent(parent);
             }
-            "pair" | "parenthesized_expression" | "sequence_expression" => {
+            "pair"
+            | "parenthesized_expression"
+            | "sequence_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression"
+            | "type_assertion" => {
                 ancestor = bounded_parent(parent);
             }
             "return_statement" | "arrow_function" => return saw_object,
@@ -1535,6 +1724,9 @@ pub(super) fn ts_ambient_exemptions(
     if !whole_file {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
+            if walk_deadline_passed() {
+                break;
+            }
             if node.kind() == "ambient_declaration" {
                 ambient.push((node.start_byte(), node.end_byte()));
                 continue;
@@ -1587,6 +1779,9 @@ pub(super) fn rust_crate_private_scopes(
     let mut restricted: HashSet<usize> = HashSet::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            break;
+        }
         let mut cursor = node.walk();
         if node.children(&mut cursor).any(|child| {
             child.kind() == "visibility_modifier"

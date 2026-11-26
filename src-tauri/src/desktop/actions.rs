@@ -16,6 +16,8 @@ pub const REVEAL_REPO: &str = "reveal-repo";
 pub const OPEN_REMOTE: &str = "open-remote";
 pub const ACTIVATE_REPO: &str = "activate-repo";
 pub const REPOSITORY_PREFIX: &str = "activate-repo:";
+pub const FOCUS_AGENT: &str = "focus-agent";
+pub const FOCUS_AGENT_PREFIX: &str = "focus-agent:";
 
 pub const OPEN: &str = "open";
 pub const CLONE: &str = "clone";
@@ -133,6 +135,7 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeAction {
     ActivateRepo(String),
+    FocusAgent(String),
     ClearRecents,
     CheckUpdates,
     StageAll,
@@ -197,6 +200,9 @@ impl NativeAction {
     pub fn parse(id: &str) -> Option<Self> {
         if let Some(path) = id.strip_prefix(REPOSITORY_PREFIX) {
             return (!path.is_empty()).then(|| Self::ActivateRepo(path.to_string()));
+        }
+        if let Some(agent_id) = id.strip_prefix(FOCUS_AGENT_PREFIX) {
+            return (!agent_id.is_empty()).then(|| Self::FocusAgent(agent_id.to_string()));
         }
         if id.starts_with("section:") {
             return SECTION_MENUS
@@ -282,6 +288,7 @@ impl NativeAction {
     pub fn event_id(&self) -> &'static str {
         match self {
             Self::ActivateRepo(_) => ACTIVATE_REPO,
+            Self::FocusAgent(_) => FOCUS_AGENT,
             Self::ClearRecents => CLEAR_RECENTS,
             Self::CheckUpdates => CHECK_UPDATES,
             Self::StageAll => STAGE_ALL,
@@ -343,13 +350,19 @@ impl NativeAction {
 
     pub fn path(&self) -> Option<&str> {
         match self {
-            Self::OpenRecent(path) | Self::ActivateRepo(path) => Some(path),
+            Self::OpenRecent(path) | Self::ActivateRepo(path) | Self::FocusAgent(path) => {
+                Some(path)
+            }
             _ => None,
         }
     }
 
     pub fn recent_menu_id(path: &str) -> String {
         format!("{RECENT_PREFIX}{path}")
+    }
+
+    pub fn focus_agent_menu_id(id: &str) -> String {
+        format!("{FOCUS_AGENT_PREFIX}{id}")
     }
 }
 
@@ -528,5 +541,22 @@ mod tests {
         for id in ["repo-tab-0", "repo-tab-10", "repo-tab-", "repo-tab"] {
             assert_eq!(NativeAction::parse(id), None);
         }
+    }
+
+    #[test]
+    fn focus_agent_round_trips_with_colons_and_rejects_empty() {
+        let simple = NativeAction::focus_agent_menu_id("term-1");
+        assert_eq!(simple, "focus-agent:term-1");
+        let parsed = NativeAction::parse(&simple).expect("focus-agent id parses");
+        assert_eq!(parsed, NativeAction::FocusAgent("term-1".into()));
+        assert_eq!(parsed.event_id(), FOCUS_AGENT);
+        assert_eq!(parsed.path(), Some("term-1"));
+
+        let with_colon = NativeAction::focus_agent_menu_id("run:with:colon");
+        let parsed_colon = NativeAction::parse(&with_colon).expect("colons survive");
+        assert_eq!(parsed_colon.event_id(), FOCUS_AGENT);
+        assert_eq!(parsed_colon.path(), Some("run:with:colon"));
+
+        assert_eq!(NativeAction::parse(FOCUS_AGENT_PREFIX), None);
     }
 }

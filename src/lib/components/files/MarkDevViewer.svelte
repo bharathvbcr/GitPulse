@@ -33,8 +33,20 @@
   } from "../../files/markdevRender";
   import { findFragmentTarget, type MarkdownNote } from "../../files/markdownLinks";
   import { takeAnchor } from "../../files/pendingAnchor";
-  import { revealRequest } from "../../files/revealRequests";
+  import { requestReveal, revealRequest } from "../../files/revealRequests";
   import { docsBacklinks, type DocBacklink } from "../../docs/client";
+  import { hostPlatform } from "../../stores/platformStore";
+  import { shortcutTextLabel } from "../../ui/platformCopy";
+  import { debounce } from "../../async/debounce";
+  import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
+  import { EMPTY_SEARCH, matchLabel, stepMatch, type SearchResult } from "../../text/lineSearch";
+  import {
+    applyDomHighlights,
+    clearDomHighlights,
+    setActiveDomHighlight,
+  } from "../../files/domSearch";
+  import { extractSelectionSeed } from "../../files/fileSearchTarget";
+  import FindField from "../FindField.svelte";
   import CodeViewer from "./CodeViewer.svelte";
   import MarkDevLogo from "./MarkDevLogo.svelte";
   import MarkdownContent from "../MarkdownContent.svelte";
@@ -51,6 +63,7 @@
     onRequestDiscard,
     revealTarget = null,
     onSendSelectionToAgent,
+    agentSend,
   }: {
     filePath: string;
     blob: {
@@ -71,7 +84,8 @@
     onDraftChange?: (newContent: string, sourceContent: string) => void;
     onRequestDiscard?: () => Promise<boolean>;
     revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
-    onSendSelectionToAgent?: (reference: string) => void;
+    onSendSelectionToAgent?: (reference: string, checkout?: string) => unknown;
+    agentSend?: { repoPath: string; checkout: string };
   } = $props();
 
   export type MarkDevViewMode = "rendered" | "split" | "raw";
@@ -168,10 +182,116 @@
     };
   });
 
+  let markdevRootEl: HTMLDivElement | undefined = $state();
   let previewContainerEl: HTMLDivElement | undefined = $state();
   let markdevBar: HTMLDivElement | undefined = $state();
   let viewportEl: HTMLDivElement | undefined = $state();
   let viewportWidth = $state(0);
+
+  let mdSearchOpen = $state(false);
+  let mdSearchMode = $state<"find" | "line">("find");
+  let mdSearchQuery = $state("");
+  let mdDebouncedQuery = $state("");
+  let mdCaseSensitive = $state(false);
+  let mdRegex = $state(false);
+  let mdCurrentMatchIdx = $state(0);
+  let mdSearchResult = $state<SearchResult>(EMPTY_SEARCH);
+  let mdMarks = $state.raw<HTMLElement[]>([]);
+  let mdFindFieldRef: ReturnType<typeof FindField> | undefined = $state();
+  let mdSearchInputEl: HTMLInputElement | undefined = $state();
+
+  const applyMdSearchQuery = debounce((q: string) => (mdDebouncedQuery = q), SEARCH_DEBOUNCE_MS);
+  $effect(() => {
+    const next = mdSearchQuery;
+    if (next === "") {
+      applyMdSearchQuery.cancel();
+      mdDebouncedQuery = "";
+      return;
+    }
+    applyMdSearchQuery(next);
+  });
+
+  $effect(() => () => applyMdSearchQuery.cancel());
+
+  $effect(() => {
+    const mode = viewMode;
+    const open = mdSearchOpen;
+    const query = mdDebouncedQuery;
+    const caseSensitive = mdCaseSensitive;
+    const regex = mdRegex;
+    void rendered;
+    const root = previewContainerEl?.querySelector<HTMLElement>(".gp-markdown") ?? null;
+    if (mode !== "rendered" || !open || !root) {
+      clearDomHighlights(root);
+      untrack(() => {
+        mdMarks = [];
+        mdSearchResult = EMPTY_SEARCH;
+        mdCurrentMatchIdx = 0;
+      });
+      return;
+    }
+    const { result, marks } = applyDomHighlights(root, query, { caseSensitive, regex });
+    untrack(() => {
+      mdMarks = marks;
+      mdSearchResult = result;
+      mdCurrentMatchIdx = 0;
+    });
+    if (marks.length > 0) {
+      setActiveDomHighlight(marks, 0, query.trim().length > 0);
+    }
+    return () => {
+      clearDomHighlights(root);
+      untrack(() => {
+        mdMarks = [];
+      });
+    };
+  });
+
+  function stepMdMatch(delta: 1 | -1) {
+    const next = stepMatch(mdCurrentMatchIdx, mdMarks.length, delta);
+    if (next < 0) return;
+    mdCurrentMatchIdx = next;
+    setActiveDomHighlight(mdMarks, next, true);
+  }
+
+  function handleRenderedGoToLine(line: number, column?: number | null) {
+    requestReveal(filePath, line, column ?? 1);
+    viewMode = "raw";
+  }
+
+  function handleMarkDevKeydown(e: KeyboardEvent) {
+    if (viewMode !== "rendered" || e.defaultPrevented) return;
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      e.stopPropagation();
+      void mdFindFieldRef?.openFind(extractSelectionSeed(null, markdevRootEl));
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "g") {
+      e.preventDefault();
+      e.stopPropagation();
+      void mdFindFieldRef?.openLine();
+      return;
+    }
+    if (e.key === "F3" && !e.metaKey && !e.ctrlKey && !e.altKey && mdSearchOpen && mdMarks.length > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      stepMdMatch(e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (e.key === "Escape" && mdSearchOpen) {
+      e.preventDefault();
+      e.stopPropagation();
+      mdFindFieldRef?.close();
+    }
+  }
+
+  $effect(() => {
+    const el = markdevRootEl;
+    if (!el) return;
+    el.addEventListener("keydown", handleMarkDevKeydown);
+    return () => el.removeEventListener("keydown", handleMarkDevKeydown);
+  });
 
   $effect(() => {
     const el = viewportEl;
@@ -325,6 +445,7 @@
 {/snippet}
 
 <div
+  bind:this={markdevRootEl}
   class="@container/markdev flex-1 flex flex-col h-full w-full bg-background font-sans text-xs min-h-0 min-w-0 overflow-hidden select-text relative"
   data-markdev-layout={layout.mode}
 >
@@ -354,6 +475,31 @@
           <span class="hidden @xl/markdev:inline">Outline</span>
           <span class="hidden @3xs/markdev:inline text-micro text-faint font-mono">({outline.length})</span>
         </button>
+      {/if}
+
+      {#if viewMode === "rendered"}
+        <div class="flex min-w-0 items-center gap-1">
+          <FindField
+            bind:this={mdFindFieldRef}
+            bind:open={mdSearchOpen}
+            bind:mode={mdSearchMode}
+            bind:query={mdSearchQuery}
+            bind:caseSensitive={mdCaseSensitive}
+            bind:regex={mdRegex}
+            bind:input={mdSearchInputEl}
+            registerControl
+            label="Find in document"
+            placeholder="Find in document…"
+            shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
+            goToShortcut={shortcutTextLabel("⌘G", $hostPlatform.os)}
+            lineCount={stats.lineCount}
+            status={matchLabel(rendered.omittedBytes > 0 ? { ...mdSearchResult, truncated: true } : mdSearchResult, mdCurrentMatchIdx)}
+            invalid={mdSearchResult.invalid}
+            hasMatches={mdMarks.length > 0}
+            onstep={stepMdMatch}
+            ongotoline={handleRenderedGoToLine}
+          />
+        </div>
       {/if}
     </div>
 
@@ -510,6 +656,7 @@
           {onRequestDiscard}
           {revealTarget}
           {onSendSelectionToAgent}
+          {agentSend}
         />
       </div>
     {:else if viewMode === "split"}
@@ -543,6 +690,7 @@
             {onRequestDiscard}
             {revealTarget}
             {onSendSelectionToAgent}
+            {agentSend}
           />
         </div>
 

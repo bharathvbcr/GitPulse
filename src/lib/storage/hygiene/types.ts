@@ -6,6 +6,8 @@ export interface CacheEntry {
   action: string | null;
   note: string;
   error: string | null;
+  modified_at: number | null;
+  confirm_only: boolean;
 }
 
 export interface CacheInventory {

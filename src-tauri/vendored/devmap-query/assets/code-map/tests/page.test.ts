@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { readView } from "../src/page/graphView";
+import { composeMapNoteLines } from "../src/page/mapView";
 import { capText, readPreview, testsSampleText, unplacedText } from "../src/page/previewModel";
 import { PAGE_CSS } from "../src/page/styles";
 
@@ -70,7 +71,10 @@ describe("readPreview", () => {
 describe("headline and sample wording", () => {
   it("says how many handoffs found no edge, and says nothing when none are missing", () => {
     expect(unplacedText(1)).toBe("1 handoff unplaced");
+    expect(unplacedText(1, 1)).toBe("1 handoff unplaced");
+    expect(unplacedText(150, 100)).toBe("150 handoffs unplaced (100 of 150 listed)");
     expect(unplacedText(1500)).toBe("1,500 handoffs unplaced");
+    expect(unplacedText(1500, 100)).toBe("1,500 handoffs unplaced (100 of 1,500 listed)");
     expect(unplacedText(0)).toBe("");
   });
 
@@ -84,15 +88,47 @@ describe("headline and sample wording", () => {
 
 describe("readView", () => {
   it("reads the view chrome and ignores malformed rows", () => {
-    const view = readView({ view: { title: "repo", level: "files", detail_fields: [["Path", "path"], ["bad"], 3], flag_filters: [["dead", "Dead candidates only"]] } });
+    const view = readView({
+      view: { title: "repo", level: "files", detail_fields: [["Path", "path"], ["bad"], 3], flag_filters: [["dead", "Dead candidates only"]] },
+      unresolved_handoffs: [{ from: "src/cli", text: "x -> y" }],
+      unresolved_handoffs_total: 150,
+      unresolved_handoffs_by_subsystem: { "src/cli": { total: 150, listed: 1 } },
+    });
     expect(view.title).toBe("repo");
     expect(view.suffix).toBe("code graph");
     expect(view.detailFields).toEqual([["Path", "path"]]);
     expect(view.flagFilters).toEqual([["dead", "Dead candidates only"]]);
+    expect(view.unresolvedTotal).toBe(150);
+    expect(view.unresolvedBySubsystem["src/cli"]).toEqual({ total: 150, listed: 1 });
+    expect(view.unplacedNote).toBe("150 handoffs unplaced (1 of 150 listed)");
   });
 
   it("falls back to a title when the view is absent", () => {
-    expect(readView({}).title).toBe("devmap");
+    const empty = readView({});
+    expect(empty.title).toBe("devmap");
+    expect(empty.unplacedNote).toBe("");
+    expect(empty.unresolvedTotal).toBe(0);
+  });
+});
+
+describe("composeMapNoteLines", () => {
+  it("appends unplacedNote when present and omits empty entries", () => {
+    expect(
+      composeMapNoteLines({
+        honesty: "Showing 2 of 3 nodes.",
+        nodesTruncated: true,
+        capHint: "Raise --max-nodes.",
+        coverageLabel: null,
+        unplacedNote: "150 handoffs unplaced (100 of 150 listed)",
+      }),
+    ).toEqual([
+      "Showing 2 of 3 nodes.",
+      "Raise --max-nodes.",
+      "150 handoffs unplaced (100 of 150 listed)",
+    ]);
+    expect(
+      composeMapNoteLines({ honesty: null, nodesTruncated: false, capHint: "x", unplacedNote: "" }),
+    ).toEqual([]);
   });
 });
 

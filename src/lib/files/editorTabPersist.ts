@@ -101,7 +101,7 @@ function toState(record: PersistedEditorRepo): EditorTabState {
     if (preview) previewSeen = true;
     return { path: tab.path, name: formatPathParts(tab.path).name, preview };
   });
-  return { tabs, active: record.active, drafts: {} };
+  return { tabs, active: record.active };
 }
 
 export function loadPersistedEditorTabs(

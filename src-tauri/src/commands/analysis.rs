@@ -273,8 +273,10 @@ pub async fn cmd_hygiene_execute(
     plan_id: String,
 ) -> Result<Guarded<crate::storage::hygiene::HygieneOutcome>, IpcError> {
     off_thread(move || {
-        let (policy, output) =
-            crate::storage::hygiene::execute(&repo_path, &plan_id, |argv, path| match argv {
+        let (policy, output) = crate::storage::hygiene::execute_confirmed(
+            &repo_path,
+            &plan_id,
+            |argv, path| match argv {
                 Some(argv) => {
                     let command_policy = guard(
                         &repo_path,
@@ -284,7 +286,9 @@ pub async fn cmd_hygiene_execute(
                     Ok(strictest_verdict(command_policy, file_policy))
                 }
                 None => guard_file(&repo_path, path, "delete").map_err(CommandError::from),
-            })?;
+            },
+            crate::desktop::confirm::native,
+        )?;
         Ok(Guarded { policy, output })
     })
     .await

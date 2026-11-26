@@ -22,7 +22,7 @@ use tree_sitter::Node;
 use crate::model::{ExtractedSymbol, SymbolKind, WiringKind};
 use crate::treesitter::{bounded_parent, get_child_text, get_node_text};
 
-use super::{Declaration, enclosing_owner};
+use super::{enclosing_owner, Declaration};
 
 /// A Kotlin declaration, or `None` when `node` declares nothing this graph
 /// records.

@@ -50,7 +50,8 @@ pub(super) fn active_on_repository(
     )?)
 }
 
-/// Whether a specific working tree checkout has an active, prepared, or unresolved run.
+/// Whether a specific working tree checkout has an active, prepared, or unresolved
+/// run that occupies the local checkout (`skip_checkout_occupancy` runs do not).
 pub(super) fn has_active_checkout(
     conn: &rusqlite::Connection,
     repository_id: &str,
@@ -59,7 +60,7 @@ pub(super) fn has_active_checkout(
 ) -> Result<bool> {
     Ok(conn.query_row(
         &format!(
-            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND json_extract(body,'$.git_dir')=?3 AND {ACTIVE})"
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND json_extract(body,'$.git_dir')=?3 AND coalesce(json_extract(body,'$.skip_checkout_occupancy'),0)=0 AND {ACTIVE})"
         ),
         params![now, repository_id, git_dir],
         |r| r.get(0),
@@ -488,6 +489,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         "max_active_runs",
         "model_choice",
         "require_subtasks_done",
+        "skip_checkout_occupancy",
         "queue_id",
         "member_id",
     ])?;
@@ -538,6 +540,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     }
     let model_choice = model_choice(input)?;
     let require_subtasks_done = input.boolean("require_subtasks_done", false)?;
+    let skip_checkout_occupancy = input.boolean("skip_checkout_occupancy", false)?;
     let queue_id = input.optional_id("queue_id")?;
     let member_id = input.optional_id("member_id")?;
     if queue_id.is_some() != member_id.is_some() {
@@ -634,9 +637,9 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     // the repository's common directory but each has its own `git_dir`, index
     // and HEAD, so two agents in two worktrees cannot touch each other's files
     // — while two in one checkout would. Keying on the repository serialized
-    // every task in it, worktrees included.
-    let busy = has_active_checkout(input.conn, &repository_id, &git_dir, now)?;
-    if busy {
+    // every task in it, worktrees included. Remote runners that do not touch
+    // the local working tree opt out via `skip_checkout_occupancy`.
+    if !skip_checkout_occupancy && has_active_checkout(input.conn, &repository_id, &git_dir, now)? {
         return Err(refuse(
             "checkout_busy",
             "this checkout already has a prepared, active or unresolved run; launch in another worktree, or finish or reconcile that run first",
@@ -657,8 +660,8 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     }
     let body: String = input.conn.query_row("SELECT json_object('id',?1,'revision',?2,'updated_at',?3,'created_at',?3,'expires_at',?4,'kind','external_terminal','task_id',?5,'source_revision',?6,'task_title',json_extract(?7,'$.task.title'),'repository_id',?8,'provider',?9,'permission_mode',?10,'bypass_acknowledged',json(CASE WHEN ?11 THEN 'true' ELSE 'false' END),'cwd',?12,'git_dir',?13,'git_common_dir',?14,'head_oid',?15,'head_ref',?16,'state','prepared','owner_id',NULL,'session_id',NULL,'process_id',NULL,'process_start',NULL,'claimed_at',NULL,'started_at',NULL,'finished_at',NULL,'exit_code',NULL,'reason','','outcome_uncertain',json('false'))",params![id,revision,now,now.saturating_add(300),task_id,source_revision,brief,repository_id,provider,mode,bypass,cwd,git_dir,common,head,head_ref],|r|r.get(0))?;
     let body: String = input.conn.query_row(
-        "SELECT json_set(?1,'$.kind',?2,'$.model_choice',json(?3))",
-        params![body, kind, model_choice],
+        "SELECT json_set(?1,'$.kind',?2,'$.model_choice',json(?3),'$.skip_checkout_occupancy',json(CASE WHEN ?4 THEN 'true' ELSE 'false' END))",
+        params![body, kind, model_choice, skip_checkout_occupancy],
         |r| r.get(0),
     )?;
     put_body(input.conn, Entity::Run, id, revision, &body)?;

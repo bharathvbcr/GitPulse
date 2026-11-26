@@ -673,7 +673,7 @@ function peerInboxSeconds(): number {
  */
 function stopOrNotifySeconds(): number {
   const readArm =
-    /if matches!\(subcommand,\s*"peer-inbox"\s*\|\s*"stop-or-notify"\)[\s\S]*?read_notify_input_within\([\s\S]*?,\s*([A-Z_]+),?\s*\)/.exec(
+    /if (?:matches!\(subcommand,\s*"peer-inbox"\s*\|\s*"stop-or-notify"\)|subcommand == "stop-or-notify")[\s\S]*?read_(?:stop_)?notify_input_within\([\s\S]*?,\s*([A-Z_]+),?\s*\)/.exec(
       hookSource,
     );
   expect(
@@ -995,9 +995,9 @@ describe("notify routes", () => {
 });
 
 
-describe("gitpulse-terminal plugin skill contract", () => {
+describe("gitpulse:terminal plugin skill contract", () => {
   const skillMd = readFileSync(
-    path.join(PLUGIN, "skills", "gitpulse-terminal", "SKILL.md"),
+    path.join(PLUGIN, "skills", "terminal", "SKILL.md"),
     "utf8",
   );
   const mcpModRs = readFileSync(path.join(ROOT, "src-tauri", "src", "mcp", "mod.rs"), "utf8");

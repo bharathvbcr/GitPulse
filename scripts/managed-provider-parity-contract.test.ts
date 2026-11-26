@@ -69,6 +69,9 @@ function harnessManagedProviders(): string[] | null {
  * operation as a codex+claude one. Only the adapter set separates them, which
  * is why the handshake carries it.
  */
+/** How long the installed `manvi serve` gets to answer `hello`. */
+const HANDSHAKE_TIMEOUT_MS = 30_000;
+
 function installedManagedProviders(): { providers: string[] } | { skipped: string } {
   const explicit = process.env.GITPULSE_MANVI_BIN;
   if (explicit !== undefined && !existsSync(explicit)) {
@@ -99,7 +102,7 @@ function installedManagedProviders(): { providers: string[] } | { skipped: strin
     line = execFileSync(binary, ["serve", "--workbench-db", profile], {
       input: `${JSON.stringify({ id: "1", op: "hello", params: { protocol: 1, host: "gitpulse" } })}\n`,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: HANDSHAKE_TIMEOUT_MS,
       env: { ...process.env, MANVI_HARNESS_INIT_ENABLED: "false" },
     }).split("\n")[0] ?? "";
   } catch (cause) {
@@ -181,7 +184,11 @@ describe("managed provider parity", () => {
       return;
     }
     expect(installed.providers).toEqual(renderer);
-  });
+    // The probe spawns `manvi serve` with its own 30 s budget, and a cold start
+    // on a Windows runner overran vitest's default 5 s: the test was killed
+    // before the probe could report either an answer or "could not be
+    // handshaken". The test's limit covers the probe's, plus `where`/`which`.
+  }, HANDSHAKE_TIMEOUT_MS + 15_000);
 
   it("agrees with the harness's adapter set, or says it could not look", () => {
     const harness = harnessManagedProviders();

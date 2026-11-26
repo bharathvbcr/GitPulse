@@ -18,6 +18,8 @@
     GitCommit,
     Layers,
     FileCode,
+    Eye,
+    Columns,
     MoreVertical,
     Check,
     Undo2,
@@ -27,6 +29,7 @@
     PencilLine,
     Trash2,
     TextSearch,
+    SquareArrowOutUpRight,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
@@ -42,6 +45,7 @@
     type FileRow,
   } from "../../files/fileTree";
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
+  import { REVEAL_TTL_MS } from "../../files/revealRequests";
   import { consumeSearchFocus, explorerLens, showExplorerRail, type ExplorerRail } from "../../files/explorerLens";
   import {
     CONTENTS_TOGGLE_LABEL,
@@ -64,10 +68,14 @@
   } from "../../files/fileStatus";
   import { copyText } from "../../desktop/clipboard";
   import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
+  import { openInPreferredEditor, reportEditorFailure } from "../../desktop/openInEditor";
   import { askConfirm, askText } from "../../stores/modalStore";
   import { reportFailure } from "../../stores/mutationOutcome";
   import type { MutationTarget } from "../../repos/storeTypes";
   import { describeDelete, isAtOrUnder, remapPath } from "../../files/fileOps";
+  import { isHtmlFile, requestHtmlViewMode, type HtmlViewMode } from "../../files/htmlPreview";
+  import { isSvgFile, requestSvgViewMode, type SvgViewMode } from "../../files/svgPreview";
+  import { consumeReveal } from "../../files/revealRequests";
   import { newPathProblem, readFileWriteError, withAncestors } from "../../files/fileWrite";
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
@@ -101,7 +109,7 @@
      * twice for the same folder is a real second request, and comparing paths
      * alone would swallow it.
      */
-    revealRequest?: { path: string; nonce: number } | null;
+    revealRequest?: { path: string; nonce: number; at?: number } | null;
     /** What the field holds in Contents mode; the host's content search reads it. */
     contentQuery?: string;
     /** Enter in the field while in Contents mode. */
@@ -517,6 +525,34 @@
     }
   }
 
+  function openHtmlInMode(path: string, mode: HtmlViewMode) {
+    if (mode === "preview") {
+      consumeReveal(path);
+    }
+    requestHtmlViewMode(effectiveRepoPath, path, mode);
+    if (typeof onSelectFile === "function") {
+      onSelectFile(path);
+    } else {
+      repoStore.selectFilePath(path);
+      repoStore.setActiveTab("code", "explorer");
+    }
+    closeContextMenu();
+  }
+
+  function openSvgInMode(path: string, mode: SvgViewMode) {
+    if (mode === "preview") {
+      consumeReveal(path);
+    }
+    requestSvgViewMode(effectiveRepoPath, path, mode);
+    if (typeof onSelectFile === "function") {
+      onSelectFile(path);
+    } else {
+      repoStore.selectFilePath(path);
+      repoStore.setActiveTab("code", "explorer");
+    }
+    closeContextMenu();
+  }
+
   function rowAction(row: FileRow) {
     selectedIndex = rows.findIndex((candidate) => candidate.key === row.key);
     if (row.kind === "dir") {
@@ -840,6 +876,17 @@
     }
   }
 
+  async function openInExternalEditor(filePath: string) {
+    closeContextMenu();
+    const repo = effectiveRepoPath;
+    if (!repo) return;
+    try {
+      await openInPreferredEditor(repo, filePath);
+    } catch (err) {
+      reportEditorFailure(err);
+    }
+  }
+
   async function revealInFinder(filePath: string) {
     closeContextMenu();
     const repo = effectiveRepoPath;
@@ -991,6 +1038,8 @@
     const request = revealRequest;
     if (!request?.path || request.nonce === lastRevealNonce) return;
     lastRevealNonce = request.nonce;
+    // A request made long before this tree mounted is not one anybody is waiting on.
+    if (request.at !== undefined && Date.now() - request.at > REVEAL_TTL_MS) return;
     untrack(() => {
       const next = { ...collapsed };
       for (const dir of [...ancestorsOf(request.path), request.path]) next[dir] = false;
@@ -1482,8 +1531,76 @@
         <span>Delete folder…</span>
       </button>
     {:else}
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
-        <FileCode size={13} class="text-accent" />
+      {#if isHtmlFile(row.path)}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-html-preview"
+          onclick={() => openHtmlInMode(row.path, "preview")}
+        >
+          <Eye size={13} class="text-accent" />
+          <span>Open as Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-html-split"
+          onclick={() => openHtmlInMode(row.path, "split")}
+        >
+          <Columns size={13} class="text-accent" />
+          <span>Open Code &amp; Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-html-code"
+          onclick={() => openHtmlInMode(row.path, "code")}
+        >
+          <FileCode size={13} class="text-textMuted" />
+          <span>Open HTML Code</span>
+        </button>
+      {:else if isSvgFile(row.path)}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-svg-preview"
+          onclick={() => openSvgInMode(row.path, "preview")}
+        >
+          <Eye size={13} class="text-accent" />
+          <span>Open as Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-svg-split"
+          onclick={() => openSvgInMode(row.path, "split")}
+        >
+          <Columns size={13} class="text-accent" />
+          <span>Open Code &amp; Preview</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="file-ctx-svg-code"
+          onclick={() => openSvgInMode(row.path, "code")}
+        >
+          <FileCode size={13} class="text-textMuted" />
+          <span>Open SVG Code</span>
+        </button>
+      {:else}
+        <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
+          <FileCode size={13} class="text-accent" />
+          <span>Open in viewer</span>
+        </button>
+      {/if}
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => openInExternalEditor(row.path)}>
+        <SquareArrowOutUpRight size={13} class="text-textMuted" />
         <span>Open in editor</span>
       </button>
 

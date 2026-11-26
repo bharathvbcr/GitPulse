@@ -391,6 +391,24 @@ pub async fn cmd_host_load_settings_save(
     .await
 }
 
+/// Current idle memory efficiency settings, as stored.
+#[tauri::command(async)]
+pub async fn cmd_idle_memory_settings() -> Result<crate::tool_config::IdleMemorySettings, IpcError>
+{
+    off_thread(|| Ok(crate::tool_config::idle_memory_settings())).await
+}
+
+/// Persists idle memory efficiency settings.
+#[tauri::command(async)]
+pub async fn cmd_idle_memory_settings_save(
+    settings: crate::tool_config::IdleMemorySettings,
+) -> Result<crate::tool_config::IdleMemorySettings, IpcError> {
+    off_thread(move || {
+        crate::tool_config::save_idle_memory_settings(settings).map_err(CommandError::from)
+    })
+    .await
+}
+
 /// Whether this repository posts verification results to GitHub. Off until
 /// turned on; an unreadable setting is an error, never a yes.
 #[tauri::command(async)]
