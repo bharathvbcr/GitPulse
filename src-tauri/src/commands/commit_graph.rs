@@ -918,8 +918,16 @@ pub(super) fn stack_hierarchy(
         commit_parents.insert(c.id, c.parent_ids);
     }
 
-    let mut nodes =
-        StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
+    let persisted_meta = crate::engine::git_reader::config_snapshot(Path::new(repo_path))
+        .map(|cfg| crate::stack::parse_stack_metadata_from_config(&cfg))
+        .unwrap_or_default();
+
+    let mut nodes = StackTreeEngine::build_stack_hierarchy_with_metadata(
+        &branch_tips,
+        &commit_parents,
+        &default_branch,
+        &persisted_meta,
+    );
 
     // Deep-history repair: the global window truncates long-lived repos,
     // which used to silently misreport deep-stacked branches as roots. Every
@@ -994,8 +1002,12 @@ pub(super) fn stack_hierarchy(
         }
     }
     if enriched {
-        nodes =
-            StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
+        nodes = StackTreeEngine::build_stack_hierarchy_with_metadata(
+            &branch_tips,
+            &commit_parents,
+            &default_branch,
+            &persisted_meta,
+        );
     }
 
     // The breadcrumb trail describes the checked-out branch's ancestry;

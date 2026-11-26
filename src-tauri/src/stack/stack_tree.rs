@@ -1,5 +1,89 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Persisted parent relationship stored per branch in local git config
+/// (`branch.<name>.waylodeParent` and `branch.<name>.waylodeBaseOid`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackBranchMeta {
+    pub parent_branch: String,
+    pub base_oid: Option<String>,
+}
+
+/// Parsed local stack config: parented branch metadata and all recorded base OIDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedStackConfig {
+    pub parents: HashMap<String, StackBranchMeta>,
+    pub base_oids: HashMap<String, String>,
+}
+
+const WAYLODE_PARENT_VAR: &str = "waylodeparent";
+const WAYLODE_BASE_OID_VAR: &str = "waylodebaseoid";
+
+/// Extracts `branch -> StackBranchMeta` from a git config key/value map
+/// (such as `config_snapshot`). Section/variable names are matched
+/// case-insensitively because `git config --list` lowercases them while
+/// preserving subsection case (`branch.<name>.waylodeParent`).
+pub fn parse_stack_metadata_from_config(
+    entries: &HashMap<String, String>,
+) -> HashMap<String, StackBranchMeta> {
+    parse_stack_metadata_with_bases(entries).parents
+}
+
+/// Extracts parented stack metadata and all base OIDs from a git config map.
+pub fn parse_stack_metadata_with_bases(entries: &HashMap<String, String>) -> ParsedStackConfig {
+    let mut parents_raw: HashMap<String, String> = HashMap::new();
+    let mut base_oids: HashMap<String, String> = HashMap::new();
+    for (key, value) in entries {
+        let Some(rest) = key.strip_prefix("branch.") else {
+            continue;
+        };
+        let Some((branch, var)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if branch.is_empty() {
+            continue;
+        }
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if var.eq_ignore_ascii_case(WAYLODE_PARENT_VAR) {
+            parents_raw.insert(branch.to_string(), trimmed.to_string());
+        } else if var.eq_ignore_ascii_case(WAYLODE_BASE_OID_VAR) {
+            base_oids.insert(branch.to_string(), trimmed.to_string());
+        }
+    }
+    let mut parents = HashMap::with_capacity(parents_raw.len());
+    for (branch, parent_branch) in parents_raw {
+        let base_oid = base_oids.get(&branch).cloned();
+        parents.insert(
+            branch,
+            StackBranchMeta {
+                parent_branch,
+                base_oid,
+            },
+        );
+    }
+    ParsedStackConfig { parents, base_oids }
+}
+
+/// Parses NUL-delimited `git config --list -z` stdout bytes (last value wins)
+/// into [`ParsedStackConfig`].
+pub fn parse_stack_config_bytes(bytes: &[u8]) -> ParsedStackConfig {
+    let text = String::from_utf8_lossy(bytes);
+    let mut raw = HashMap::new();
+    for entry in text.split('\0').filter(|entry| !entry.is_empty()) {
+        match entry.split_once('\n') {
+            Some((key, value)) => {
+                raw.insert(key.to_string(), value.to_string());
+            }
+            None => {
+                raw.insert(entry.to_string(), String::new());
+            }
+        }
+    }
+    parse_stack_metadata_with_bases(&raw)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StackedBranchNode {
@@ -44,6 +128,70 @@ pub struct StackTreeEngine;
 /// turns a pathological history into bounded work instead of an unbounded one.
 const MAX_FIRST_PARENT_WALK: usize = 100_000;
 
+fn persisted_parent_is_valid<'a>(
+    branch_name: &str,
+    default_branch: &str,
+    branch_tips: &HashMap<String, String>,
+    persisted_meta: &'a HashMap<String, StackBranchMeta>,
+) -> Option<&'a StackBranchMeta> {
+    let meta = persisted_meta.get(branch_name)?;
+    let parent = meta.parent_branch.as_str();
+    if parent == branch_name || !branch_tips.contains_key(parent) {
+        return None;
+    }
+    // Reject cycles in persisted parent edges so a corrupted config falls back
+    // to git history instead of looping.
+    let mut seen: HashSet<&str> = HashSet::new();
+    seen.insert(branch_name);
+    let mut cur = parent;
+    while seen.insert(cur) {
+        if cur == default_branch {
+            return Some(meta);
+        }
+        let Some(next_meta) = persisted_meta.get(cur) else {
+            return Some(meta);
+        };
+        let next = next_meta.parent_branch.as_str();
+        if !branch_tips.contains_key(next) {
+            return Some(meta);
+        }
+        cur = next;
+    }
+    None
+}
+
+fn ahead_count_to_parent(
+    tip_id: &str,
+    parent_tip: &str,
+    base_oid: Option<&str>,
+    commit_parents: &HashMap<String, Vec<String>>,
+) -> usize {
+    if tip_id == parent_tip || base_oid == Some(tip_id) {
+        return 0;
+    }
+    let mut current: &str = tip_id;
+    let mut count = 0usize;
+    let mut visited: HashSet<&str> = HashSet::new();
+    visited.insert(current);
+    for _ in 0..MAX_FIRST_PARENT_WALK {
+        let Some(parents) = commit_parents.get(current) else {
+            return 0;
+        };
+        let Some(first_parent) = parents.first() else {
+            return 0;
+        };
+        if !visited.insert(first_parent.as_str()) {
+            return 0;
+        }
+        count += 1;
+        if first_parent == parent_tip || base_oid == Some(first_parent.as_str()) {
+            return count;
+        }
+        current = first_parent.as_str();
+    }
+    0
+}
+
 impl StackTreeEngine {
     /// Computes stacked branch hierarchies based on merge base and branch heads.
     ///
@@ -57,6 +205,24 @@ impl StackTreeEngine {
         branch_tips: &HashMap<String, String>, // branch_name -> commit_id
         commit_parents: &HashMap<String, Vec<String>>, // commit_id -> parents
         default_branch: &str,
+    ) -> Vec<StackedBranchNode> {
+        Self::build_stack_hierarchy_with_metadata(
+            branch_tips,
+            commit_parents,
+            default_branch,
+            &HashMap::new(),
+        )
+    }
+
+    /// Computes stacked branch hierarchies, preferring persisted parent edges
+    /// (`branch.<name>.waylodeParent` / `waylodeBaseOid`) when present and valid
+    /// (preventing parent amend/commit/rebase from orphaning child branches),
+    /// and falling back to the first-parent walk when unset.
+    pub fn build_stack_hierarchy_with_metadata(
+        branch_tips: &HashMap<String, String>,
+        commit_parents: &HashMap<String, Vec<String>>,
+        default_branch: &str,
+        persisted_meta: &HashMap<String, StackBranchMeta>,
     ) -> Vec<StackedBranchNode> {
         // One pass builds tip -> owning branch, so the per-branch walk is a
         // hash lookup instead of a scan over every tip at every step. Ties
@@ -91,6 +257,26 @@ impl StackTreeEngine {
                     parent_branch_name: None,
                     child_branch_names: Vec::new(),
                     commit_count_ahead_of_parent: 0,
+                });
+                continue;
+            }
+
+            if let Some(meta) =
+                persisted_parent_is_valid(branch_name, default_branch, branch_tips, persisted_meta)
+            {
+                let parent_tip = &branch_tips[meta.parent_branch.as_str()];
+                let ahead = ahead_count_to_parent(
+                    tip_id,
+                    parent_tip,
+                    meta.base_oid.as_deref(),
+                    commit_parents,
+                );
+                nodes.push(StackedBranchNode {
+                    branch_name: branch_name.clone(),
+                    tip_commit_id: tip_id.clone(),
+                    parent_branch_name: Some(meta.parent_branch.clone()),
+                    child_branch_names: Vec::new(),
+                    commit_count_ahead_of_parent: ahead,
                 });
                 continue;
             }
@@ -492,5 +678,131 @@ mod tests {
         let a = build();
         let b = build();
         assert_eq!(a, b, "same input must give byte-identical output");
+    }
+
+    #[test]
+    fn persisted_parent_retains_child_when_parent_is_amended_or_rebased() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "m1".to_string());
+        // Parent was amended from p1 -> p1_amended, so p1 is no longer parent's tip.
+        tips.insert("feat-parent".to_string(), "p1_amended".to_string());
+        // Child still sits on top of the pre-amend commit p1 -> c1 -> c2.
+        tips.insert("feat-child".to_string(), "c2".to_string());
+
+        let mut parents = HashMap::new();
+        parents.insert("m1".to_string(), vec![]);
+        parents.insert("p1_amended".to_string(), vec!["m1".to_string()]);
+        parents.insert("p1".to_string(), vec!["m1".to_string()]);
+        parents.insert("c1".to_string(), vec!["p1".to_string()]);
+        parents.insert("c2".to_string(), vec!["c1".to_string()]);
+
+        // Without persisted metadata, feat-child falls back onto main (or misses feat-parent).
+        let unpersisted = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+        let child_without = unpersisted
+            .iter()
+            .find(|n| n.branch_name == "feat-child")
+            .unwrap();
+        assert_eq!(child_without.parent_branch_name.as_deref(), Some("main"));
+
+        // With persisted metadata, feat-child stays stacked on feat-parent with exact ahead count 2.
+        let mut persisted = HashMap::new();
+        persisted.insert(
+            "feat-parent".to_string(),
+            StackBranchMeta {
+                parent_branch: "main".to_string(),
+                base_oid: Some("m1".to_string()),
+            },
+        );
+        persisted.insert(
+            "feat-child".to_string(),
+            StackBranchMeta {
+                parent_branch: "feat-parent".to_string(),
+                base_oid: Some("p1".to_string()),
+            },
+        );
+        let nodes = StackTreeEngine::build_stack_hierarchy_with_metadata(
+            &tips, &parents, "main", &persisted,
+        );
+        let child = nodes
+            .iter()
+            .find(|n| n.branch_name == "feat-child")
+            .unwrap();
+        assert_eq!(child.parent_branch_name.as_deref(), Some("feat-parent"));
+        assert_eq!(child.commit_count_ahead_of_parent, 2);
+
+        let parent = nodes
+            .iter()
+            .find(|n| n.branch_name == "feat-parent")
+            .unwrap();
+        assert_eq!(parent.child_branch_names, vec!["feat-child".to_string()]);
+    }
+
+    #[test]
+    fn persisted_metadata_ignores_deleted_or_cyclic_parent_and_falls_back() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "m0".to_string());
+        tips.insert("feat-a".to_string(), "a1".to_string());
+        tips.insert("feat-b".to_string(), "b1".to_string());
+
+        let mut parents = HashMap::new();
+        parents.insert("m0".to_string(), vec![]);
+        parents.insert("a1".to_string(), vec!["m0".to_string()]);
+        parents.insert("b1".to_string(), vec!["a1".to_string()]);
+
+        let mut persisted = HashMap::new();
+        // Deleted parent -> ignored, falls back to first-parent walk (main).
+        persisted.insert(
+            "feat-a".to_string(),
+            StackBranchMeta {
+                parent_branch: "deleted-branch".to_string(),
+                base_oid: None,
+            },
+        );
+        // Cyclic edge feat-b -> feat-a with feat-a -> feat-b would loop; ensure fallback still works.
+        persisted.insert(
+            "feat-b".to_string(),
+            StackBranchMeta {
+                parent_branch: "feat-a".to_string(),
+                base_oid: Some("a1".to_string()),
+            },
+        );
+        let nodes = StackTreeEngine::build_stack_hierarchy_with_metadata(
+            &tips, &parents, "main", &persisted,
+        );
+        let a = nodes.iter().find(|n| n.branch_name == "feat-a").unwrap();
+        let b = nodes.iter().find(|n| n.branch_name == "feat-b").unwrap();
+        assert_eq!(a.parent_branch_name.as_deref(), Some("main"));
+        assert_eq!(b.parent_branch_name.as_deref(), Some("feat-a"));
+
+        // Direct 2-cycle in persisted metadata must be rejected and fall back to history.
+        persisted.insert(
+            "feat-a".to_string(),
+            StackBranchMeta {
+                parent_branch: "feat-b".to_string(),
+                base_oid: None,
+            },
+        );
+        let nodes_cycle = StackTreeEngine::build_stack_hierarchy_with_metadata(
+            &tips, &parents, "main", &persisted,
+        );
+        let a2 = nodes_cycle
+            .iter()
+            .find(|n| n.branch_name == "feat-a")
+            .unwrap();
+        assert_eq!(a2.parent_branch_name.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parse_stack_config_bytes_preserves_branch_case_and_handles_dots() {
+        let raw =
+            b"branch.feat/V1.2.waylodeparent\nmain\0branch.feat/V1.2.waylodebaseoid\nabc123\0";
+        let parsed = parse_stack_config_bytes(raw);
+        let entry = parsed.parents.get("feat/V1.2").expect("branch meta");
+        assert_eq!(entry.parent_branch, "main");
+        assert_eq!(entry.base_oid.as_deref(), Some("abc123"));
+        assert_eq!(
+            parsed.base_oids.get("feat/V1.2").map(String::as_str),
+            Some("abc123")
+        );
     }
 }
