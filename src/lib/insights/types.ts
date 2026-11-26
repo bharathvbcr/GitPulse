@@ -249,6 +249,8 @@ export interface CollisionRisk {
   claims_total?: number;
   /** True when `file_claims` holds only the newest rows up to its cap. Omitted when it was not cut. */
   claims_truncated?: boolean;
+  /** Worktrees whose uncommitted-path scan stopped at `MAX_CHANGED_PATHS`. Omitted when empty. */
+  truncated_worktrees?: string[];
 }
 
 /**

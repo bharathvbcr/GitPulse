@@ -569,6 +569,7 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
     let locks = read_worktree_locks(worktree_paths);
     let (claims, problems) = load_claims(worktree_paths);
     let mut facet = attribute_with(observation, worktree_paths, &locks, &claims);
+    augment_ide_peers(worktree_paths, &mut facet);
     if !problems.is_empty() {
         // Attribution fell back to the registry or process cwd for whatever
         // the claims would have said, so the facet is not "observed
@@ -577,6 +578,217 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
         facet.attribution_error = format!("hook claims not read in full: {}", problems.join("; "));
     }
     facet
+}
+
+const PEERS_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct IdePeersFile {
+    #[serde(default)]
+    peers: Vec<IdePeerRecord>,
+}
+
+#[derive(Deserialize)]
+struct IdePeerRecord {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    surface: String,
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    worktree_path: String,
+    #[serde(default)]
+    turn_state: String,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    proc_start_ns: Option<u64>,
+}
+
+/// Supplements `facet` with live Antigravity IDE sessions recorded in
+/// `<git-common-dir>/gitpulse/lanes/peers.json` whose presence lock is actively
+/// held (or whose `(pid, proc_start_ns)` is alive and `turn_state != "exited"`).
+/// Strictly read-only: never takes `.bus.lock` or writes any files.
+pub(crate) fn augment_ide_peers(worktree_paths: &[String], facet: &mut LiveSessionFacet) {
+    let agy_homes = crate::workbench::conversation::antigravity_homes();
+    augment_ide_peers_in(
+        worktree_paths,
+        &agy_homes,
+        &process_birth::running_since,
+        facet,
+    );
+}
+
+pub(crate) fn augment_ide_peers_in(
+    worktree_paths: &[String],
+    agy_homes: &[PathBuf],
+    alive_probe: &dyn Fn(u32, u128) -> Liveness,
+    facet: &mut LiveSessionFacet,
+) {
+    use std::io::Read;
+
+    if worktree_paths.is_empty() {
+        return;
+    }
+    let roots: Vec<(String, PathBuf)> = worktree_paths
+        .iter()
+        .map(|p| (p.clone(), comparable(p)))
+        .collect();
+
+    let mut seen_common = HashSet::new();
+    let mut existing_sids: HashSet<String> = HashSet::new();
+    let mut existing_pids: HashSet<u32> = HashSet::new();
+    for wt in &facet.worktrees {
+        for s in &wt.sessions {
+            if s.pid > 0 {
+                existing_pids.insert(s.pid);
+            }
+            if let Some(ref sid) = s.session_id {
+                existing_sids.insert(sid.to_ascii_lowercase());
+            }
+        }
+    }
+
+    let mut added = 0u32;
+    let mut touched_worktrees: HashSet<String> = HashSet::new();
+
+    for path in worktree_paths {
+        let Ok(common) = crate::engine::git_cli::resolve_git_common_dir(Path::new(path)) else {
+            continue;
+        };
+        if !seen_common.insert(common.clone()) {
+            continue;
+        }
+        if !matches!(super::claims::admitted(Path::new(path)), Ok(true)) {
+            continue;
+        }
+        let peers_path = common.join("gitpulse").join("lanes").join("peers.json");
+        let Ok(file) = std::fs::File::open(&peers_path) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if file
+            .take(PEERS_MAX_BYTES + 1)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        if buf.len() as u64 > PEERS_MAX_BYTES || buf.is_empty() {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_slice::<IdePeersFile>(&buf) else {
+            continue;
+        };
+        for peer in parsed.peers {
+            let provider = crate::engine::agent_bus::canonical_provider(&peer.provider);
+            let surface = crate::engine::agent_bus::canonical_surface(&peer.surface);
+            if provider != "agy" || surface != "ide" {
+                continue;
+            }
+            if peer.worktree_path.trim().is_empty() {
+                continue;
+            }
+            let peer_wt_comp = comparable(&peer.worktree_path);
+            let Some(owner_wt) = owning_worktree(&peer_wt_comp, &roots) else {
+                continue;
+            };
+            let sid_lower = peer
+                .provider_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| crate::workbench::terminal_command::is_canonical_uuid(s))
+                .map(|s| s.to_ascii_lowercase());
+            let presence_locked = sid_lower.as_deref().is_some_and(|sid| {
+                crate::engine::agent_bus::is_antigravity_presence_locked(agy_homes, sid)
+            });
+            let pid_alive = peer.turn_state != "exited"
+                && match (peer.pid, peer.proc_start_ns) {
+                    (Some(pid), Some(start_ns)) => {
+                        matches!(alive_probe(pid, u128::from(start_ns)), Liveness::Alive)
+                    }
+                    _ => false,
+                };
+            if !presence_locked && !pid_alive {
+                continue;
+            }
+            if let Some(ref sid) = sid_lower {
+                if existing_sids.contains(sid) {
+                    continue;
+                }
+                existing_sids.insert(sid.clone());
+            } else if let Some(pid) = peer.pid.filter(|&p| p > 0) {
+                if existing_pids.contains(&pid) {
+                    continue;
+                }
+                existing_pids.insert(pid);
+            }
+
+            let owner_wt_owned = owner_wt.to_string();
+            let session = LiveSession {
+                kind: "antigravity".to_string(),
+                pid: peer.pid.unwrap_or(0),
+                entrypoint: "ide".to_string(),
+                status: if peer.turn_state.trim().is_empty() {
+                    "idle".to_string()
+                } else {
+                    peer.turn_state.clone()
+                },
+                cwd: owner_wt_owned.clone(),
+                tree: None,
+                run_id: peer.run_id.clone(),
+                parent_pid: None,
+                session_id: sid_lower,
+                proc_start: None,
+                registry_cwd: Some(peer.worktree_path.clone()),
+                start_us: None,
+                is_caller: false,
+                ide_hosted: true,
+                terminal_session_id: None,
+            };
+            touched_worktrees.insert(owner_wt_owned.clone());
+            match facet
+                .worktrees
+                .iter_mut()
+                .find(|w| w.path == owner_wt_owned)
+            {
+                Some(row) => row.sessions.push(session),
+                None => facet.worktrees.push(LiveWorktree {
+                    path: owner_wt_owned,
+                    sessions: vec![session],
+                    children: Vec::new(),
+                    children_truncated: false,
+                }),
+            }
+            added += 1;
+        }
+    }
+
+    if added > 0 {
+        for row in &mut facet.worktrees {
+            if touched_worktrees.contains(&row.path) {
+                row.sessions.sort_by_key(|s| s.pid);
+                (row.children, row.children_truncated) = nest(&row.sessions);
+            }
+        }
+        facet.worktrees.sort_by(|a, b| a.path.cmp(&b.path));
+        if let Some(kind) = facet.kinds.iter_mut().find(|k| k.kind == "antigravity") {
+            kind.sessions += added;
+        } else {
+            facet.kinds.push(LiveKindStatus {
+                kind: "antigravity".to_string(),
+                ok: true,
+                error: String::new(),
+                sessions: added,
+                unverified: 0,
+                truncated: false,
+            });
+        }
+        facet.sessions = facet.kinds.iter().map(|k| k.sessions).sum();
+    }
 }
 
 pub(crate) fn attribute_with(
@@ -2337,5 +2549,139 @@ mod tests {
         assert_eq!(online.sessions[1].state, "blocked");
         assert_eq!(online.sessions[1].state_source, "hub");
         assert_eq!(online.sessions[1].state_age_s, Some(5));
+    }
+
+    #[test]
+    fn augment_ide_peers_surfaces_antigravity_from_peers_json_and_presence_lock() {
+        let repo = crate::test_support::git_repo();
+        let repo_str = repo.path().to_string_lossy().into_owned();
+        let common = crate::engine::git_cli::resolve_git_common_dir(repo.path()).unwrap();
+        let lanes_dir = common.join("gitpulse").join("lanes");
+        std::fs::create_dir_all(&lanes_dir).unwrap();
+
+        let agy_home = tempfile::tempdir().unwrap();
+        let presence_dir = agy_home.path().join("presence");
+        std::fs::create_dir_all(&presence_dir).unwrap();
+
+        let conv_locked = "aaaaaaaa-1111-4222-8333-444444444444";
+        let conv_locked_2 = "cccccccc-1111-4222-8333-444444444444";
+        let conv_stale = "bbbbbbbb-1111-4222-8333-444444444444";
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(presence_dir.join(format!("{conv_locked}.lock")))
+            .unwrap();
+        let lock_file_2 = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(presence_dir.join(format!("{conv_locked_2}.lock")))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            assert_eq!(
+                unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::flock(lock_file_2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+        }
+        std::fs::write(presence_dir.join(format!("{conv_stale}.lock")), b"").unwrap();
+
+        let peers_json = serde_json::json!({
+            "peers": [
+                {
+                    "peer_id": format!("agy:{conv_locked}"),
+                    "provider": "antigravity",
+                    "surface": "ide",
+                    "provider_session_id": conv_locked,
+                    "pid": 40908,
+                    "worktree_path": repo_str,
+                    "turn_state": "idle",
+                    "updated_at_ms": 1000
+                },
+                {
+                    "peer_id": format!("agy:{conv_locked_2}"),
+                    "provider": "agy",
+                    "surface": "ide",
+                    "provider_session_id": conv_locked_2,
+                    "pid": 40908,
+                    "worktree_path": repo_str,
+                    "turn_state": "running",
+                    "updated_at_ms": 1001
+                },
+                {
+                    "peer_id": format!("agy:{conv_stale}"),
+                    "provider": "agy",
+                    "surface": "ide",
+                    "provider_session_id": conv_stale,
+                    "worktree_path": repo_str,
+                    "turn_state": "exited",
+                    "updated_at_ms": 1000
+                }
+            ]
+        });
+        std::fs::write(
+            lanes_dir.join("peers.json"),
+            serde_json::to_vec_pretty(&peers_json).unwrap(),
+        )
+        .unwrap();
+
+        let obs = from_scan(&[], &[]);
+        let mut facet = attribute_with(&obs, std::slice::from_ref(&repo_str), &[], &[]);
+        let homes = vec![agy_home.path().to_path_buf()];
+        augment_ide_peers_in(
+            std::slice::from_ref(&repo_str),
+            &homes,
+            &|_, _| Liveness::Gone,
+            &mut facet,
+        );
+
+        let agy = facet
+            .kinds
+            .iter()
+            .find(|k| k.kind == "antigravity")
+            .expect("antigravity kind status");
+        if cfg!(unix) {
+            assert_eq!(
+                agy.sessions, 2,
+                "both presence-locked agy IDE sessions sharing pid must be surfaced: {facet:?}"
+            );
+            assert_eq!(facet.sessions, 2, "{facet:?}");
+            assert_eq!(facet.worktrees[0].sessions.len(), 2);
+            let sids: Vec<Option<&str>> = facet.worktrees[0]
+                .sessions
+                .iter()
+                .map(|s| s.session_id.as_deref())
+                .collect();
+            assert!(sids.contains(&Some(conv_locked)), "{sids:?}");
+            assert!(sids.contains(&Some(conv_locked_2)), "{sids:?}");
+            assert!(facet.worktrees[0].sessions.iter().all(|s| s.ide_hosted));
+
+            // Second augmentation pass must deduplicate without double-counting.
+            augment_ide_peers_in(
+                std::slice::from_ref(&repo_str),
+                &homes,
+                &|_, _| Liveness::Gone,
+                &mut facet,
+            );
+            assert_eq!(
+                facet
+                    .kinds
+                    .iter()
+                    .find(|k| k.kind == "antigravity")
+                    .unwrap()
+                    .sessions,
+                2
+            );
+        }
+        drop(lock_file);
+        drop(lock_file_2);
     }
 }

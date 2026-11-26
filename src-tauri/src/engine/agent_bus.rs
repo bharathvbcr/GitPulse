@@ -21,21 +21,19 @@ use crate::codeintel::worktree_overlay::{
     compute_worktree_dirty_nodes_readonly, open_worktree_or_anchor_csr, DirtyNodeScan,
 };
 use crate::engine::git_cli::{resolve_git_common_dir, validate_repo};
-use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
-use crate::engine::process::DEFAULT_TIMEOUT;
+use crate::engine::object_quarantine::MergeCandidate;
 use crate::engine::worktree::{
-    admit_worktree_pair, head_branch_from_metadata, list_worktrees, list_worktrees_lite,
-    WorktreeInfo,
+    admit_worktree_pair, head_branch_from_metadata, list_worktrees_lite, WorktreeInfo,
 };
 use crate::ipc_error::CommandError;
 use devmap_query::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_ACTIVE_LANES: usize = 64;
 pub const MAX_PEER_RECORDS: usize = 256;
@@ -52,6 +50,12 @@ pub const MAX_READ_BY_ENTRIES: usize = 64;
 pub const DEFAULT_MAX_HOPS: u32 = 6;
 pub const MAX_ODB_RADAR_PAIRS: usize = 32;
 pub const MAX_RADAR_CONFLICTS_PER_LAYER: usize = 128;
+pub const LANE_CLAIM_TTL_MS: u64 = 4 * 60 * 60 * 1000;
+const PEER_HEARTBEAT_WRITE_MIN_MS: u64 = 30_000;
+const STALE_LANE_TEMP_AGE: Duration = Duration::from_secs(60);
+const RADAR_TOTAL_BUDGET: Duration = Duration::from_secs(25);
+const RADAR_OVERLAY_BUDGET: Duration = Duration::from_secs(10);
+const RADAR_ODB_BUDGET: Duration = Duration::from_secs(15);
 
 const LANES_SUBDIR: &str = "gitpulse/lanes";
 const CLAIMS_FILE: &str = "claims.json";
@@ -73,6 +77,14 @@ pub struct AgentLaneClaim {
     pub claimed_files: Vec<String>,
     pub claimed_symbols: Vec<String>,
     pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_proc_start_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -329,12 +341,34 @@ struct OverlayScan {
     overlays: Vec<(String, Option<String>, RoaringBitmap)>,
 }
 
+#[cfg(test)]
 fn scan_worktree_overlays(
     worktrees: &[&WorktreeInfo],
+    scan: impl FnMut(&WorktreeInfo) -> Result<DirtyNodeScan, CommandError>,
+) -> OverlayScan {
+    scan_worktree_overlays_within(worktrees, None, scan)
+}
+
+fn scan_worktree_overlays_within(
+    worktrees: &[&WorktreeInfo],
+    deadline: Option<Instant>,
     mut scan: impl FnMut(&WorktreeInfo) -> Result<DirtyNodeScan, CommandError>,
 ) -> OverlayScan {
     let mut out = OverlayScan::default();
+    let mut deadline_logged = false;
     for wt in worktrees {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            out.unscanned += 1;
+            out.truncated = true;
+            if !deadline_logged {
+                deadline_logged = true;
+                out.errors.push(RadarScanError {
+                    worktree: wt.path.clone(),
+                    error: "overlay scan budget (10s) exhausted".to_string(),
+                });
+            }
+            continue;
+        }
         if !Path::new(&wt.path).is_dir() {
             out.unscanned += 1;
             continue;
@@ -491,6 +525,111 @@ pub(crate) fn exclusive_file_lock(
     lock_exclusive_within(file, lock_path, timeout, what)
 }
 
+fn parse_lane_temp_pid(file_name: &str) -> Option<u32> {
+    let without_tmp = file_name.strip_suffix(".tmp")?;
+    let (rest, seq_str) = without_tmp.rsplit_once('.')?;
+    if seq_str.is_empty() || !seq_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (stem, pid_str) = rest.rsplit_once('.')?;
+    if stem.is_empty() || pid_str.is_empty() {
+        return None;
+    }
+    pid_str.parse::<u32>().ok()
+}
+
+fn is_pid_dead(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(native_pid) = i32::try_from(pid) else {
+            return true;
+        };
+        if native_pid <= 0 {
+            return true;
+        }
+        // SAFETY: `kill(pid, 0)` performs only an existence/permission check and sends no signal.
+        let rc = unsafe { libc::kill(native_pid, 0) };
+        if rc == -1 {
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        } else {
+            false
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn sweep_stale_lane_temps(lanes_dir: &Path) {
+    let Ok(entries) = fs::read_dir(lanes_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(pid) = parse_lane_temp_pid(name) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let stale_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > STALE_LANE_TEMP_AGE);
+        if is_pid_dead(pid) || stale_mtime {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Non-fsynced atomic write-and-rename for ephemeral heartbeat registries (`peers.json`).
+fn write_ephemeral_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ephemeral path has no parent",
+        ));
+    };
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("state");
+    let seq = NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = parent.join(format!("{file_name}.{}.{seq}.tmp", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(bytes)?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
 fn with_bus_lock<T>(
     lanes_dir: &Path,
     create_dir: bool,
@@ -499,6 +638,9 @@ fn with_bus_lock<T>(
     let lock = bus_lock_for(lanes_dir);
     let _in_proc = lock.lock().unwrap_or_else(PoisonError::into_inner);
     let _cross_proc = acquire_bus_file_lock(lanes_dir, create_dir)?;
+    if create_dir {
+        sweep_stale_lane_temps(lanes_dir);
+    }
     f()
 }
 
@@ -662,6 +804,12 @@ pub fn register_or_update_lane_with_conflicts(
     with_bus_lock(&lanes_dir, true, || {
         let claims_path = lanes_dir.join(CLAIMS_FILE);
         let mut state: ClaimsState = read_json_bounded(&claims_path, 4 * 1024 * 1024)?;
+        let now = now_epoch_ms();
+        state.lanes = filter_live_lanes(
+            std::mem::take(&mut state.lanes),
+            now,
+            &resolve_live_sessions_for_lanes,
+        );
 
         let record = AgentLaneClaim {
             agent_id: agent.clone(),
@@ -672,7 +820,11 @@ pub fn register_or_update_lane_with_conflicts(
             sparse_cone: cone_clean,
             claimed_files: files_clean,
             claimed_symbols: symbols_clean,
-            updated_at_ms: now_epoch_ms(),
+            updated_at_ms: now,
+            expires_at_ms: Some(now.saturating_add(LANE_CLAIM_TTL_MS)),
+            owner_pid: None,
+            owner_proc_start_ns: None,
+            session_id: None,
         };
 
         if let Some(existing) = state.lanes.iter_mut().find(|l| l.agent_id == agent) {
@@ -737,15 +889,22 @@ pub fn release_lane(repo_path: &str, agent_id: &str) -> Result<bool, CommandErro
         let mut state: ClaimsState = read_json_bounded(&claims_path, 4 * 1024 * 1024)?;
         let before = state.lanes.len();
         state.lanes.retain(|l| l.agent_id != agent);
-        if state.lanes.len() == before {
-            return Ok(false);
+        let removed_target = state.lanes.len() != before;
+        let after_target = state.lanes.len();
+        state.lanes = filter_live_lanes(
+            std::mem::take(&mut state.lanes),
+            now_epoch_ms(),
+            &resolve_live_sessions_for_lanes,
+        );
+        let compacted = state.lanes.len() != after_target;
+        if removed_target || compacted {
+            let bytes = serde_json::to_vec_pretty(&state)
+                .map_err(|e| CommandError::from(format!("cannot serialize claims: {e}")))?;
+            devmap_query::write_atomic(&claims_path, &bytes).map_err(|e| {
+                CommandError::from(format!("cannot write {}: {e}", claims_path.display()))
+            })?;
         }
-        let bytes = serde_json::to_vec_pretty(&state)
-            .map_err(|e| CommandError::from(format!("cannot serialize claims: {e}")))?;
-        devmap_query::write_atomic(&claims_path, &bytes).map_err(|e| {
-            CommandError::from(format!("cannot write {}: {e}", claims_path.display()))
-        })?;
-        Ok(true)
+        Ok(removed_target)
     })
 }
 
@@ -799,7 +958,14 @@ pub(crate) fn release_lanes_matching(
             true
         });
         let removed = before.saturating_sub(state.lanes.len());
-        if removed > 0 {
+        let after_match = state.lanes.len();
+        state.lanes = filter_live_lanes(
+            std::mem::take(&mut state.lanes),
+            now_epoch_ms(),
+            &resolve_live_sessions_for_lanes,
+        );
+        let compacted = state.lanes.len() != after_match;
+        if removed > 0 || compacted {
             let bytes = serde_json::to_vec_pretty(&state)
                 .map_err(|e| CommandError::from(format!("cannot serialize claims: {e}")))?;
             devmap_query::write_atomic(&claims_path, &bytes).map_err(|e| {
@@ -810,13 +976,140 @@ pub(crate) fn release_lanes_matching(
     })
 }
 
-/// Lists all registered parallel agent lanes in this repository family.
+fn is_lane_structurally_live(lane: &AgentLaneClaim) -> bool {
+    if let Some(wt) = lane
+        .worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !Path::new(wt).is_dir() {
+            return false;
+        }
+    }
+    if let Some(pid) = lane.owner_pid {
+        if let Some(start_ns) = lane.owner_proc_start_ns {
+            if matches!(
+                crate::workbench::process_birth::running_since(pid, u128::from(start_ns)),
+                crate::workbench::process_birth::Liveness::Gone
+            ) {
+                return false;
+            }
+        } else if is_pid_dead(pid) {
+            return false;
+        }
+    }
+    true
+}
+
+fn resolve_live_sessions_for_lanes(
+    worktree_paths: &[String],
+) -> (HashSet<String>, HashSet<String>) {
+    if worktree_paths.is_empty() {
+        return (HashSet::new(), HashSet::new());
+    }
+    let obs = crate::insights::live_sessions::observe();
+    let facet = crate::insights::live_sessions::attribute(&obs, worktree_paths);
+    let mut sids = HashSet::new();
+    let mut wts = HashSet::new();
+    for wt in facet.worktrees {
+        if !wt.sessions.is_empty() {
+            wts.insert(wt.path.clone());
+            if let Ok(canon) = fs::canonicalize(&wt.path) {
+                wts.insert(crate::engine::process::plain_path_text(
+                    &canon.to_string_lossy(),
+                ));
+            }
+            for s in wt.sessions {
+                if let Some(sid) = s.session_id {
+                    sids.insert(sid.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    (sids, wts)
+}
+
+type LiveSessionResolver = dyn Fn(&[String]) -> (HashSet<String>, HashSet<String>);
+
+fn filter_live_lanes(
+    lanes: Vec<AgentLaneClaim>,
+    now_ms: u64,
+    resolve_sessions: &LiveSessionResolver,
+) -> Vec<AgentLaneClaim> {
+    let mut live = Vec::new();
+    let mut needs_session_check = Vec::new();
+    let mut check_wts = BTreeSet::new();
+    for lane in lanes {
+        if !is_lane_structurally_live(&lane) {
+            continue;
+        }
+        let effective_expires = lane
+            .expires_at_ms
+            .unwrap_or_else(|| lane.updated_at_ms.saturating_add(LANE_CLAIM_TTL_MS));
+        if now_ms <= effective_expires {
+            live.push(lane);
+        } else {
+            if let Some(wt) = lane
+                .worktree_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                check_wts.insert(wt.to_string());
+            }
+            needs_session_check.push(lane);
+        }
+    }
+    if !needs_session_check.is_empty() {
+        let wt_list: Vec<String> = check_wts.into_iter().collect();
+        let (live_sids, live_wts) = resolve_sessions(&wt_list);
+        for lane in needs_session_check {
+            let sid_live = lane
+                .session_id
+                .as_deref()
+                .is_some_and(|s| live_sids.contains(&s.to_ascii_lowercase()));
+            let wt_live = lane.worktree_path.as_deref().is_some_and(|w| {
+                live_wts.contains(w)
+                    || fs::canonicalize(w).ok().is_some_and(|c| {
+                        live_wts.contains(&crate::engine::process::plain_path_text(
+                            &c.to_string_lossy(),
+                        ))
+                    })
+            });
+            if sid_live || wt_live {
+                live.push(lane);
+            }
+        }
+    }
+    live
+}
+
+/// Lists all registered parallel agent lanes in this repository family (raw persisted rows).
 pub fn list_lanes(repo_path: &str) -> Result<Vec<AgentLaneClaim>, CommandError> {
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
         let state: ClaimsState = read_json_bounded(&lanes_dir.join(CLAIMS_FILE), 4 * 1024 * 1024)?;
         Ok(state.lanes)
     })
+}
+
+/// Pure read-only view of live parallel agent lanes, excluding expired, dead-PID, and
+/// deleted-worktree claims without mutating `claims.json`.
+pub fn list_live_lanes(repo_path: &str) -> Result<Vec<AgentLaneClaim>, CommandError> {
+    list_live_lanes_at(repo_path, now_epoch_ms())
+}
+
+pub(crate) fn list_live_lanes_at(
+    repo_path: &str,
+    now_ms: u64,
+) -> Result<Vec<AgentLaneClaim>, CommandError> {
+    let lanes = list_lanes(repo_path)?;
+    Ok(filter_live_lanes(
+        lanes,
+        now_ms,
+        &resolve_live_sessions_for_lanes,
+    ))
 }
 
 /// Returns `<git-common-dir>/gitpulse/lanes/messages.json` (ensuring `lanes/` exists
@@ -2079,6 +2372,13 @@ fn upsert_peer_checked(
                 transcript_path: transcript_path.or_else(|| prev.transcript_path.clone()),
                 updated_at_ms: now,
             };
+            let mut next_cmp = next.clone();
+            next_cmp.updated_at_ms = prev.updated_at_ms;
+            if &next_cmp == prev
+                && now.saturating_sub(prev.updated_at_ms) < PEER_HEARTBEAT_WRITE_MIN_MS
+            {
+                return Ok(Ok(prev.clone()));
+            }
             state.peers[idx] = next.clone();
             next
         } else {
@@ -2110,7 +2410,7 @@ fn upsert_peer_checked(
         state.peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
         let bytes = serde_json::to_vec_pretty(&state)
             .map_err(|e| CommandError::from(format!("cannot serialize peers: {e}")))?;
-        devmap_query::write_atomic(&peers_path, &bytes).map_err(|e| {
+        write_ephemeral_atomic(&peers_path, &bytes).map_err(|e| {
             CommandError::from(format!("cannot write {}: {e}", peers_path.display()))
         })?;
         Ok(Ok(record))
@@ -2921,6 +3221,11 @@ fn compute_claim_conflicts(lanes: &[AgentLaneClaim]) -> Vec<ClaimConflict> {
         for j in (i + 1)..lanes.len() {
             let la = &lanes[i];
             let lb = &lanes[j];
+            if la.agent_id == lb.agent_id
+                || (la.session_id.is_some() && la.session_id == lb.session_id)
+            {
+                continue;
+            }
             let mut file_hits = BTreeSet::new();
             for fa in &la.claimed_files {
                 for fb in &lb.claimed_files {
@@ -3010,24 +3315,201 @@ fn compute_semantic_conflicts(
     conflicts
 }
 
+fn merge_file_claims_into_radar_holders(
+    repo: &Path,
+    lanes: &[AgentLaneClaim],
+    non_bare: &[&WorktreeInfo],
+    scan_errors: &mut Vec<RadarScanError>,
+    anchor_path: &Path,
+) -> Vec<AgentLaneClaim> {
+    let mut holders = lanes.to_vec();
+    let read =
+        match crate::insights::claims::read_for_worktree(repo, crate::insights::claims::now_ms()) {
+            Ok(r) => r,
+            Err(err) => {
+                scan_errors.push(RadarScanError {
+                    worktree: anchor_path.to_string_lossy().into_owned(),
+                    error: format!("file-claims.jsonl read failed: {err}"),
+                });
+                return holders;
+            }
+        };
+    if read.untrusted || read.rows.is_empty() {
+        return holders;
+    }
+
+    let branch_for_wt = |wt: &str| -> String {
+        let wt_canon = fs::canonicalize(wt).ok();
+        non_bare
+            .iter()
+            .find(|info| {
+                info.path == wt
+                    || wt_canon
+                        .as_ref()
+                        .is_some_and(|c| fs::canonicalize(&info.path).ok().as_ref() == Some(c))
+            })
+            .and_then(|info| info.branch.clone())
+            .unwrap_or_else(|| "(unregistered)".to_string())
+    };
+
+    struct GroupedFileClaim {
+        session_id: Option<String>,
+        paths: BTreeSet<String>,
+        ts_ms: u64,
+    }
+
+    let mut grouped: HashMap<(String, String), GroupedFileClaim> = HashMap::new();
+    for fc in read.rows {
+        let holder_id = if let Some(ref sid) = fc.session_id {
+            format!("session:{sid}")
+        } else if let Some(ref rid) = fc.run_id {
+            format!("run:{rid}")
+        } else {
+            format!("worktree:{}", fc.worktree)
+        };
+        let wt_key = fs::canonicalize(&fc.worktree)
+            .ok()
+            .map(|p| crate::engine::process::plain_path_text(&p.to_string_lossy()))
+            .unwrap_or_else(|| fc.worktree.clone());
+        let entry = grouped
+            .entry((holder_id, wt_key))
+            .or_insert_with(|| GroupedFileClaim {
+                session_id: fc.session_id.clone(),
+                paths: BTreeSet::new(),
+                ts_ms: fc.ts_ms,
+            });
+        entry.paths.insert(fc.path);
+        entry.ts_ms = entry.ts_ms.max(fc.ts_ms);
+    }
+
+    let mut sorted_groups: Vec<_> = grouped.into_iter().collect();
+    sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for ((holder_id, wt_key), group) in sorted_groups {
+        let GroupedFileClaim {
+            session_id,
+            paths,
+            ts_ms,
+        } = group;
+        let lane_agent_from_run = holder_id.strip_prefix("run:lane:").map(str::to_string);
+        if let Some(existing) = holders.iter_mut().find(|lane| {
+            lane.agent_id == holder_id
+                || lane_agent_from_run
+                    .as_deref()
+                    .is_some_and(|a| lane.agent_id == a)
+                || (session_id.is_some() && lane.session_id == session_id)
+        }) {
+            let mut merged: BTreeSet<String> = existing.claimed_files.iter().cloned().collect();
+            merged.extend(paths);
+            existing.claimed_files = merged.into_iter().collect();
+            continue;
+        }
+        holders.push(AgentLaneClaim {
+            agent_id: holder_id,
+            branch: branch_for_wt(&wt_key),
+            worktree_path: Some(wt_key),
+            sparse_cone: Vec::new(),
+            claimed_files: paths.into_iter().collect(),
+            claimed_symbols: Vec::new(),
+            updated_at_ms: ts_ms,
+            expires_at_ms: None,
+            owner_pid: None,
+            owner_proc_start_ns: None,
+            session_id,
+        });
+    }
+    holders
+}
+
+/// Runs Layer 3 ODB merge conflict checks via `insights::merge_conflicts::merge_conflicts_from_lanes`.
+fn radar_odb_conflicts(
+    anchor_path: &Path,
+    non_bare: &[&WorktreeInfo],
+    active_paths: &HashSet<String>,
+    max_pairs: usize,
+    odb_budget: Duration,
+) -> (Vec<OdbPairConflict>, bool, Vec<RadarScanError>) {
+    let mut errors = Vec::new();
+    if non_bare.len() <= 1 {
+        return (Vec::new(), false, errors);
+    }
+    if odb_budget.is_zero() {
+        errors.push(RadarScanError {
+            worktree: anchor_path.to_string_lossy().into_owned(),
+            error: "ODB merge layer skipped: 25s radar budget exhausted".to_string(),
+        });
+        return (Vec::new(), true, errors);
+    }
+
+    let mc = crate::insights::merge_conflicts::merge_conflicts_from_lanes(
+        anchor_path,
+        non_bare,
+        Some(active_paths),
+        max_pairs,
+        odb_budget,
+    );
+    let branch_for = |path: &str| -> Option<String> {
+        non_bare
+            .iter()
+            .find(|w| w.path == path)
+            .and_then(|w| w.branch.clone())
+    };
+    let mut conflicts = Vec::new();
+    for item in mc.items {
+        let branch_a = branch_for(&item.a_path);
+        let branch_b = branch_for(&item.b_path);
+        match item.verdict {
+            MergeCandidate::Clean { .. } => {}
+            MergeCandidate::Conflict { paths, paths_total } => {
+                conflicts.push(OdbPairConflict {
+                    worktree_a: item.a_path,
+                    branch_a,
+                    worktree_b: item.b_path,
+                    branch_b,
+                    state: "conflict".to_string(),
+                    paths,
+                    paths_total,
+                    reason: None,
+                });
+            }
+            MergeCandidate::Unknown { reason } => {
+                conflicts.push(OdbPairConflict {
+                    worktree_a: item.a_path,
+                    branch_a,
+                    worktree_b: item.b_path,
+                    branch_b,
+                    state: "unknown".to_string(),
+                    paths: Vec::new(),
+                    paths_total: 0,
+                    reason: Some(reason),
+                });
+            }
+        }
+    }
+    if !mc.ok && conflicts.is_empty() && !mc.error.is_empty() {
+        errors.push(RadarScanError {
+            worktree: anchor_path.to_string_lossy().into_owned(),
+            error: format!("ODB merge layer skipped: {}", mc.error),
+        });
+    }
+    (conflicts, mc.truncated, errors)
+}
+
 /// Runs the 3-layer parallel agent collision radar across all worktrees and registered
 /// lanes of `repo_path`:
-/// 1. Pre-edit file & symbol claim overlaps
+/// 1. Pre-edit file & symbol claim overlaps (`claims.json` + `file-claims.jsonl`)
 /// 2. Zero-copy `WorktreeOverlay` `RoaringBitmap` + 1-hop `CsrGraphReader` caller/callee collisions
 /// 3. Quarantined ODB 3-way `git merge-tree` committed conflict checks
 pub fn scan_parallel_agent_radar(
     repo_path: &str,
 ) -> Result<ParallelAgentRadarReport, CommandError> {
-    let repo = validate_repo(repo_path)?;
-    let lanes = list_lanes(repo_path)?;
-    let mut claim_conflicts = compute_claim_conflicts(&lanes);
-    let mut truncated = false;
-    if claim_conflicts.len() > MAX_RADAR_CONFLICTS_PER_LAYER {
-        claim_conflicts.truncate(MAX_RADAR_CONFLICTS_PER_LAYER);
-        truncated = true;
-    }
+    let radar_started = Instant::now();
+    let radar_deadline = radar_started + RADAR_TOTAL_BUDGET;
+    let overlay_deadline = radar_started + RADAR_OVERLAY_BUDGET;
 
-    let worktrees = list_worktrees(repo_path)?;
+    let repo = validate_repo(repo_path)?;
+    let lanes = list_live_lanes(repo_path)?;
+    let worktrees = list_worktrees_lite(repo_path)?;
     let non_bare: Vec<_> = worktrees.iter().filter(|w| !w.is_bare).collect();
 
     let anchor_path = non_bare
@@ -3035,6 +3517,21 @@ pub fn scan_parallel_agent_radar(
         .find(|w| w.is_main)
         .map(|w| PathBuf::from(&w.path))
         .unwrap_or_else(|| repo.clone());
+
+    let mut scan_errors = Vec::new();
+    let layer1_holders = merge_file_claims_into_radar_holders(
+        &repo,
+        &lanes,
+        &non_bare,
+        &mut scan_errors,
+        &anchor_path,
+    );
+    let mut claim_conflicts = compute_claim_conflicts(&layer1_holders);
+    let mut truncated = false;
+    if claim_conflicts.len() > MAX_RADAR_CONFLICTS_PER_LAYER {
+        claim_conflicts.truncate(MAX_RADAR_CONFLICTS_PER_LAYER);
+        truncated = true;
+    }
 
     let csr_opt = open_worktree_or_anchor_csr(&anchor_path);
     let csr_graph_available = csr_opt.is_some();
@@ -3044,11 +3541,12 @@ pub fn scan_parallel_agent_radar(
         scanned: worktrees_scanned,
         unscanned: worktrees_unscanned,
         truncated: overlays_truncated,
-        errors: mut scan_errors,
+        errors: overlay_errors,
         overlays,
-    } = scan_worktree_overlays(&non_bare, |wt| {
+    } = scan_worktree_overlays_within(&non_bare, Some(overlay_deadline), |wt| {
         compute_worktree_dirty_nodes_readonly(&wt.path, Some(&anchor_path))
     });
+    scan_errors.extend(overlay_errors);
     truncated |= overlays_truncated;
 
     let mut semantic_conflicts = match csr_opt.as_ref() {
@@ -3060,68 +3558,22 @@ pub fn scan_parallel_agent_radar(
         truncated = true;
     }
 
-    let mut odb_merge_conflicts = Vec::new();
-    let mut pairs_checked = 0usize;
-
-    let quarantine = ObjectQuarantine::new(&anchor_path);
-    if let Err(err) = &quarantine {
-        scan_errors.push(RadarScanError {
-            worktree: anchor_path.to_string_lossy().into_owned(),
-            error: format!("ODB merge layer skipped: {err}"),
-        });
-    }
-    if let Ok(quarantine) = quarantine {
-        'outer: for i in 0..non_bare.len() {
-            for j in (i + 1)..non_bare.len() {
-                let wa = non_bare[i];
-                let wb = non_bare[j];
-                if wa.head.is_empty() || wb.head.is_empty() || wa.head == wb.head {
-                    continue;
-                }
-                if pairs_checked >= MAX_ODB_RADAR_PAIRS {
-                    truncated = true;
-                    break 'outer;
-                }
-                pairs_checked += 1;
-                match quarantine.merge_tree(
-                    &anchor_path,
-                    &wa.head,
-                    &wb.head,
-                    Instant::now() + DEFAULT_TIMEOUT,
-                ) {
-                    Ok(MergeOutcome::Clean { .. }) => {}
-                    Ok(MergeOutcome::Conflicted {
-                        paths, paths_total, ..
-                    }) => {
-                        odb_merge_conflicts.push(OdbPairConflict {
-                            worktree_a: wa.path.clone(),
-                            branch_a: wa.branch.clone(),
-                            worktree_b: wb.path.clone(),
-                            branch_b: wb.branch.clone(),
-                            state: "conflict".to_string(),
-                            paths,
-                            paths_total,
-                            reason: None,
-                        });
-                    }
-                    Err(err) => {
-                        odb_merge_conflicts.push(OdbPairConflict {
-                            worktree_a: wa.path.clone(),
-                            branch_a: wa.branch.clone(),
-                            worktree_b: wb.path.clone(),
-                            branch_b: wb.branch.clone(),
-                            state: "unknown".to_string(),
-                            paths: Vec::new(),
-                            paths_total: 0,
-                            reason: Some(err.to_string()),
-                        });
-                    }
-                }
-            }
+    let mut active_paths: HashSet<String> = overlays.iter().map(|(wt, _, _)| wt.clone()).collect();
+    for lane in &lanes {
+        if let Some(ref wt) = lane.worktree_path {
+            active_paths.insert(wt.clone());
         }
-    } else if non_bare.len() > 1 {
-        truncated = true;
     }
+    let odb_budget = RADAR_ODB_BUDGET.min(radar_deadline.saturating_duration_since(Instant::now()));
+    let (odb_merge_conflicts, odb_truncated, odb_errors) = radar_odb_conflicts(
+        &anchor_path,
+        &non_bare,
+        &active_paths,
+        MAX_ODB_RADAR_PAIRS,
+        odb_budget,
+    );
+    truncated |= odb_truncated;
+    scan_errors.extend(odb_errors);
 
     Ok(ParallelAgentRadarReport {
         worktrees_scanned,
@@ -3141,6 +3593,7 @@ pub fn scan_parallel_agent_radar(
 mod tests {
     use super::*;
     use crate::codeintel::{provision_worktree_devmap_zero_copy, sync_worktree_overlay};
+    use crate::engine::worktree::list_worktrees;
     use crate::procguard::LockedSpawn;
     use std::process::Command;
 
@@ -5746,5 +6199,269 @@ mod tests {
         fs::write(&path, "not json at all").unwrap();
         post_one(anchor, "after-garbage");
         assert!(!stale.exists(), "stale repair file survived");
+    }
+
+    #[test]
+    fn peers_heartbeat_throttle_skips_disk_rewrite_within_30s_and_sweeps_stale_temps() {
+        let anchor_dir = crate::test_support::git_repo();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        let (_repo, lanes_dir) = lanes_dir_for_repo(anchor).unwrap();
+        fs::create_dir_all(&lanes_dir).unwrap();
+
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let first = upsert_peer(
+            anchor,
+            PeerUpsert {
+                provider: "claude".into(),
+                surface: "external_cli".into(),
+                provider_session_id: Some(sid.into()),
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                turn_state: Some("running".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let peers_path = lanes_dir.join(PEERS_FILE);
+        #[cfg(unix)]
+        let initial_ino = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&peers_path).unwrap().ino()
+        };
+
+        // Seed dead-PID temp, live-PID fresh temp, and live-PID >60s temp.
+        let dead_tmp = lanes_dir.join("peers.json.999999.0.tmp");
+        let live_fresh_tmp = lanes_dir.join(format!("peers.json.{}.0.tmp", std::process::id()));
+        let live_old_tmp = lanes_dir.join(format!("peers.json.{}.1.tmp", std::process::id()));
+        fs::write(&dead_tmp, b"{}").unwrap();
+        fs::write(&live_fresh_tmp, b"{}").unwrap();
+        fs::write(&live_old_tmp, b"{}").unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(120);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&live_old_tmp)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        // Identical heartbeat within <30s: sweeps dead/old temps AND performs 0 disk rewrites.
+        let second = upsert_peer(
+            anchor,
+            PeerUpsert {
+                provider: "claude".into(),
+                surface: "external_cli".into(),
+                provider_session_id: Some(sid.into()),
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                turn_state: Some("running".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !dead_tmp.exists(),
+            "dead-PID temp file must be swept under .bus.lock"
+        );
+        assert!(
+            !live_old_tmp.exists(),
+            "mtime > 60s temp file must be swept under .bus.lock"
+        );
+        assert!(
+            live_fresh_tmp.exists(),
+            "fresh live-PID temp file must not be swept prematurely"
+        );
+        let _ = fs::remove_file(&live_fresh_tmp);
+
+        assert_eq!(second.updated_at_ms, first.updated_at_ms);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let after_ino = fs::metadata(&peers_path).unwrap().ino();
+            assert_eq!(
+                after_ino, initial_ino,
+                "<30s identical heartbeat must perform 0 disk rewrites"
+            );
+        }
+
+        // Changing a field within <30s must still rewrite peers.json.
+        let third = upsert_peer(
+            anchor,
+            PeerUpsert {
+                provider: "claude".into(),
+                surface: "external_cli".into(),
+                provider_session_id: Some(sid.into()),
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                turn_state: Some("idle".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(third.turn_state, "idle");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let changed_ino = fs::metadata(&peers_path).unwrap().ino();
+            assert_ne!(changed_ino, initial_ino);
+        }
+    }
+
+    #[test]
+    fn expired_and_deleted_legacy_lanes_excluded_from_live_while_live_surfaces_in_read_unified() {
+        let anchor_dir = crate::test_support::git_repo();
+        let anchor = anchor_dir.path();
+        let anchor_str = anchor.to_str().unwrap();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_live = wt_parent.path().join("wt-live");
+        let wt_expired = wt_parent.path().join("wt-expired");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/live",
+                wt_live.to_str().unwrap(),
+            ],
+        );
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/expired",
+                wt_expired.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt_live);
+        crate::test_support::trust_repo(&wt_expired);
+
+        let live_claim = register_or_update_lane(
+            anchor_str,
+            "live-agent",
+            "lane/live",
+            wt_live.to_str(),
+            &[],
+            &["src/live_lane.rs".into()],
+            &[],
+        )
+        .unwrap();
+        assert!(live_claim.expires_at_ms.is_some());
+
+        // Inject two legacy claims (no `expires_at_ms`, `owner_pid`, `owner_proc_start_ns`, `session_id`):
+        // one expired >4h ago and one pointing to a deleted worktree directory.
+        let (_repo, lanes_dir) = lanes_dir_for_repo(anchor_str).unwrap();
+        let claims_path = lanes_dir.join(CLAIMS_FILE);
+        let now = now_epoch_ms();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&claims_path).unwrap()).unwrap();
+        let lanes_arr = raw["lanes"].as_array_mut().unwrap();
+        lanes_arr.push(serde_json::json!({
+            "agent_id": "legacy-expired",
+            "branch": "lane/expired",
+            "worktree_path": wt_expired.to_string_lossy(),
+            "sparse_cone": [],
+            "claimed_files": ["src/expired.rs"],
+            "claimed_symbols": [],
+            "updated_at_ms": now.saturating_sub(LANE_CLAIM_TTL_MS + 60_000)
+        }));
+        lanes_arr.push(serde_json::json!({
+            "agent_id": "legacy-deleted",
+            "branch": "lane/deleted",
+            "worktree_path": wt_parent.path().join("no-longer-exists").to_string_lossy(),
+            "sparse_cone": [],
+            "claimed_files": ["src/deleted.rs"],
+            "claimed_symbols": [],
+            "updated_at_ms": now
+        }));
+        fs::write(&claims_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        // Read-only `list_live_lanes` excludes both legacy zombies without mutating claims.json.
+        let live_only = list_live_lanes(anchor_str).unwrap();
+        assert_eq!(live_only.len(), 1, "{live_only:?}");
+        assert_eq!(live_only[0].agent_id, "live-agent");
+        assert_eq!(list_lanes(anchor_str).unwrap().len(), 3);
+
+        // `insights::claims::read_unified` surfaces the live lane as Declared (`lane:<agent_id>`)
+        // and excludes the expired / deleted-worktree legacy lanes.
+        let unified = crate::insights::claims::read_unified(anchor, now).unwrap();
+        assert_eq!(unified.rows.len(), 1, "{unified:?}");
+        assert_eq!(unified.rows[0].path, "src/live_lane.rs");
+        assert_eq!(
+            unified.rows[0].source,
+            crate::insights::claims::ClaimSource::Declared
+        );
+        assert_eq!(unified.rows[0].run_id.as_deref(), Some("lane:live-agent"));
+
+        // Lazy compaction on write prunes the expired/deleted rows from claims.json.
+        register_or_update_lane(
+            anchor_str,
+            "second-live",
+            "lane/expired",
+            wt_expired.to_str(),
+            &[],
+            &["src/second.rs".into()],
+            &[],
+        )
+        .unwrap();
+        let persisted_ids: Vec<String> = list_lanes(anchor_str)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.agent_id)
+            .collect();
+        assert_eq!(persisted_ids, vec!["live-agent", "second-live"]);
+    }
+
+    #[test]
+    fn radar_merges_file_claims_jsonl_into_layer1_conflicts() {
+        let anchor_dir = crate::test_support::git_repo();
+        let anchor = anchor_dir.path();
+        let anchor_str = anchor.to_str().unwrap();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_a = wt_parent.path().join("wt-a");
+        let wt_b = wt_parent.path().join("wt-b");
+        git(
+            anchor,
+            &["worktree", "add", "-b", "feat/a", wt_a.to_str().unwrap()],
+        );
+        git(
+            anchor,
+            &["worktree", "add", "-b", "feat/b", wt_b.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&wt_a);
+        crate::test_support::trust_repo(&wt_b);
+
+        crate::insights::claims::record_observed(
+            &wt_a,
+            "sess-a",
+            "src/shared.rs",
+            wt_a.to_str().unwrap(),
+            crate::insights::claims::now_ms(),
+        )
+        .unwrap();
+        register_or_update_lane(
+            anchor_str,
+            "lane-b",
+            "feat/b",
+            wt_b.to_str(),
+            &[],
+            &["src/shared.rs".into()],
+            &[],
+        )
+        .unwrap();
+
+        let radar = scan_parallel_agent_radar(anchor_str).unwrap();
+        assert!(
+            radar
+                .claim_conflicts
+                .iter()
+                .any(|c| c.overlapping_files.iter().any(|p| p == "src/shared.rs")),
+            "expected file-claims.jsonl + lane claim overlap in Layer 1: {radar:?}"
+        );
     }
 }

@@ -83,6 +83,8 @@ export interface InstallOutcome {
   rung?: InstallRung | null;
 }
 
+export type SharedCheckoutGuardMode = "off" | "ask" | "enforce";
+
 export interface ToolConfigView {
   config: {
     version: number;
@@ -93,6 +95,7 @@ export interface ToolConfigView {
       skipped_tools: string[];
       dismissed: boolean;
     };
+    shared_checkout_guard?: SharedCheckoutGuardMode;
   };
   path: string;
   stale: Array<{ field: string; path: string; reason: string; detail: string }>;

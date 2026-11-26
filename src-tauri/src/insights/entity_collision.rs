@@ -1182,6 +1182,7 @@ mod tests {
             claims_error: String::new(),
             claims_total: 0,
             claims_truncated: false,
+            truncated_worktrees: Vec::new(),
         }
     }
 
