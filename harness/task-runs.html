@@ -159,7 +159,7 @@ import { adoptOutput, pushOutput, emitExit } from "./tauriMocks";
       case "cmd_terminal_detach":report.detaches=(report.detaches??0)+1;show();return true;
       case "cmd_terminal_resize":report.resizes.push({id:args.sessionId,rows:args.rows,cols:args.cols});return null;
       case "cmd_terminal_write":report.writes.push({id:args.sessionId,data:typeof args.data==="string"?args.data:""});return null;
-      case "cmd_terminal_ack":case "cmd_workspace_sync":return null;
+      case "cmd_terminal_ack":case "cmd_terminal_set_title":case "cmd_workspace_sync":return null;
       // One uncommitted file, so the pane has a real status reading to show.
       case "cmd_get_status":return [{path:"src/reconnect.ts",status_code:"M",is_staged:false,is_conflicted:false,additions:3,deletions:1}];
       case "cmd_list_branches":case "cmd_list_remotes":case "cmd_list_submodules":return [];
