@@ -7336,6 +7336,31 @@ done
         crate::test_support::coverage_relaxed(BUDGET * 6)
     }
 
+    /// What the app's real serving code reads for `repo`, required to be a
+    /// complete reading: the "honest answer" the asker tests replay. On a host
+    /// loaded past the handler's (scaled) deadline the read rightly answers
+    /// every facet not scanned, and replaying that would test the fixture, not
+    /// the asker (eight copies of one test at once refused all 24 "honest"
+    /// replays this way). Reads again until a reading is complete, within an
+    /// unhurried bound, and fails as the fixture's problem otherwise.
+    #[cfg(target_os = "macos")]
+    fn complete_reading(repo: &str) -> Value {
+        let mut last: Option<Result<Value, String>> = None;
+        let complete = crate::test_support::wait_until(BUDGET * 12, || {
+            let reading = serve_insights(repo);
+            let whole = reading.as_ref().is_ok_and(|value| {
+                serde_json::from_value::<insights::AppFacets>(value.clone())
+                    .is_ok_and(|facets| facets.not_scanned.is_empty() && !facets.deadline_expired)
+            });
+            last = Some(reading);
+            whole
+        });
+        match last {
+            Some(Ok(value)) if complete => value,
+            other => panic!("the app's read of the fixture never completed: {other:?}"),
+        }
+    }
+
     /// The production collision guard, its scope judged on this thread, given
     /// [`unhurried`] to finish.
     #[cfg(unix)]
@@ -8264,7 +8289,7 @@ done
     #[test]
     fn a_fresh_app_answer_replaces_the_askers_own_scan() {
         let farm = farm(false);
-        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let canned = complete_reading(&farm.repo);
         let app = app_for(&farm.repo, false);
         let reply = canned.clone();
         app._owner
@@ -8307,7 +8332,7 @@ done
     #[test]
     fn an_app_that_is_absent_slow_stale_or_partial_leaves_the_asker_to_scan() {
         let farm = farm(false);
-        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let canned = complete_reading(&farm.repo);
 
         // Absent: nobody owns the profile.
         let empty = tempfile::Builder::new()
@@ -8347,7 +8372,12 @@ done
             edit(&mut reply);
             insights_replayed(&farm, reply, unhurried())
         };
-        assert!(tampered(|_| {}).is_ok(), "an honest answer is believed");
+        let honest = tampered(|_| {});
+        assert!(
+            honest.is_ok(),
+            "an honest answer is believed: {:?}",
+            honest.err()
+        );
         let old = tampered(|r| r["age_ms"] = json!(INSIGHTS_MAX_AGE_MS + 1)).unwrap_err();
         assert!(old.contains("ms old"), "{old}");
         // The bound is inclusive: the oldest believed answer is believed.
@@ -8374,7 +8404,7 @@ done
     fn the_mcp_document_is_the_apps_with_its_age_or_its_own_scan() {
         use crate::mcp::resources::insights_document;
         let farm = farm(false);
-        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let canned = complete_reading(&farm.repo);
 
         // No app registered for this repository: the MCP scans for itself,
         // and says why the app did not serve it and what asking cost.
@@ -8430,7 +8460,7 @@ done
     fn a_partial_app_answer_leaves_the_document_to_the_askers_own_scan() {
         use crate::mcp::resources::insights_document;
         let farm = farm(false);
-        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let canned = complete_reading(&farm.repo);
         let partials: [fn(&mut Value); 4] = [
             |r| r["deadline_expired"] = json!(true),
             |r| r["collisions"]["unscanned_worktrees"] = json!(2),
@@ -8463,7 +8493,7 @@ done
     #[test]
     fn an_answer_about_another_repository_is_refused() {
         let farm = farm(false);
-        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let canned = complete_reading(&farm.repo);
         let canonical = std::fs::canonicalize(&farm.repo)
             .expect("canonical")
             .to_string_lossy()
@@ -8496,7 +8526,7 @@ done
         use std::sync::Arc;
 
         let farm = farm(false);
-        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let canned = complete_reading(&farm.repo);
         let profile = tempfile::Builder::new()
             .prefix("cg")
             .tempdir_in("/tmp")
@@ -8606,7 +8636,7 @@ done
         use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
         use std::sync::Arc;
         let farm = farm(false);
-        let whole = serve_insights(&farm.repo).expect("the app reads");
+        let whole = complete_reading(&farm.repo);
         let mut partial = whole.clone();
         partial["deadline_expired"] = json!(true);
 
@@ -9773,7 +9803,7 @@ done
 
         let farm = farm(false);
         std::fs::write(Path::new(&farm.repo).join("here.txt"), "dirty here").expect("dirty main");
-        let mut canned = serve_insights(&farm.repo).expect("the app reads");
+        let mut canned = complete_reading(&farm.repo);
         canned["age_ms"] = json!(340);
 
         let app = app_for(&farm.repo, false);
@@ -10027,7 +10057,7 @@ done
 
         let farm = farm(false);
         std::fs::write(Path::new(&farm.repo).join("here.txt"), "dirty").expect("dirty main");
-        let canned = serve_insights(&farm.repo).expect("app reads");
+        let canned = complete_reading(&farm.repo);
 
         let partials: [fn(&mut Value); 6] = [
             |r| {
