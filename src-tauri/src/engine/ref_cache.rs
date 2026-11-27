@@ -1127,6 +1127,15 @@ mod tests {
     /// a change is caught serving the stale answer on the second ask at the
     /// latest.
     fn run_oracle(fx: &Fixture, seed: u64, steps: usize) -> u64 {
+        // Hundreds of git children, and every test thread of a full
+        // `cargo test --lib` draws on one spawn-rate bucket: once it ran dry
+        // the gate deferred the direct listing, and the oracle panicked on a
+        // read it never made (a full local run; alone it passed 16 of 16).
+        // What is under test is the cache's answer, not the rate limit.
+        crate::engine::process::with_unmetered_spawn_rate(|| run_oracle_unmetered(fx, seed, steps))
+    }
+
+    fn run_oracle_unmetered(fx: &Fixture, seed: u64, steps: usize) -> u64 {
         let _held = retention();
         git_in(&fx.main, &["branch", "side-gone"]);
         git_in(&fx.main, &["branch", "parked"]);
