@@ -616,6 +616,18 @@ export function closeGroup(
 }
 
 /**
+ * The group a tab gets from its parent folder: the folder holding its
+ * repository root when one is known, else the folder holding the tab itself.
+ * A worktree is grouped by where its repository lives, not by the directory
+ * it was checked out into: every agent worktree sits under some
+ * `.claude/worktrees/`, and grouping by that put them all in one "worktrees"
+ * group, away from the repository they belong to.
+ */
+export function parentFolderGroup(tab: TabRecord, repositoryRoot?: string | null): string | null {
+  return parentFolderName(repositoryRoot || tab.path);
+}
+
+/**
  * Automatically groups open tabs by their parent folder name.
  * Tabs in the same parent folder are clustered together.
  */
@@ -623,17 +635,10 @@ export function groupByParentFolder(
   ws: WorkspaceTabs,
   repositoryRoot: (tab: TabRecord) => string | null | undefined = () => null,
 ): WorkspaceTabs {
-  const mapped = ws.tabs.map((tab) => {
-    // A worktree is grouped by where its repository lives, not by the
-    // directory it was checked out into: every agent worktree sits under some
-    // `.claude/worktrees/`, and grouping by that put them all in one
-    // "worktrees" group, away from the repository they belong to.
-    const parent = parentFolderName(repositoryRoot(tab) || tab.path);
-    return {
-      ...tab,
-      group: parent ?? null,
-    };
-  });
+  const mapped = ws.tabs.map((tab) => ({
+    ...tab,
+    group: parentFolderGroup(tab, repositoryRoot(tab)),
+  }));
 
   // Cluster tabs by group while preserving initial order
   const clustered: TabRecord[] = [];

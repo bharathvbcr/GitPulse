@@ -555,10 +555,16 @@ describe("RepoTabBar", () => {
       const stripMenu = source.slice(source.indexOf("{#if stripMenu}"));
 
       // The tab menu acts on one tab only.
-      for (const label of ["Pin", "Move to start", "Move to end", "Add to group…", "Change group…", "Remove from group",
+      for (const label of ["Pin", "Move to start", "Move to end", "Add to group", "Change group (", "Remove from group",
         "Copy path", "Revoke repository trust…", "Close others", "Close tabs to the right"]) {
         expect(tabMenu).toContain(label);
       }
+      // Joining a group is a submenu row (with its arrow) that swaps in the
+      // group picker page, not a prompt; its own rows live in RepoGroupPicker.
+      expect(tabMenu.match(/data-group-submenu aria-haspopup="menu"/g)?.length).toBe(2);
+      expect(tabMenu).toContain("<RepoGroupPicker");
+      expect(tabMenu).not.toContain("Add to group…");
+      expect(tabMenu).not.toContain("Change group…");
       for (const label of ["Move left", "Move right", "Move to group", "Collapse", "Expand", "Ungroup",
         "Group all by parent folder", "active shells", "Close group", "Open repository…"]) {
         expect(tabMenu).not.toContain(label);

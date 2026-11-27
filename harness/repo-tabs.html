@@ -929,7 +929,7 @@
           m = await openTabMenu(MAIN);
           const tabLabels = items(m).map(words);
           check("a tab outside any group offers Add to group and no group-wide or strip-wide actions", () =>
-            tabLabels.includes("Add to group…") && !tabLabels.includes("Remove from group") &&
+            tabLabels.includes("Add to group") && !tabLabels.includes("Remove from group") &&
             !tabLabels.some((label) => /^(Move to group|Group all by parent folder|Collapse|Expand|Ungroup|Close group|Open repository)/.test(label)));
           // The colour swatches are menuitems too; they share one row. The logo
           // choices are one row as well, however many images a repository has,
@@ -937,17 +937,54 @@
           check("the tab menu stays short", () =>
             items(m).filter((el) => !el.hasAttribute("data-color-choice") && !el.hasAttribute("data-logo-choice")).length +
               ($("[data-logo-choices]", m) ? 1 : 0) <= 12);
-          itemNamed(m, "Add to group…").click();
+          const groupRow = () => $("[data-group-submenu]", repoMenu());
+          check("Add to group is a submenu row, marked with an arrow", () =>
+            groupRow()?.getAttribute("aria-haspopup") === "menu" && !!$("svg", groupRow()) && words(groupRow()) === "Add to group");
+          groupRow().click();
           await settle(); await wait(20);
-          check("Add to group asks for a name and names the groups it could join", () =>
-            promptNow()?.options.title === "Add to group" && promptNow().options.message.includes("Existing groups: operations"));
+          const pickerLabels = items(repoMenu()).map(words);
+          check("its page lists every open group, the tab's parent folder and a new group", () =>
+            pickerLabels.includes("operations") && !!$('[data-group-choice="operations"]', repoMenu()) &&
+            $("[data-group-parent]", repoMenu())?.getAttribute("data-group-parent") === "devtools" &&
+            pickerLabels.includes("Parent folder (devtools)") && pickerLabels.includes("New group…") &&
+            document.activeElement === $('[data-group-choice="operations"]', repoMenu()));
+          check("the page replaces the actions rather than adding to them", () =>
+            !pickerLabels.some((label) => /^(Pin|Copy path|Close)/.test(label)));
+          await press(repoMenu(), { key: "ArrowLeft" });
+          check("ArrowLeft backs out to the actions, on the group row", () =>
+            !!repoMenu() && !$("[data-group-choice]", repoMenu()) && document.activeElement === groupRow());
+          await press(groupRow(), { key: "ArrowRight" });
+          check("ArrowRight on the group row opens the page again", () => !!$("[data-group-new]", repoMenu()));
+          await press(repoMenu(), { key: "Escape" });
+          check("Escape on the page backs out one level, not out of the menu", () =>
+            !!repoMenu() && document.activeElement === groupRow());
+          groupRow().click();
+          await settle(); await wait(20);
+          $("[data-group-new]", repoMenu()).click();
+          await settle(); await wait(20);
+          check("New group asks for a name", () => promptNow()?.options.title === "New group");
           await answer("tools");
           check("the name becomes the tab's group", () => rec(MAIN).group === "tools" && !!groupHead("tools"));
           m = await openTabMenu(MAIN);
           const inGroupLabels = items(m).map(words);
           check("a grouped tab offers Change group and Remove from group, leaving the group's own controls to its head", () =>
-            inGroupLabels.includes("Change group… (tools)") && inGroupLabels.includes("Remove from group") &&
+            inGroupLabels.includes("Change group (tools)") && inGroupLabels.includes("Remove from group") &&
             !inGroupLabels.some((label) => /^(Collapse|Expand|Close group)/.test(label)));
+          groupRow().click();
+          await settle(); await wait(20);
+          check("Change group offers the other groups and leaves out the tab's own", () =>
+            !!$('[data-group-choice="operations"]', repoMenu()) && !$('[data-group-choice="tools"]', repoMenu()));
+          $('[data-group-choice="operations"]', repoMenu()).click();
+          await settle(); await wait(20);
+          check("picking a group moves the tab into it and closes the menu", () =>
+            rec(MAIN).group === "operations" && !repoMenu() && !groupHead("tools"));
+          m = await openTabMenu(MAIN);
+          groupRow().click();
+          await settle(); await wait(20);
+          $("[data-group-parent]", repoMenu()).click();
+          await settle(); await wait(20);
+          check("the parent folder row puts the tab in the group its folder names", () => rec(MAIN).group === "devtools");
+          m = await openTabMenu(MAIN);
           itemNamed(m, "Remove from group").click();
           await settle();
           check("Remove from group ungroups just that tab", () => !rec(MAIN).group && rec(SITE).group === "operations");

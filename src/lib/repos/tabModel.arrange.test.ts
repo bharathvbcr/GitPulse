@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { arrangeTabs, emptyWorkspace, groupByParentFolder, openTab, type WorkspaceTabs } from "./tabModel";
+import { arrangeTabs, emptyWorkspace, groupByParentFolder, openTab, parentFolderGroup, type WorkspaceTabs } from "./tabModel";
 
 const options = { caseInsensitive: false };
 
@@ -59,5 +59,27 @@ describe("groupByParentFolder with repository roots", () => {
     const agent = "/code/devtools/GitPulse/.claude/worktrees/x";
     const grouped = groupByParentFolder(workspace([agent]), () => null);
     expect(grouped.tabs[0].group).toBe("worktrees");
+  });
+});
+
+describe("parentFolderGroup", () => {
+  const tab = (path: string) => ({ id: path, path, pinned: false });
+
+  it("names the folder holding the repository root, when there is one", () => {
+    expect(parentFolderGroup(tab("/code/devtools/GitPulse/.claude/worktrees/fix"), "/code/devtools/GitPulse")).toBe("devtools");
+  });
+
+  it("falls back to the folder holding the tab", () => {
+    expect(parentFolderGroup(tab("/code/web/site"))).toBe("web");
+    expect(parentFolderGroup(tab("/code/web/site"), null)).toBe("web");
+  });
+
+  it("is what Group all by parent folder gives the same tab", () => {
+    const main = "/code/devtools/GitPulse";
+    const agent = `${main}/.claude/worktrees/handoff-fix`;
+    const ws = workspace([main, agent, "/code/web/site"]);
+    const roots = new Map([[agent, main]]);
+    const grouped = groupByParentFolder(ws, (t) => roots.get(t.path));
+    for (const t of grouped.tabs) expect(t.group).toBe(parentFolderGroup(t, roots.get(t.path)));
   });
 });

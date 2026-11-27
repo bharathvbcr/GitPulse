@@ -63,6 +63,7 @@ import {
   MAX_OPEN_TABS,
   moveTabTo as moveWorkspaceTabTo,
   openTab as openWorkspaceTab,
+  parentFolderGroup,
   pinTab as pinWorkspaceTab,
   removeRecent as removeWorkspaceRecent,
   renameGroup as renameWorkspaceGroup,
@@ -837,6 +838,14 @@ export function createTabActions(deps: TabActionsDeps) {
       deps.replaceWorkspace(next);
       deps.publish();
       deps.flushPersist();
+    },
+    /**
+     * The group "Group all by parent folder" would give this one tab, so the
+     * tab menu can offer it by name. Null when the path has no parent folder.
+     */
+    parentFolderGroupOf: (id: string): string | null => {
+      const tab = deps.getInternal().workspace.tabs.find((t) => t.id === id);
+      return tab ? parentFolderGroup(tab, familyOfTab(id)?.root) : null;
     },
     groupByParentFolder: () => {
       deps.commitEdit();

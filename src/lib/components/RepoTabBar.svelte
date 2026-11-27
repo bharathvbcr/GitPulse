@@ -88,6 +88,7 @@
   import ScrollCue from "./ScrollCue.svelte";
   import RepoLogo from "./RepoLogo.svelte";
   import RepoLogoChoices from "./RepoLogoChoices.svelte";
+  import RepoGroupPicker from "./RepoGroupPicker.svelte";
   import LazyMount from "./LazyMount.svelte";
   import { loadRepoLogoBrowser } from "./lazyLoaders";
   import { taskChrome } from "../workbench/taskTabs";
@@ -112,6 +113,9 @@
   const terminalCounts = $derived(sessionsByRepo($terminalSessions));
 
   let menu = $state<{ x: number; y: number; id: string } | null>(null);
+  /** Which page the tab menu shows: its actions, or the group picker its
+   *  "Add to group ›" row opens in place. */
+  let menuPage = $state<"root" | "group">("root");
   /** The tab whose logo is being chosen in the browser; the dialog outlives the menu that opened it. */
   let logoBrowseId = $state<string | null>(null);
   /** The tab that opened the menu, for focus to go back to when the browser closes. */
@@ -374,6 +378,7 @@
     const opener = currentOpener();
     closeCard();
     menu = null;
+    menuPage = "root";
     recentsOpen = false;
     overflowOpen = false;
     groupMenu = null;
@@ -420,24 +425,37 @@
     }
   }
 
-  async function promptSetGroup(tabId: string, currentGroup?: string | null) {
+  // The group picker's "New group…" row. The picker already lists the
+  // groups to join, so the prompt only names a new one; a blank answer
+  // leaves the tab where it was.
+  async function promptNewGroup(tabId: string) {
     closeMenu();
-    // The tab menu no longer lists a "Move to group" row per group, so the
-    // prompt names the existing ones: typing one joins it.
-    const others = distinctGroupNames.filter((group) => group !== currentGroup);
-    const shown = others.slice(0, 5).join(", ");
-    const more = others.length > 5 ? ` and ${others.length - 5} more` : "";
-    const existing = others.length > 0 ? ` Existing groups: ${shown}${more}.` : "";
     const next = await askText({
-      title: currentGroup ? "Change group" : "Add to group",
-      message: `Enter group name for this repository tab (leave blank to ungroup):${existing}`,
+      title: "New group",
+      message: "Enter a name for the new group:",
       placeholder: "e.g. backend, frontend, tools",
-      initialValue: currentGroup ?? "",
-      confirmLabel: currentGroup ? "Update group" : "Set group",
+      initialValue: "",
+      confirmLabel: "Create group",
     });
-    if (next !== null) {
+    if (next !== null && normalizeGroupName(next) !== null) {
       repoStore.setTabGroup(tabId, next);
     }
+  }
+
+  function focusMenuRow(selector: string) {
+    window.setTimeout(() => {
+      menuEl?.querySelector<HTMLElement>(selector)?.focus();
+    }, 0);
+  }
+
+  function openGroupPage() {
+    menuPage = "group";
+    focusMenuRow("[data-group-choice], [data-group-parent], [data-group-new]");
+  }
+
+  function closeGroupPage() {
+    menuPage = "root";
+    focusMenuRow("[data-group-submenu]");
   }
 
   async function promptRenameGroup(group: string) {
@@ -543,6 +561,7 @@
       ? e.currentTarget.querySelector<HTMLElement>('[role="tab"]')
       : null;
     menu = { x: e.clientX, y: e.clientY, id };
+    menuPage = "root";
     recentsOpen = false;
     groupMenu = null;
     stackMenu = null;
@@ -593,7 +612,7 @@
   const menuDismissal = $derived({
     anchor: { kind: "point" as const, x: menu?.x ?? 0, y: menu?.y ?? 0 },
     estimate: { width: 176, height: 150 },
-    revision: menu?.id,
+    revision: menu ? `${menu.id}:${menuPage}` : undefined,
     dismiss: { inside: "[data-repo-menu]", resize: true, escape: "none" as const },
     onDismiss: () => closeMenu(),
   });
@@ -653,6 +672,24 @@
   $effect(() => {
     if (stackMenu && stackMenuEl) focusPopup(stackMenuEl);
   });
+
+  // The tab menu's keys: ArrowRight on the group row opens the picker page,
+  // ArrowLeft or Escape there backs out to the actions (Escape stops here, so
+  // the window handler does not close the whole menu); the rest is shared.
+  function handleRepoMenuKeydown(e: KeyboardEvent) {
+    if (menuPage === "group" && (e.key === "Escape" || e.key === "ArrowLeft")) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeGroupPage();
+      return;
+    }
+    if (menuPage === "root" && e.key === "ArrowRight" && e.target instanceof HTMLElement && e.target.hasAttribute("data-group-submenu")) {
+      e.preventDefault();
+      openGroupPage();
+      return;
+    }
+    handlePopupKeydown(e);
+  }
 
   function handlePopupKeydown(e: KeyboardEvent) {
     if (e.key === "Tab") {
@@ -2090,10 +2127,21 @@
       role="menu"
       aria-label={`Repository actions for ${tab.label}`}
       tabindex="-1"
-      onkeydown={handlePopupKeydown}
+      onkeydown={handleRepoMenuKeydown}
       class="fixed min-w-44 gp-menu gp-pop text-meta text-textPrimary"
       style="z-index: {LAYERS.MENU}"
     >
+      {#if menuPage === "group"}
+        <RepoGroupPicker
+          title={tab.group ? "Change group" : "Add to group"}
+          current={normalizeGroupName(tab.group)}
+          groups={distinctGroupNames}
+          parentFolder={repoStore.parentFolderGroupOf(tab.id)}
+          onback={closeGroupPage}
+          onpick={(group) => { repoStore.setTabGroup(tab.id, group); closeMenu(); }}
+          onnew={() => { const id = tab.id; closeMenu(); void promptNewGroup(id); }}
+        />
+      {:else}
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
         {#if tab.pinned}<PinOff size={12} class="shrink-0 text-textMuted" />{:else}<Pin size={12} class="shrink-0 text-textMuted" />{/if}
         <span>{tab.pinned ? "Unpin" : "Pin"} tab</span>
@@ -2150,15 +2198,13 @@
            (collapse, rename, close the group) live on the group head's menu;
            strip-wide ones (group by folder, collapse all, open) on the strip's. -->
       <span class="gp-menu-sep" aria-hidden="true"></span>
+      <!-- The group row opens the group picker in place of this page: every
+           open group, the tab's parent folder, or a new group. -->
       {#if tab.group}
-        <button role="menuitem" class="gp-menu-item" onclick={() => {
-          const id = tab.id;
-          const grp = tab.group;
-          closeMenu();
-          void promptSetGroup(id, grp);
-        }}>
+        <button role="menuitem" class="gp-menu-item" data-group-submenu aria-haspopup="menu" aria-expanded="false" onclick={openGroupPage}>
           <FolderInput size={12} class="shrink-0 text-textMuted" />
-          <span class="truncate">Change group… ({tab.group})</span>
+          <span class="truncate flex-1 min-w-0">Change group ({tab.group})</span>
+          <ChevronRight size={12} class="shrink-0 text-textMuted" aria-hidden="true" />
         </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => {
           repoStore.setTabGroup(tab.id, null);
@@ -2168,13 +2214,10 @@
           <span>Remove from group</span>
         </button>
       {:else}
-        <button role="menuitem" class="gp-menu-item" onclick={() => {
-          const id = tab.id;
-          closeMenu();
-          void promptSetGroup(id);
-        }}>
+        <button role="menuitem" class="gp-menu-item" data-group-submenu aria-haspopup="menu" aria-expanded="false" onclick={openGroupPage}>
           <FolderPlus size={12} class="shrink-0 text-textMuted" />
-          <span>Add to group…</span>
+          <span class="flex-1 min-w-0">Add to group</span>
+          <ChevronRight size={12} class="shrink-0 text-textMuted" aria-hidden="true" />
         </button>
       {/if}
       <span class="gp-menu-sep" aria-hidden="true"></span>
@@ -2203,6 +2246,7 @@
         <PanelRightClose size={12} class="shrink-0 text-textMuted" />
         <span>Close tabs to the right</span>
       </button>
+      {/if}
     </div>
   {/if}
 {/if}
