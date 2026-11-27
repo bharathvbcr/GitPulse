@@ -1,7 +1,7 @@
 use crate::engine::git_cli::{
     git_captured, git_captured_with_stdin, git_global_observed, git_text, git_text_network,
     git_with_stdin, git_with_timeout, is_transient_git_lock_error, resolve_git_common_dir,
-    sandbox_join, validate_repo,
+    resolve_git_dir, sandbox_join, validate_repo,
 };
 use crate::engine::git_reader::{config_snapshot, config_snapshot_fresh};
 use crate::engine::process::{
@@ -12,8 +12,10 @@ use crate::ipc_error::CommandError;
 use crate::leak_scan::range::{guard_push as guard_pushed_secrets, PushRefs};
 use crate::leak_scan::staged::guard_commit as guard_staged_secrets;
 pub use crate::leak_scan::staged::Policy as SecretPolicy;
+use crate::stack::{ParsedStackConfig, StackBranchMeta};
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,6 +49,19 @@ pub(crate) struct RepoMutationGuard<'a> {
     // another thread in this process never wakes into a self-contended flock.
     _cross_proc: Option<AdvisoryFileLock>,
     _in_proc: std::sync::MutexGuard<'a, ()>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StacksFile {
+    #[serde(default)]
+    branches: HashMap<String, StackFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StackFileEntry {
+    parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_oid: Option<String>,
 }
 
 fn open_mutation_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -2172,6 +2187,251 @@ Unset the local override with `git config --local --unset-all user.name` and \
         ])
     }
 
+    const STACKS_FILE_NAME: &'static str = "stacks.json";
+    const STACKS_LOCK_NAME: &'static str = "stacks.lock";
+    const STACKS_FILE_CAP: usize = 4 * 1024 * 1024;
+
+    fn rev_parse_commit_oid(repo: &Path, rev: &str) -> Result<String, CommandError> {
+        let spec = format!("{rev}^{{commit}}");
+        let run = git_captured(repo, &["rev-parse", "--verify", "--quiet", &spec])?
+            .require_complete("git rev-parse")?;
+        if !run.success {
+            return Err(format!("Could not resolve commit '{rev}'").into());
+        }
+        let oid = String::from_utf8_lossy(&run.stdout).trim().to_string();
+        if !is_full_oid(&oid) {
+            return Err(format!("Resolved '{rev}' to invalid commit id '{oid}'").into());
+        }
+        Ok(oid)
+    }
+
+    fn stacks_paths(repo: &Path) -> Result<(PathBuf, PathBuf), CommandError> {
+        let common = resolve_git_common_dir(repo)?;
+        let dir = common.join("gitpulse");
+        Ok((
+            dir.join(Self::STACKS_FILE_NAME),
+            dir.join(Self::STACKS_LOCK_NAME),
+        ))
+    }
+
+    fn read_stacks_file(path: &Path) -> Result<StacksFile, CommandError> {
+        use std::io::Read;
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(format!(
+                        "Refusing non-regular stack metadata file {}",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StacksFile::default());
+            }
+            Err(err) => {
+                return Err(
+                    format!("Failed to stat stack metadata {}: {err}", path.display()).into(),
+                );
+            }
+        }
+        let file = std::fs::File::open(path).map_err(|e| {
+            CommandError::from(format!(
+                "Failed to open stack metadata {}: {e}",
+                path.display()
+            ))
+        })?;
+        let mut buf = Vec::new();
+        file.take((Self::STACKS_FILE_CAP as u64) + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| {
+                CommandError::from(format!(
+                    "Failed to read stack metadata {}: {e}",
+                    path.display()
+                ))
+            })?;
+        if buf.len() > Self::STACKS_FILE_CAP {
+            return Err(format!(
+                "Stack metadata {} exceeds {} byte cap",
+                path.display(),
+                Self::STACKS_FILE_CAP
+            )
+            .into());
+        }
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(StacksFile::default());
+        }
+        serde_json::from_slice(&buf).map_err(|e| {
+            CommandError::from(format!(
+                "Failed to parse stack metadata {}: {e}",
+                path.display()
+            ))
+        })
+    }
+
+    fn write_stacks_file_atomic(path: &Path, data: &StacksFile) -> Result<(), CommandError> {
+        use std::io::Write;
+        static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let bytes = serde_json::to_vec_pretty(data)
+            .map_err(|e| CommandError::from(format!("Failed to serialize stack metadata: {e}")))?;
+        if bytes.len() > Self::STACKS_FILE_CAP {
+            return Err(
+                format!("Stack metadata exceeds {} byte cap", Self::STACKS_FILE_CAP).into(),
+            );
+        }
+        let Some(parent) = path.parent() else {
+            return Err("Stack metadata path has no parent".into());
+        };
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CommandError::from(format!(
+                "Failed to create stack metadata dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+        if let Ok(meta) = std::fs::symlink_metadata(parent) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(
+                    format!("Refusing symlinked stack metadata dir {}", parent.display()).into(),
+                );
+            }
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(
+                    format!("Refusing symlinked stack metadata file {}", path.display()).into(),
+                );
+            }
+        }
+        let seq = NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = parent.join(format!("stacks.{}.{seq}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Failed to write stack metadata {}: {err}", path.display()).into());
+        }
+        Ok(())
+    }
+
+    fn mutate_stacks_file(
+        repo: &Path,
+        mutate: impl FnOnce(&mut StacksFile) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
+        let (stacks_path, lock_path) = Self::stacks_paths(repo)?;
+        let _lock =
+            acquire_mutation_file_lock(&lock_path, std::time::Duration::from_secs(10), None)?;
+        let mut data = Self::read_stacks_file(&stacks_path)?;
+        mutate(&mut data)?;
+        if data.branches.is_empty() {
+            match std::fs::remove_file(&stacks_path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(format!(
+                    "Failed to remove empty stack metadata {}: {err}",
+                    stacks_path.display()
+                )
+                .into()),
+            }
+        } else {
+            Self::write_stacks_file_atomic(&stacks_path, &data)
+        }
+    }
+
+    fn read_stack_metadata_with_bases_local(
+        repo: &Path,
+    ) -> Result<ParsedStackConfig, CommandError> {
+        let (stacks_path, _) = Self::stacks_paths(repo)?;
+        let data = Self::read_stacks_file(&stacks_path)?;
+        let mut parents = HashMap::new();
+        let mut base_oids = HashMap::new();
+        for (branch, entry) in data.branches {
+            if validate_short_ref_name(&branch).is_err()
+                || validate_short_ref_name(&entry.parent).is_err()
+                || branch == entry.parent
+            {
+                continue;
+            }
+            let base_oid = entry.base_oid.filter(|oid| validate_oid(oid).is_ok());
+            if let Some(ref oid) = base_oid {
+                base_oids.insert(branch.clone(), oid.clone());
+            }
+            parents.insert(
+                branch,
+                StackBranchMeta {
+                    parent_branch: entry.parent,
+                    base_oid,
+                },
+            );
+        }
+        Ok(ParsedStackConfig { parents, base_oids })
+    }
+
+    /// Persists `(parent_branch, base_oid)` for `branch` in
+    /// `<common_git_dir>/gitpulse/stacks.json`.
+    pub fn set_stack_parent(
+        repo: &Path,
+        branch: &str,
+        parent: &str,
+        base_oid: Option<&str>,
+    ) -> Result<(), CommandError> {
+        validate_short_ref_name(branch)?;
+        validate_short_ref_name(parent)?;
+        if branch == parent {
+            return Err("A branch cannot be stacked onto itself".into());
+        }
+        if let Some(oid) = base_oid {
+            validate_oid(oid)?;
+        }
+        let branch_key = branch.to_string();
+        let entry = StackFileEntry {
+            parent: parent.to_string(),
+            base_oid: base_oid.map(str::to_string),
+        };
+        Self::mutate_stacks_file(repo, |data| {
+            data.branches.insert(branch_key, entry);
+            Ok(())
+        })
+    }
+
+    /// Removes persisted stack metadata for `branch` from
+    /// `<common_git_dir>/gitpulse/stacks.json`.
+    pub fn clear_stack_metadata(repo: &Path, branch: &str) -> Result<(), CommandError> {
+        validate_short_ref_name(branch)?;
+        Self::mutate_stacks_file(repo, |data| {
+            data.branches.remove(branch);
+            Ok(())
+        })
+    }
+
+    /// Reads all persisted `(parent_branch, base_oid)` edges from
+    /// `<common_git_dir>/gitpulse/stacks.json`.
+    pub fn read_stack_metadata(
+        repo: &Path,
+    ) -> Result<HashMap<String, StackBranchMeta>, CommandError> {
+        Self::read_stack_metadata_with_bases_local(repo).map(|parsed| parsed.parents)
+    }
+
+    /// Reads the persisted `base_oid` for `branch` from
+    /// `<common_git_dir>/gitpulse/stacks.json`, if set.
+    pub fn read_branch_base_oid(repo: &Path, branch: &str) -> Result<Option<String>, CommandError> {
+        validate_short_ref_name(branch)?;
+        Self::read_stack_metadata_with_bases_local(repo)
+            .map(|mut parsed| parsed.base_oids.remove(branch))
+    }
+
     pub fn create_branch(
         repo_path: &str,
         branch_name: &str,
@@ -2184,6 +2444,27 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let argv = Self::create_branch_argv(branch_name, start_point)?;
         git_text(&repo, &Self::argv_refs(&argv)[1..])?;
+        let resolved_parent = match start_point {
+            None | Some("HEAD") => match crate::engine::git_reader::head_branch(&repo)? {
+                Some(cur) if cur != branch_name => {
+                    Self::rev_parse_commit_oid(&repo, &format!("refs/heads/{cur}"))
+                        .ok()
+                        .map(|oid| (cur, oid))
+                }
+                _ => None,
+            },
+            Some(sp) if sp != branch_name && validate_short_ref_name(sp).is_ok() => {
+                Self::rev_parse_commit_oid(&repo, &format!("refs/heads/{sp}"))
+                    .ok()
+                    .map(|oid| (sp.to_string(), oid))
+            }
+            Some(_) => None,
+        };
+        if let Some((parent, base_oid)) = resolved_parent {
+            Self::set_stack_parent(&repo, branch_name, &parent, Some(&base_oid))?;
+        } else {
+            Self::clear_stack_metadata(&repo, branch_name)?;
+        }
         Ok(())
     }
 
@@ -2224,6 +2505,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 ).into());
             }
         }
+        let all_meta = Self::read_stack_metadata(&repo)?;
+        let deleted_parent = all_meta.get(branch_name).map(|m| m.parent_branch.clone());
         // Capture before the ref disappears — after `-d`/`-D` there is nothing
         // to rev-parse, and the Undo toast is not a durable store.
         let tip = git_text(&repo, &["rev-parse", &format!("refs/heads/{branch_name}")])?
@@ -2231,6 +2514,26 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .to_string();
         validate_oid(&tip)?;
         git_text(&repo, &Self::argv_refs(&argv)[1..])?;
+        if validate_short_ref_name(branch_name).is_ok() {
+            Self::clear_stack_metadata(&repo, branch_name)?;
+        }
+        for (child, child_meta) in all_meta {
+            if child == branch_name || child_meta.parent_branch != branch_name {
+                continue;
+            }
+            if let Some(ref grandparent) = deleted_parent {
+                if grandparent != &child {
+                    Self::set_stack_parent(
+                        &repo,
+                        &child,
+                        grandparent,
+                        child_meta.base_oid.as_deref(),
+                    )?;
+                    continue;
+                }
+            }
+            Self::clear_stack_metadata(&repo, &child)?;
+        }
         // Journal only after a successful delete so a refused `-d` never claims
         // the branch is gone. The tip itself was resolved before the ref left.
         record_deleted_branch_tip(repo_path, branch_name, &tip, &argv);
@@ -2248,7 +2551,32 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let argv = Self::rename_branch_argv(old_name, new_name)?;
+        let all_meta = Self::read_stack_metadata(&repo)?;
         git_text(&repo, &Self::argv_refs(&argv)[1..])?;
+        if old_name != new_name {
+            // `git branch -m` renames the ref only; move `<old>`'s persisted
+            // stack entry in `<common_git_dir>/gitpulse/stacks.json` and
+            // reparent any children pointing to `<old>`.
+            for (child, child_meta) in &all_meta {
+                if child == old_name {
+                    continue;
+                }
+                if child_meta.parent_branch == old_name {
+                    Self::set_stack_parent(&repo, child, new_name, child_meta.base_oid.as_deref())?;
+                }
+            }
+            if let Some(old_meta) = all_meta.get(old_name) {
+                if old_meta.parent_branch != new_name {
+                    Self::set_stack_parent(
+                        &repo,
+                        new_name,
+                        &old_meta.parent_branch,
+                        old_meta.base_oid.as_deref(),
+                    )?;
+                }
+            }
+            Self::clear_stack_metadata(&repo, old_name)?;
+        }
         Ok(())
     }
 
@@ -3103,6 +3431,23 @@ Unset the local override with `git config --local --unset-all user.name` and \
             }
             return Ok(fork_point.to_string());
         }
+        if let Ok(all_meta) = Self::read_stack_metadata(repo_canon) {
+            if let Some(meta) = all_meta.get(branch) {
+                if meta.parent_branch == onto {
+                    if let Some(ref base_oid) = meta.base_oid {
+                        if validate_oid(base_oid).is_ok()
+                            && git_captured(
+                                repo_canon,
+                                &["merge-base", "--is-ancestor", base_oid, branch],
+                            )
+                            .is_ok_and(|run| run.success)
+                        {
+                            return Ok(base_oid.clone());
+                        }
+                    }
+                }
+            }
+        }
         Ok([
             vec!["merge-base", "--fork-point", onto, branch],
             vec!["merge-base", onto, branch],
@@ -3117,18 +3462,263 @@ Unset the local override with `git config --local --unset-all user.name` and \
         .unwrap_or_else(|| onto.to_string()))
     }
 
+    /// Linear ODB fast-path restacking via `git replay --ref-action=print`.
+    ///
+    /// Replays `<old_base>..<top_branch>` onto `<onto>` in the object database
+    /// without mutating refs/index/worktrees during replay, verifies every
+    /// checked-out worktree holder for every affected ref satisfies clean or
+    /// disjoint-dirty guards, applies all ref updates atomically via
+    /// `git update-ref --stdin`, advances checked-out holders safely with
+    /// rollback, and updates persisted `waylodeBaseOid` metadata.
+    ///
+    /// Returns `OdbRestackOutcome::Fallback` (leaving every ref and worktree
+    /// untouched) on conflict (`rc=1`), merge commits in range (`rc=128`),
+    /// unsupported git (`rc=129`), or unsafe/dirty worktree holders.
+    pub(crate) fn execute_restack_odb(
+        repo_canon: &Path,
+        top_branch: &str,
+        onto: &str,
+        old_base: &str,
+    ) -> Result<OdbRestackOutcome, CommandError> {
+        validate_short_ref_name(top_branch)?;
+        validate_short_ref_name(onto)?;
+        if old_base != onto {
+            validate_oid_or_revision(old_base)?;
+        }
+        if let Some(parked) = crate::engine::repo_op::detect(repo_canon)? {
+            return Err(format!(
+                "A {} is already in progress in this repository; \
+                 finish or abort it before restacking",
+                parked.kind.label()
+            )
+            .into());
+        }
+        Self::refuse_fixture_identity(repo_canon, false)?;
+        // Fail closed if `symbolic-ref HEAD` cannot be read.
+        let _ = crate::engine::git_reader::head_branch(repo_canon)?;
+
+        let onto_oid = Self::rev_parse_commit_oid(repo_canon, &format!("refs/heads/{onto}"))
+            .or_else(|_| Self::rev_parse_commit_oid(repo_canon, onto))?;
+        let top_oid = Self::rev_parse_commit_oid(repo_canon, &format!("refs/heads/{top_branch}"))?;
+        let old_base_oid = if old_base == onto {
+            onto_oid.clone()
+        } else {
+            Self::rev_parse_commit_oid(repo_canon, old_base)?
+        };
+
+        let updates = if old_base_oid == top_oid {
+            if top_oid == onto_oid {
+                Self::update_restacked_base_oids(repo_canon, &[], top_branch, onto, &onto_oid)?;
+                return Ok(OdbRestackOutcome::Applied {
+                    message: format!("'{top_branch}' is already up to date with '{onto}'."),
+                });
+            }
+            vec![ReplayRefUpdate {
+                refname: format!("refs/heads/{top_branch}"),
+                short_name: top_branch.to_string(),
+                new_oid: onto_oid.clone(),
+                old_oid: top_oid.clone(),
+            }]
+        } else {
+            let range = format!("{old_base_oid}..refs/heads/{top_branch}");
+            let run = git_captured(
+                repo_canon,
+                &[
+                    "replay",
+                    "--ref-action=print",
+                    "--contained",
+                    "--onto",
+                    &onto_oid,
+                    &range,
+                ],
+            )?
+            .require_complete("git replay")?;
+            match run.status_code {
+                0 => {
+                    let parsed = parse_replay_updates(&run.stdout)?;
+                    if parsed.is_empty() {
+                        if top_oid == onto_oid {
+                            Self::update_restacked_base_oids(
+                                repo_canon,
+                                &[],
+                                top_branch,
+                                onto,
+                                &onto_oid,
+                            )?;
+                            return Ok(OdbRestackOutcome::Applied {
+                                message: format!(
+                                    "'{top_branch}' is already up to date with '{onto}'."
+                                ),
+                            });
+                        }
+                        return Ok(OdbRestackOutcome::Fallback {
+                            reason: "git replay produced no ref updates".to_string(),
+                        });
+                    }
+                    parsed
+                }
+                1 => {
+                    return Ok(OdbRestackOutcome::Fallback {
+                        reason: "conflict during ODB replay".to_string(),
+                    });
+                }
+                128 | 129 => {
+                    let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+                    return Ok(OdbRestackOutcome::Fallback {
+                        reason: if stderr.is_empty() {
+                            format!("git replay exited {}", run.status_code)
+                        } else {
+                            summarize_git_failure(&stderr)
+                        },
+                    });
+                }
+                code => {
+                    let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+                    return Ok(OdbRestackOutcome::Fallback {
+                        reason: if stderr.is_empty() {
+                            format!("git replay exited {code}")
+                        } else {
+                            summarize_git_failure(&stderr)
+                        },
+                    });
+                }
+            }
+        };
+
+        let entries = crate::engine::worktree::read_worktree_entries(repo_canon)?;
+        let mut plans: Vec<RestackBranchPlan> = Vec::with_capacity(updates.len());
+        for update in &updates {
+            let old_tree = restack_tree_of(repo_canon, &update.old_oid)?;
+            let new_tree = restack_tree_of(repo_canon, &update.new_oid)?;
+            let holders: Vec<RestackHolder> = entries
+                .iter()
+                .filter(|entry| entry.branch.as_deref() == Some(update.short_name.as_str()))
+                .map(|entry| RestackHolder {
+                    path: PathBuf::from(&entry.path),
+                    is_prunable: entry.is_prunable,
+                })
+                .collect();
+            if let Err(reason) = refuse_unsafe_restack_holders(
+                repo_canon,
+                &update.short_name,
+                &old_tree,
+                &new_tree,
+                &holders,
+            ) {
+                return Ok(OdbRestackOutcome::Fallback { reason });
+            }
+            let mut pre_digests = Vec::with_capacity(holders.len());
+            for holder in &holders {
+                let digest = restack_cached_index_digest(&holder.path, &old_tree)?;
+                pre_digests.push(digest);
+            }
+            plans.push(RestackBranchPlan {
+                update: update.clone(),
+                old_tree,
+                new_tree,
+                holders,
+                pre_digests,
+            });
+        }
+
+        let mut stdin = String::new();
+        for plan in &plans {
+            stdin.push_str(&format!(
+                "update {} {} {}\n",
+                plan.update.refname, plan.update.new_oid, plan.update.old_oid
+            ));
+        }
+        let ref_tx =
+            git_captured_with_stdin(repo_canon, &["update-ref", "--stdin"], stdin.as_bytes())?
+                .require_complete("git update-ref --stdin")?;
+        if !ref_tx.success {
+            let stderr = String::from_utf8_lossy(&ref_tx.stderr).trim().to_string();
+            return Err(format!(
+                "Atomic ref update failed during restack of '{top_branch}' onto '{onto}': {}",
+                summarize_git_failure(&stderr)
+            )
+            .into());
+        }
+
+        let mut advanced: Vec<(&PathBuf, &str, &str, [u8; 32])> = Vec::new();
+        for plan in &plans {
+            for (holder, &pre_digest) in plan.holders.iter().zip(plan.pre_digests.iter()) {
+                if let Err(err) =
+                    advance_restack_checkout(&holder.path, &plan.old_tree, &plan.new_tree)
+                {
+                    let rollback_msg = restore_after_failed_restack_advance(
+                        repo_canon,
+                        &plans,
+                        &holder.path,
+                        &plan.old_tree,
+                        pre_digest,
+                        &advanced,
+                        &err,
+                    );
+                    return Err(rollback_msg.into());
+                }
+                advanced.push((&holder.path, &plan.old_tree, &plan.new_tree, pre_digest));
+            }
+        }
+
+        Self::update_restacked_base_oids(repo_canon, &updates, top_branch, onto, &onto_oid)?;
+        let branch_list: Vec<&str> = updates.iter().map(|u| u.short_name.as_str()).collect();
+        Ok(OdbRestackOutcome::Applied {
+            message: format!(
+                "Restacked [{}] onto '{onto}' via object database",
+                branch_list.join(", ")
+            ),
+        })
+    }
+
+    fn update_restacked_base_oids(
+        repo: &Path,
+        updates: &[ReplayRefUpdate],
+        top_branch: &str,
+        onto: &str,
+        onto_oid: &str,
+    ) -> Result<(), CommandError> {
+        let all_meta = Self::read_stack_metadata(repo)?;
+        let new_tips: HashMap<&str, &str> = updates
+            .iter()
+            .map(|u| (u.short_name.as_str(), u.new_oid.as_str()))
+            .collect();
+
+        for update in updates {
+            let Some(meta) = all_meta.get(&update.short_name) else {
+                continue;
+            };
+            if meta.parent_branch == onto {
+                Self::set_stack_parent(repo, &update.short_name, onto, Some(onto_oid))?;
+            } else if let Some(&new_parent_oid) = new_tips.get(meta.parent_branch.as_str()) {
+                Self::set_stack_parent(
+                    repo,
+                    &update.short_name,
+                    &meta.parent_branch,
+                    Some(new_parent_oid),
+                )?;
+            } else if update.short_name == top_branch {
+                Self::set_stack_parent(repo, &update.short_name, onto, Some(onto_oid))?;
+            }
+        }
+
+        if updates.is_empty() {
+            if let Some(meta) = all_meta.get(top_branch) {
+                if meta.parent_branch == onto {
+                    Self::set_stack_parent(repo, top_branch, onto, Some(onto_oid))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Executes a restack with full preflight and rollback semantics. Caller
     /// MUST hold the repo mutation lock.
     ///
-    /// - Preflight refuses a dirty worktree and any in-progress operation
-    ///   (merge, rebase, cherry-pick, revert, `am`, bisect) before any state
-    ///   is touched, naming the one it actually found.
-    /// - On failure the half-applied rebase is aborted and the user's
-    ///   original checkout restored; the error says what was rolled back.
-    /// - On success `git rebase <branch>` leaves `branch` checked out, which
-    ///   would silently switch the user's working copy; the original branch
-    ///   is restored, and a failed restore is reported as partial success —
-    ///   never as total failure.
+    /// Attempts the linear ODB fast path (`execute_restack_odb` with
+    /// `git replay --ref-action=print`) first; falls back cleanly to working-tree
+    /// `git rebase --onto` on conflict (`rc=1`), merge commits (`rc=128`), or
+    /// unsafe/dirty holders without mutating any checkout on failure.
     pub fn execute_restack(
         repo_canon: &Path,
         branch: &str,
@@ -3157,19 +3747,26 @@ Unset the local override with `git config --local --unset-all user.name` and \
             )
             .into());
         }
-        let dirty = git_text(repo_canon, &["status", "--porcelain"])?;
-        if !dirty.trim().is_empty() {
-            return Err(
-                "Working tree has uncommitted changes; commit or stash before restacking".into(),
-            );
-        }
-        // A rebase re-commits every replayed commit as the configured committer.
+        // A restack re-commits every replayed commit as the configured committer.
         Self::refuse_fixture_identity(repo_canon, false)?;
 
         // symbolic-ref fails on detached HEAD; then there is no branch to restore.
         // A refused read is an error, never "detached": the restore below
         // would then be skipped and the repository left on the wrong branch.
         let original_head = crate::engine::git_reader::head_branch(repo_canon)?;
+
+        if let OdbRestackOutcome::Applied { message } =
+            Self::execute_restack_odb(repo_canon, branch, onto, upstream)?
+        {
+            return Ok(message);
+        }
+
+        let dirty = git_text(repo_canon, &["status", "--porcelain"])?;
+        if !dirty.trim().is_empty() {
+            return Err(
+                "Working tree has uncommitted changes; commit or stash before restacking".into(),
+            );
+        }
 
         let restore_checkout = |repo_canon: &Path, target: &str| -> Result<(), String> {
             if git_text(repo_canon, &["checkout", target]).is_ok() {
@@ -3193,6 +3790,16 @@ Unset the local override with `git config --local --unset-all user.name` and \
                                  The repository is left on '{branch}'."
                             )
                             .into());
+                        }
+                    }
+                }
+                if let Ok(all_meta) = Self::read_stack_metadata(repo_canon) {
+                    if all_meta.contains_key(branch) {
+                        if let Ok(onto_oid) =
+                            Self::rev_parse_commit_oid(repo_canon, &format!("refs/heads/{onto}"))
+                        {
+                            let _ =
+                                Self::set_stack_parent(repo_canon, branch, onto, Some(&onto_oid));
                         }
                     }
                 }
@@ -4881,6 +5488,470 @@ fn prune_op_snapshots_locked(
     }
 
     Ok(removed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OdbRestackOutcome {
+    Applied { message: String },
+    Fallback { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayRefUpdate {
+    refname: String,
+    short_name: String,
+    new_oid: String,
+    old_oid: String,
+}
+
+struct RestackHolder {
+    path: PathBuf,
+    is_prunable: bool,
+}
+
+struct RestackBranchPlan {
+    update: ReplayRefUpdate,
+    old_tree: String,
+    new_tree: String,
+    holders: Vec<RestackHolder>,
+    pre_digests: Vec<[u8; 32]>,
+}
+
+struct RestackIncomingEntry {
+    old_mode: String,
+    new_mode: String,
+    path: String,
+}
+
+fn parse_replay_updates(stdout: &[u8]) -> Result<Vec<ReplayRefUpdate>, CommandError> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|_| CommandError::from("git replay output was not valid UTF-8"))?;
+    let mut updates = Vec::new();
+    let mut seen_refs = HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_ascii_whitespace().collect();
+        if parts.len() != 4 || parts[0] != "update" {
+            return Err(format!("Unexpected git replay output line '{trimmed}'").into());
+        }
+        let refname = parts[1];
+        let Some(short_name) = refname.strip_prefix("refs/heads/") else {
+            return Err(format!("Unexpected non-branch ref '{refname}' in git replay").into());
+        };
+        validate_short_ref_name(short_name)?;
+        let new_oid = parts[2];
+        let old_oid = parts[3];
+        if !is_full_oid(new_oid) || !is_full_oid(old_oid) {
+            return Err(format!("Invalid OID in git replay output line '{trimmed}'").into());
+        }
+        if !seen_refs.insert(refname.to_string()) {
+            return Err(format!("Duplicate ref '{refname}' in git replay output").into());
+        }
+        updates.push(ReplayRefUpdate {
+            refname: refname.to_string(),
+            short_name: short_name.to_string(),
+            new_oid: new_oid.to_string(),
+            old_oid: old_oid.to_string(),
+        });
+    }
+    Ok(updates)
+}
+
+fn restack_tree_of(repo: &Path, oid: &str) -> Result<String, CommandError> {
+    let spec = format!("{oid}^{{tree}}");
+    let text = git_text(repo, &["rev-parse", "--verify", spec.as_str()])?;
+    let tree = text.trim();
+    if !is_full_oid(tree) {
+        return Err(format!("{oid} has no valid tree object ({tree})").into());
+    }
+    Ok(tree.to_string())
+}
+
+fn restack_incoming_changes(
+    repo: &Path,
+    old_tree: &str,
+    new_tree: &str,
+) -> Result<(Vec<RestackIncomingEntry>, bool), String> {
+    let run = git_captured(
+        repo,
+        &["diff-tree", "-r", "--raw", "-z", old_tree, new_tree],
+    )
+    .and_then(|r| r.require_complete("git diff-tree"))
+    .map_err(|e| e.into_message())?;
+    if !run.success {
+        return Err(format!(
+            "Could not inspect incoming tree diff: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
+    }
+    let bytes = &run.stdout;
+    let mut entries = Vec::new();
+    let mut touches_gitlink = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(meta_rel_end) = bytes[i..].iter().position(|&b| b == 0) else {
+            return Err("git diff-tree returned truncated metadata".to_string());
+        };
+        let meta = std::str::from_utf8(&bytes[i..i + meta_rel_end])
+            .map_err(|_| "git diff-tree returned non-UTF-8 metadata".to_string())?;
+        i += meta_rel_end + 1;
+        let Some(rest) = meta.strip_prefix(':') else {
+            return Err(format!("Unexpected git diff-tree record '{meta}'"));
+        };
+        let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+        if parts.len() != 5 {
+            return Err(format!("Unexpected git diff-tree raw fields in '{meta}'"));
+        }
+        let (old_mode, new_mode, status) = (parts[0], parts[1], parts[4]);
+        if !matches!(status, "A" | "M" | "D" | "T") {
+            return Err(format!("Unexpected git diff-tree status '{status}'"));
+        }
+        let Some(path_rel_end) = bytes[i..].iter().position(|&b| b == 0) else {
+            return Err("git diff-tree returned truncated path".to_string());
+        };
+        let path = std::str::from_utf8(&bytes[i..i + path_rel_end])
+            .map_err(|_| "Incoming restack change has a non-UTF-8 path".to_string())?;
+        i += path_rel_end + 1;
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.ends_with('/')
+            || path
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(format!("Incoming restack path '{path}' is unsafe"));
+        }
+        if old_mode == "160000" || new_mode == "160000" {
+            touches_gitlink = true;
+        }
+        entries.push(RestackIncomingEntry {
+            old_mode: old_mode.to_string(),
+            new_mode: new_mode.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok((entries, touches_gitlink))
+}
+
+fn restack_holder_ignores_case(holder: &Path) -> Result<bool, String> {
+    let platform_ci = cfg!(any(target_os = "macos", target_os = "windows"));
+    let run = git_captured(holder, &["config", "--bool", "--get", "core.ignorecase"])
+        .map_err(|e| format!("could not read core.ignorecase ({})", e.message()))?;
+    match run.status_code {
+        0 => Ok(platform_ci
+            || String::from_utf8_lossy(&run.stdout)
+                .trim()
+                .eq_ignore_ascii_case("true")),
+        1 => Ok(platform_ci),
+        code => Err(format!(
+            "could not read core.ignorecase (git exit {code}: {})",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )),
+    }
+}
+
+fn restack_normalize_rel_path(raw: &str, ignore_case: bool) -> Option<String> {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    if ignore_case {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn restack_paths_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || (a.len() > b.len() && a.as_bytes()[b.len()] == b'/' && a.starts_with(b))
+        || (b.len() > a.len() && b.as_bytes()[a.len()] == b'/' && b.starts_with(a))
+}
+
+fn restack_has_symlink_ancestor(root: &Path, rel_path: &str) -> Result<bool, std::io::Error> {
+    let mut parts = rel_path.split('/').peekable();
+    let mut cur = root.to_path_buf();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(false)
+}
+
+fn refuse_unsafe_restack_holders(
+    repo: &Path,
+    branch: &str,
+    old_tree: &str,
+    new_tree: &str,
+    holders: &[RestackHolder],
+) -> Result<(), String> {
+    if holders.is_empty() {
+        return Ok(());
+    }
+    let (incoming, touches_gitlink) = restack_incoming_changes(repo, old_tree, new_tree)?;
+
+    for holder in holders {
+        let shown = holder.path.display().to_string();
+        if holder.is_prunable || !holder.path.is_dir() {
+            return Err(format!(
+                "checkout '{shown}' holding '{branch}' is missing or prunable"
+            ));
+        }
+        let git_dir = resolve_git_dir(&holder.path)
+            .map_err(|e| format!("checkout '{shown}' could not be checked ({})", e.message()))?;
+        match std::fs::symlink_metadata(git_dir.join("index.lock")) {
+            Ok(_) => {
+                return Err(format!(
+                    "checkout '{shown}' holding '{branch}' has index.lock held"
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "checkout '{shown}' could not check index.lock ({err})"
+                ));
+            }
+        }
+        match crate::engine::repo_op::detect_kind(&holder.path) {
+            Ok(None) => {}
+            Ok(Some(kind)) => {
+                return Err(format!(
+                    "checkout '{shown}' holding '{branch}' has a {} in progress",
+                    kind.label()
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "checkout '{shown}' could not check parked operations ({})",
+                    err.message()
+                ));
+            }
+        }
+        match crate::engine::repo_op::conflicted_paths(&holder.path) {
+            Ok((_, 0)) => {}
+            Ok((_, total)) => {
+                return Err(format!(
+                    "checkout '{shown}' holding '{branch}' has {total} unmerged file(s)"
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "checkout '{shown}' could not check unmerged files ({})",
+                    err.message()
+                ));
+            }
+        }
+
+        let holder_str = holder
+            .path
+            .to_str()
+            .ok_or_else(|| format!("checkout '{shown}' path is not UTF-8"))?;
+        let (dirty_paths, truncated) = crate::engine::worktree::user_changed_paths(holder_str)
+            .map_err(|e| format!("checkout '{shown}' dirty check failed: {}", e.message()))?;
+        if truncated {
+            return Err(format!(
+                "checkout '{shown}' holding '{branch}' has too many uncommitted files to verify disjointness"
+            ));
+        }
+
+        if !dirty_paths.is_empty() {
+            if touches_gitlink {
+                return Err(format!(
+                    "checkout '{shown}' holding '{branch}' has uncommitted files and restack updates a submodule"
+                ));
+            }
+            let ignore_case = restack_holder_ignores_case(&holder.path)?;
+            if ignore_case
+                && (dirty_paths.iter().any(|p| !p.is_ascii())
+                    || incoming.iter().any(|e| !e.path.is_ascii()))
+            {
+                return Err(format!(
+                    "checkout '{shown}' holding '{branch}' has uncommitted non-ASCII paths on case-insensitive fs"
+                ));
+            }
+            let mut norm_incoming = Vec::with_capacity(incoming.len());
+            for entry in &incoming {
+                let norm =
+                    restack_normalize_rel_path(&entry.path, ignore_case).ok_or_else(|| {
+                        format!("incoming path '{}' cannot be normalized", entry.path)
+                    })?;
+                norm_incoming.push(norm);
+            }
+            for raw_dirty in &dirty_paths {
+                let norm_dirty = restack_normalize_rel_path(raw_dirty, ignore_case)
+                    .ok_or_else(|| format!("uncommitted path '{raw_dirty}' is unsafe"))?;
+                if let Some(clash) = norm_incoming
+                    .iter()
+                    .find(|inc| restack_paths_overlap(inc, &norm_dirty))
+                {
+                    return Err(format!(
+                        "checkout '{shown}' holding '{branch}' has uncommitted '{raw_dirty}' overlapping '{clash}'"
+                    ));
+                }
+            }
+        }
+
+        for entry in &incoming {
+            let is_added = entry.old_mode == "000000";
+            let is_type_change = !is_added
+                && entry.new_mode != "000000"
+                && entry.old_mode.get(..3) != entry.new_mode.get(..3);
+            if !is_added && !(is_type_change && !dirty_paths.is_empty()) {
+                continue;
+            }
+            match restack_has_symlink_ancestor(&holder.path, &entry.path) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(format!(
+                        "checkout '{shown}' has a symlinked parent for incoming '{}'",
+                        entry.path
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "checkout '{shown}' could not inspect parent of '{}' ({err})",
+                        entry.path
+                    ));
+                }
+            }
+            match std::fs::symlink_metadata(holder.path.join(&entry.path)) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "checkout '{shown}' already has '{}' on disk",
+                        entry.path
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "checkout '{shown}' could not verify '{}' is absent ({err})",
+                        entry.path
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restack_cached_index_digest(path: &Path, old_tree: &str) -> Result<[u8; 32], CommandError> {
+    let run = git_captured(path, &["diff-index", "--cached", "--raw", "-z", old_tree])?
+        .require_complete("git diff-index")?;
+    if !run.success {
+        return Err(CommandError::plain(format!(
+            "git diff-index --cached --raw -z {old_tree} exited {}: {}",
+            run.status_code,
+            String::from_utf8_lossy(&run.stderr).trim()
+        )));
+    }
+    Ok(Sha256::digest(&run.stdout).into())
+}
+
+fn advance_restack_checkout(
+    path: &Path,
+    from_tree: &str,
+    to_tree: &str,
+) -> Result<(), CommandError> {
+    git_text(path, &["update-index", "-q", "--refresh"])?;
+    git_text(path, &["read-tree", "-m", "-u", from_tree, to_tree]).map(|_| ())
+}
+
+fn restore_after_failed_restack_advance(
+    repo: &Path,
+    plans: &[RestackBranchPlan],
+    failed_path: &Path,
+    failed_old_tree: &str,
+    failed_pre_digest: [u8; 32],
+    advanced: &[(&PathBuf, &str, &str, [u8; 32])],
+    why: &CommandError,
+) -> String {
+    let mut unresolved = Vec::new();
+    for (holder_path, old_tree, new_tree, pre_digest) in advanced.iter().rev() {
+        match advance_restack_checkout(holder_path, new_tree, old_tree) {
+            Err(error) => {
+                unresolved.push(format!(
+                    "{} could not be moved back ({})",
+                    holder_path.display(),
+                    error.message()
+                ));
+            }
+            Ok(()) => match restack_cached_index_digest(holder_path, old_tree) {
+                Ok(digest) if digest == *pre_digest => {}
+                Ok(_) => unresolved.push(format!(
+                    "the staged index of {} changed during rollback",
+                    holder_path.display()
+                )),
+                Err(error) => unresolved.push(format!(
+                    "the staged index of {} could not be verified ({})",
+                    holder_path.display(),
+                    error.message()
+                )),
+            },
+        }
+    }
+
+    let mut revert_stdin = String::new();
+    for plan in plans {
+        revert_stdin.push_str(&format!(
+            "update {} {} {}\n",
+            plan.update.refname, plan.update.old_oid, plan.update.new_oid
+        ));
+    }
+    match git_captured_with_stdin(repo, &["update-ref", "--stdin"], revert_stdin.as_bytes()) {
+        Ok(run) if run.success => {}
+        Ok(run) => unresolved.push(format!(
+            "refs could not be rolled back ({})",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )),
+        Err(error) => unresolved.push(format!(
+            "refs could not be rolled back ({})",
+            error.message()
+        )),
+    }
+
+    match restack_cached_index_digest(failed_path, failed_old_tree) {
+        Ok(digest) if digest == failed_pre_digest => {}
+        Ok(_) => unresolved.push(format!(
+            "the staged index of {} no longer matches its pre-restack state",
+            failed_path.display()
+        )),
+        Err(error) => unresolved.push(format!(
+            "the staged index of {} could not be verified ({})",
+            failed_path.display(),
+            error.message()
+        )),
+    }
+
+    if unresolved.is_empty() {
+        format!(
+            "Checkout {} could not be advanced after restack ({}), so all refs were rolled back.",
+            failed_path.display(),
+            why.message()
+        )
+    } else {
+        format!(
+            "Checkout {} could not be advanced after restack ({}), and rollback was incomplete: {}.",
+            failed_path.display(),
+            why.message(),
+            unresolved.join("; ")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -10943,6 +12014,325 @@ mod bound_to_checked_state {
             "branch #75 tip must match pre-gc commit"
         );
         git_in(p, &["fsck", "--full", "--no-dangling"]);
+    }
+
+    #[test]
+    fn stack_metadata_delete_and_rename_branch_updates_and_cleans_children() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        let path_str = p.to_str().unwrap();
+        let main_tip = commit_file(p, "seed.txt");
+
+        GitWriter::create_branch(path_str, "feat-parent", None).expect("create parent");
+        git_in(p, &["checkout", "-q", "feat-parent"]);
+        let parent_tip = commit_file(p, "parent.txt");
+
+        GitWriter::create_branch(path_str, "feat-child", None).expect("create child");
+        git_in(p, &["checkout", "-q", "feat-child"]);
+        commit_file(p, "child.txt");
+
+        GitWriter::create_branch(path_str, "feat-grandchild", None).expect("create grandchild");
+        git_in(p, &["checkout", "-q", "main"]);
+
+        let meta = GitWriter::read_stack_metadata(p).expect("read stack metadata");
+        assert!(p.join(".git/gitpulse/stacks.json").is_file());
+        let git_cfg = std::fs::read_to_string(p.join(".git/config")).unwrap();
+        assert!(!git_cfg.contains("waylodeParent"));
+        assert!(!git_cfg.contains("waylodeBaseOid"));
+        assert_eq!(meta["feat-parent"].parent_branch, "main");
+        assert_eq!(
+            meta["feat-parent"].base_oid.as_deref(),
+            Some(main_tip.as_str())
+        );
+        assert_eq!(meta["feat-child"].parent_branch, "feat-parent");
+        assert_eq!(
+            meta["feat-child"].base_oid.as_deref(),
+            Some(parent_tip.as_str())
+        );
+        assert_eq!(meta["feat-grandchild"].parent_branch, "feat-child");
+
+        // Renaming feat-parent -> feat-auth must preserve feat-auth's own parent
+        // AND update feat-child's waylodeParent to feat-auth.
+        GitWriter::rename_branch(path_str, "feat-parent", "feat-auth").expect("rename parent");
+        let after_rename = GitWriter::read_stack_metadata(p).expect("read after rename");
+        assert!(!after_rename.contains_key("feat-parent"));
+        assert_eq!(after_rename["feat-auth"].parent_branch, "main");
+        assert_eq!(after_rename["feat-child"].parent_branch, "feat-auth");
+        assert_eq!(
+            after_rename["feat-child"].base_oid.as_deref(),
+            Some(parent_tip.as_str())
+        );
+
+        // Force-deleting feat-child must remove feat-child's config keys AND
+        // reparent feat-grandchild to feat-auth (feat-child's parent).
+        GitWriter::delete_branch(path_str, "feat-child", true).expect("delete child");
+        let after_delete = GitWriter::read_stack_metadata(p).expect("read after delete");
+        assert!(!after_delete.contains_key("feat-child"));
+        assert_eq!(after_delete["feat-grandchild"].parent_branch, "feat-auth");
+
+        // Force-deleting feat-auth (parent = main) reparents feat-grandchild -> main;
+        // clearing feat-grandchild removes all keys cleanly.
+        GitWriter::delete_branch(path_str, "feat-auth", true).expect("delete feat-auth");
+        let after_delete2 = GitWriter::read_stack_metadata(p).expect("read after delete2");
+        assert_eq!(after_delete2["feat-grandchild"].parent_branch, "main");
+        GitWriter::delete_branch(path_str, "feat-grandchild", true).expect("delete grandchild");
+        assert!(GitWriter::read_stack_metadata(p).unwrap().is_empty());
+        assert!(!p.join(".git/gitpulse/stacks.json").exists());
+    }
+
+    #[test]
+    fn stack_metadata_retains_child_after_parent_amend_in_hierarchy() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        let path_str = p.to_str().unwrap();
+        crate::test_support::trust_repo(p);
+        commit_file(p, "m0.txt");
+
+        GitWriter::create_branch(path_str, "feat-parent", None).expect("create parent");
+        git_in(p, &["checkout", "-q", "feat-parent"]);
+        commit_file(p, "p.txt");
+
+        GitWriter::create_branch(path_str, "feat-child", None).expect("create child");
+        git_in(p, &["checkout", "-q", "feat-child"]);
+        commit_file(p, "c.txt");
+
+        // Amend feat-parent so its tip OID changes and feat-child no longer sits
+        // on feat-parent's literal tip.
+        git_in(p, &["checkout", "-q", "feat-parent"]);
+        std::fs::write(p.join("p.txt"), "amended parent\n").unwrap();
+        git_in(p, &["add", "p.txt"]);
+        git_in(p, &["commit", "--amend", "-q", "-m", "amended parent"]);
+        git_in(p, &["checkout", "-q", "main"]);
+
+        let branches = crate::engine::GitReader::list_branches(path_str).unwrap();
+        let mut branch_tips = HashMap::new();
+        for b in branches.iter().filter(|b| !b.is_remote) {
+            branch_tips.insert(b.name.clone(), b.tip_commit_id.clone());
+        }
+        let raw_commits =
+            crate::engine::GitReader::read_commit_history(path_str, 50, None).unwrap();
+        let mut commit_parents = HashMap::new();
+        for c in raw_commits {
+            commit_parents.insert(c.id, c.parent_ids);
+        }
+        let persisted = GitWriter::read_stack_metadata(p).unwrap();
+        let nodes = crate::stack::StackTreeEngine::build_stack_hierarchy_with_metadata(
+            &branch_tips,
+            &commit_parents,
+            "main",
+            &persisted,
+        );
+        let child = nodes
+            .iter()
+            .find(|n| n.branch_name == "feat-child")
+            .expect("feat-child node");
+        assert_eq!(child.parent_branch_name.as_deref(), Some("feat-parent"));
+        assert_eq!(child.commit_count_ahead_of_parent, 1);
+
+        // Also verify cmd_get_stack_hierarchy uses persisted metadata end-to-end.
+        let payload = tauri::async_runtime::block_on(crate::commands::cmd_get_stack_hierarchy(
+            path_str.to_string(),
+        ))
+        .expect("cmd_get_stack_hierarchy");
+        let ipc_child = payload
+            .nodes
+            .iter()
+            .find(|n| n.branch_name == "feat-child")
+            .expect("ipc child");
+        assert_eq!(ipc_child.parent_branch_name.as_deref(), Some("feat-parent"));
+    }
+
+    #[test]
+    fn three_branch_linear_stack_restacks_via_git_replay_without_corrupting_checked_out_worktree() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        let canon = p.canonicalize().unwrap();
+        let path_str = canon.to_str().unwrap();
+        crate::test_support::trust_repo(&canon);
+        let c0 = commit_file(&canon, "base.txt");
+
+        GitWriter::create_branch(path_str, "b1", None).expect("b1");
+        git_in(&canon, &["checkout", "-q", "b1"]);
+        commit_file(&canon, "b1.txt");
+
+        GitWriter::create_branch(path_str, "b2", None).expect("b2");
+        git_in(&canon, &["checkout", "-q", "b2"]);
+        commit_file(&canon, "b2.txt");
+
+        GitWriter::create_branch(path_str, "b3", None).expect("b3");
+        git_in(&canon, &["checkout", "-q", "b3"]);
+        commit_file(&canon, "b3.txt");
+
+        // Advance main while b2 is checked out in a linked worktree with a disjoint dirty file.
+        git_in(&canon, &["checkout", "-q", "main"]);
+        let new_main = commit_file(&canon, "main_advance.txt");
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_b2 = wt_parent.path().join("wt-b2");
+        git_in(&canon, &["worktree", "add", wt_b2.to_str().unwrap(), "b2"]);
+        std::fs::write(wt_b2.join("disjoint_local.txt"), "keep me\n").unwrap();
+
+        // If wt_b2 has an OVERLAPPING dirty file (main_advance.txt, which the
+        // incoming rebase onto new_main adds), ODB restack must refuse cleanly
+        // with Fallback without touching any ref or worktree.
+        std::fs::write(wt_b2.join("main_advance.txt"), "overlapping dirty edit\n").unwrap();
+        let pre_b3 = rev(&canon, "refs/heads/b3");
+        let unsafe_res = GitWriter::execute_restack_odb(&canon, "b3", "main", &c0)
+            .expect("unsafe check returns Fallback");
+        assert!(
+            matches!(unsafe_res, OdbRestackOutcome::Fallback { .. }),
+            "overlapping dirty holder must fall back, got {unsafe_res:?}"
+        );
+        assert_eq!(
+            rev(&canon, "refs/heads/b3"),
+            pre_b3,
+            "fallback must not move refs"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt_b2.join("main_advance.txt")).unwrap(),
+            "overlapping dirty edit\n",
+            "fallback must not overwrite dirty holder file"
+        );
+        // Remove the overlapping untracked file so only disjoint_local.txt remains dirty.
+        std::fs::remove_file(wt_b2.join("main_advance.txt")).unwrap();
+
+        let applied = GitWriter::execute_restack_odb(&canon, "b3", "main", &c0)
+            .expect("3-branch ODB restack");
+        assert!(
+            matches!(applied, OdbRestackOutcome::Applied { .. }),
+            "expected ODB fast-path apply, got {applied:?}"
+        );
+
+        let b1_tip = rev(&canon, "refs/heads/b1");
+        let b2_tip = rev(&canon, "refs/heads/b2");
+        let b3_tip = rev(&canon, "refs/heads/b3");
+        assert_eq!(rev(&canon, "refs/heads/b1^"), new_main);
+        assert_eq!(rev(&canon, "refs/heads/b2^"), b1_tip);
+        assert_eq!(rev(&canon, "refs/heads/b3^"), b2_tip);
+        assert_eq!(rev(&wt_b2, "HEAD"), b2_tip);
+        assert_eq!(
+            git_text(&wt_b2, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "b2"
+        );
+        // Worktree wt_b2 must have main_advance.txt + b1.txt + b2.txt, NO staged deletions,
+        // and disjoint_local.txt untouched.
+        assert!(wt_b2.join("main_advance.txt").exists());
+        assert!(wt_b2.join("b1.txt").exists());
+        assert!(wt_b2.join("b2.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(wt_b2.join("disjoint_local.txt")).unwrap(),
+            "keep me\n"
+        );
+        let wt_status = git_text(&wt_b2, &["status", "--porcelain"]).unwrap();
+        assert_eq!(wt_status.trim(), "?? disjoint_local.txt");
+
+        // Persisted waylodeBaseOid must track the newly replayed parent tips.
+        let meta = GitWriter::read_stack_metadata(&canon).unwrap();
+        assert_eq!(meta["b1"].base_oid.as_deref(), Some(new_main.as_str()));
+        assert_eq!(meta["b2"].base_oid.as_deref(), Some(b1_tip.as_str()));
+        assert_eq!(meta["b3"].base_oid.as_deref(), Some(b2_tip.as_str()));
+        assert_ne!(b3_tip, c0);
+    }
+
+    #[test]
+    fn restack_odb_falls_back_cleanly_on_merge_commit_and_conflict() {
+        // Case A: merge commit in range -> git replay exits 128 -> Fallback, then
+        // execute_restack falls back cleanly to working-tree `git rebase --onto`.
+        let dir = repo_on("main");
+        let p = dir.path();
+        let canon = p.canonicalize().unwrap();
+        let c0 = commit_file(&canon, "base.txt");
+
+        git_in(&canon, &["checkout", "-q", "-b", "side"]);
+        let side_tip = commit_file(&canon, "side.txt");
+
+        git_in(&canon, &["checkout", "-q", "main"]);
+        git_in(&canon, &["checkout", "-q", "-b", "feat-merge", &c0]);
+        commit_file(&canon, "feat.txt");
+        git_in(
+            &canon,
+            &["merge", "--no-ff", "-q", &side_tip, "-m", "merge side"],
+        );
+        let pre_merge_tip = rev(&canon, "refs/heads/feat-merge");
+
+        git_in(&canon, &["checkout", "-q", "main"]);
+        let new_main = commit_file(&canon, "main_new.txt");
+
+        let odb_merge = GitWriter::execute_restack_odb(&canon, "feat-merge", "main", &c0)
+            .expect("merge commit returns Fallback");
+        assert!(
+            matches!(odb_merge, OdbRestackOutcome::Fallback { .. }),
+            "merge commit must fall back, got {odb_merge:?}"
+        );
+        assert_eq!(
+            rev(&canon, "refs/heads/feat-merge"),
+            pre_merge_tip,
+            "fallback must leave branch untouched"
+        );
+        GitWriter::execute_restack(&canon, "feat-merge", "main", &c0)
+            .expect("working-tree fallback must rebase merge branch cleanly");
+        assert!(canon.join("base.txt").exists());
+        assert_eq!(
+            git_text(&canon, &["merge-base", "main", "feat-merge"])
+                .unwrap()
+                .trim(),
+            new_main
+        );
+
+        // Case B: conflict -> git replay exits 1 -> Fallback, and execute_restack
+        // aborts and rolls back cleanly without corrupting worktrees.
+        let dir2 = repo_on("main");
+        let p2 = dir2.path();
+        let canon2 = p2.canonicalize().unwrap();
+        std::fs::write(canon2.join("shared.txt"), "base\n").unwrap();
+        git_in(&canon2, &["add", "shared.txt"]);
+        git_in(&canon2, &["commit", "-q", "-m", "base shared"]);
+        let base2 = rev(&canon2, "HEAD");
+
+        git_in(&canon2, &["checkout", "-q", "-b", "feat-conflict"]);
+        std::fs::write(canon2.join("shared.txt"), "feature change\n").unwrap();
+        git_in(&canon2, &["add", "shared.txt"]);
+        git_in(&canon2, &["commit", "-q", "-m", "feature shared"]);
+        let conflict_tip = rev(&canon2, "HEAD");
+
+        git_in(&canon2, &["checkout", "-q", "main"]);
+        std::fs::write(canon2.join("shared.txt"), "main change\n").unwrap();
+        git_in(&canon2, &["add", "shared.txt"]);
+        git_in(&canon2, &["commit", "-q", "-m", "main shared"]);
+
+        let odb_conflict = GitWriter::execute_restack_odb(&canon2, "feat-conflict", "main", &base2)
+            .expect("conflict returns Fallback");
+        assert!(
+            matches!(odb_conflict, OdbRestackOutcome::Fallback { .. }),
+            "conflict must fall back, got {odb_conflict:?}"
+        );
+        assert_eq!(rev(&canon2, "refs/heads/feat-conflict"), conflict_tip);
+        assert!(git_text(&canon2, &["status", "--porcelain"])
+            .unwrap()
+            .trim()
+            .is_empty());
+
+        let err = GitWriter::execute_restack(&canon2, "feat-conflict", "main", &base2)
+            .expect_err("conflicting rebase must roll back and fail");
+        assert!(
+            err.message().contains("rolled back"),
+            "got: {}",
+            err.message()
+        );
+        assert_eq!(rev(&canon2, "refs/heads/feat-conflict"), conflict_tip);
+        assert_eq!(
+            git_text(&canon2, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "main"
+        );
+        assert!(git_text(&canon2, &["status", "--porcelain"])
+            .unwrap()
+            .trim()
+            .is_empty());
+        assert!(crate::engine::repo_op::detect(&canon2).unwrap().is_none());
     }
 }
 

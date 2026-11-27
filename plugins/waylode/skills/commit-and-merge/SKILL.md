@@ -106,14 +106,9 @@ A branch is **locked-in** when any of these is true:
 ## Before you start
 
 1. **Orient.** Call `waylode_insights` and `waylode_sessions`. Check each facet's `ok`: a facet that could not scan has not come back clean.
-2. **Settle one integrator.**
-   - **When a calling skill** (`waylode:wrap-up`, `waylode:merge-prs`) already holds the lock, skip this step.
-   - Otherwise run `mkdir "$(git rev-parse --path-format=absolute --git-common-dir)/merge-train.lock"`. This is the lock that `waylode:merge-train`, `waylode:merge-prs` and `waylode:wrap-up` use too.
-   - **If you took it,** write `owner` inside it, with one line each for your session id, your pid, the host name and the start time. Remove the lock on every exit path, including failure.
-   - **If `mkdir` fails,** another integration is running. Read `owner`, stop, and say who holds it.
-     - Never delete someone else's lock.
-     - If the owner file names this host and `kill -0 <pid>` fails, the holder is gone. Tell the owner the lock is stale and that they can remove the directory. Only they remove it.
-   - **Look for an integrator that skipped the lock:**
+2. **Cross-process serialization.** Waylode's Rust engine (`waylode_worktree_merge`, `waylode-worktree merge`, and `LandQueue`) automatically serializes ref and checkout mutations across processes via a kernel-released `flock` at `"$(git rev-parse --path-format=absolute --git-common-dir)/gitpulse/mutation.lock"`, and coordinates hot-file conflict resolution via sorted-path SQLite WAL FIFO tickets (`<common>/gitpulse/land_tickets.sqlite`).
+   - **When a calling skill** (`waylode:wrap-up`, `waylode:merge-prs`) coordinates a multi-step external gate run, keep its outer coordinator lock if used; otherwise do **not** create a manual `mkdir .../merge-train.lock` directory just to invoke `waylode_worktree_merge` or `LandQueue` (directory locks leak on `SIGKILL`, whereas `mutation.lock` auto-releases on crash).
+   - **Look for an integrator operating outside Waylode's engine:**
      - entries in the default branch's reflog from the last few hours that this session did not make;
      - an integration branch (`train/*`, `integrat*`) whose tip moved in the last hour;
      - peers that `waylode_agent_peers` (or, in Claude Code, `ListAgents`) name as integrating.
@@ -186,22 +181,25 @@ Locked-in candidates get their own group. Wait for the owner's yes, and take the
   - **Two or more:** run them through the `waylode:merge-train` skill with this batch. You already hold its lock, so skip its lock step.
   - **One:** in the integration worktree, merge the pinned commit onto the default branch's tip with `git merge --no-ff --no-edit <sha>`. Then run the full gate there and compare it with a base run of the default branch, using merge-train's compare and confirm steps.
 - **Review each candidate's diff** (`<merge-base>..<sha>`) with the strongest model the host has. In Claude Code that is an `Agent` with `model: "opus"`. Give the reviewer the brief, the branch's card if it has one, and `devmap_impact` on the symbols the diff changes. Ask for correctness bugs, regressions, and tests that would not fail without the change.
-- **Record the verified result:** the commit, and its tree from `git rev-parse <commit>^{tree}`. Landing compares against it.
+- **Record the verified result:** the commit, and its tree from `git rev-parse <commit>^{tree}`. Waylode's verification gate and `LandQueue` compare `^{tree}` equality (and verified lands best-effort advance `refs/gitpulse/green/<default>` monotonically via CAS).
 - **A branch that regresses** or fails review is not merged. Report its failing tests or findings. This skill never deletes it; `waylode:wrap-up` decides that.
 
 ## 5. Land
 
-1. **Re-read the default branch's tip** just before landing. If it moved since the verified run:
-   - merge the verified result onto the new tip;
-   - re-run the quick checks;
-   - re-run the full gate, unless `git rev-parse <new>^{tree}` equals the verified tree. Commits verified one at a time do not verify their combination.
-2. **Find where the default branch is checked out.**
-   - **Nowhere:** move it with a compare-and-swap, `git update-ref refs/heads/<default> <new> <old>`. It refuses if someone else moved it.
-   - **In a clean worktree:** run `git merge --ff-only <new>` in that worktree.
-   - **In a worktree with uncommitted work:** `git merge --ff-only <new>` still works when none of the dirty files are in the landed change, and git refuses when one is.
-3. **If git refuses** because dirty files overlap the landing, stop. Show the owner the overlapping paths and whose session holds them. Land only after the holder commits, or after the owner approves a three-way landing of those files.
+1. **Primary path — Rust `LandQueue` & `merge_tree::land` (`waylode_worktree_merge` / `waylode-worktree merge`):**
+   - Prefer Waylode's Rust landing engine over manual plumbing. It handles:
+     - **Batched single-quarantine landing (`LandQueue`):** coalesces concurrent lands (`10ms` window, AIMD sizing) into one `ObjectQuarantine` + one `git pack-objects` migration + one atomic CAS `update-ref`, isolating conflicting lanes without losing clean lanes (`CompleteEarly` safety proof, `split_dependents`, and sequential solo fallback on hook rejection).
+     - **Idempotent land identity (`land_identities`):** persists `(target_ref, source_oid) -> landed_oid` in `.devcouncil/ledger.sqlite` with `revertOf` (including revert-of-revert) awareness so retried lands return `AlreadyLanded` cleanly.
+     - **Cross-process `mutation.lock` & disjoint-dirty advancement:** under `<common>/gitpulse/mutation.lock` (`flock`), `merge_tree::land` moves `refs/heads/<default>` by CAS and advances every checkout holding `<default>` via `git read-tree -m -u` — allowing strictly disjoint uncommitted/staged/untracked edits to remain untouched while failing closed on all 5 data-loss guards (APFS case-folding, `symlink_metadata == NotFound` for added/type-changed paths including gitignored files, `160000` gitlink refusal, untruncated dirty scan, per-holder `repo_op`/`index.lock` checks, and `pre_cached_digest` CAS rollback).
+     - **Verified green pointer:** when verified in pooled CoW scratch (`<common>/gitpulse/verify-scratch/`), best-effort advances `refs/gitpulse/green/<default>` without failing an already-landed merge.
+2. **If `waylode_worktree_merge` is unavailable or `refs/heads/<default>` moved since the verified run:**
+   - Re-verify if `git rev-parse <new>^{tree}` differs from the verified tree.
+   - If landing manually without `LandQueue`:
+     - **Checked out nowhere:** `git update-ref refs/heads/<default> <new> <old>`.
+     - **Checked out in a clean or strictly disjoint-dirty worktree:** `git merge --ff-only <new>` in that worktree.
+3. **If git or `merge_tree::land` refuses** because dirty files overlap the landing (`HeldReason::CheckoutDirty`), stop. Show the owner the overlapping paths and whose session holds them. Land only after the holder commits, or after the owner explicitly approves an emergency manual three-way landing.
 
-   **The three-way landing.** Run it in the checkout that has the default branch, with `<old>` as its current tip. Give git every path with `--literal-pathspecs`, so a name like `docs/[x].md` cannot also match `docs/x.md`.
+   **Emergency / Manual Fallback Only — Three-way landing (`git merge-file`):** Use this manual procedure *only* as an emergency fallback when `waylode_worktree_merge` / `LandQueue` refuses an overlapping dirty file and the owner explicitly approves merging their uncommitted edit in place. Run it in the checkout that has the default branch, with `<old>` as its current tip. Give git every path with `--literal-pathspecs`, so a name like `docs/[x].md` cannot also match `docs/x.md`.
    1. **List both sides.** The dirty paths: `git status --porcelain=v1 -z -uall --no-renames`, which includes untracked files. The landed paths: `git diff --no-renames --raw -z <old> <new>`, which also gives each path's old and new mode.
    2. **Refuse** unless every overlap is a regular file that both sides modified and nothing staged. Refuse if:
       - an overlapping path has staged changes (`git diff --cached --no-renames --name-only -z`);

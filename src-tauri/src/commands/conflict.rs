@@ -60,3 +60,71 @@ pub(super) fn save_conflict_folded(
 pub fn cmd_preview_conflict(document: ConflictDocument) -> Result<String, IpcError> {
     ConflictResolver::render_preview(&document).map_err(IpcError::from)
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProposalResolutionChoiceInput {
+    AcceptProposal,
+    SessionChoice(crate::diff::conflict_session::ConflictFileChoice),
+}
+
+impl From<ProposalResolutionChoiceInput> for conflict_session::ProposalResolutionChoice {
+    fn from(value: ProposalResolutionChoiceInput) -> Self {
+        match value {
+            ProposalResolutionChoiceInput::AcceptProposal => Self::AcceptProposal,
+            ProposalResolutionChoiceInput::SessionChoice(choice) => Self::SessionChoice(choice),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalFileResolutionInput {
+    pub file_path: String,
+    pub revision: Option<String>,
+    pub choice: ProposalResolutionChoiceInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildProposalTreeInput {
+    pub proposal_ref: String,
+    pub expected_proposal_commit_oid: Option<String>,
+    pub target_tip_oid: Option<String>,
+    pub resolutions: Vec<ProposalFileResolutionInput>,
+}
+
+#[tauri::command(async)]
+pub async fn cmd_load_conflict_proposal(
+    repo_path: String,
+    proposal_ref: String,
+) -> Result<conflict_session::ProposalSessionSnapshot, IpcError> {
+    off_thread(move || conflict_session::load_proposal_for_session(&repo_path, &proposal_ref)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_build_resolved_proposal_tree(
+    repo_path: String,
+    request: BuildProposalTreeInput,
+) -> Result<conflict_session::ResolvedProposalTree, IpcError> {
+    off_thread(move || {
+        crate::engine::process::mark_user_action(&repo_path);
+        let engine_req = conflict_session::BuildProposalTreeRequest {
+            proposal_ref: request.proposal_ref,
+            expected_proposal_commit_oid: request.expected_proposal_commit_oid,
+            target_tip_oid: request.target_tip_oid,
+            resolutions: request
+                .resolutions
+                .into_iter()
+                .map(|r| conflict_session::ProposalFileResolution {
+                    file_path: r.file_path,
+                    revision: r.revision,
+                    choice: r.choice.into(),
+                })
+                .collect(),
+        };
+        conflict_session::build_resolved_proposal_tree(&repo_path, &engine_req)
+    })
+    .await
+}
+
+#[cfg(test)]
+#[path = "conflict_tests.rs"]
+mod tests;

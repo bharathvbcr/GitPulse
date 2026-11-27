@@ -150,6 +150,11 @@ export interface WaveDeps {
    * landed with its cleanup unfinished returns, saying so: it counts as merged.
    */
   merge(target: { taskId: string; runId: string; cwd: string; head: string }): Promise<MergeRead>;
+  /**
+   * Optional batch merge handler for multiple ready members in one wave turn.
+   * When absent, or when only one ready member exists, the wave falls back to `merge`.
+   */
+  mergeBatch?(targets: readonly { taskId: string; runId: string; cwd: string; head: string }[]): Promise<readonly ({ ok: true; result: MergeRead } | { ok: false; cause: unknown })[]>;
   /** The main checkout now: its uncommitted file count (null when it could not be counted) and the parked operation, if any. Throws when it cannot be read. */
   mainState(signal: AbortSignal): Promise<MainState>;
   /** Writes the record durably; a failure stops the wave. */
@@ -487,6 +492,9 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     inflight.set(m.taskId, settled);
   };
 
+  const cancelledNote = "Stopped by the person; no further task was launched or merged.";
+  let pendingHaltReason: string | null = null;
+
   /**
    * The gate after a merge: re-verifies every member merged so far in this batch
    * over the range from the target's tip before its own merge to the checkout's
@@ -494,13 +502,15 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
    * wave and is written on the member it was found in.
    */
   const gateMerge = async () => {
-    const landed = record.members.find((m) => m.phase === "verifying_merge");
-    if (!landed) return;
-    const held = (why: string) => (m: WaveMember): WaveMember => (m.taskId === landed.taskId ? { ...m, phase: "held", detail: `${landed.detail} ${why}`.trim() } : m);
+    const pending = record.members.filter((m) => m.phase === "verifying_merge");
+    if (pending.length === 0) return;
+    const landed = pending[pending.length - 1];
+    const isPending = (taskId: string) => pending.some((p) => p.taskId === taskId);
+    const held = (why: string) => (m: WaveMember): WaveMember => (isPending(m.taskId) ? { ...m, phase: "held", detail: `${m.detail} ${why}`.trim() } : m);
     // Every exit below is ONE write that carries the gate outcome with the member's move out of
     // `verifying_merge`, so no record ever holds a terminal member without it, or a halt without its member.
     if (cancelled) {
-      await settle(held("The wave was stopped before the merge was re-verified; check the main worktree."), "cancelled", "Stopped by the person; no further task was launched or merged.");
+      await settle(held("The wave was stopped before the merge was re-verified; check the main worktree."), "cancelled", cancelledNote);
       return;
     }
     const tip = landed.mergeAfter, base = landed.mergeBefore;
@@ -522,32 +532,107 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       catch (cause) { return { m, verdict: null, why: message(cause) }; }
     }));
     if (cancelled) {
-      await settle(held("The wave was stopped before the merge was re-verified; check the main worktree."), "cancelled", "Stopped by the person; no further task was launched or merged.");
+      await settle(held("The wave was stopped before the merge was re-verified; check the main worktree."), "cancelled", cancelledNote);
       return;
     }
     const faults = results.flatMap((r) => { const fault = gateFault(r.verdict, r.why, tip); return fault ? [{ m: r.m, fault }] : []; });
     const own = faults.find((f) => f.m.taskId === landed.taskId);
     const first = own ?? faults[0];
     const outcome = (m: WaveMember): WaveMember => {
-      if (m.taskId === landed.taskId) return { ...m, phase: "merged", detail: own ? `${landed.detail} Re-verification after the merge ${own.fault}.` : landed.detail };
       const f = faults.find((entry) => entry.m.taskId === m.taskId);
+      if (isPending(m.taskId)) return { ...m, phase: "merged", detail: f ? `${m.detail} Re-verification after the merge ${f.fault}.`.trim() : m.detail };
       return f ? { ...m, detail: `${m.detail} Re-verification after merging "${landed.title}" ${f.fault}.`.trim() } : m;
     };
-    if (!first) { await save({ members: record.members.map(outcome) }); return; }
+    if (!first) {
+      if (pendingHaltReason) {
+        const reason = pendingHaltReason;
+        pendingHaltReason = null;
+        await settle(outcome, "halted", reason);
+      } else {
+        await save({ members: record.members.map(outcome) });
+      }
+      return;
+    }
+    pendingHaltReason = null;
     await settle(outcome, "halted", `Re-verification after merging "${landed.title}" ${first === own ? first.fault : `found "${first.m.title}" ${first.fault}`}; no further merge was made.`);
   };
 
-  /** One merge at a time, in launch order; the merge is recorded as `verifying_merge`, and the gate runs on the loop's next turn. */
+  /** Merges ready members: batched via `deps.mergeBatch` when multiple are ready, falling back to single-item `deps.merge` otherwise. */
   const mergeNext = async (): Promise<boolean> => {
-    const next = record.members.find((m) => m.phase === "ready");
-    if (!next || !next.cwd || !next.head) return false;
+    const ready = record.members.filter((m): m is WaveMember & { cwd: string; head: string } => m.phase === "ready" && Boolean(m.cwd) && Boolean(m.head));
+    if (ready.length === 0) return false;
     let blocker: string;
     try { blocker = mainBlocker(await deps.mainState(abort.signal)); }
     catch (cause) { if (cancelled) return true; blocker = `the main worktree couldn't be read (${message(cause)})`; }
     if (blocker) {
-      await update(next.taskId, { phase: "held", detail: `Not merged: ${blocker}.` });
+      await update(ready[0].taskId, { phase: "held", detail: `Not merged: ${blocker}.` });
       return true;
     }
+
+    if (ready.length > 1 && deps.mergeBatch) {
+      const batchIds = new Set(ready.map((m) => m.taskId));
+      await save({
+        members: record.members.map((m) => (batchIds.has(m.taskId) ? { ...m, phase: "merging" as MemberPhase } : m)),
+      });
+      let outcomes: readonly ({ ok: true; result: MergeRead } | { ok: false; cause: unknown })[];
+      try {
+        outcomes = await deps.mergeBatch(ready.map((m) => ({ taskId: m.taskId, runId: m.runId, cwd: m.cwd, head: m.head })));
+      } catch (cause) {
+        const halting = haltingCode(cause);
+        if (halting) {
+          await settle(
+            (m) => (batchIds.has(m.taskId) ? { ...m, phase: "held", detail: `Not merged: ${message(cause)}` } : m),
+            "halted",
+            `Merging batch ended in a ${halting === "conflict" ? "conflict" : "parked squash"}; no further task was launched or merged.`,
+          );
+          return true;
+        }
+        await save({
+          members: record.members.map((m) => (batchIds.has(m.taskId) ? { ...m, phase: "held" as MemberPhase, detail: `Not merged: ${message(cause)}` } : m)),
+        });
+        return true;
+      }
+
+      const byTask = new Map(ready.map((m, i) => [m.taskId, outcomes[i] ?? { ok: false as const, cause: new Error("Batch merge omitted this member.") }]));
+      let anyVerifying = false;
+      let firstHalting: { member: WaveMember; reason: string } | null = null;
+      const updated = record.members.map((m) => {
+        const out = byTask.get(m.taskId);
+        if (!out) return m;
+        if (out.ok) {
+          anyVerifying = true;
+          return {
+            ...m,
+            phase: "verifying_merge" as MemberPhase,
+            detail: out.result.message,
+            mergeBefore: out.result.beforeOid || null,
+            mergeAfter: out.result.afterOid || null,
+          };
+        }
+        const halting = haltingCode(out.cause);
+        if (!firstHalting && halting) {
+          firstHalting = {
+            member: m,
+            reason: `Merging "${m.title}" ended in a ${halting === "conflict" ? "conflict" : "parked squash"}; no further task was launched or merged.`,
+          };
+        } else if (!firstHalting && writeTreeUnavailable(out.cause)) {
+          firstHalting = {
+            member: m,
+            reason: `Merging "${m.title}" was refused because merge-tree --write-tree is unavailable; no further task was launched or merged.`,
+          };
+        }
+        return { ...m, phase: "held" as MemberPhase, detail: `Not merged: ${message(out.cause)}` };
+      });
+      if (firstHalting && !anyVerifying) {
+        await settle((m) => updated.find((u) => u.taskId === m.taskId) ?? m, "halted", (firstHalting as { reason: string }).reason);
+      } else {
+        if (firstHalting) pendingHaltReason = (firstHalting as { reason: string }).reason;
+        await save({ members: updated });
+      }
+      return true;
+    }
+
+    const next = ready[0];
     await update(next.taskId, { phase: "merging" });
     let said: MergeRead;
     try {

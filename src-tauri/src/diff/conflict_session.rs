@@ -4,9 +4,11 @@
 
 use super::conflict::{ConflictDocument, ConflictResolutionChoice, ConflictResolver, FileSegment};
 use crate::engine::git_cli::{
-    git, git_text, git_with_index, git_with_stdin, resolve_git_dir, sandbox_join, validate_repo,
+    git, git_captured_with_stdin, git_text, git_with_index, git_with_stdin, resolve_git_dir,
+    sandbox_join, validate_repo,
 };
-use crate::engine::git_writer::repo_mutation_lock;
+use crate::engine::git_writer::{absent_oid_for_len, repo_mutation_lock};
+use crate::engine::land_proposals::{self, ConflictFileKey};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -1054,6 +1056,612 @@ pub fn save_with_gate(
     })
 }
 
+// ── ODB Proposal Session Bridge ──────────────────────────────────────────────
+
+/// Per-file view of an ODB conflict proposal opened for resolution without
+/// mutating the user's working tree or `.git/index`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalSessionFile {
+    pub file_path: String,
+    pub key: ConflictFileKey,
+    pub snapshot: ConflictSnapshot,
+    pub proposed_mode: Option<String>,
+    pub proposed_oid: Option<String>,
+    pub proposed_text: Option<String>,
+    pub proposed_marker_free: bool,
+}
+
+/// Snapshot of a persisted ODB proposal ref (`refs/gitpulse/proposals/...`)
+/// hydrated against its `[tip_oid, source_commit_oid]` conflict state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalSessionSnapshot {
+    pub repo_path: String,
+    pub proposal_ref: String,
+    pub proposal_commit_oid: String,
+    pub tip_oid: String,
+    pub source_commit_oid: String,
+    pub resolver: String,
+    pub requested_by: String,
+    pub files: Vec<ProposalSessionFile>,
+}
+
+/// Resolution choice for one conflicted file in an ODB proposal session.
+#[derive(Debug, Clone)]
+pub enum ProposalResolutionChoice {
+    /// Apply the proposed file blob & mode stored in the ODB proposal commit.
+    AcceptProposal,
+    /// Resolve using Waylode's atomic [`ConflictFileChoice`] (`Chunks`, `Ours`, `Theirs`).
+    SessionChoice(ConflictFileChoice),
+}
+
+/// Per-file resolution instruction passed to [`build_resolved_proposal_tree`].
+#[derive(Debug, Clone)]
+pub struct ProposalFileResolution {
+    pub file_path: String,
+    pub revision: Option<String>,
+    pub choice: ProposalResolutionChoice,
+}
+
+/// Request to build a resolved Git tree OID from an ODB proposal ref without
+/// mutating the user's working tree or `.git/index`.
+#[derive(Debug, Clone)]
+pub struct BuildProposalTreeRequest {
+    pub proposal_ref: String,
+    pub expected_proposal_commit_oid: Option<String>,
+    /// Optional updated target branch tip OID (defaults to the proposal's `tip_oid`).
+    /// When set, `AcceptProposal` verifies that the file's [`ConflictFileKey`]
+    /// is unchanged relative to the proposal's recorded `tip_oid`.
+    pub target_tip_oid: Option<String>,
+    pub resolutions: Vec<ProposalFileResolution>,
+}
+
+/// Resulting resolved Git tree OID ready for verification/landing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedProposalTree {
+    pub proposal_ref: String,
+    pub proposal_commit_oid: String,
+    pub target_tip_oid: String,
+    pub source_commit_oid: String,
+    pub tree_oid: String,
+    pub resolved_files: Vec<String>,
+    pub keys: Vec<ConflictFileKey>,
+}
+
+const PROPOSAL_INDEX_FLAGS: [&str; 4] =
+    ["-c", "core.fsmonitor=false", "-c", "core.splitIndex=false"];
+
+fn hydrate_conflict_stages(
+    repo: &Path,
+    raw_stages: &[land_proposals::MergeStageEntry],
+) -> Result<Vec<ConflictStage>, CommandError> {
+    let mut stages = Vec::with_capacity(raw_stages.len());
+    for entry in raw_stages {
+        let mut stage = ConflictStage {
+            stage: entry.stage,
+            mode: entry.mode.clone(),
+            oid: entry.oid.clone(),
+            size: 0,
+            text: None,
+        };
+        if stage.mode != "160000" {
+            stage.size = git_text(repo, &["cat-file", "-s", &stage.oid])?
+                .trim()
+                .parse()
+                .map_err(|_| "Invalid Git object size")?;
+            if stage.size <= 128 * 1024 {
+                let bytes = git(repo, &["cat-file", "blob", &stage.oid])?;
+                if !bytes.contains(&0) {
+                    stage.text = String::from_utf8(bytes).ok();
+                }
+            }
+        }
+        stages.push(stage);
+    }
+    Ok(stages)
+}
+
+fn proposal_file_revision(
+    repo: &Path,
+    proposal_ref: &str,
+    proposal_commit_oid: &str,
+    key: &ConflictFileKey,
+    proposed_oid: Option<&str>,
+) -> Result<String, CommandError> {
+    hash(
+        repo,
+        &serde_json::to_vec(&(
+            repo.to_string_lossy(),
+            proposal_ref,
+            proposal_commit_oid,
+            key,
+            proposed_oid,
+        ))
+        .map_err(|e| e.to_string())?,
+    )
+}
+
+fn parse_conflict_document_from_bytes(
+    repo: &Path,
+    file_path: &str,
+    mode: &str,
+    bytes: Option<&[u8]>,
+) -> Result<(Option<ConflictDocument>, Option<String>), CommandError> {
+    let marker_size = conflict_marker_size(repo, file_path)?;
+    match (bytes, mode) {
+        (Some(raw), "100644" | "100755") if !raw.contains(&0) => match std::str::from_utf8(raw) {
+            Ok(text) => match ConflictResolver::parse_checked_with_marker_size(
+                file_path,
+                text,
+                marker_size,
+            ) {
+                Ok(doc) => Ok((Some(doc), None)),
+                Err(err) => Ok((None, Some(err.into()))),
+            },
+            Err(_) => Ok((
+                None,
+                Some("This file is not valid UTF-8. Choose a complete side to preserve its bytes.".into()),
+            )),
+        },
+        (_, "missing") | (None, _) => Ok((
+            None,
+            Some("This conflict has no merged text blob. Choose a complete side or proposal.".into()),
+        )),
+        (_, "120000") => Ok((
+            None,
+            Some("This conflict contains a symbolic link. Whole-file choices preserve the link itself.".into()),
+        )),
+        (_, "160000") => Ok((
+            None,
+            Some("This is a submodule or directory conflict.".into()),
+        )),
+        _ => Ok((
+            None,
+            Some("This file is binary. Whole-file choices preserve its bytes.".into()),
+        )),
+    }
+}
+
+/// Opens an ODB proposal ref (`refs/gitpulse/proposals/...`) inside Waylode's
+/// `conflict_session` model without mutating the user's working tree, `.git/index`,
+/// or the repository ODB.
+pub fn load_proposal_for_session(
+    repo_path: &str,
+    proposal_ref: &str,
+) -> Result<ProposalSessionSnapshot, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    let pkg = land_proposals::read_proposal_by_ref(&repo, proposal_ref)?
+        .ok_or_else(|| format!("Proposal ref {proposal_ref} does not exist"))?;
+    let inspection = land_proposals::inspect_merge_conflicts_quarantined(
+        &repo,
+        &pkg.summary.tip_oid,
+        &pkg.summary.source_commit_oid,
+    )?;
+
+    let mut files = Vec::with_capacity(inspection.conflicts.len());
+    for conflict in &inspection.conflicts {
+        let stages = hydrate_conflict_stages(&repo, &conflict.stages)?;
+        let blob_mode = conflict.conflict_blob_mode.as_deref().unwrap_or("100644");
+        let (document, reason) = parse_conflict_document_from_bytes(
+            &repo,
+            &conflict.key.path,
+            blob_mode,
+            conflict.conflict_blob_bytes.as_deref(),
+        )?;
+
+        let proposed = pkg.files.iter().find(|f| f.path == conflict.key.path);
+        let proposed_mode = proposed.map(|f| f.mode.clone());
+        let proposed_oid = proposed.map(|f| f.blob_oid.clone());
+        let proposed_text = proposed.and_then(|f| {
+            if f.bytes.len() <= 128 * 1024 && !f.bytes.contains(&0) {
+                std::str::from_utf8(&f.bytes).ok().map(str::to_string)
+            } else {
+                None
+            }
+        });
+        let proposed_marker_free = match proposed {
+            Some(f) if f.mode != "120000" && !f.bytes.contains(&0) => {
+                match std::str::from_utf8(&f.bytes) {
+                    Ok(text) => {
+                        let marker_size = conflict_marker_size(&repo, &conflict.key.path)?;
+                        ConflictResolver::validate_marker_free(text, marker_size).is_ok()
+                    }
+                    Err(_) => true,
+                }
+            }
+            Some(_) => true,
+            None => false,
+        };
+
+        let rev = proposal_file_revision(
+            &repo,
+            proposal_ref,
+            &pkg.summary.proposal_commit_oid,
+            &conflict.key,
+            proposed_oid.as_deref(),
+        )?;
+
+        let snapshot = ConflictSnapshot {
+            file_path: conflict.key.path.clone(),
+            revision: rev,
+            operation: format!("proposal:{}", pkg.summary.proposal_commit_oid),
+            document,
+            stages,
+            reason,
+            worktree_mode: blob_mode.to_string(),
+        };
+
+        files.push(ProposalSessionFile {
+            file_path: conflict.key.path.clone(),
+            key: conflict.key.clone(),
+            snapshot,
+            proposed_mode,
+            proposed_oid,
+            proposed_text,
+            proposed_marker_free,
+        });
+    }
+
+    Ok(ProposalSessionSnapshot {
+        repo_path: repo.to_string_lossy().into_owned(),
+        proposal_ref: pkg.summary.ref_name,
+        proposal_commit_oid: pkg.summary.proposal_commit_oid,
+        tip_oid: pkg.summary.tip_oid,
+        source_commit_oid: pkg.summary.source_commit_oid,
+        resolver: pkg.summary.resolver,
+        requested_by: pkg.summary.requested_by,
+        files,
+    })
+}
+
+/// Resolves an ODB proposal ref atomically in a private temporary index (never
+/// mutating the user's working tree or `.git/index`) and returns the resulting
+/// Git tree OID ready for verification and landing.
+pub fn build_resolved_proposal_tree(
+    repo_path: &str,
+    request: &BuildProposalTreeRequest,
+) -> Result<ResolvedProposalTree, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    let pkg = land_proposals::read_proposal_by_ref(&repo, &request.proposal_ref)?
+        .ok_or_else(|| format!("Proposal ref {} does not exist", request.proposal_ref))?;
+
+    if let Some(expected) = &request.expected_proposal_commit_oid {
+        if pkg.summary.proposal_commit_oid != *expected {
+            return Err(format!(
+                "Proposal ref {} moved from {expected} to {}; reload the proposal",
+                request.proposal_ref, pkg.summary.proposal_commit_oid
+            )
+            .into());
+        }
+    }
+
+    let target_tip_oid = request
+        .target_tip_oid
+        .as_deref()
+        .unwrap_or(&pkg.summary.tip_oid);
+    if !land_proposals::is_full_lowercase_oid(target_tip_oid) {
+        return Err(format!("Invalid target_tip_oid: {target_tip_oid:?}").into());
+    }
+
+    // Validate chunk limits up front just like `save_with_gate`.
+    for res in &request.resolutions {
+        if let ProposalResolutionChoice::SessionChoice(ConflictFileChoice::Chunks(choices)) =
+            &res.choice
+        {
+            let bytes = choices.iter().fold(0usize, |sum, choice| {
+                sum.saturating_add(match choice {
+                    ConflictResolutionChoice::Custom(text) => text.len(),
+                    _ => 0,
+                })
+            });
+            if choices.len() > super::conflict::MAX_CONFLICT_CHUNKS
+                || bytes > super::conflict::MAX_CONFLICT_TEXT_BYTES
+            {
+                return Err("Resolution choices exceed the editor limit".into());
+            }
+        }
+    }
+
+    // Inspect conflicts in quarantine first so invalid/missing resolutions fail
+    // before writing anything to the repository ODB.
+    let inspection = land_proposals::inspect_merge_conflicts_quarantined(
+        &repo,
+        target_tip_oid,
+        &pkg.summary.source_commit_oid,
+    )?;
+
+    let recorded_keys: Option<Vec<ConflictFileKey>> = if target_tip_oid != pkg.summary.tip_oid {
+        Some(land_proposals::extract_conflict_keys(
+            &repo,
+            &pkg.summary.tip_oid,
+            &pkg.summary.source_commit_oid,
+        )?)
+    } else {
+        None
+    };
+
+    let mut res_by_path: std::collections::HashMap<&str, &ProposalFileResolution> =
+        std::collections::HashMap::with_capacity(request.resolutions.len());
+    for res in &request.resolutions {
+        if res_by_path.insert(res.file_path.as_str(), res).is_some() {
+            return Err(format!("Duplicate resolution for {}", res.file_path).into());
+        }
+    }
+
+    // Prepare every conflicted file's resolved bytes/oid/mode before mutating the ODB.
+    struct PreparedResolution {
+        path: String,
+        mode: String,
+        oid_or_bytes: Option<Result<String, (String, Vec<u8>)>>,
+    }
+    let mut prepared = Vec::with_capacity(inspection.conflicts.len());
+    let mut keys = Vec::with_capacity(inspection.conflicts.len());
+
+    for conflict in &inspection.conflicts {
+        let path = &conflict.key.path;
+        keys.push(conflict.key.clone());
+        let res = res_by_path
+            .remove(path.as_str())
+            .ok_or_else(|| format!("Missing resolution for conflicted file {path}"))?;
+
+        let proposed = pkg.files.iter().find(|f| f.path == *path);
+        if let Some(expected_rev) = &res.revision {
+            let actual_rev = proposal_file_revision(
+                &repo,
+                &request.proposal_ref,
+                &pkg.summary.proposal_commit_oid,
+                &conflict.key,
+                proposed.map(|f| f.blob_oid.as_str()),
+            )?;
+            if actual_rev != *expected_rev {
+                return Err(format!(
+                    "Proposal conflict state changed for {path}; reload the proposal"
+                )
+                .into());
+            }
+        }
+
+        let stages = hydrate_conflict_stages(&repo, &conflict.stages)?;
+        let marker_size = conflict_marker_size(&repo, path)?;
+
+        let item = match &res.choice {
+            ProposalResolutionChoice::AcceptProposal => {
+                if let Some(ref rec) = recorded_keys {
+                    if !rec.contains(&conflict.key) {
+                        return Err(format!(
+                            "Proposed resolution for {path} is stale because the target tip changed that file"
+                        )
+                        .into());
+                    }
+                }
+                let entry = proposed.ok_or_else(|| {
+                    format!(
+                        "Proposal {} does not contain a proposed file for {path}",
+                        request.proposal_ref
+                    )
+                })?;
+                if entry.mode != "120000" && !entry.bytes.contains(&0) {
+                    if let Ok(text) = std::str::from_utf8(&entry.bytes) {
+                        ConflictResolver::validate_marker_free(text, marker_size)?;
+                    }
+                }
+                PreparedResolution {
+                    path: path.clone(),
+                    mode: entry.mode.clone(),
+                    oid_or_bytes: Some(Err((entry.mode.clone(), entry.bytes.clone()))),
+                }
+            }
+            ProposalResolutionChoice::SessionChoice(ConflictFileChoice::WorkingTree)
+            | ProposalResolutionChoice::SessionChoice(ConflictFileChoice::StageOnly) => {
+                return Err(
+                    "ODB proposal resolution cannot read the user's working tree; choose Chunks, Ours, Theirs, or AcceptProposal"
+                        .into(),
+                );
+            }
+            ProposalResolutionChoice::SessionChoice(ConflictFileChoice::Ours)
+            | ProposalResolutionChoice::SessionChoice(ConflictFileChoice::Theirs) => {
+                let side = if matches!(
+                    res.choice,
+                    ProposalResolutionChoice::SessionChoice(ConflictFileChoice::Ours)
+                ) {
+                    2
+                } else {
+                    3
+                };
+                match stages.iter().find(|s| s.stage == side) {
+                    Some(stage) => PreparedResolution {
+                        path: path.clone(),
+                        mode: stage.mode.clone(),
+                        oid_or_bytes: Some(Ok(stage.oid.clone())),
+                    },
+                    None => PreparedResolution {
+                        path: path.clone(),
+                        mode: String::new(),
+                        oid_or_bytes: None,
+                    },
+                }
+            }
+            ProposalResolutionChoice::SessionChoice(ConflictFileChoice::Chunks(choices)) => {
+                let blob_mode = conflict.conflict_blob_mode.as_deref().unwrap_or("100644");
+                let (doc_opt, reason) = parse_conflict_document_from_bytes(
+                    &repo,
+                    path,
+                    blob_mode,
+                    conflict.conflict_blob_bytes.as_deref(),
+                )?;
+                let mut doc = doc_opt.ok_or_else(|| {
+                    reason.unwrap_or_else(|| "This file cannot be resolved as UTF-8 text".into())
+                })?;
+                if doc.total_conflicts == 0 || choices.len() != doc.total_conflicts {
+                    return Err(
+                        "Resolution choices do not match the current conflict blocks".into(),
+                    );
+                }
+                for segment in &mut doc.segments {
+                    if let FileSegment::Conflict(chunk) = segment {
+                        chunk.resolution = choices[chunk.chunk_index].clone();
+                    }
+                }
+                let bytes = ConflictResolver::render_resolved(&doc)?.into_bytes();
+                let mode = merged_regular_mode(&stages)
+                    .unwrap_or(blob_mode)
+                    .to_string();
+                PreparedResolution {
+                    path: path.clone(),
+                    mode: mode.clone(),
+                    oid_or_bytes: Some(Err((mode, bytes))),
+                }
+            }
+        };
+        prepared.push(item);
+    }
+
+    if !res_by_path.is_empty() {
+        let extra: Vec<&str> = res_by_path.keys().copied().collect();
+        return Err(format!(
+            "Resolution provided for non-conflicted path(s): {}",
+            extra.join(", ")
+        )
+        .into());
+    }
+
+    // Run merge-tree --write-tree against `(target_tip_oid, source_commit_oid)` in
+    // the repo ODB to materialize the base merged tree, then resolve all conflicted
+    // entries inside an isolated private temp index (never touching `.git/index` or
+    // the working tree).
+    let merge_run = git_captured_with_stdin(
+        &repo,
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            target_tip_oid,
+            &pkg.summary.source_commit_oid,
+        ],
+        b"",
+    )?
+    .require_complete("git merge-tree")?;
+    if !matches!(merge_run.status_code, 0 | 1) {
+        return Err(format!(
+            "git merge-tree failed (exit {}): {}",
+            merge_run.status_code,
+            String::from_utf8_lossy(&merge_run.stderr).trim()
+        )
+        .into());
+    }
+    let merged_tree_oid = String::from_utf8_lossy(
+        merge_run
+            .stdout
+            .split(|&b| b == 0)
+            .next()
+            .unwrap_or_default(),
+    )
+    .trim()
+    .to_string();
+    if !land_proposals::is_full_lowercase_oid(&merged_tree_oid) {
+        return Err(format!("merge-tree returned invalid tree OID {merged_tree_oid:?}").into());
+    }
+
+    let git_dir = resolve_git_dir(&repo)?;
+    let (private_index, _file) = create_temp(&git_dir, "proposal-index")?;
+
+    let mut read_tree_args: Vec<&str> = PROPOSAL_INDEX_FLAGS.to_vec();
+    read_tree_args.extend(["read-tree", &merged_tree_oid]);
+    git_with_index(&repo, &private_index.path, &read_tree_args, b"")?;
+
+    let zero = absent_oid_for_len(target_tip_oid.len());
+    let mut resolved_files = Vec::with_capacity(prepared.len());
+
+    for item in prepared {
+        let blob_oid = match item.oid_or_bytes {
+            None => None,
+            Some(Ok(existing_oid)) => Some(existing_oid),
+            Some(Err((mode, bytes))) => {
+                let filter_arg = if mode == "120000" {
+                    "--no-filters".to_string()
+                } else {
+                    format!("--path={}", item.path)
+                };
+                let oid_bytes = git_with_stdin(
+                    &repo,
+                    &["hash-object", "-w", &filter_arg, "--stdin"],
+                    &bytes,
+                )?;
+                let oid = String::from_utf8(oid_bytes)
+                    .map_err(|e| e.to_string())?
+                    .trim()
+                    .to_string();
+                if !land_proposals::is_full_lowercase_oid(&oid) {
+                    return Err(format!("hash-object returned invalid OID {oid:?}").into());
+                }
+                Some(oid)
+            }
+        };
+
+        let mut index_info = format!("0 {zero}\t{}\0", item.path);
+        if let Some(oid) = &blob_oid {
+            index_info.push_str(&format!("{} {oid}\t{}\0", item.mode, item.path));
+        }
+        let mut update_args: Vec<&str> = PROPOSAL_INDEX_FLAGS.to_vec();
+        update_args.extend(["update-index", "-z", "--index-info"]);
+        git_with_index(
+            &repo,
+            &private_index.path,
+            &update_args,
+            index_info.as_bytes(),
+        )?;
+
+        let literal = format!(":(literal){}", item.path);
+        let mut check_args: Vec<&str> = PROPOSAL_INDEX_FLAGS.to_vec();
+        check_args.extend([
+            "-c",
+            "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,-indent-with-non-tab,-tab-in-indent,cr-at-eol",
+            "diff",
+            "--cached",
+            "--check",
+            "--no-ext-diff",
+            "--no-color",
+            "--",
+            &literal,
+        ]);
+        git_with_index(&repo, &private_index.path, &check_args, b"").map_err(|error| {
+            error.wrap(|msg| {
+                format!(
+                    "Prepared proposal object for {} failed staged integrity check: {msg}",
+                    item.path
+                )
+            })
+        })?;
+        resolved_files.push(item.path);
+    }
+
+    let mut unmerged_args: Vec<&str> = PROPOSAL_INDEX_FLAGS.to_vec();
+    unmerged_args.extend(["ls-files", "--unmerged", "-z"]);
+    let unmerged = git_with_index(&repo, &private_index.path, &unmerged_args, b"")?;
+    if !unmerged.is_empty() {
+        return Err("Private proposal index still contains unmerged entries".into());
+    }
+
+    let mut write_tree_args: Vec<&str> = PROPOSAL_INDEX_FLAGS.to_vec();
+    write_tree_args.push("write-tree");
+    let tree_bytes = git_with_index(&repo, &private_index.path, &write_tree_args, b"")?;
+    let tree_oid = String::from_utf8_lossy(&tree_bytes).trim().to_string();
+    if !land_proposals::is_full_lowercase_oid(&tree_oid) {
+        return Err(format!("write-tree returned invalid tree OID {tree_oid:?}").into());
+    }
+
+    Ok(ResolvedProposalTree {
+        proposal_ref: pkg.summary.ref_name,
+        proposal_commit_oid: pkg.summary.proposal_commit_oid,
+        target_tip_oid: target_tip_oid.to_string(),
+        source_commit_oid: pkg.summary.source_commit_oid,
+        tree_oid,
+        resolved_files,
+        keys,
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1552,6 +2160,218 @@ mod tests {
                 .staged
         );
         assert_eq!(index_mode(&repo), "160000");
+    }
+
+    #[test]
+    fn proposal_session_loads_and_builds_resolved_tree_without_mutating_worktree() {
+        use crate::engine::land_proposals::{
+            create_proposal, decide_land, drop_proposal, FileResolutionVerdict, LandAnswer,
+            LandDecisionInput, ProposedFileInput,
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().canonicalize().unwrap();
+        crate::test_support::git_in(&repo, &["init", "-b", "main"]);
+        crate::test_support::git_in(&repo, &["config", "user.name", "Test"]);
+        crate::test_support::git_in(&repo, &["config", "user.email", "test@example.com"]);
+        crate::test_support::git_in(&repo, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(&repo);
+
+        fs::write(repo.join("shared.txt"), "top\nbase\nbottom\n").unwrap();
+        fs::write(repo.join("keep.txt"), "untouched\n").unwrap();
+        crate::test_support::git_in(&repo, &["add", "."]);
+        crate::test_support::git_in(&repo, &["commit", "-m", "base"]);
+
+        crate::test_support::git_in(&repo, &["checkout", "-b", "feat"]);
+        fs::write(repo.join("shared.txt"), "top\ntheirs\nbottom\n").unwrap();
+        fs::write(repo.join("feat_only.txt"), "from feat\n").unwrap();
+        crate::test_support::git_in(&repo, &["add", "."]);
+        crate::test_support::git_in(&repo, &["commit", "-m", "feat"]);
+        let feat_oid = git_text(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        crate::test_support::git_in(&repo, &["checkout", "main"]);
+        fs::write(repo.join("shared.txt"), "top\nours\nbottom\n").unwrap();
+        fs::write(repo.join("main_only.txt"), "from main\n").unwrap();
+        crate::test_support::git_in(&repo, &["add", "."]);
+        crate::test_support::git_in(&repo, &["commit", "-m", "ours"]);
+        let tip_oid = git_text(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Keep an uncommitted edit in the user's working tree and verify nothing touches it.
+        fs::write(repo.join("dirty.txt"), "user local work\n").unwrap();
+        let index_before = fs::read(repo.join(".git/index")).unwrap();
+
+        let summary = create_proposal(
+            &repo,
+            &crate::engine::land_proposals::CreateProposalRequest {
+                branch: "main".to_string(),
+                tip_oid: tip_oid.clone(),
+                source_commit_oid: feat_oid.clone(),
+                resolver: "model-v1".to_string(),
+                requested_by: "alice".to_string(),
+                files: vec![ProposedFileInput {
+                    path: "shared.txt".to_string(),
+                    mode: "100644".to_string(),
+                    bytes: b"top\nproposed-merge\nbottom\n".to_vec(),
+                }],
+                expected_old_oid: None,
+            },
+        )
+        .unwrap();
+
+        let repo_str = repo.to_str().unwrap();
+        let session = load_proposal_for_session(repo_str, &summary.ref_name).unwrap();
+        assert_eq!(session.files.len(), 1);
+        let file = &session.files[0];
+        assert_eq!(file.file_path, "shared.txt");
+        assert!(file.proposed_marker_free);
+        assert_eq!(
+            file.proposed_text.as_deref(),
+            Some("top\nproposed-merge\nbottom\n")
+        );
+        let doc = file
+            .snapshot
+            .document
+            .as_ref()
+            .expect("conflict document parsed");
+        assert_eq!(doc.total_conflicts, 1);
+
+        // Build resolved tree using ConflictFileChoice::Chunks via the bridge.
+        let chunk_tree = build_resolved_proposal_tree(
+            repo_str,
+            &BuildProposalTreeRequest {
+                proposal_ref: summary.ref_name.clone(),
+                expected_proposal_commit_oid: Some(summary.proposal_commit_oid.clone()),
+                target_tip_oid: None,
+                resolutions: vec![ProposalFileResolution {
+                    file_path: "shared.txt".to_string(),
+                    revision: Some(file.snapshot.revision.clone()),
+                    choice: ProposalResolutionChoice::SessionChoice(ConflictFileChoice::Chunks(
+                        vec![ConflictResolutionChoice::AcceptBothOursFirst],
+                    )),
+                }],
+            },
+        )
+        .unwrap();
+        let resolved_shared = git_text(
+            &repo,
+            &[
+                "cat-file",
+                "blob",
+                &format!("{}:shared.txt", chunk_tree.tree_oid),
+            ],
+        )
+        .unwrap();
+        assert_eq!(resolved_shared, "top\nours\ntheirs\nbottom\n");
+        let resolved_feat = git_text(
+            &repo,
+            &[
+                "cat-file",
+                "blob",
+                &format!("{}:feat_only.txt", chunk_tree.tree_oid),
+            ],
+        )
+        .unwrap();
+        assert_eq!(resolved_feat, "from feat\n");
+        let resolved_main = git_text(
+            &repo,
+            &[
+                "cat-file",
+                "blob",
+                &format!("{}:main_only.txt", chunk_tree.tree_oid),
+            ],
+        )
+        .unwrap();
+        assert_eq!(resolved_main, "from main\n");
+
+        // Build resolved tree accepting the ODB proposal blob directly.
+        let accepted_tree = build_resolved_proposal_tree(
+            repo_str,
+            &BuildProposalTreeRequest {
+                proposal_ref: summary.ref_name.clone(),
+                expected_proposal_commit_oid: Some(summary.proposal_commit_oid.clone()),
+                target_tip_oid: None,
+                resolutions: vec![ProposalFileResolution {
+                    file_path: "shared.txt".to_string(),
+                    revision: Some(file.snapshot.revision.clone()),
+                    choice: ProposalResolutionChoice::AcceptProposal,
+                }],
+            },
+        )
+        .unwrap();
+        let accepted_shared = git_text(
+            &repo,
+            &[
+                "cat-file",
+                "blob",
+                &format!("{}:shared.txt", accepted_tree.tree_oid),
+            ],
+        )
+        .unwrap();
+        assert_eq!(accepted_shared, "top\nproposed-merge\nbottom\n");
+
+        // WorkingTree choice is refused in ODB-only proposal mode.
+        assert!(build_resolved_proposal_tree(
+            repo_str,
+            &BuildProposalTreeRequest {
+                proposal_ref: summary.ref_name.clone(),
+                expected_proposal_commit_oid: None,
+                target_tip_oid: None,
+                resolutions: vec![ProposalFileResolution {
+                    file_path: "shared.txt".to_string(),
+                    revision: None,
+                    choice: ProposalResolutionChoice::SessionChoice(
+                        ConflictFileChoice::WorkingTree
+                    ),
+                }],
+            },
+        )
+        .is_err());
+
+        // Gate check: decide_land requires exact verified tree OID match.
+        let answer = LandAnswer {
+            files: vec![FileResolutionVerdict::proposed_by_model(
+                file.key.clone(),
+                Some("100644".to_string()),
+                Some(b"top\nproposed-merge\nbottom\n".to_vec()),
+            )],
+        };
+        assert!(
+            !decide_land(&LandDecisionInput {
+                answer: Some(&answer),
+                candidate_tree_oid: &accepted_tree.tree_oid,
+                verified_tree_oid: Some(&chunk_tree.tree_oid),
+                verify_required: false,
+            })
+            .allowed
+        );
+        assert!(
+            decide_land(&LandDecisionInput {
+                answer: Some(&answer),
+                candidate_tree_oid: &accepted_tree.tree_oid,
+                verified_tree_oid: Some(&accepted_tree.tree_oid),
+                verify_required: false,
+            })
+            .allowed
+        );
+
+        // Clean working tree + real index were completely untouched.
+        assert_eq!(
+            fs::read(repo.join("shared.txt")).unwrap(),
+            b"top\nours\nbottom\n"
+        );
+        assert_eq!(
+            fs::read(repo.join("dirty.txt")).unwrap(),
+            b"user local work\n"
+        );
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index_before);
+
+        assert!(drop_proposal(&repo, "main", &feat_oid).unwrap());
     }
 }
 

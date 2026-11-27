@@ -36,6 +36,7 @@ mod cap;
 mod consolidated;
 pub mod freshness;
 pub mod ids;
+pub mod land_identity;
 pub mod lifecycle;
 pub mod redact;
 
@@ -217,6 +218,20 @@ CREATE TABLE IF NOT EXISTS fleet_languages (
   percentage                REAL NOT NULL,
   PRIMARY KEY (repo_path, language)
 );
+CREATE TABLE IF NOT EXISTS land_identities (
+  id              INTEGER PRIMARY KEY,
+  repo_path       TEXT NOT NULL,
+  target_ref      TEXT NOT NULL,
+  source_oid      TEXT NOT NULL,
+  landed_oid      TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'confirmed' CHECK (status IN ('intent','confirmed','aborted')),
+  invocation_id   TEXT,
+  recorded_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_land_identities_lookup
+  ON land_identities(repo_path, target_ref, source_oid, id DESC);
+CREATE INDEX IF NOT EXISTS idx_land_identities_invocation
+  ON land_identities(invocation_id) WHERE invocation_id IS NOT NULL;
 "#;
 
 /// This build's event schema version, written into every row.

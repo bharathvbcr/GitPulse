@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 142 contracts over
- * 373 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 147 contracts over
+ * 386 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -379,7 +379,12 @@ export const CONTRACTS = Object.freeze([
   { label: "idle-trim", rustPath: rust("idle_trim.rs"), tsPath: ts("runtime", "idleShedderWiring.ts"), structs: ["IdleTrimReport"] },
   // Turn checkpoints (`refs/gitpulse/turns/`): `omissions` is how a partial
   // checkpoint says so, and a renamed field there would read as complete.
-  { label: "turn-checkpoints", rustPath: rust("engine", "turn_checkpoint.rs"), tsPath: ts("diff", "turnCheckpoints.ts"), structs: ["TurnCheckpointList", "TurnCheckpointSummary", "Omissions", "TurnCheckpointDiff"] },
+  { label: "turn-checkpoints", rustPath: rust("engine", "turn_checkpoint.rs"), tsPath: ts("diff", "turnCheckpoints.ts"), structs: ["TurnCheckpointList", "TurnCheckpointSummary", "Omissions", "TurnCheckpointDiff", "TurnCheckpointRestore"] },
+  { label: "worktree-merge-batch", rustPath: rust("commands", "worktrees.rs"), tsPath: ts("workbench", "attemptWorktree.ts"), structs: ["WorktreeMergeBatchLane", "WorktreeMergeBatchOutcome", "WorktreeMergeBatchResult"] },
+  { label: "conflict-proposal-session", rustPath: rust("diff", "conflict_session.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ProposalSessionFile", "ProposalSessionSnapshot", "ResolvedProposalTree"] },
+  { label: "conflict-proposal-request", rustPath: rust("commands", "conflict.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ProposalFileResolutionInput", "BuildProposalTreeInput"] },
+  { label: "conflict-file-key", rustPath: rust("engine", "land_proposals.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ConflictFileKey"] },
+  { label: "non-standard-ref-inventory", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["NonStandardRefSample", "NonStandardRefNamespaceSummary", "NonStandardRefInventory"] },
 ]);
 
 /**

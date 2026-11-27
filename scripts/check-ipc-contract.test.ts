@@ -371,7 +371,7 @@ describe("annotated but unregistered commands", () => {
     // and to pause one of an agent GitPulse did not launch). 370 with
     // cmd_mavi_close_thread_children (forgetting a Mavi thread closes its
     // terminal children). 371 with cmd_mavi_summarize.
-    expect(found.size).toBe(371);
+    expect(found.size).toBe(376);
     for (const legacy of ["hosts", "kill", "transcript"]) {
       expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
     }

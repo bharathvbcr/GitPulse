@@ -179,6 +179,30 @@ SUBCOMMANDS:
     campaign             Enforce formal multi-lane leases, SHA-256 BULLETIN & sole-integrator commits
       --repo <path>      Repository checkout path (required)
       --action <act>     init | status | audit | register-lane | acquire-lease | release-lease | bulletin | stage | integrate
+
+    land-batch           Batch-land multiple branches onto a target branch via LandQueueRegistry
+      --repo <path>      Repository checkout path (required)
+      --branches <b1,b2> Comma-separated branch names to land (or repeatable --branch)
+      --target <base>    Target branch (defaults to repo default base)
+      --squash           Squash each lane into a single commit on target
+      --message <msg>    Explicit commit message for landed commits
+      --verify-in-scratch Verify candidate in pooled scratch before advancing target
+
+    proposals            List or sweep persisted ODB conflict proposals (refs/gitpulse/proposals/)
+      list | sweep       Action (positional or via --action <list|sweep>)
+      --repo <path>      Repository checkout path (required)
+      --branch <name>    Target branch filter (optional for list; defaults to repo base for sweep)
+      --ttl-secs <n>     Retention TTL in seconds for sweep (default: 7 days)
+      --max-per-branch <n> Max retained proposals per branch for sweep (default: 20)
+
+    checkpoint-restore   Restore a worktree's tracked tree to a refs/gitpulse/turns/ checkpoint
+      --repo <path>      Repository checkout path (required)
+      --worktree <dir>   Target worktree path (defaults to --repo)
+      --ref <refname>    Full refs/gitpulse/turns/... checkpoint ref (required)
+      --force            Overwrite uncommitted working-tree changes
+
+    ref-inventory        Read-only inventory of non-standard ref namespaces (refs/backup, refs/gitpulse, etc.)
+      --repo <path>      Repository checkout path (required)
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +348,30 @@ enum Subcommand {
         max_bytes: Option<u64>,
     },
     Campaign(Box<CampaignArgs>),
+    LandBatch {
+        repo: String,
+        branches: Vec<String>,
+        target: Option<String>,
+        squash: bool,
+        message: Option<String>,
+        verify_in_scratch: bool,
+    },
+    Proposals {
+        repo: String,
+        action: String,
+        branch: Option<String>,
+        ttl_secs: Option<u64>,
+        max_per_branch: Option<usize>,
+    },
+    CheckpointRestore {
+        repo: String,
+        worktree: Option<String>,
+        checkpoint_ref: String,
+        force: bool,
+    },
+    RefInventory {
+        repo: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -975,6 +1023,168 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                 verified,
             }))
         }
+        "land-batch" => {
+            let mut repo = None;
+            let mut branches = Vec::new();
+            let mut target = None;
+            let mut squash = false;
+            let mut message = None;
+            let mut verify_in_scratch = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" => repo = Some(take_val(rest, &mut i, "--repo").map_err(map_err)?),
+                    "--branches" => {
+                        let v = take_val(rest, &mut i, "--branches").map_err(map_err)?;
+                        split_csv_into(&v, &mut branches).map_err(map_err)?;
+                    }
+                    "--branch" => {
+                        branches.push(take_val(rest, &mut i, "--branch").map_err(map_err)?);
+                    }
+                    "--target" => {
+                        target = Some(take_val(rest, &mut i, "--target").map_err(map_err)?)
+                    }
+                    "--squash" => squash = true,
+                    "--message" => {
+                        message = Some(take_val(rest, &mut i, "--message").map_err(map_err)?)
+                    }
+                    "--verify-in-scratch" => verify_in_scratch = true,
+                    other => {
+                        return Err((json_mode, format!("unknown flag for land-batch: {other}")))
+                    }
+                }
+                i += 1;
+            }
+            if branches.is_empty() {
+                return Err((
+                    json_mode,
+                    "land-batch requires --branches <b1,b2,...> or --branch <name>".to_string(),
+                ));
+            }
+            Subcommand::LandBatch {
+                repo: require_flag(repo, "--repo", "land-batch").map_err(map_err)?,
+                branches,
+                target,
+                squash,
+                message,
+                verify_in_scratch,
+            }
+        }
+        "proposals" => {
+            let mut repo = None;
+            let mut action = None;
+            let mut branch = None;
+            let mut ttl_secs = None;
+            let mut max_per_branch = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "list" | "sweep" if action.is_none() => {
+                        action = Some(rest[i].clone());
+                    }
+                    "--action" => {
+                        action = Some(take_val(rest, &mut i, "--action").map_err(map_err)?)
+                    }
+                    "--repo" => repo = Some(take_val(rest, &mut i, "--repo").map_err(map_err)?),
+                    "--branch" => {
+                        branch = Some(take_val(rest, &mut i, "--branch").map_err(map_err)?)
+                    }
+                    "--ttl-secs" => {
+                        let raw = take_val(rest, &mut i, "--ttl-secs").map_err(map_err)?;
+                        let parsed = raw.parse::<u64>().map_err(|_| {
+                            (json_mode, format!("invalid u64 for --ttl-secs: {raw:?}"))
+                        })?;
+                        ttl_secs = Some(parsed);
+                    }
+                    "--max-per-branch" => {
+                        let raw = take_val(rest, &mut i, "--max-per-branch").map_err(map_err)?;
+                        let parsed = raw.parse::<usize>().map_err(|_| {
+                            (
+                                json_mode,
+                                format!("invalid usize for --max-per-branch: {raw:?}"),
+                            )
+                        })?;
+                        max_per_branch = Some(parsed);
+                    }
+                    other => {
+                        return Err((json_mode, format!("unknown flag for proposals: {other}")))
+                    }
+                }
+                i += 1;
+            }
+            let act = action.ok_or_else(|| {
+                (
+                    json_mode,
+                    "proposals requires `list` or `sweep` (positional or via --action)".to_string(),
+                )
+            })?;
+            let normalized = act.trim().to_ascii_lowercase();
+            if normalized != "list" && normalized != "sweep" {
+                return Err((
+                    json_mode,
+                    format!("unknown proposals action {act:?} (expected list or sweep)"),
+                ));
+            }
+            Subcommand::Proposals {
+                repo: require_flag(repo, "--repo", "proposals").map_err(map_err)?,
+                action: normalized,
+                branch,
+                ttl_secs,
+                max_per_branch,
+            }
+        }
+        "checkpoint-restore" => {
+            let mut repo = None;
+            let mut worktree = None;
+            let mut checkpoint_ref = None;
+            let mut force = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" => repo = Some(take_val(rest, &mut i, "--repo").map_err(map_err)?),
+                    "--worktree" => {
+                        worktree = Some(take_val(rest, &mut i, "--worktree").map_err(map_err)?)
+                    }
+                    "--ref" => {
+                        checkpoint_ref = Some(take_val(rest, &mut i, "--ref").map_err(map_err)?)
+                    }
+                    "--force" => force = true,
+                    other => {
+                        return Err((
+                            json_mode,
+                            format!("unknown flag for checkpoint-restore: {other}"),
+                        ))
+                    }
+                }
+                i += 1;
+            }
+            Subcommand::CheckpointRestore {
+                repo: require_flag(repo, "--repo", "checkpoint-restore").map_err(map_err)?,
+                worktree,
+                checkpoint_ref: require_flag(checkpoint_ref, "--ref", "checkpoint-restore")
+                    .map_err(map_err)?,
+                force,
+            }
+        }
+        "ref-inventory" => {
+            let mut repo = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" => repo = Some(take_val(rest, &mut i, "--repo").map_err(map_err)?),
+                    other => {
+                        return Err((
+                            json_mode,
+                            format!("unknown flag for ref-inventory: {other}"),
+                        ))
+                    }
+                }
+                i += 1;
+            }
+            Subcommand::RefInventory {
+                repo: require_flag(repo, "--repo", "ref-inventory").map_err(map_err)?,
+            }
+        }
         other => {
             return Err((
                 json_mode,
@@ -998,7 +1208,11 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
 fn execute_admitted(cmd: Subcommand) -> Result<Value, String> {
     if matches!(
         cmd,
-        Subcommand::Create { .. } | Subcommand::Switch { .. } | Subcommand::Isolate { .. }
+        Subcommand::Create { .. }
+            | Subcommand::Switch { .. }
+            | Subcommand::Isolate { .. }
+            | Subcommand::LandBatch { .. }
+            | Subcommand::CheckpointRestore { .. }
     ) {
         waylode_lib::engine::process::run_as_user_action(|| execute_subcommand(cmd))
     } else {
@@ -1972,6 +2186,336 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 )),
             }
         }
+        Subcommand::LandBatch {
+            repo,
+            branches,
+            target,
+            squash,
+            message,
+            verify_in_scratch,
+        } => {
+            waylode_lib::repository_trust::require(Path::new(&repo))
+                .map_err(CommandError::into_message)?;
+            let family =
+                resolve_worktree_family(&repo, &repo).map_err(CommandError::into_message)?;
+            let anchor = family.anchor;
+            let anchor_str = anchor
+                .to_str()
+                .ok_or_else(|| "repository anchor path is not valid UTF-8".to_string())?;
+            let target_branch = match target {
+                Some(t) => t,
+                None => compute_default_base(&anchor)
+                    .checked()
+                    .ok()
+                    .and_then(|d| d.base.map(|(n, _)| n))
+                    .unwrap_or_else(|| "main".to_string()),
+            };
+            waylode_lib::engine::git_writer::validate_ref_name(&target_branch)
+                .map_err(CommandError::into_message)?;
+
+            let target_ref = format!("refs/heads/{target_branch}");
+            let before_oid = waylode_lib::engine::git_cli::git_text(
+                &anchor,
+                &["rev-parse", "--verify", &target_ref],
+            )
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+            let merge_flag = if squash { "--squash" } else { "--no-edit" };
+            let mut outcomes: Vec<Option<Value>> = vec![None; branches.len()];
+            let mut queued_indices = Vec::new();
+            let mut requests = Vec::new();
+
+            for (idx, branch) in branches.iter().enumerate() {
+                if waylode_lib::engine::git_writer::validate_ref_name(branch).is_err() {
+                    outcomes[idx] = Some(json!({
+                        "branch": branch,
+                        "ok": false,
+                        "error_code": "invalid_argument",
+                        "error": format!("invalid branch name {branch:?}"),
+                    }));
+                    continue;
+                }
+                if branch == &target_branch {
+                    outcomes[idx] = Some(json!({
+                        "branch": branch,
+                        "ok": false,
+                        "error_code": "invalid_argument",
+                        "error": format!("cannot land branch {branch:?} onto itself"),
+                    }));
+                    continue;
+                }
+                waylode_lib::harness::guard_command(
+                    anchor_str,
+                    &["git", "merge", merge_flag, branch],
+                )?;
+
+                let rev_spec = format!("refs/heads/{branch}^{{commit}}");
+                let source_oid = match waylode_lib::engine::git_cli::git_text(
+                    &anchor,
+                    &["rev-parse", "--verify", &rev_spec],
+                ) {
+                    Ok(oid) => oid.trim().to_string(),
+                    Err(err) => {
+                        outcomes[idx] = Some(json!({
+                            "branch": branch,
+                            "ok": false,
+                            "error_code": "invalid_argument",
+                            "error": err.into_message(),
+                        }));
+                        continue;
+                    }
+                };
+
+                let mut req = waylode_lib::engine::land_queue::LandRequest::new(
+                    &anchor,
+                    branch,
+                    &target_branch,
+                    &source_oid,
+                );
+                req.squash = squash;
+                req.commit_message = message.clone();
+                req.verify_in_scratch = verify_in_scratch;
+                queued_indices.push(idx);
+                requests.push(req);
+            }
+
+            if !requests.is_empty() {
+                let results = waylode_lib::engine::land_queue::global_land_queue()
+                    .submit_batch_static(requests);
+                for (idx, res) in queued_indices.into_iter().zip(results) {
+                    outcomes[idx] = Some(match res {
+                        Ok(landed) if landed.reverted_by.is_some() => json!({
+                            "branch": landed.branch,
+                            "ok": false,
+                            "already_landed": landed.already_landed,
+                            "reverted_by": landed.reverted_by,
+                            "source_oid": landed.source_oid,
+                            "landed_oid": landed.landed_oid,
+                            "batch_tip": landed.batch_tip,
+                            "error_code": "refused",
+                            "error": format!(
+                                "{} already landed on {} as {} (AlreadyLanded), but that landing was reverted by {}",
+                                landed.branch,
+                                landed.target_branch,
+                                landed.landed_oid,
+                                landed.reverted_by.as_deref().unwrap_or("")
+                            ),
+                        }),
+                        Ok(landed) => json!({
+                            "branch": landed.branch,
+                            "ok": true,
+                            "already_landed": landed.already_landed,
+                            "reverted_by": landed.reverted_by,
+                            "source_oid": landed.source_oid,
+                            "landed_oid": landed.landed_oid,
+                            "batch_tip": landed.batch_tip,
+                            "checkout_advanced": landed.checkout_advanced,
+                            "checkout_note": landed.checkout_note,
+                            "green_ref_note": landed.green_ref_note,
+                        }),
+                        Err(err) => {
+                            let (code, paths) = match &err {
+                                waylode_lib::engine::land_queue::LandError::Conflict {
+                                    paths,
+                                    ..
+                                } => ("conflict", paths.clone()),
+                                waylode_lib::engine::land_queue::LandError::PermissionDenied {
+                                    ..
+                                } => ("permission_denied", Vec::new()),
+                                waylode_lib::engine::land_queue::LandError::InvalidArgument {
+                                    ..
+                                } => ("invalid_argument", Vec::new()),
+                                waylode_lib::engine::land_queue::LandError::Held { .. } => {
+                                    ("held", Vec::new())
+                                }
+                                waylode_lib::engine::land_queue::LandError::CommitHooks {
+                                    ..
+                                } => ("commit_hooks", Vec::new()),
+                                waylode_lib::engine::land_queue::LandError::Rejected { .. } => {
+                                    ("rejected", Vec::new())
+                                }
+                                waylode_lib::engine::land_queue::LandError::CasExhausted {
+                                    ..
+                                } => ("cas_exhausted", Vec::new()),
+                                waylode_lib::engine::land_queue::LandError::Canceled => {
+                                    ("canceled", Vec::new())
+                                }
+                                waylode_lib::engine::land_queue::LandError::Failed { .. } => {
+                                    ("failed", Vec::new())
+                                }
+                            };
+                            json!({
+                                "branch": branches[idx],
+                                "ok": false,
+                                "error_code": code,
+                                "error": err.to_string(),
+                                "conflict_paths": paths,
+                            })
+                        }
+                    });
+                }
+            }
+
+            let after_oid = waylode_lib::engine::git_cli::git_text(
+                &anchor,
+                &["rev-parse", "--verify", &target_ref],
+            )
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+            let final_outcomes: Vec<Value> = outcomes
+                .into_iter()
+                .enumerate()
+                .map(|(idx, o)| {
+                    o.unwrap_or_else(|| {
+                        json!({
+                            "branch": branches[idx],
+                            "ok": false,
+                            "error_code": "failed",
+                            "error": "lane produced no outcome",
+                        })
+                    })
+                })
+                .collect();
+            let succeeded = final_outcomes
+                .iter()
+                .filter(|v| v["ok"] == json!(true))
+                .count();
+            let failed = final_outcomes.len().saturating_sub(succeeded);
+            let mut payload = json!({
+                "ok": failed == 0,
+                "target_branch": target_branch,
+                "before_oid": before_oid,
+                "after_oid": after_oid,
+                "total": final_outcomes.len(),
+                "succeeded": succeeded,
+                "failed": failed,
+                "outcomes": final_outcomes,
+            });
+            if failed > 0 {
+                payload["error"] = json!(format!(
+                    "{failed} of {} branch(es) failed to land onto {target_branch}",
+                    final_outcomes.len()
+                ));
+            }
+            Ok(payload)
+        }
+        Subcommand::Proposals {
+            repo,
+            action,
+            branch,
+            ttl_secs,
+            max_per_branch,
+        } => {
+            waylode_lib::repository_trust::require(Path::new(&repo))
+                .map_err(CommandError::into_message)?;
+            let family =
+                resolve_worktree_family(&repo, &repo).map_err(CommandError::into_message)?;
+            let anchor = family.anchor;
+            match action.as_str() {
+                "list" => {
+                    let report = waylode_lib::engine::land_proposals::list_proposals_report(
+                        &anchor,
+                        branch.as_deref(),
+                    )
+                    .map_err(CommandError::into_message)?;
+                    Ok(json!({
+                        "ok": true,
+                        "action": "list",
+                        "branch": branch,
+                        "proposals": report.proposals,
+                        "skipped": report.skipped,
+                    }))
+                }
+                "sweep" => {
+                    let target_branch = match branch {
+                        Some(b) => b,
+                        None => compute_default_base(&anchor)
+                            .checked()
+                            .ok()
+                            .and_then(|d| d.base.map(|(n, _)| n))
+                            .unwrap_or_else(|| "main".to_string()),
+                    };
+                    let sweeper = waylode_lib::engine::land_proposals::ProposalSweeper::new(
+                        Duration::from_secs(
+                            ttl_secs
+                                .unwrap_or(waylode_lib::engine::land_proposals::PROPOSAL_TTL_SECS),
+                        ),
+                        max_per_branch.unwrap_or(
+                            waylode_lib::engine::land_proposals::PROPOSAL_MAX_PER_BRANCH,
+                        ),
+                        waylode_lib::engine::land_proposals::PROPOSAL_SWEEP_TIMEOUT,
+                    );
+                    let report = sweeper
+                        .sweep_branch(&anchor, &target_branch)
+                        .map_err(CommandError::into_message)?;
+                    Ok(json!({
+                        "ok": true,
+                        "action": "sweep",
+                        "branch": target_branch,
+                        "report": report,
+                    }))
+                }
+                other => Err(format!("unknown proposals action {other:?}")),
+            }
+        }
+        Subcommand::CheckpointRestore {
+            repo,
+            worktree,
+            checkpoint_ref,
+            force,
+        } => {
+            waylode_lib::repository_trust::require(Path::new(&repo))
+                .map_err(CommandError::into_message)?;
+            let wt_str = worktree
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&repo);
+            waylode_lib::harness::guard_command(
+                &repo,
+                &["git", "read-tree", "--reset", "-u", &checkpoint_ref],
+            )?;
+            let restore = waylode_lib::engine::turn_checkpoint::restore_turn_checkpoint(
+                Path::new(&repo),
+                Path::new(wt_str),
+                &checkpoint_ref,
+                force,
+            )?;
+            Ok(json!({
+                "ok": true,
+                "restore": restore,
+            }))
+        }
+        Subcommand::RefInventory { repo } => {
+            waylode_lib::repository_trust::require(Path::new(&repo))
+                .map_err(CommandError::into_message)?;
+            let inventory = waylode_lib::ops::non_standard_ref_inventory(&repo)
+                .map_err(CommandError::into_message)?;
+            let summary = if inventory.namespaces.is_empty() {
+                "No non-standard refs found".to_string()
+            } else {
+                let parts: Vec<String> = inventory
+                    .namespaces
+                    .iter()
+                    .map(|ns| format!("{}: {}", ns.namespace, ns.count))
+                    .collect();
+                format!(
+                    "{} non-standard ref(s) across {} namespace(s) ({})",
+                    inventory.total_refs,
+                    inventory.namespaces.len(),
+                    parts.join(", ")
+                )
+            };
+            Ok(json!({
+                "ok": true,
+                "summary": summary,
+                "inventory": inventory,
+            }))
+        }
     }
 }
 
@@ -2437,5 +2981,355 @@ mod tests {
                 }))
             }
         );
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git command should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    struct SessionTrustGuard(String);
+
+    impl SessionTrustGuard {
+        fn grant(repo_str: &str) -> Self {
+            let view = waylode_lib::repository_trust::inspect(repo_str).expect("inspect trust");
+            waylode_lib::repository_trust::grant(repo_str, &view.identity, false)
+                .expect("grant session trust");
+            Self(repo_str.to_string())
+        }
+    }
+
+    impl Drop for SessionTrustGuard {
+        fn drop(&mut self) {
+            let _ = waylode_lib::repository_trust::revoke(&self.0);
+        }
+    }
+
+    fn init_cli_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        run_git(repo, &["init", "-q", "-b", "main"]);
+        run_git(repo, &["config", "user.name", "CLI Tester"]);
+        run_git(repo, &["config", "user.email", "cli@example.test"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "base.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn parse_cli_handles_land_batch_proposals_checkpoint_restore_and_ref_inventory() {
+        let batch = parse_cli(&vec_str(&[
+            "land-batch",
+            "--repo",
+            "/tmp/repo",
+            "--branches",
+            "lane-a,lane-b",
+            "--branch",
+            "lane-c",
+            "--target",
+            "main",
+            "--squash",
+            "--verify-in-scratch",
+            "--json",
+        ]))
+        .expect("land-batch");
+        assert_eq!(
+            batch,
+            Invocation::Command {
+                json: true,
+                cmd: Subcommand::LandBatch {
+                    repo: "/tmp/repo".to_string(),
+                    branches: vec![
+                        "lane-a".to_string(),
+                        "lane-b".to_string(),
+                        "lane-c".to_string(),
+                    ],
+                    target: Some("main".to_string()),
+                    squash: true,
+                    message: None,
+                    verify_in_scratch: true,
+                },
+            }
+        );
+
+        let prop_list = parse_cli(&vec_str(&[
+            "proposals",
+            "list",
+            "--repo",
+            "/tmp/repo",
+            "--branch",
+            "main",
+            "--json",
+        ]))
+        .expect("proposals list");
+        assert_eq!(
+            prop_list,
+            Invocation::Command {
+                json: true,
+                cmd: Subcommand::Proposals {
+                    repo: "/tmp/repo".to_string(),
+                    action: "list".to_string(),
+                    branch: Some("main".to_string()),
+                    ttl_secs: None,
+                    max_per_branch: None,
+                },
+            }
+        );
+
+        let prop_sweep = parse_cli(&vec_str(&[
+            "proposals",
+            "--action",
+            "sweep",
+            "--repo",
+            "/tmp/repo",
+            "--ttl-secs",
+            "60",
+            "--max-per-branch",
+            "2",
+        ]))
+        .expect("proposals sweep");
+        assert_eq!(
+            prop_sweep,
+            Invocation::Command {
+                json: false,
+                cmd: Subcommand::Proposals {
+                    repo: "/tmp/repo".to_string(),
+                    action: "sweep".to_string(),
+                    branch: None,
+                    ttl_secs: Some(60),
+                    max_per_branch: Some(2),
+                },
+            }
+        );
+
+        let restore = parse_cli(&vec_str(&[
+            "checkpoint-restore",
+            "--repo",
+            "/tmp/repo",
+            "--worktree",
+            "/tmp/wt",
+            "--ref",
+            "refs/gitpulse/turns/0123456789abcdef/0000000000000001",
+            "--force",
+            "--json",
+        ]))
+        .expect("checkpoint-restore");
+        assert_eq!(
+            restore,
+            Invocation::Command {
+                json: true,
+                cmd: Subcommand::CheckpointRestore {
+                    repo: "/tmp/repo".to_string(),
+                    worktree: Some("/tmp/wt".to_string()),
+                    checkpoint_ref: "refs/gitpulse/turns/0123456789abcdef/0000000000000001"
+                        .to_string(),
+                    force: true,
+                },
+            }
+        );
+
+        let inv = parse_cli(&vec_str(&[
+            "ref-inventory",
+            "--repo",
+            "/tmp/repo",
+            "--json",
+        ]))
+        .expect("ref-inventory");
+        assert_eq!(
+            inv,
+            Invocation::Command {
+                json: true,
+                cmd: Subcommand::RefInventory {
+                    repo: "/tmp/repo".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn new_subcommands_enforce_trust_and_execute_end_to_end() {
+        let dir = init_cli_repo();
+        let repo = dir.path();
+        let repo_str = repo.to_str().unwrap().to_string();
+        let base_oid = run_git(repo, &["rev-parse", "HEAD"]);
+
+        // Untrusted repository is rejected before any engine call runs.
+        assert!(execute_subcommand(Subcommand::RefInventory {
+            repo: repo_str.clone(),
+        })
+        .is_err());
+        assert!(execute_subcommand(Subcommand::Proposals {
+            repo: repo_str.clone(),
+            action: "list".to_string(),
+            branch: None,
+            ttl_secs: None,
+            max_per_branch: None,
+        })
+        .is_err());
+
+        // Grant in-memory session trust (never persisted to disk) and clean up on drop.
+        let _trust = SessionTrustGuard::grant(&repo_str);
+
+        // 1. ref-inventory
+        run_git(repo, &["update-ref", "refs/backup/manual-1", &base_oid]);
+        let inv = execute_subcommand(Subcommand::RefInventory {
+            repo: repo_str.clone(),
+        })
+        .expect("ref-inventory");
+        assert_eq!(inv["ok"], json!(true));
+        assert_eq!(inv["inventory"]["total_refs"], json!(1));
+        assert_eq!(
+            inv["inventory"]["namespaces"][0]["namespace"],
+            json!("refs/backup")
+        );
+
+        // 2. proposals list and sweep
+        run_git(repo, &["checkout", "-q", "-b", "feat/prop-1", &base_oid]);
+        std::fs::write(repo.join("prop.txt"), "p1\n").unwrap();
+        run_git(repo, &["add", "prop.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "p1"]);
+        let p1_oid = run_git(repo, &["rev-parse", "HEAD"]);
+
+        run_git(repo, &["checkout", "-q", "-b", "feat/prop-2", &base_oid]);
+        std::fs::write(repo.join("prop.txt"), "p2\n").unwrap();
+        run_git(repo, &["add", "prop.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "p2"]);
+        let p2_oid = run_git(repo, &["rev-parse", "HEAD"]);
+
+        run_git(repo, &["checkout", "-q", "main"]);
+        for oid in [&p1_oid, &p2_oid] {
+            waylode_lib::engine::land_proposals::create_proposal(
+                repo,
+                &waylode_lib::engine::land_proposals::CreateProposalRequest {
+                    branch: "main".to_string(),
+                    tip_oid: base_oid.clone(),
+                    source_commit_oid: oid.clone(),
+                    resolver: "cli-test".to_string(),
+                    requested_by: "tester".to_string(),
+                    files: vec![waylode_lib::engine::land_proposals::ProposedFileInput {
+                        path: "prop.txt".to_string(),
+                        mode: "100644".to_string(),
+                        bytes: b"resolved\n".to_vec(),
+                    }],
+                    expected_old_oid: None,
+                },
+            )
+            .expect("create_proposal");
+        }
+        let listed = execute_subcommand(Subcommand::Proposals {
+            repo: repo_str.clone(),
+            action: "list".to_string(),
+            branch: Some("main".to_string()),
+            ttl_secs: None,
+            max_per_branch: None,
+        })
+        .expect("proposals list");
+        assert_eq!(listed["ok"], json!(true));
+        assert_eq!(listed["proposals"].as_array().unwrap().len(), 2);
+
+        let swept = execute_subcommand(Subcommand::Proposals {
+            repo: repo_str.clone(),
+            action: "sweep".to_string(),
+            branch: Some("main".to_string()),
+            ttl_secs: Some(3600),
+            max_per_branch: Some(1),
+        })
+        .expect("proposals sweep");
+        assert_eq!(swept["ok"], json!(true));
+        assert_eq!(swept["report"]["deleted_excess"], json!(1));
+        assert_eq!(swept["report"]["kept"], json!(1));
+
+        // 3. checkpoint-restore
+        std::fs::write(repo.join("base.txt"), "checkpoint-state\n").unwrap();
+        let cap = waylode_lib::engine::turn_checkpoint::capture_turn_checkpoint(
+            &repo_str,
+            &waylode_lib::engine::turn_checkpoint::CaptureRequest {
+                event: waylode_lib::engine::turn_checkpoint::TurnEvent::TurnEnd,
+                session_id: Some("cli-sess"),
+                label: Some("cli checkpoint"),
+            },
+            &waylode_lib::engine::turn_checkpoint::CaptureConfig::production(),
+        );
+        let cp_ref = cap.ref_name.expect("checkpoint ref");
+
+        std::fs::write(repo.join("base.txt"), "dirty-after-checkpoint\n").unwrap();
+        let no_force = execute_subcommand(Subcommand::CheckpointRestore {
+            repo: repo_str.clone(),
+            worktree: None,
+            checkpoint_ref: cp_ref.clone(),
+            force: false,
+        });
+        assert!(no_force.is_err());
+
+        let forced = execute_subcommand(Subcommand::CheckpointRestore {
+            repo: repo_str.clone(),
+            worktree: None,
+            checkpoint_ref: cp_ref.clone(),
+            force: true,
+        })
+        .expect("checkpoint-restore --force");
+        assert_eq!(forced["ok"], json!(true));
+        assert_eq!(forced["restore"]["checkpoint_ref"], json!(cp_ref));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+            "checkpoint-state\n"
+        );
+        // Reset index and working tree back to HEAD before batch land checkout tests.
+        run_git(repo, &["reset", "--hard", "HEAD"]);
+
+        // 4. land-batch (two clean branches + one conflicting branch)
+        run_git(repo, &["checkout", "-q", "-b", "batch/one", &base_oid]);
+        std::fs::write(repo.join("one.txt"), "one\n").unwrap();
+        run_git(repo, &["add", "one.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "one"]);
+
+        run_git(repo, &["checkout", "-q", "-b", "batch/conflict", &base_oid]);
+        std::fs::write(repo.join("base.txt"), "conflict-branch\n").unwrap();
+        run_git(repo, &["add", "base.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "conflict"]);
+
+        run_git(repo, &["checkout", "-q", "-b", "batch/two", &base_oid]);
+        std::fs::write(repo.join("two.txt"), "two\n").unwrap();
+        run_git(repo, &["add", "two.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "two"]);
+
+        run_git(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("base.txt"), "conflict-main\n").unwrap();
+        run_git(repo, &["add", "base.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "advance main"]);
+
+        let batch = execute_subcommand(Subcommand::LandBatch {
+            repo: repo_str,
+            branches: vec![
+                "batch/one".to_string(),
+                "batch/conflict".to_string(),
+                "batch/two".to_string(),
+            ],
+            target: Some("main".to_string()),
+            squash: true,
+            message: None,
+            verify_in_scratch: false,
+        })
+        .expect("land-batch");
+        assert_eq!(batch["ok"], json!(false), "batch={batch:#}");
+        assert_eq!(batch["succeeded"], json!(2), "batch={batch:#}");
+        assert_eq!(batch["failed"], json!(1));
+        assert_eq!(batch["outcomes"][0]["ok"], json!(true));
+        assert_eq!(batch["outcomes"][1]["ok"], json!(false));
+        assert_eq!(batch["outcomes"][1]["error_code"], json!("conflict"));
+        assert_eq!(batch["outcomes"][2]["ok"], json!(true));
+        assert_eq!(run_git(repo, &["show", "main:one.txt"]), "one");
+        assert_eq!(run_git(repo, &["show", "main:two.txt"]), "two");
     }
 }

@@ -26,10 +26,10 @@ Below, **main** means the repository's default branch, worked out as `waylode:co
    - Leave out branches whose tip moved in the last hour, or whose worktree has a live agent session. Those are live work, not finished work.
    - A branch 0 ahead / 0 behind with its own fresh worktree is an unstarted lane, not a leftover.
    - Show the list and get a yes before merging anything. When `waylode:commit-and-merge` or `waylode:wrap-up` called this skill, the batch is the plan the owner already approved.
-3. **Take the lock.** Run `mkdir "$(git rev-parse --path-format=absolute --git-common-dir)/merge-train.lock"`.
-   - **When a calling skill** (`waylode:commit-and-merge`, `waylode:merge-prs`, `waylode:wrap-up`) already holds the lock, skip this step.
-   - **If you took it,** write `owner` inside it the way `waylode:commit-and-merge` does: session id, pid, host and start time. Remove it at the end, on every path, including failure.
-   - **If `mkdir` fails,** another train or integration is running in this repository. Stop and say so. Never delete someone else's lock; for a stale one, tell the owner, as `waylode:commit-and-merge` describes.
+3. **Coordination & locks.**
+   - Waylode's Rust landing engine (`LandQueue`, `waylode_worktree_merge`, `waylode-worktree merge`) already serializes cross-process ref/checkout mutations with a kernel-released `flock` at `"$(git rev-parse --path-format=absolute --git-common-dir)/gitpulse/mutation.lock"` and coordinates concurrent conflict resolution via `<common>/gitpulse/land_tickets.sqlite`.
+   - For multi-step external gate runs orchestrated by this skill, keep a lightweight train coordinator lock only if needed by the caller (`waylode:commit-and-merge`, `waylode:merge-prs`, `waylode:wrap-up`), and prefer Waylode's pooled CoW scratch worktree (`<common>/gitpulse/verify-scratch/`, which preserves `target/` and `node_modules/` via APFS CoW cloning and `git clean -fdx -e target -e node_modules`) or `gitpulse.trainWorktree` over the main checkout.
+   - If a legacy directory lock `merge-train.lock` exists from an older script and `kill -0 <pid>` fails on its `owner` file, tell the owner it is stale; only they remove it.
 4. **Check the disk.** `df -h .` must show at least `gitpulse.gateDiskGb` free (30 GB when unset). Below it, stop and report.
 
 ## The repository's gate
@@ -187,8 +187,8 @@ Then tell the owner:
 
 Remove the lock, unless a calling skill holds it. Leave the integration worktree for the next train, apart from build output you deleted for disk.
 
-## What this does not do yet
+## What is built in the Rust engine vs external gates
 
-- **Reusing results for a tree verified before.** This skill reuses only base logs, by main's sha and the toolchain versions. A result keyed by tree hash, which would also cover the sibling checkouts and tools a gate reads, is not built yet.
+- **Landing & verification pointers (`LandQueue` + `refs/gitpulse/green/`):** Waylode's Rust `LandQueue` performs single-quarantine batched landing, cross-process `mutation.lock` serialization, disjoint-dirty target advancement (`read-tree -m -u` with 5 safety guards), `land_identities` idempotency (`revertOf`), tree-OID equivalence checks (`^{tree}`), and monotonic CAS updates to `refs/gitpulse/green/<branch>` after verified lands.
 - **Skipping gates a diff cannot affect.** That belongs inside each repository's own gate, not in a second gate list here.
 - **Telling lanes to stop running the full suite.** Until a train has actually run in a repository, every lane still runs its full suite.

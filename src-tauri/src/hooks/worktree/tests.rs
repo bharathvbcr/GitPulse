@@ -823,6 +823,61 @@ fn plan_create_uses_shared_engine_worktree_path_resolver() {
 }
 
 #[test]
+fn worktree_create_provisions_stack_lease_when_anchor_ready_and_falls_back_to_copy_otherwise() {
+    let gate = Recorder::answering(PolicyStatus::Allowed);
+
+    // 1. Committed indexed anchor -> provisions stack_lease.json without copying devmap.sqlite.
+    let ready_anchor = crate::codeintel::tests::repo_with_one_generation();
+    let ready_root = crate::engine::process::canonicalize_plain(ready_anchor.path()).unwrap();
+    crate::test_support::trust_repo(&ready_root);
+    crate::codeintel::tests::commit_and_stamp_head(&ready_root);
+
+    let finished_ready = create(
+        &input_for_create(&ready_root, "stacked-hook"),
+        &|r, a| gate.judge(r, a),
+        &progress(),
+    );
+    assert_eq!(finished_ready.exit_code, EXIT_DONE, "{finished_ready:?}");
+    let ready_wt = PathBuf::from(finished_ready.path.expect("stacked hook worktree path"));
+    assert!(
+        devmap_extract::paths::stack_lease_path(&ready_wt).is_file(),
+        "expected stack_lease.json in {}",
+        ready_wt.display()
+    );
+    assert!(
+        !devmap_query::paths::store_path(&ready_wt).exists(),
+        "stacked hook worktree must not copy devmap.sqlite"
+    );
+
+    // 2. Anchor with placeholder head_sha ("fixture") -> automatic Copy fallback.
+    let fallback_anchor = crate::codeintel::tests::repo_with_one_generation();
+    let fallback_root = crate::engine::process::canonicalize_plain(fallback_anchor.path()).unwrap();
+    crate::test_support::trust_repo(&fallback_root);
+    git_in(&fallback_root, &["add", "src"]);
+    git_in(&fallback_root, &["commit", "-q", "-m", "init"]);
+
+    let finished_fallback = create(
+        &input_for_create(&fallback_root, "fallback-hook"),
+        &|r, a| gate.judge(r, a),
+        &progress(),
+    );
+    assert_eq!(
+        finished_fallback.exit_code, EXIT_DONE,
+        "{finished_fallback:?}"
+    );
+    let fallback_wt = PathBuf::from(finished_fallback.path.expect("fallback hook worktree path"));
+    assert!(
+        devmap_query::paths::store_path(&fallback_wt).is_file(),
+        "expected Copy fallback devmap.sqlite in {}",
+        fallback_wt.display()
+    );
+    assert!(
+        !devmap_extract::paths::stack_lease_path(&fallback_wt).exists(),
+        "Copy fallback must not leave stack_lease.json"
+    );
+}
+
+#[test]
 fn the_main_checkout_and_a_refused_removal_are_kept() {
     let fixture = fixture();
     let (finished, gate) = removing(&fixture.root, true);

@@ -55,6 +55,18 @@ export interface TurnCheckpointDiff {
   redacted: boolean;
 }
 
+export interface TurnCheckpointRestore {
+  checkpoint_ref: string;
+  commit: string;
+  tree: string;
+  branch: string | null;
+  head_before: string | null;
+  head_after: string | null;
+  op_snapshot_ref: string;
+  op_snapshot_seq: number;
+  forced: boolean;
+}
+
 export async function listTurnCheckpoints(
   repoPath: string,
   limit = 50,
@@ -68,6 +80,19 @@ export async function diffTurnCheckpoint(
   against: string | null = null,
 ): Promise<TurnCheckpointDiff> {
   return invoke<TurnCheckpointDiff>("cmd_diff_turn_checkpoint", { repoPath, id, against });
+}
+
+export async function restoreTurnCheckpoint(
+  repoPath: string,
+  checkpointRef: string,
+  options: { worktreePath?: string | null; force?: boolean } = {},
+): Promise<TurnCheckpointRestore> {
+  return invoke<TurnCheckpointRestore>("cmd_restore_turn_checkpoint", {
+    repoPath,
+    worktreePath: options.worktreePath ?? null,
+    checkpointRef,
+    force: options.force ?? false,
+  });
 }
 
 export function totalOmittedFiles(omissions: Omissions): number {

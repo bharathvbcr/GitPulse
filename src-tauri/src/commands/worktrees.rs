@@ -474,6 +474,447 @@ pub(crate) fn merge_teardown_guarded(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeMergeBatchLane {
+    pub worktree_path: Option<String>,
+    pub branch: String,
+    pub source_oid: Option<String>,
+    pub squash: Option<bool>,
+    pub commit_message: Option<String>,
+    pub hot_files: Option<Vec<String>>,
+    pub verify_in_scratch: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeMergeBatchOutcome {
+    pub branch: String,
+    pub worktree_path: Option<String>,
+    pub ok: bool,
+    pub already_landed: bool,
+    pub source_oid: Option<String>,
+    pub landed_oid: Option<String>,
+    pub before_oid: Option<String>,
+    pub batch_tip: Option<String>,
+    pub checkout_advanced: bool,
+    pub checkout_note: Option<String>,
+    pub green_ref_note: Option<String>,
+    pub worktree_removed: bool,
+    pub removal_error: Option<String>,
+    pub branch_deleted: bool,
+    pub branch_error: Option<String>,
+    pub error_code: Option<String>,
+    pub error: Option<String>,
+    pub conflict_paths: Vec<String>,
+    pub held_reason: Option<crate::engine::merge_tree::HeldReason>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeMergeBatchResult {
+    pub target_branch: String,
+    pub before_oid: Option<String>,
+    pub after_oid: Option<String>,
+    pub policy: crate::harness::PolicyVerdict,
+    pub outcomes: Vec<WorktreeMergeBatchOutcome>,
+}
+
+fn land_error_parts(
+    err: crate::engine::land_queue::LandError,
+) -> (
+    &'static str,
+    String,
+    Vec<String>,
+    Option<crate::engine::merge_tree::HeldReason>,
+) {
+    use crate::engine::land_queue::LandError;
+    match err {
+        LandError::Conflict { message, paths, .. } => ("conflict", message, paths, None),
+        LandError::PermissionDenied { message } => ("permission_denied", message, Vec::new(), None),
+        LandError::InvalidArgument { message } => ("invalid_argument", message, Vec::new(), None),
+        LandError::Held {
+            reason, message, ..
+        } => ("held", message, Vec::new(), Some(reason)),
+        LandError::CommitHooks { hooks } => (
+            "commit_hooks",
+            format!("active commit hooks blocked landing: {}", hooks.join(", ")),
+            Vec::new(),
+            Some(crate::engine::merge_tree::HeldReason::CommitHooks),
+        ),
+        LandError::Rejected { message } => ("rejected", message, Vec::new(), None),
+        LandError::CasExhausted { message } => ("cas_exhausted", message, Vec::new(), None),
+        LandError::Canceled => (
+            "canceled",
+            "land request canceled".to_string(),
+            Vec::new(),
+            None,
+        ),
+        LandError::Failed { message } => ("failed", message, Vec::new(), None),
+    }
+}
+
+fn failed_batch_outcome(
+    lane: &WorktreeMergeBatchLane,
+    before_oid: Option<&str>,
+    source_oid: Option<String>,
+    code: &str,
+    message: String,
+    conflict_paths: Vec<String>,
+    held_reason: Option<crate::engine::merge_tree::HeldReason>,
+) -> WorktreeMergeBatchOutcome {
+    WorktreeMergeBatchOutcome {
+        branch: lane.branch.clone(),
+        worktree_path: lane.worktree_path.clone(),
+        ok: false,
+        already_landed: false,
+        source_oid,
+        landed_oid: None,
+        before_oid: before_oid.map(str::to_string),
+        batch_tip: None,
+        checkout_advanced: false,
+        checkout_note: None,
+        green_ref_note: None,
+        worktree_removed: false,
+        removal_error: None,
+        branch_deleted: false,
+        branch_error: None,
+        error_code: Some(code.to_string()),
+        error: Some(message),
+        conflict_paths,
+        held_reason,
+    }
+}
+
+/// Submits a batch of lane merges for a single target branch through
+/// [`crate::engine::land_queue::global_land_queue`], isolating per-lane failures
+/// and optionally tearing down cleanly landed worktrees.
+#[tauri::command(async)]
+pub async fn cmd_worktree_merge_batch(
+    repo_path: String,
+    target_branch: Option<String>,
+    lanes: Vec<WorktreeMergeBatchLane>,
+    remove_worktrees: Option<bool>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+) -> Result<WorktreeMergeBatchResult, IpcError> {
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        worktree_merge_batch_guarded(
+            &workbench,
+            &repo_path,
+            target_branch.as_deref(),
+            &lanes,
+            remove_worktrees.unwrap_or(false),
+            &|repo, argv| guard(repo, argv),
+        )
+    })
+    .await
+}
+
+pub(crate) fn worktree_merge_batch_guarded(
+    workbench: &crate::workbench::WorkbenchState,
+    repo_path: &str,
+    target_branch: Option<&str>,
+    lanes: &[WorktreeMergeBatchLane],
+    remove_worktrees: bool,
+    judge: WorktreeGate<'_>,
+) -> Result<WorktreeMergeBatchResult, CommandError> {
+    if lanes.is_empty() {
+        return Err("At least one lane is required for batch merge".into());
+    }
+    let repo = crate::engine::validate_repo(repo_path)?;
+    let target = match target_branch.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => {
+            validate_ref_name(name)?;
+            name.to_string()
+        }
+        None => crate::engine::git_reader::compute_default_base(&repo)
+            .checked()
+            .ok()
+            .and_then(|d| d.base.map(|(n, _)| n))
+            .unwrap_or_else(|| "main".to_string()),
+    };
+
+    let target_ref = format!("refs/heads/{target}");
+    let before_oid = git_text(&repo, &["rev-parse", "--verify", &target_ref])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let fold = VerdictFold::default();
+    let mut outcomes: Vec<Option<WorktreeMergeBatchOutcome>> = vec![None; lanes.len()];
+    let mut queued_indices = Vec::new();
+    let mut requests = Vec::new();
+
+    for (idx, lane) in lanes.iter().enumerate() {
+        let branch = lane.branch.trim();
+        if branch.is_empty() || validate_ref_name(branch).is_err() {
+            outcomes[idx] = Some(failed_batch_outcome(
+                lane,
+                before_oid.as_deref(),
+                lane.source_oid.clone(),
+                "invalid_argument",
+                format!("Invalid branch name {:?}", lane.branch),
+                Vec::new(),
+                None,
+            ));
+            continue;
+        }
+        if branch == target {
+            outcomes[idx] = Some(failed_batch_outcome(
+                lane,
+                before_oid.as_deref(),
+                lane.source_oid.clone(),
+                "invalid_argument",
+                format!("Cannot merge branch {branch:?} into itself"),
+                Vec::new(),
+                None,
+            ));
+            continue;
+        }
+        if let Some(wt_path) = lane
+            .worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Err(err) = workbench.refuse_if_in_use(wt_path) {
+                outcomes[idx] = Some(failed_batch_outcome(
+                    lane,
+                    before_oid.as_deref(),
+                    lane.source_oid.clone(),
+                    "refused",
+                    err,
+                    Vec::new(),
+                    None,
+                ));
+                continue;
+            }
+        }
+
+        let branch_ref = format!("refs/heads/{branch}");
+        let resolved_oid = match git_text(
+            &repo,
+            &["rev-parse", "--verify", &format!("{branch_ref}^{{commit}}")],
+        ) {
+            Ok(oid) => oid.trim().to_string(),
+            Err(err) => {
+                outcomes[idx] = Some(failed_batch_outcome(
+                    lane,
+                    before_oid.as_deref(),
+                    lane.source_oid.clone(),
+                    "invalid_argument",
+                    format!("Branch {branch:?} could not be resolved: {}", err.message()),
+                    Vec::new(),
+                    None,
+                ));
+                continue;
+            }
+        };
+
+        if let Some(expected) = lane
+            .source_oid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if expected != resolved_oid {
+                outcomes[idx] = Some(failed_batch_outcome(
+                    lane,
+                    before_oid.as_deref(),
+                    Some(resolved_oid.clone()),
+                    "moved",
+                    format!(
+                        "Branch {branch} moved from {} to {} before landing",
+                        &expected[..expected.len().min(12)],
+                        &resolved_oid[..resolved_oid.len().min(12)]
+                    ),
+                    Vec::new(),
+                    None,
+                ));
+                continue;
+            }
+        }
+
+        let squash = lane.squash.unwrap_or(false);
+        let merge_flag = if squash { "--squash" } else { "--no-edit" };
+        fold.record(judge(repo_path, &["git", "merge", merge_flag, branch])?);
+
+        let mut req =
+            crate::engine::land_queue::LandRequest::new(&repo, branch, &target, &resolved_oid);
+        req.squash = squash;
+        req.commit_message = lane.commit_message.clone();
+        req.hot_files = lane.hot_files.clone().unwrap_or_default();
+        req.verify_in_scratch = lane.verify_in_scratch.unwrap_or(false);
+        queued_indices.push(idx);
+        requests.push(req);
+    }
+
+    if !requests.is_empty() {
+        let queue_outcomes =
+            crate::engine::land_queue::global_land_queue().submit_batch_static(requests);
+        for (idx, res) in queued_indices.into_iter().zip(queue_outcomes) {
+            let lane = &lanes[idx];
+            outcomes[idx] = Some(match res {
+                Ok(landed) if landed.reverted_by.is_some() => failed_batch_outcome(
+                    lane,
+                    before_oid.as_deref(),
+                    Some(landed.source_oid),
+                    "refused",
+                    format!(
+                        "{} already landed on {} as {} (AlreadyLanded), but that landing was reverted by {}; worktree and branch were kept.",
+                        landed.branch,
+                        landed.target_branch,
+                        landed.landed_oid,
+                        landed.reverted_by.as_deref().unwrap_or("")
+                    ),
+                    Vec::new(),
+                    None,
+                ),
+                Ok(landed) => {
+                    let mut worktree_removed = false;
+                    let mut removal_error = None;
+                    let mut branch_deleted = false;
+                    let mut branch_error = None;
+
+                    if remove_worktrees {
+                        let mut safe_to_delete_branch = true;
+                        if let Some(wt_path) = lane
+                            .worktree_path
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let clean = crate::engine::worktree::user_changed_paths(wt_path)
+                                .map(|(dirty, truncated)| dirty.is_empty() && !truncated)
+                                .unwrap_or(false);
+                            if !clean {
+                                removal_error = Some(
+                                    "The worktree has uncommitted changes or could not be checked, so it was kept."
+                                        .to_string(),
+                                );
+                                safe_to_delete_branch = false;
+                            } else {
+                                let remove_argv =
+                                    crate::engine::worktree::remove_worktree_argv(wt_path, false);
+                                let remove_refs: Vec<&str> =
+                                    remove_argv.iter().map(String::as_str).collect();
+                                match judge(repo_path, &remove_refs) {
+                                    Ok(v) => {
+                                        fold.record(v);
+                                        match crate::engine::worktree::remove_worktree(
+                                            repo_path, wt_path, false,
+                                        ) {
+                                            Ok(_) => worktree_removed = true,
+                                            Err(err) => {
+                                                removal_error = Some(err.message().to_string());
+                                                safe_to_delete_branch = false;
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        removal_error = Some(err);
+                                        safe_to_delete_branch = false;
+                                    }
+                                }
+                            }
+                        }
+
+                        if safe_to_delete_branch {
+                            let force_del = lane.squash.unwrap_or(false);
+                            match GitWriter::delete_branch_argv(&landed.branch, force_del) {
+                                Ok(del_argv) => {
+                                    let del_refs: Vec<&str> =
+                                        del_argv.iter().map(String::as_str).collect();
+                                    match judge(repo_path, &del_refs) {
+                                        Ok(v) => {
+                                            fold.record(v);
+                                            match GitWriter::delete_branch(
+                                                repo_path,
+                                                &landed.branch,
+                                                force_del,
+                                            ) {
+                                                Ok(_) => branch_deleted = true,
+                                                Err(err) => {
+                                                    branch_error = Some(err.message().to_string());
+                                                }
+                                            }
+                                        }
+                                        Err(err) => branch_error = Some(err),
+                                    }
+                                }
+                                Err(err) => branch_error = Some(err.message().to_string()),
+                            }
+                        }
+                    }
+
+                    WorktreeMergeBatchOutcome {
+                        branch: landed.branch,
+                        worktree_path: lane.worktree_path.clone(),
+                        ok: true,
+                        already_landed: landed.already_landed,
+                        source_oid: Some(landed.source_oid),
+                        landed_oid: Some(landed.landed_oid),
+                        before_oid: before_oid.clone(),
+                        batch_tip: Some(landed.batch_tip),
+                        checkout_advanced: landed.checkout_advanced,
+                        checkout_note: landed.checkout_note,
+                        green_ref_note: landed.green_ref_note,
+                        worktree_removed,
+                        removal_error,
+                        branch_deleted,
+                        branch_error,
+                        error_code: None,
+                        error: None,
+                        conflict_paths: Vec::new(),
+                        held_reason: None,
+                    }
+                }
+                Err(err) => {
+                    let (code, message, conflict_paths, held_reason) = land_error_parts(err);
+                    failed_batch_outcome(
+                        lane,
+                        before_oid.as_deref(),
+                        lane.source_oid.clone(),
+                        code,
+                        message,
+                        conflict_paths,
+                        held_reason,
+                    )
+                }
+            });
+        }
+    }
+
+    let after_oid = git_text(&repo, &["rev-parse", "--verify", &target_ref])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let final_outcomes = outcomes
+        .into_iter()
+        .enumerate()
+        .map(|(idx, opt)| {
+            opt.unwrap_or_else(|| {
+                failed_batch_outcome(
+                    &lanes[idx],
+                    before_oid.as_deref(),
+                    lanes[idx].source_oid.clone(),
+                    "failed",
+                    "batch merge produced no outcome".to_string(),
+                    Vec::new(),
+                    None,
+                )
+            })
+        })
+        .collect();
+
+    Ok(WorktreeMergeBatchResult {
+        target_branch: target,
+        before_oid,
+        after_oid,
+        policy: fold.finish().unwrap_or_else(no_git_verdict),
+        outcomes: final_outcomes,
+    })
+}
+
 /// Reflink-copies the repository's ignored dependency caches into one of its
 /// worktrees. A cache that could not be copied whole fails the call.
 #[tauri::command(async)]
@@ -1147,6 +1588,216 @@ mod tests {
         assert!(
             !status.contains(".gitpulse"),
             "fork worktree container leaked into main checkout status:\n{status}"
+        );
+    }
+
+    #[test]
+    fn worktree_merge_batch_guarded_lands_clean_lanes_and_isolates_conflicts() {
+        let dir = tempfile::tempdir().expect("temp repo");
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main", "."]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Tester"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "shared.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-m", "init"]);
+        let base_oid = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Create two clean lanes and one conflicting lane.
+        crate::test_support::git_in(repo, &["checkout", "-q", "-b", "lane/a", &base_oid]);
+        std::fs::write(repo.join("a.txt"), "from-a\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "a.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-q", "-m", "lane a"]);
+        let oid_a = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        crate::test_support::git_in(repo, &["checkout", "-q", "-b", "lane/conflict", &base_oid]);
+        std::fs::write(repo.join("shared.txt"), "conflict-branch\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "shared.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-q", "-m", "conflict branch"]);
+        let oid_conflict = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        crate::test_support::git_in(repo, &["checkout", "-q", "-b", "lane/b", &base_oid]);
+        std::fs::write(repo.join("b.txt"), "from-b\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "b.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-q", "-m", "lane b"]);
+        let oid_b = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        crate::test_support::git_in(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("shared.txt"), "conflict-main\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "shared.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-q", "-m", "advance main"]);
+        crate::test_support::trust_repo(repo);
+
+        let workbench = crate::workbench::WorkbenchState::default();
+        let res = worktree_merge_batch_guarded(
+            &workbench,
+            repo.to_str().unwrap(),
+            Some("main"),
+            &[
+                WorktreeMergeBatchLane {
+                    worktree_path: None,
+                    branch: "lane/a".to_string(),
+                    source_oid: Some(oid_a),
+                    squash: Some(true),
+                    commit_message: None,
+                    hot_files: None,
+                    verify_in_scratch: None,
+                },
+                WorktreeMergeBatchLane {
+                    worktree_path: None,
+                    branch: "lane/conflict".to_string(),
+                    source_oid: Some(oid_conflict),
+                    squash: Some(true),
+                    commit_message: None,
+                    hot_files: None,
+                    verify_in_scratch: None,
+                },
+                WorktreeMergeBatchLane {
+                    worktree_path: None,
+                    branch: "lane/b".to_string(),
+                    source_oid: Some(oid_b),
+                    squash: Some(true),
+                    commit_message: None,
+                    hot_files: None,
+                    verify_in_scratch: None,
+                },
+            ],
+            false,
+            &|r, argv| crate::harness::guard_command(r, argv),
+        )
+        .expect("worktree_merge_batch_guarded");
+
+        assert_eq!(res.target_branch, "main");
+        assert_eq!(res.outcomes.len(), 3);
+        assert!(
+            res.outcomes[0].ok,
+            "lane a should land: {:?}",
+            res.outcomes[0]
+        );
+        assert!(!res.outcomes[1].ok);
+        assert_eq!(res.outcomes[1].error_code.as_deref(), Some("conflict"));
+        assert!(res.outcomes[1]
+            .conflict_paths
+            .contains(&"shared.txt".to_string()));
+        assert!(
+            res.outcomes[2].ok,
+            "lane b should land: {:?}",
+            res.outcomes[2]
+        );
+        assert_ne!(res.before_oid, res.after_oid);
+        assert_eq!(
+            crate::engine::git_cli::git_text(repo, &["show", "main:a.txt"])
+                .unwrap()
+                .trim(),
+            "from-a"
+        );
+        assert_eq!(
+            crate::engine::git_cli::git_text(repo, &["show", "main:b.txt"])
+                .unwrap()
+                .trim(),
+            "from-b"
+        );
+    }
+
+    #[test]
+    fn worktree_merge_batch_guarded_refuses_reverted_lane_and_keeps_branch() {
+        let dir = tempfile::tempdir().expect("temp repo");
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main", "."]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Tester"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "base.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-m", "init"]);
+        let base_oid = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        crate::test_support::git_in(repo, &["checkout", "-q", "-b", "lane/reverted", &base_oid]);
+        std::fs::write(repo.join("feat.txt"), "reverted feature\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "feat.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-q", "-m", "add feat"]);
+        let source_oid = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        crate::test_support::git_in(repo, &["checkout", "-q", "main"]);
+        crate::test_support::trust_repo(repo);
+
+        let workbench = crate::workbench::WorkbenchState::default();
+        let lane = WorktreeMergeBatchLane {
+            worktree_path: None,
+            branch: "lane/reverted".to_string(),
+            source_oid: Some(source_oid.clone()),
+            squash: Some(true),
+            commit_message: None,
+            hot_files: None,
+            verify_in_scratch: None,
+        };
+
+        // First land succeeds without removing the branch.
+        let first = worktree_merge_batch_guarded(
+            &workbench,
+            repo.to_str().unwrap(),
+            Some("main"),
+            std::slice::from_ref(&lane),
+            false,
+            &|r, argv| crate::harness::guard_command(r, argv),
+        )
+        .expect("initial land");
+        assert!(first.outcomes[0].ok);
+        let landed_oid = first.outcomes[0]
+            .landed_oid
+            .clone()
+            .expect("landed_oid recorded");
+
+        // Revert the landed commit on main.
+        crate::test_support::git_in(repo, &["revert", "--no-edit", &landed_oid]);
+        let revert_oid = crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Retrying the batch with remove_worktrees = true MUST refuse and preserve the branch.
+        let retry = worktree_merge_batch_guarded(
+            &workbench,
+            repo.to_str().unwrap(),
+            Some("main"),
+            std::slice::from_ref(&lane),
+            true,
+            &|r, argv| crate::harness::guard_command(r, argv),
+        )
+        .expect("retry returns isolated outcome");
+        assert_eq!(retry.outcomes.len(), 1);
+        let out = &retry.outcomes[0];
+        assert!(!out.ok, "reverted lane must be refused: {out:?}");
+        assert_eq!(out.error_code.as_deref(), Some("refused"));
+        assert!(!out.branch_deleted);
+        let err_msg = out.error.as_deref().unwrap_or("");
+        assert!(
+            err_msg.contains("AlreadyLanded") && err_msg.contains(&revert_oid),
+            "error must name AlreadyLanded and reverted_by SHA ({revert_oid}): {err_msg}"
+        );
+        assert!(
+            crate::engine::git_cli::git_text(
+                repo,
+                &["rev-parse", "--verify", "refs/heads/lane/reverted"]
+            )
+            .is_ok(),
+            "branch lane/reverted must still exist"
         );
     }
 }

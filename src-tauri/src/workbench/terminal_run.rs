@@ -55,6 +55,8 @@ pub(super) fn parse(input: &str) -> Result<Launch, WorkbenchError> {
 #[derive(Deserialize)]
 struct Source {
     id: String,
+    #[serde(default)]
+    task_id: String,
     revision: u64,
     state: String,
     cwd: String,
@@ -66,6 +68,217 @@ struct Source {
 #[derive(Deserialize)]
 struct Brief {
     markdown: String,
+}
+
+const PREVIOUS_ATTEMPTS_HEADING: &str = "## Previous attempts";
+const MAX_PREVIOUS_ATTEMPTS: usize = 5;
+const MAX_PREVIOUS_ATTEMPTS_BYTES: usize = 4096;
+const MAX_BRIEF_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ATTEMPT_FIELD_CHARS: usize = 240;
+const MAX_CRITERIA_PER_ATTEMPT: usize = 6;
+const MAX_FINDINGS_PER_CRITERION: usize = 3;
+
+fn sanitize_attempt_text(raw: &str, max_chars: usize) -> String {
+    let redacted = crate::ledger::redact::text(raw);
+    let mut out = String::new();
+    let mut pending_space = false;
+    let mut truncated = false;
+    for ch in redacted.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if out.chars().count() >= max_chars {
+            truncated = true;
+            break;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    if truncated && max_chars > 1 {
+        let trimmed: String = out.chars().take(max_chars - 1).collect();
+        format!("{trimmed}…")
+    } else {
+        out
+    }
+}
+
+fn prior_attempt_outcome(record: &super::verification_gate::Record) -> Option<&'static str> {
+    match record.outcome.as_str() {
+        "failed" => Some("failed"),
+        "held" => Some("held"),
+        "degraded" => Some("degraded"),
+        "" if record.state == "held" => Some("held"),
+        _ => None,
+    }
+}
+
+fn format_attempt_entry(record: &super::verification_gate::Record, outcome: &str) -> String {
+    let head = sanitize_attempt_text(record.head.trim(), 64);
+    let head_display = if head.is_empty() {
+        "unknown"
+    } else {
+        head.as_str()
+    };
+    let mut entry = format!("- Attempt (head: {head_display}, outcome: {outcome})\n");
+    let mut details = 0usize;
+    for criterion in record
+        .criteria
+        .iter()
+        .filter(|c| c.status != "met")
+        .take(MAX_CRITERIA_PER_ATTEMPT)
+    {
+        let status = sanitize_attempt_text(&criterion.status, 32);
+        let status = if status.is_empty() {
+            "unmet"
+        } else {
+            status.as_str()
+        };
+        let text = sanitize_attempt_text(&criterion.text, MAX_ATTEMPT_FIELD_CHARS);
+        entry.push_str(&format!(
+            "  - criterion {} ({status}): {text}",
+            criterion.index
+        ));
+        let findings: Vec<String> = criterion
+            .findings
+            .iter()
+            .map(|f| sanitize_attempt_text(f, MAX_ATTEMPT_FIELD_CHARS))
+            .filter(|f| !f.is_empty())
+            .take(MAX_FINDINGS_PER_CRITERION)
+            .collect();
+        if !findings.is_empty() {
+            entry.push_str(&format!("; findings: {}", findings.join("; ")));
+        }
+        entry.push('\n');
+        details += 1;
+    }
+    for item in record.degraded.iter().take(MAX_CRITERIA_PER_ATTEMPT) {
+        let text = sanitize_attempt_text(item, MAX_ATTEMPT_FIELD_CHARS);
+        if !text.is_empty() {
+            entry.push_str(&format!("  - degraded: {text}\n"));
+            details += 1;
+        }
+    }
+    let summary = sanitize_attempt_text(&record.critic_summary, MAX_ATTEMPT_FIELD_CHARS);
+    if !summary.is_empty() {
+        entry.push_str(&format!("  - summary: {summary}\n"));
+        details += 1;
+    }
+    if details == 0 {
+        entry.push_str("  - summary: No unmet criteria details recorded.\n");
+    }
+    entry
+}
+
+/// Appends a bounded, redacted `"## Previous attempts"` section when prior
+/// `failed` / `held` / `degraded` verification verdicts exist in `dc_store`
+/// evidence for `task_id`. First-attempt briefs with no matching verdicts are
+/// returned untouched.
+pub(crate) fn augment_brief_with_previous_attempts(
+    store: &dc_store::Store,
+    task_id: &str,
+    markdown: &str,
+) -> String {
+    if task_id.trim().is_empty() {
+        return markdown.to_owned();
+    }
+    let Ok((rows, _)) = store.evidence_list(Some(task_id)) else {
+        return markdown.to_owned();
+    };
+    let mut matching: Vec<(super::verification_gate::Record, &'static str)> = Vec::new();
+    for row in rows {
+        if row.kind != super::verification_gate::EVIDENCE_TYPE {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<super::verification_gate::Record>(&row.data_json)
+        else {
+            continue;
+        };
+        if !record.item_id.is_empty() && record.item_id != task_id {
+            continue;
+        }
+        if let Some(outcome) = prior_attempt_outcome(&record) {
+            matching.push((record, outcome));
+        }
+    }
+    if matching.is_empty() {
+        return markdown.to_owned();
+    }
+
+    let separator = if markdown.ends_with("\n\n") {
+        ""
+    } else if markdown.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let remaining_total = MAX_BRIEF_TOTAL_BYTES.saturating_sub(markdown.len() + separator.len());
+    let section_budget = MAX_PREVIOUS_ATTEMPTS_BYTES.min(remaining_total);
+    let header = format!("{PREVIOUS_ATTEMPTS_HEADING}\n");
+    if section_budget <= header.len() + 16 {
+        return markdown.to_owned();
+    }
+
+    let mut section = header;
+    let total = matching.len();
+    let mut shown = 0usize;
+    for (record, outcome) in matching.iter().take(MAX_PREVIOUS_ATTEMPTS) {
+        let entry = format_attempt_entry(record, outcome);
+        if section.len() + entry.len() > section_budget {
+            if shown == 0 {
+                let mut end = section_budget.saturating_sub(2);
+                while end > section.len() && !entry.is_char_boundary(end - section.len()) {
+                    end -= 1;
+                }
+                let take = end.saturating_sub(section.len());
+                if take == 0 {
+                    return markdown.to_owned();
+                }
+                section.push_str(&entry[..take]);
+                section.push_str("…\n");
+                shown += 1;
+            }
+            break;
+        }
+        section.push_str(&entry);
+        shown += 1;
+    }
+    if total > shown {
+        let omitted = format!(
+            "- … ({} older failed/held/degraded attempts omitted)\n",
+            total - shown
+        );
+        if section.len() + omitted.len() <= section_budget {
+            section.push_str(&omitted);
+        }
+    }
+
+    format!("{markdown}{separator}{section}")
+}
+
+fn prepare_brief_markdown(state: &WorkbenchState, task_id: &str, markdown: &str) -> String {
+    if task_id.trim().is_empty() {
+        return markdown.to_owned();
+    }
+    match state.with_store(|store| {
+        Ok(augment_brief_with_previous_attempts(
+            store, task_id, markdown,
+        ))
+    }) {
+        Ok(augmented) => augmented,
+        Err(error) => {
+            log::warn!(
+                target: "workbench",
+                "could not read prior attempt evidence for task {task_id}: {}: {}",
+                error.code,
+                error.message
+            );
+            markdown.to_owned()
+        }
+    }
 }
 
 pub(super) fn spawn<R: tauri::Runtime>(
@@ -164,7 +377,8 @@ fn start<R: tauri::Runtime>(
     options: terminal_command::LaunchOptions<'_>,
     output: terminal::OutputSink,
 ) -> Result<TerminalSpawned, WorkbenchError> {
-    let brief = terminal_command::BriefFile::create(&source.brief.markdown)?;
+    let brief_markdown = prepare_brief_markdown(state, &source.task_id, &source.brief.markdown);
+    let brief = terminal_command::BriefFile::create(&brief_markdown)?;
     let args = terminal_command::arguments(
         &source.provider,
         &source.permission_mode,
@@ -1057,5 +1271,152 @@ mod tests {
         }
         drop(terminals);
         assert_eq!(serving.join().unwrap(), server::exit_code::IDLE);
+    }
+
+    #[test]
+    fn brief_omits_previous_attempts_on_first_attempt_and_includes_bounded_redacted_verdicts_after_failure(
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let state = fixture(root.path());
+        let first_source = source(&state);
+        let first_brief = super::prepare_brief_markdown(
+            &state,
+            &first_source.task_id,
+            &first_source.brief.markdown,
+        );
+        assert_eq!(
+            first_brief, first_source.brief.markdown,
+            "first-attempt brief must remain untouched"
+        );
+        assert!(!first_brief.contains("## Previous attempts"));
+
+        // Passed verdict alone must also leave the brief untouched.
+        let passed_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let passed_evidence = json!({
+            "request_id": "req-pass",
+            "item_id": "task",
+            "state": "settled",
+            "outcome": "passed",
+            "worktree": root.path().to_str().unwrap(),
+            "head": passed_head,
+            "criteria": [{"index": 1, "text": "builds", "status": "met", "findings": []}],
+            "degraded": []
+        });
+        state
+            .with_store(|store| {
+                store
+                    .evidence_append(
+                        crate::workbench::verification_gate::EVIDENCE_TYPE,
+                        Some("task"),
+                        None,
+                        None,
+                        &passed_evidence.to_string(),
+                    )
+                    .map(|_| ())
+                    .map_err(|e| {
+                        crate::workbench::WorkbenchError::new("store_error", e.to_string())
+                    })
+            })
+            .unwrap();
+        let after_pass = super::prepare_brief_markdown(
+            &state,
+            &first_source.task_id,
+            &first_source.brief.markdown,
+        );
+        assert_eq!(after_pass, first_source.brief.markdown);
+
+        // Append failed and held attempts with a secret token and long criterion text.
+        let secret = format!("{}{}", "ghp_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let failed_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let held_head = "cccccccccccccccccccccccccccccccccccccccc";
+        let failed_evidence = json!({
+            "request_id": "req-fail",
+            "item_id": "task",
+            "state": "settled",
+            "outcome": "failed",
+            "worktree": root.path().to_str().unwrap(),
+            "head": failed_head,
+            "criteria": [
+                {
+                    "index": 1,
+                    "text": format!("exports csv without leaking {secret} {}", "x".repeat(400)),
+                    "status": "unmet",
+                    "findings": [format!("missing csv writer; saw {secret}")]
+                },
+                {
+                    "index": 2,
+                    "text": "compiles cleanly",
+                    "status": "met",
+                    "findings": []
+                }
+            ],
+            "degraded": [],
+            "critic_summary": format!("Verification failed near {secret}")
+        });
+        let held_evidence = json!({
+            "request_id": "req-held",
+            "item_id": "task",
+            "state": "held",
+            "outcome": "held",
+            "worktree": root.path().to_str().unwrap(),
+            "head": held_head,
+            "criteria": [],
+            "degraded": ["critic timed out"]
+        });
+        let degraded_head = "dddddddddddddddddddddddddddddddddddddddd";
+        let degraded_evidence = json!({
+            "request_id": "req-degraded",
+            "item_id": "task",
+            "state": "settled",
+            "outcome": "degraded",
+            "worktree": root.path().to_str().unwrap(),
+            "head": degraded_head,
+            "criteria": [{"index": 3, "text": "handles edge case", "status": "unknown", "findings": []}],
+            "degraded": ["test runner skipped"]
+        });
+        state
+            .with_store(|store| {
+                for ev in [&failed_evidence, &held_evidence, &degraded_evidence] {
+                    store
+                        .evidence_append(
+                            crate::workbench::verification_gate::EVIDENCE_TYPE,
+                            Some("task"),
+                            None,
+                            None,
+                            &ev.to_string(),
+                        )
+                        .map_err(|e| {
+                            crate::workbench::WorkbenchError::new("store_error", e.to_string())
+                        })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let retry_brief = super::prepare_brief_markdown(
+            &state,
+            &first_source.task_id,
+            &first_source.brief.markdown,
+        );
+        assert!(retry_brief.starts_with(&first_source.brief.markdown));
+        assert!(retry_brief.contains("\n## Previous attempts\n"));
+        assert!(retry_brief.contains(failed_head));
+        assert!(retry_brief.contains("outcome: failed"));
+        assert!(retry_brief.contains("criterion 1 (unmet):"));
+        assert!(retry_brief.contains("missing csv writer"));
+        assert!(!retry_brief.contains("criterion 2 (met)"));
+        assert!(retry_brief.contains(held_head));
+        assert!(retry_brief.contains("outcome: held"));
+        assert!(retry_brief.contains("critic timed out"));
+        assert!(retry_brief.contains(degraded_head));
+        assert!(retry_brief.contains("outcome: degraded"));
+        assert!(retry_brief.contains("test runner skipped"));
+        assert!(!retry_brief.contains(&secret), "secret must be redacted");
+        let section = retry_brief.split("## Previous attempts").nth(1).unwrap();
+        assert!(
+            section.len() <= super::MAX_PREVIOUS_ATTEMPTS_BYTES,
+            "section length {} exceeded bound",
+            section.len()
+        );
     }
 }
