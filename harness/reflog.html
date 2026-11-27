@@ -352,6 +352,9 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
   for(const width of [400,480])mount(CommitRow,{target:tiny[width],props:{row:fixtureRow(4),refs:TIP}});
   const card=host(320);
   mount(GraphNodeTooltip,{target:card,props:{row:fixtureRow(3,{summary:"Fix https://example.com/a/very/long/url/without/any/spaces/that/has/to/wrap/inside/the/card"}),mainlineName:"origin/an-extremely-long-mainline-branch-name-that-cannot-fit"}});
+  const LONG_REFS=[{name:"origin/feature/an-extremely-long-branch-name-that-keeps-going",kind:"remote-branch"},{name:"release/2026.11-hotfix-candidate-with-a-long-name",kind:"tag",aheadOfBase:3,comparedTo:"main"},{name:"HEAD",kind:"head"},{name:"main",kind:"current-branch"}];
+  const fullCard=host(320);
+  mount(GraphNodeTooltip,{target:fullCard,props:{row:fixtureRow(5,{summary:"fix: short",author_email:"ada.lovelace.with.a.long.address@analytical-engine.example.com",connections:[{is_dangling:true},{is_dangling:true}],parent_ids:[hex(950),hex(951)]}),refs:LONG_REFS,hasMore:true,authorCommitCount:12,mainlineName:"main",mergeTarget:fixtureRow(6,{summary:"Merge a target commit whose subject is long enough to need more than one line in the card"})}});
   // ResizeObserver reports on rendering frames, not timers: settle on frames.
   const frame=()=>Promise.race([new Promise(r=>requestAnimationFrame(()=>r())),wait(100)]);
   for(let i=0;i<6;i++){await tick();await frame();}
@@ -380,7 +383,13 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
   const subject=tip&&[...tip.querySelectorAll("div")].find(d=>d.children.length===0&&d.textContent.trim().startsWith("Fix https://"));
   check("a hover card wraps an unbreakable subject inside the card",()=>subject&&subject.getBoundingClientRect().right<=tip.getBoundingClientRect().right+0.5&&whole(subject),()=>subject?subject.clientWidth+"/"+subject.scrollWidth:"no subject");
   const mainline=tip?.querySelector('[data-testid="mainline-chip"]');
-  check("a long mainline name ellipsizes inside its chip and the card",()=>{const label=mainline?.querySelector("span")??mainline;return label&&mainline.getBoundingClientRect().right<=tip.getBoundingClientRect().right+0.5&&(label.scrollWidth<=label.clientWidth+1||getComputedStyle(label).textOverflow==="ellipsis")&&label!==mainline;},()=>mainline?mainline.outerHTML.slice(0,160):"no chip");
+  check("a long mainline name is whole inside its chip and the card",()=>{const label=mainline?.querySelector("span");return label&&mainline.getBoundingClientRect().right<=tip.getBoundingClientRect().right+0.5&&whole(label)&&whole(mainline)&&label.textContent.includes("origin/an-extremely-long-mainline-branch-name-that-cannot-fit");},()=>mainline?mainline.outerHTML.slice(0,160):"no chip");
+  // The card's host takes no pointer, so a title on cut text is never seen:
+  // every name, address and hint in it must be readable whole.
+  const full=fullCard.querySelector('[role="tooltip"]');
+  const cut=()=>[...full.querySelectorAll("*")].filter(el=>{if(getComputedStyle(el).webkitLineClamp!=="none")return false;const r=el.getBoundingClientRect();return el.scrollWidth>el.clientWidth+1&&getComputedStyle(el).overflowX!=="visible"||r.right>full.getBoundingClientRect().right+0.5;}).map(el=>el.tagName+":"+el.textContent.trim().slice(0,60));
+  check("nothing in a crowded hover card is cut or runs out of it",()=>full&&cut().length===0,()=>JSON.stringify(cut()));
+  check("the crowded card shows every ref name, the address and the load hint in full",()=>full&&[...LONG_REFS.map(r=>r.name),"ada.lovelace.with.a.long.address@analytical-engine.example.com","load older history to follow it"].every(t=>full.textContent.replace(/\s+/g," ").includes(t)),()=>full?.textContent.replace(/\s+/g," ").slice(0,400));
   lab.remove();
  }
 

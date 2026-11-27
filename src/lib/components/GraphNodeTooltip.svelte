@@ -136,13 +136,14 @@
           <!-- The straight column-0 rail, labelled by the branch it belongs
                to: a leftmost line with no name is just a colour. -->
           <span
-            class="gp-chip min-w-0 font-semibold"
+            class="gp-chip h-auto min-w-0 whitespace-normal py-0.5 font-semibold"
             style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
             data-testid="mainline-chip"
           >
-            <!-- A long branch name ellipsizes here; a bare text node in the
-                 chip's flex box would be clipped mid-glyph with no ellipsis. -->
-            <span class="min-w-0 truncate">{mainlineLabel}</span>
+            <!-- The card takes no pointer (its host is pointer-events-none), so
+                 nothing in it may be cut: an ellipsized name has no title to
+                 hover. A long branch name wraps inside the chip instead. -->
+            <span class="min-w-0 leading-tight [overflow-wrap:anywhere]">{mainlineLabel}</span>
           </span>
         {/if}
       </div>
@@ -156,7 +157,9 @@
     <div class="flex items-center gap-2 bg-background px-3 py-2 text-meta">
       <GitMerge size={11} class="shrink-0 text-accent" />
       {#if mergeTarget}
-        <span class="min-w-0 truncate text-textPrimary">
+        <!-- Wraps rather than ellipsizes: nothing in this card can be hovered
+             for the rest. The target's subject stops at two lines. -->
+        <span class="line-clamp-2 min-w-0 text-textPrimary [overflow-wrap:anywhere]">
           Merges into
           <span class="font-mono text-textMuted">{mergeTarget.id.slice(0, 7)}</span>
           · {mergeTarget.summary || "No commit message"}
@@ -171,7 +174,7 @@
     <!-- The stub's meaning, in words: which parent is missing and why. -->
     <div class="flex items-center gap-2 bg-background px-3 py-2 text-meta" data-testid="dangling-strip">
       <GitCommit size={11} class="shrink-0 text-textMuted" />
-      <span class="min-w-0 truncate text-textPrimary">
+      <span class="min-w-0 text-textPrimary [overflow-wrap:anywhere]">
         Parent <span class="font-mono text-textMuted">{missingParents[0].slice(0, 7)}</span>
         {missingParents.length > 1 ? `and ${missingParents.length - 1} more are` : "is"} outside the loaded history{hasMore ? " · load older history to follow it" : ""}
       </span>
@@ -186,7 +189,7 @@
         class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-micro font-semibold text-white ring-1 ring-background"
         ariaHidden
       />
-      <span class="min-w-0 truncate text-textPrimary">
+      <span class="min-w-0 text-textPrimary [overflow-wrap:anywhere]">
         {authorCommitCount}
         {authorCommitCount === 1 ? "commit" : "commits"} by {row.author_name || "Unknown"} in the
         loaded history
@@ -197,7 +200,7 @@
   {#if refs.length > 0}
     <div class="flex flex-wrap gap-1 bg-background px-3 py-2">
       {#each visibleRefs as ref}
-        <span class="gp-chip min-w-0 max-w-40 font-mono" data-tone="neutral">
+        <span class="gp-chip h-auto min-w-0 whitespace-normal py-0.5 font-mono" data-tone="neutral">
           {#if ref.kind === "tag"}
             <Tag size={9} class="shrink-0 text-warn" />
             {#if ref.comparedTo && ref.aheadOfBase && ref.aheadOfBase > 0}
@@ -213,7 +216,7 @@
           {:else}
             <GitBranch size={9} class="shrink-0 text-accent" />
           {/if}
-          <span class="min-w-0 truncate">{ref.name}</span>
+          <span class="min-w-0 leading-tight [overflow-wrap:anywhere]">{ref.name}</span>
         </span>
       {/each}
       {#if hiddenRefCount > 0}
@@ -237,7 +240,7 @@
       Author
     </dt>
     <dd
-      class="truncate text-right"
+      class="text-right [overflow-wrap:anywhere]"
       title={(row.author_name || "Unknown") + (row.author_email ? ` <${row.author_email}>` : "")}
     >
       <!-- The separator's spaces live in the expression: leading template
