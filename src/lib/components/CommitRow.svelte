@@ -235,10 +235,13 @@
    * label (`main`, `v2`) never shrinks: squeezed, it became a bare icon.
    * A long one ellipsizes, but no narrower than its icon plus a few glyphs:
    * the floor sits below any label past the cut-off, so it never pads one.
+   * `max-w-none` lifts the chip's own `max-width: 100%`: clamped to a strip
+   * narrower than itself, a short chip shrank to its icon with nothing to say
+   * it no longer fit (see wrappedChildren).
    */
   const SHORT_REF_LABEL = 12;
   function refChipFit(label: string): string {
-    return label.length <= SHORT_REF_LABEL ? "shrink-0" : "min-w-[4.5rem] max-w-[11rem]";
+    return label.length <= SHORT_REF_LABEL ? "shrink-0 max-w-none" : "min-w-[4.5rem] max-w-[11rem]";
   }
   /** Ref chips the strip moved off its one visible line (see wrappedChildren). */
   let wrappedRefs = $state(0);
@@ -311,7 +314,7 @@
       >
         {#each refs as r}
           {#if r.kind === "head"}
-            <span class="gp-chip shrink-0 font-mono font-semibold" data-tone="accent">
+            <span class="gp-chip {refChipFit("HEAD")} font-mono font-semibold" data-tone="accent">
               <Compass size={10} class="shrink-0" />
               HEAD
             </span>

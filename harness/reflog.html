@@ -346,6 +346,10 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
   mount(CommitRow,{target:crowded,props:{row:fixtureRow(1,{summary:"fix: tiny"}),refs:many}});
   const narrow={spacious:host(560),compact:host(560)};
   for(const density of ["spacious","compact"])mount(CommitRow,{target:narrow[density],props:{row:fixtureRow(2),refs:TIP,density}});
+  // Narrower than the first chip's share: at 400px the strip has no room for
+  // HEAD, at 480px only part of it.
+  const tiny={400:host(400),480:host(480)};
+  for(const width of [400,480])mount(CommitRow,{target:tiny[width],props:{row:fixtureRow(4),refs:TIP}});
   const card=host(320);
   mount(GraphNodeTooltip,{target:card,props:{row:fixtureRow(3,{summary:"Fix https://example.com/a/very/long/url/without/any/spaces/that/has/to/wrap/inside/the/card"}),mainlineName:"origin/an-extremely-long-mainline-branch-name-that-cannot-fit"}});
   // ResizeObserver reports on rendering frames, not timers: settle on frames.
@@ -363,6 +367,14 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
    check(`the narrow ${density} row's +N chip counts and names exactly the refs that left`,()=>{const gone=layout().filter(c=>c.gone).map(c=>c.name);if(gone.length===0)return !fold;const names=TIP.slice(TIP.length-gone.length).map(r=>r.name);return fold&&fold.textContent.trim()===`+${gone.length}`&&fold.title===names.join("\n");},()=>JSON.stringify({gone:layout().filter(c=>c.gone).map(c=>c.name),fold:fold?.textContent.trim(),title:fold?.title}));
    check(`the narrow ${density} row leaves no gap where the departed chips were`,()=>{const box=strip.getBoundingClientRect();const shown=chipsOf(strip).filter(c=>c.getBoundingClientRect().top<box.bottom-0.5);const lastRight=Math.max(...shown.map(c=>c.getBoundingClientRect().right));return shown.length>0&&box.right-lastRight<=2;},()=>{const box=strip.getBoundingClientRect();return JSON.stringify({strip:[box.left,box.right],chips:chipsOf(strip).map(c=>{const r=c.getBoundingClientRect();return [c.textContent.trim(),r.left,r.right,r.top];})});});
    check(`the summary keeps its share of a narrow ${density} row`,()=>{const s=summaryOf(el);const area=s?.parentElement;return s&&area&&s.clientWidth>=area.clientWidth*0.2;},()=>{const s=summaryOf(el);return s?s.clientWidth+"/"+s.parentElement.clientWidth:"no summary";});
+  }
+  for(const width of [400,480]){
+   const el=tiny[width];
+   const strip=el.querySelector("[data-row-refs]");
+   const fold=el.querySelector("[data-row-refs-hidden]");
+   const layout=()=>{const box=strip.getBoundingClientRect();return chipsOf(strip).map(c=>{const r=c.getBoundingClientRect();const inside=r.left>=box.left-0.5&&r.right<=box.right+0.5&&r.bottom<=box.bottom+0.5&&whole(c)&&[...c.querySelectorAll("span")].every(whole);const gone=r.top>=box.bottom-0.5||r.left>=box.right-0.5;return {name:c.textContent.trim(),width:Math.round(r.width),inside,gone};});};
+   check(`on a ${width}px row a ref chip with no room is gone, not squeezed or cut`,()=>{const l=layout();return l.length===4&&l.every(c=>c.inside||c.gone);},()=>JSON.stringify({strip:Math.round(strip.getBoundingClientRect().width),chips:layout()}));
+   check(`the ${width}px row's +N chip counts and names every ref out of view`,()=>{const gone=layout().filter(c=>!c.inside).map(c=>c.name);const names=TIP.slice(TIP.length-gone.length).map(r=>r.name);return gone.length>0&&fold&&fold.textContent.trim()===`+${gone.length}`&&fold.title===names.join("\n");},()=>JSON.stringify({out:layout().filter(c=>!c.inside).map(c=>c.name),fold:fold?.textContent.trim(),title:fold?.title}));
   }
   const tip=card.querySelector('[role="tooltip"]');
   const subject=tip&&[...tip.querySelectorAll("div")].find(d=>d.children.length===0&&d.textContent.trim().startsWith("Fix https://"));
