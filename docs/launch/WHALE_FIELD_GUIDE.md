@@ -54,7 +54,7 @@ canonical feature that already exists. It never stands for a new product.
 | Nickname | Canonical feature | Why the whale fits | One-line pitch |
 |---|---|---|---|
 | *Whale Sonic* | **DevMap code graph**: navigation (search, explore, trace, neighbours), blast radius, affected tests, regression suspects, dead symbols | Whales find their way by sound. Sonic is echolocation for your codebase. | "Agents see what a change touches before they make it." |
-| *Whale Song* | **A2A Peer Bus**, plus the collision radar and file claims | Whales talk to each other across distance. | "Agents from different vendors talk to each other instead of overwriting each other." |
+| *Whale Song* | **A2A Peer Bus** across Claude Code, Antigravity, Codex and Manvi, plus the collision radar and file claims | Whales talk to each other across distance. | "Agents from different vendors talk to each other instead of overwriting each other." |
 | *Whale Pod* | **Fleet & Agents tree**, with live detection of sessions Waylode did not launch | A pod is the group that travels together. | "Every agent, every worktree, every repository, in one view." |
 
 ### Proposed additions (owner to approve or veto)
@@ -185,7 +185,7 @@ Replace "the 18 products we checked" with "the products listed in the Whale fiel
 **Long pitch**
 > Waylode, also called Whale, is the open-source command centre for parallel coding agents. Its code graph
 > (*Whale Sonic*) shows every agent the blast radius of an edit across all your worktrees. Its peer bus
-> (*Whale Song*) lets Claude Code, Codex and others message each other, and it warns before their edits meet.
+> (*Whale Song*) lets Claude Code, Antigravity, Codex and Manvi agents message each other, and it warns before their edits meet.
 > Then it lands their branches together, verified, while the load governor keeps the laptop responsive.
 
 **Feature cards (website)**
@@ -193,7 +193,7 @@ Replace "the 18 products we checked" with "the products listed in the Whale fiel
 | Card | Headline | Body | Proof |
 |---|---|---|---|
 | *Whale Sonic* · DevMap | Know what breaks before you edit | One code graph shared by the worktrees Waylode creates for agents, with each worktree's changes layered on top. Blast radius, affected tests, regression suspects. | `devmap_impact`, `waylode_codeintel_suspects` |
-| *Whale Song* · A2A Peer Bus | Agents that talk, across vendors | Agents from different vendors message each other and claim files. Agents can ask the radar whether their edits meet another agent's in the same file or in the call graph, and a hook asks before an edit to a file another worktree has changed, where Waylode's hooks are registered (not Antigravity). | `waylode_agent_*`, `waylode_worktree_radar` |
+| *Whale Song* · A2A Peer Bus | Agents that talk, across vendors | Claude Code, Antigravity, Codex and Manvi agents message each other and claim files; Claude Code and Antigravity sessions get messages delivered live, and other peers read them with `waylode_agent_inbox`. Agents can ask the radar whether their edits meet another agent's in the same file or in the call graph, and a hook asks before an edit to a file another worktree has changed, where Waylode's hooks are registered (the edit hook does not cover Antigravity, but A2A messaging does). | `waylode_agent_*`, `waylode_worktree_radar` |
 | *Whale Pod* · Fleet & Agents | See every agent, even ones you didn't start | Live sessions from every vendor, nested by parent, beside a grid of every repository. | `waylode_sessions`, `⌘⇧A`, `⌘⇧F` |
 | *Whale Tide* · Load Governor | Parallel builds, no beachball | Waylode refuses to start another agent while memory is under pressure (you can admit it anyway), and queues heavy cargo/go builds for a slot. | **Admit anyway** in Health |
 | *Whale Migration* · Land Queue | Land ten branches, not one at a time | Batches of finished, already-verified branches are trial-merged together in Git's object store and landed, all before you push (coming in 0.2.0). | `waylode-worktree land-batch` |
