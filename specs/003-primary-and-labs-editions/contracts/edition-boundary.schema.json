@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitpulse.vbcr.dev/schemas/edition-boundary.schema.json",
+  "title": "Waylode Primary and Waylode Labs Edition Boundary Contract",
+  "description": "Public wire tier definitions and boundary invariants separating Waylode Primary (free OSS, MIT OR Apache-2.0, zero sign-in) from Waylode Labs hosted relay tiers (free inbox, pro, team, enterprise).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "primary_edition",
+    "wire_tiers",
+    "invariants"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "primary_edition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "license",
+        "requires_sign_in",
+        "paywalled",
+        "byok_compute_allowed"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "const": "Waylode Primary"
+        },
+        "license": {
+          "type": "string",
+          "const": "MIT OR Apache-2.0"
+        },
+        "requires_sign_in": {
+          "type": "boolean",
+          "const": false
+        },
+        "paywalled": {
+          "type": "boolean",
+          "const": false
+        },
+        "byok_compute_allowed": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "wire_tiers": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tier_id",
+          "display_name",
+          "edition",
+          "requires_sign_in",
+          "paywalled"
+        ],
+        "properties": {
+          "tier_id": {
+            "type": "string",
+            "enum": [
+              "free",
+              "pro",
+              "team",
+              "enterprise"
+            ]
+          },
+          "display_name": {
+            "type": "string",
+            "enum": [
+              "Waylode Primary / Free Inbox",
+              "Labs Geek",
+              "Labs Geek Squad",
+              "Enterprise"
+            ]
+          },
+          "edition": {
+            "type": "string",
+            "enum": [
+              "primary",
+              "labs"
+            ]
+          },
+          "requires_sign_in": {
+            "type": "boolean"
+          },
+          "paywalled": {
+            "type": "boolean"
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "invariants": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "zero_local_paywalls",
+        "zero_telemetry_in_primary",
+        "relay_auth_required_for_labs",
+        "e2ee_audit_required_before_customer_payloads"
+      ],
+      "properties": {
+        "zero_local_paywalls": {
+          "type": "boolean",
+          "const": true
+        },
+        "zero_telemetry_in_primary": {
+          "type": "boolean",
+          "const": true
+        },
+        "relay_auth_required_for_labs": {
+          "type": "boolean",
+          "const": true
+        },
+        "e2ee_audit_required_before_customer_payloads": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": 1,
+      "primary_edition": {
+        "name": "Waylode Primary",
+        "license": "MIT OR Apache-2.0",
+        "requires_sign_in": false,
+        "paywalled": false,
+        "byok_compute_allowed": true
+      },
+      "wire_tiers": [
+        {
+          "tier_id": "free",
+          "display_name": "Waylode Primary / Free Inbox",
+          "edition": "primary",
+          "requires_sign_in": true,
+          "paywalled": false,
+          "capabilities": [
+            "share_receiving_inbox"
+          ]
+        },
+        {
+          "tier_id": "pro",
+          "display_name": "Labs Geek",
+          "edition": "labs",
+          "requires_sign_in": true,
+          "paywalled": true,
+          "capabilities": [
+            "device_sync",
+            "task_sharing_5",
+            "r2_devmap_cache",
+            "mobile_steering",
+            "private_pr_gates"
+          ]
+        },
+        {
+          "tier_id": "team",
+          "display_name": "Labs Geek Squad",
+          "edition": "labs",
+          "requires_sign_in": true,
+          "paywalled": true,
+          "capabilities": [
+            "space_radar",
+            "team_killswitch",
+            "unlimited_private_pr_gates",
+            "team_spend_rollups"
+          ]
+        },
+        {
+          "tier_id": "enterprise",
+          "display_name": "Enterprise",
+          "edition": "labs",
+          "requires_sign_in": true,
+          "paywalled": true,
+          "capabilities": [
+            "org_signed_policy_bundles",
+            "siem_soc2_audit_export",
+            "oidc_scim",
+            "byoc_relay",
+            "mdm"
+          ]
+        }
+      ],
+      "invariants": {
+        "zero_local_paywalls": true,
+        "zero_telemetry_in_primary": true,
+        "relay_auth_required_for_labs": true,
+        "e2ee_audit_required_before_customer_payloads": true
+      }
+    }
+  ]
+}
