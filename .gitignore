@@ -420,3 +420,15 @@ blob-report/
 
 /src-tauri/crates/waylode-protocol/target/
 /crates/waylode-worktree/target/
+
+# Launch plans and copy, the rename plan, a one-off verification record and the
+# social banner are local-only: untracked 2026-11-28, and history up to 33c6e0862
+# still has them. The two user-facing launch guides stay tracked.
+/docs/launch/*
+!/docs/launch/MIGRATING_FROM_CONDUCTOR.md
+!/docs/launch/WHALE_FIELD_GUIDE.md
+/docs/WAYLODE_RENAME_PLAN.md
+/docs/REMOTE_CONTROL_E2E_VERIFICATION.md
+/docs/assets/waylode-social-banner.png
+# Exported agent session transcripts
+/transcript-*.txt
